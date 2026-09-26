@@ -13,3 +13,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+thiserror = "2.0.17"
