@@ -274,6 +274,14 @@ fn is_ident_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_'
 }
 
+/// Words with no syntax yet but reserved so a later feature does not break
+/// existing code (spec r5 §5.3, D26). Not real keywords: they still lex as
+/// `Tok::Ident` (nothing in the grammar treats them specially yet), but
+/// using one as a name is a compile error at the lexer.
+fn is_reserved_word(s: &str) -> bool {
+    matches!(s, "async" | "await")
+}
+
 fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
@@ -373,6 +381,16 @@ impl Lexer<'_> {
                         self.bump();
                     }
                     let text = &self.src[start..self.pos];
+                    if is_reserved_word(text) {
+                        self.diags.push(
+                            Diagnostic::error(
+                                "W0010",
+                                Span::new(start, self.pos),
+                                format!("`{text}` is reserved for future use and cannot be used as a name"),
+                            )
+                            .with_hint("pick a different name; `async`/`await` are reserved for a future language feature (spec r5 \u{00a7}5.3)"),
+                        );
+                    }
                     let tok = keyword(text).unwrap_or_else(|| Tok::Ident(text.to_string()));
                     self.push(tok, start);
                 }
