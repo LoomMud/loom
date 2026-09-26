@@ -182,6 +182,31 @@ impl Ty {
         matches!(self, Ty::Any | Ty::Error)
     }
 
+    /// Is this type a function type, or does it contain one (in an array,
+    /// a map's key or value, or `T?`)? Spec r5 §5.2.2 rule 4: a `persistent`
+    /// variable's type can never be or contain `fn(...)` — function values
+    /// pin a code version and a principal that may not survive a reboot.
+    /// Struct fields are not checked yet: V1 structs are not implemented by
+    /// the type checker (`W0208`), so `Ty` has no struct variant to recurse
+    /// into; add that arm here when structs land.
+    pub fn contains_fn(&self) -> bool {
+        match self {
+            Ty::Fn(_) => true,
+            Ty::Array(t) | Ty::Optional(t) => t.contains_fn(),
+            Ty::Map(k, v) => k.contains_fn() || v.contains_fn(),
+            Ty::Int
+            | Ty::Float
+            | Ty::Bool
+            | Ty::String
+            | Ty::Object
+            | Ty::Null
+            | Ty::Any
+            | Ty::Void
+            | Ty::Never
+            | Ty::Error => false,
+        }
+    }
+
     /// Does not produce a diagnostic when used anywhere (any/poison/never).
     pub fn is_lenient(&self) -> bool {
         matches!(self, Ty::Any | Ty::Error | Ty::Never)
