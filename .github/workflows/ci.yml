@@ -54,3 +54,16 @@ jobs:
           tar -xzf "$workdir/gitleaks.tar.gz" -C "$workdir" gitleaks
           "$workdir/gitleaks" git --redact --exit-code 1 .
       - uses: fsfe/reuse-action@v5
+  fuzz-smoke:
+    # Weft parser fuzz smoke (OBI-23): <= 60 s of libFuzzer seeded from the
+    # golden files. Not (yet) a required check on `main`.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/loom-syntax/fuzz
+      - run: cargo install cargo-fuzz --locked
+      - run: FUZZ_SECONDS=45 scripts/fuzz-smoke.sh
