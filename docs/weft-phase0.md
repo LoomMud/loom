@@ -134,6 +134,7 @@ Precedence, loosest first:
 | `inventory(ob) -> [object]` | in move order |
 | `move_to(dest)` | moves **self** into `dest` (containment cycles are an error) |
 | `send(ob, text)` | writes `text` verbatim to the connection bound to `ob`; no-op if none or `ob` is `null` |
+| `disconnect(ob)` | closes the connection bound to `ob` (e.g. `quit`); no-op if none or `ob` is `null`. `net_dead()` runs once the network layer reports the close, as for a dropped link |
 | `bind_connection(ob)` | **master only**: rebinds the current execution's connection to `ob` |
 | `compile_object(path) -> string?` | recompile (the `update` command); `null` on success, else the diagnostics |
 | `len(x) -> int` | string (code points), array, map |

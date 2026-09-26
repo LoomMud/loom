@@ -27,6 +27,7 @@ const EFUNS: &[(&str, usize, usize)] = &[
     ("inventory", 1, 1),
     ("move_to", 1, 1),
     ("send", 2, 2),
+    ("disconnect", 1, 1),
     ("bind_connection", 1, 1),
     ("compile_object", 1, 1),
     ("len", 1, 1),
@@ -176,6 +177,23 @@ impl Exec<'_> {
                         f,
                         span,
                         format!("send(): expected object, got {}", a0.type_name()),
+                    ));
+                }
+                Ok(Value::Null)
+            }
+            "disconnect" => {
+                // Ask the host to close the link; the driver runs `net_dead()`
+                // when the network layer reports the disconnect, exactly as
+                // for a dropped link.
+                if let Value::Object(id) = a0
+                    && let Some(conn) = self.st.objects.get(id).and_then(|o| o.conn)
+                {
+                    self.host.close(conn);
+                } else if !matches!(a0, Value::Null | Value::Object(_)) {
+                    return Err(self.err(
+                        f,
+                        span,
+                        format!("disconnect(): expected object, got {}", a0.type_name()),
                     ));
                 }
                 Ok(Value::Null)
