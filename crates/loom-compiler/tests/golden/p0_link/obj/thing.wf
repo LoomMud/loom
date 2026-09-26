@@ -1,0 +1,35 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+inherit /std/base
+
+var hp: int = 3
+var dup: int = 1
+fn dup() {
+}
+
+fn create() {
+}
+
+override fn nothing() {
+}
+
+fn params(a: int, a: int) {
+}
+
+fn defaults(a: int = 1, b: int) {
+}
+
+fn types(x: strng, y: mapping) {
+}
+
+fn body() {
+    let fixed = 1
+    fixed = 2
+    self = self
+    missing = 3
+    let n = lenn("x")
+    let m = len("a", "b")
+    super::nope()
+    undefined_fn()
+    send(self)
+}

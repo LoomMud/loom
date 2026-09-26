@@ -1,0 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// Clean: the gradual boundary. Values leaving `any` get a runtime cast.
+inherit /std/base
+
+pub override fn describe(extra: string = "") -> string {
+    let dyn: any = load_object("/x").query()
+    let n: int = dyn
+    let names: [string] = keys({"a": dyn})
+    let parts: [any] = [1, "two"]
+    return super::describe($"{n} {len(names)} {len(parts)}")
+}

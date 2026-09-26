@@ -1,0 +1,152 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+
+//! Efun type signatures for the checker (spec §5.5).
+//!
+//! This is the compile-time half of the efun registry: parameter and return
+//! types plus the privilege class. The runtime half (implementation, tick
+//! cost) lives in `loom-vm`. V6 (OBI-33) merges both into one registry; until
+//! then this table must list exactly the efuns `loom-vm` implements
+//! (`efun_table_matches_vm` in the tests keeps them in sync by name).
+
+use crate::ty::Ty;
+
+/// Privilege class (§5.5). Enforcement is the VM's job (V6); the checker
+/// only records it in the HIR so codegen can emit the gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Privilege {
+    P0,
+    P1,
+    P2,
+    P3,
+    P4,
+}
+
+/// One parameter of an efun.
+#[derive(Clone, Debug)]
+pub enum Param {
+    Ty(Ty),
+    /// `string`, `[T]` or `{K: V}` (for `len`).
+    Sized,
+    /// Any map `{K: V}` (for `keys`).
+    AnyMap,
+}
+
+#[derive(Clone, Debug)]
+pub enum Ret {
+    Ty(Ty),
+    /// `[K]` for a `{K: V}` first argument.
+    KeysOf,
+}
+
+#[derive(Clone, Debug)]
+pub struct EfunSig {
+    pub name: &'static str,
+    pub params: Vec<Param>,
+    /// Arguments after `min_args` are optional.
+    pub min_args: usize,
+    pub ret: Ret,
+    pub privilege: Privilege,
+}
+
+const NAMES: &[&str] = &[
+    "self",
+    "this_player",
+    "load_object",
+    "clone_object",
+    "find_object",
+    "object_name",
+    "environment",
+    "inventory",
+    "move_to",
+    "send",
+    "disconnect",
+    "bind_connection",
+    "compile_object",
+    "len",
+    "split",
+    "join",
+    "keys",
+    "trim",
+];
+
+/// All efun names known to the checker.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    NAMES.iter().copied()
+}
+
+/// The signature of efun `name`, if it exists.
+pub fn lookup(name: &str) -> Option<EfunSig> {
+    use Param::Ty as P;
+    use Privilege::*;
+    let obj = Ty::Object;
+    let oobj = Ty::optional(Ty::Object);
+    let s = Ty::String;
+    let (name, params, min_args, ret, privilege) = match name {
+        "self" => ("self", vec![], 0, Ret::Ty(obj), P0),
+        "this_player" => ("this_player", vec![], 0, Ret::Ty(oobj), P0),
+        "load_object" => ("load_object", vec![P(s)], 1, Ret::Ty(obj), P0),
+        "clone_object" => ("clone_object", vec![P(s)], 1, Ret::Ty(obj), P0),
+        "find_object" => ("find_object", vec![P(s)], 1, Ret::Ty(oobj), P0),
+        "object_name" => ("object_name", vec![P(obj)], 1, Ret::Ty(s), P0),
+        "environment" => ("environment", vec![P(oobj.clone())], 0, Ret::Ty(oobj), P0),
+        "inventory" => (
+            "inventory",
+            vec![P(obj)],
+            1,
+            Ret::Ty(Ty::array(Ty::Object)),
+            P0,
+        ),
+        "move_to" => ("move_to", vec![P(obj)], 1, Ret::Ty(Ty::Void), P0),
+        "send" => ("send", vec![P(oobj), P(s)], 2, Ret::Ty(Ty::Void), P0),
+        "disconnect" => ("disconnect", vec![P(oobj)], 1, Ret::Ty(Ty::Void), P0),
+        "bind_connection" => ("bind_connection", vec![P(obj)], 1, Ret::Ty(Ty::Void), P3),
+        "compile_object" => (
+            "compile_object",
+            vec![P(s)],
+            1,
+            Ret::Ty(Ty::optional(Ty::String)),
+            P1,
+        ),
+        "len" => ("len", vec![Param::Sized], 1, Ret::Ty(Ty::Int), P0),
+        "split" => (
+            "split",
+            vec![P(s.clone()), P(s)],
+            2,
+            Ret::Ty(Ty::array(Ty::String)),
+            P0,
+        ),
+        "join" => (
+            "join",
+            vec![P(Ty::array(Ty::String)), P(s)],
+            2,
+            Ret::Ty(Ty::String),
+            P0,
+        ),
+        "keys" => ("keys", vec![Param::AnyMap], 1, Ret::KeysOf, P0),
+        "trim" => ("trim", vec![P(s.clone())], 1, Ret::Ty(s), P0),
+        _ => return None,
+    };
+    Some(EfunSig {
+        name,
+        params,
+        min_args,
+        ret,
+        privilege,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_name_has_a_signature() {
+        for n in names() {
+            let sig = lookup(n).unwrap_or_else(|| panic!("no signature for {n}"));
+            assert_eq!(sig.name, n);
+            assert!(sig.min_args <= sig.params.len());
+        }
+        assert!(lookup("nope").is_none());
+    }
+}

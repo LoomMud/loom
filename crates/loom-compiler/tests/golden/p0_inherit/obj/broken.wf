@@ -1,0 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+fn f() -> int {
+    return "x"
+}

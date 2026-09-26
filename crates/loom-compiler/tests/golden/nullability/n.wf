@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+var here: object? = null
+
+fn f(xs: [string]?) {
+    let env = environment()
+    env.tell("hi")
+    env?.tell("ok")
+    if env != null {
+        env.tell("narrowed")
+    }
+    if env == null {
+        return
+    }
+    env.tell("narrowed after early return")
+    here.tell("program variables are not narrowed")
+    let first = xs[0]
+    for x in xs {
+    }
+    var cur = environment()
+    while cur != null {
+        cur.tell("loop narrowed")
+        cur = environment(cur)
+    }
+    var o = find_object("/x")
+    if o != null {
+        o = find_object("/y")
+        o.tell("assignment ends narrowing")
+    }
+    if o != null and o.ok() {
+    }
+}

@@ -1,0 +1,11 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// Phase 0 link-checker diagnostics, preserved by loom-compiler.
+var hp: int = 10
+
+fn create() {
+}
+
+pub fn greet(name: string) -> string {
+    return $"hi {name}"
+}

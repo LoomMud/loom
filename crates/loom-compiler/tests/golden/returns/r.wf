@@ -1,0 +1,36 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+fn nothing() {
+    return 1
+}
+
+fn needs() -> int {
+    return
+}
+
+fn falls_off(b: bool) -> string {
+    if b {
+        return "yes"
+    }
+}
+
+fn all_paths(b: bool) -> string {
+    if b {
+        return "yes"
+    } else {
+        return "no"
+    }
+}
+
+fn forever() -> int {
+    while true {
+    }
+}
+
+fn use_void() {
+    let x = nothing2()
+    send(self, nothing2())
+}
+
+fn nothing2() {
+}

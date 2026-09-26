@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+var count: int = "zero"
+var maybe: string? = null
+var label: string = null
+
+fn takes(s: string, o: object) {
+}
+
+fn f() -> string {
+    let a: int = "one"
+    var b = 1
+    b = "two"
+    takes(5, self)
+    takes(maybe, self)
+    let x: float = 1
+    return 42
+}

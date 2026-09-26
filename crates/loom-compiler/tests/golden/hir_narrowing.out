@@ -1,0 +1,38 @@
+ok
+program /room
+  linearization /room
+  var internal exits: {string: string}
+    map : {string: string}
+      "north" : string
+        "/r/n" : string
+  fn pub dest(%0 dir: string) -> string?
+    if
+      In Map : bool
+        %0:dir : string
+        global /room::exits : {string: string}
+    then
+      return
+        index MapPresent : string
+          global /room::exits : {string: string}
+          %0:dir : string
+    return
+      null : null
+  fn private helper(%0 o: object) -> string
+    return
+      efun object_name P0 : string
+        %0:o : object
+  fn pub where_am_i() -> string
+    local %0 env: object?
+    let %0:env
+      efun environment P0 : object?
+    if
+      Eq Generic : bool
+        %0:env : object?
+        null : null
+    then
+      return
+        "nowhere" : string
+    return
+      call static /room::helper : string
+        %0:env : object
+

@@ -1,0 +1,13 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+fn f(n: int, s: string, xs: [int], o: object?) {
+    if n {
+    }
+    while s {
+    }
+    if xs and true {
+    }
+    if not o {
+    }
+    let ok = n > 0 or len(s) > 0
+}
