@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+
+.git
+.github
+target
+**/target
+*.log
+.DS_Store

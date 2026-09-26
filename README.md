@@ -21,6 +21,18 @@ cargo run -p loom-cli     # prints the version (Phase 0 bootstrap)
 scripts/ci-local.sh       # fmt, clippy, test, cargo-deny, DCO
 ```
 
+## Docker dev environment
+
+```sh
+docker compose up --build
+# with Prometheus + Grafana:
+docker compose --profile obs up --build
+```
+
+- Loom serves telnet on `localhost:4000` and reads the mounted mudlib from `./mudlib`.
+- Postgres is available at `localhost:5432` with `loom/loom` credentials.
+- With `obs` profile: Prometheus (`localhost:9090`) and Grafana (`localhost:3000`, anonymous viewer) start with a starter dashboard.
+
 ## Remotes
 
 - Canonical remote: `https://github.com/LoomMud/loom` (public).
