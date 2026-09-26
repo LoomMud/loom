@@ -1,6 +1,6 @@
 version = 1
 
 [[annotations]]
-path = ["Cargo.lock", "README.md", "CONTRIBUTING.md", ".gitignore", ".github/**", "docs/**"]
+path = ["Cargo.lock", "README.md", "CONTRIBUTING.md", ".gitignore", ".github/**", "docs/**", "crates/*/tests/golden/**", "crates/*/tests/fixtures/**"]
 SPDX-FileCopyrightText = "2026 Oberfield"
 SPDX-License-Identifier = "LicenseRef-Oberfield-Proprietary"

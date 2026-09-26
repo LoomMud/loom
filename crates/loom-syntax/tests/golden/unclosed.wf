@@ -1,0 +1,7 @@
+fn a() {
+    if true {
+        send(this_player(), "hi")
+
+fn b() {
+    let m = {}
+}

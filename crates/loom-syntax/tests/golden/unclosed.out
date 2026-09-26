@@ -1,0 +1,10 @@
+unclosed.wf:2:13: error: this `{` is not closed before the next declaration
+  |
+2 |     if true {
+  |             ^
+  = help: add a matching `}`
+unclosed.wf:6:13: error: `{}` is ambiguous
+  |
+6 |     let m = {}
+  |             ^^
+  = help: write the empty map as `{:}`

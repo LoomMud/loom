@@ -1,0 +1,45 @@
+errors.wf:1:9: error: inherit paths are not quoted
+  |
+1 | inherit "/std/room"
+  |         ^^^^^^^^^^^
+  = help: write `inherit /std/room`
+errors.wf:4:19: error: expected an expression, found `=`
+  |
+4 | var broken: int = = 2
+  |                   ^
+errors.wf:8:5: error: expected an expression, found `let`
+  |
+8 |     let y = @
+  |     ^^^
+errors.wf:8:13: error: unexpected character `@`
+  |
+8 |     let y = @
+  |             ^
+errors.wf:10:16: error: expected `{`, found `return`
+   |
+10 |     while true return
+   |                ^^^^^^
+errors.wf:11:11: error: expected end of statement, found integer `2`
+   |
+11 |     x = 1 2
+   |           ^
+   = help: put each statement on its own line or separate them with `;`
+errors.wf:12:5: error: cannot assign to this expression
+   |
+12 |     1 + 2 = 3
+   |     ^^^^^
+   = help: assign to a variable (`x = …`) or an element (`a[i] = …`)
+errors.wf:13:17: error: empty `{}` in interpolated string
+   |
+13 |     let s = $"a {  } b"
+   |                 ^^^^
+errors.wf:16:1: error: `import` is not supported in the Phase 0 Weft subset
+   |
+16 | import /x/y
+   | ^^^^^^
+   = help: use `inherit` for code reuse in Phase 0
+errors.wf:19:18: error: comparison operators cannot be chained
+   |
+19 |     return a < b < c
+   |                  ^
+   = help: combine comparisons with `and`: `a < b and b < c`

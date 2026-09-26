@@ -1,0 +1,45 @@
+unsupported.wf:1:9: error: labelled inherit is not supported in Phase 0
+  |
+1 | inherit combat = /std/mixins/combat
+  |         ^^^^^^
+  = help: write `inherit /path/to/program`
+unsupported.wf:2:1: error: `const` is not supported in the Phase 0 Weft subset
+  |
+2 | const MAX = 3
+  | ^^^^^
+  = help: use a `var` for now
+unsupported.wf:3:1: error: `enum` is not supported in the Phase 0 Weft subset
+  |
+3 | enum Kind { A, B }
+  | ^^^^
+  = help: use strings or ints for now
+unsupported.wf:4:1: error: `protected` is not supported in the Phase 0 Weft subset
+  |
+4 | protected var p: int = 1
+  | ^^^^^^^^^
+  = help: use the default (internal) visibility or `private`
+unsupported.wf:7:5: error: `try` is not supported in the Phase 0 Weft subset
+  |
+7 |     try { g() } catch e { }
+  |     ^^^
+  = help: runtime errors abort the execution in Phase 0
+unsupported.wf:9:13: error: closures are not supported in Phase 0
+  |
+9 |     let c = fn(x) => x + 1
+  |             ^^
+  = help: call a named function instead
+unsupported.wf:10:8: error: objects have no fields; `field` must be called
+   |
+10 |     ob.field
+   |        ^^^^^
+   = help: write `.field()`
+unsupported.wf:11:23: error: named arguments are not supported in Phase 0
+   |
+11 |     ob.tell_room("x", exclude: [me])
+   |                       ^^^^^^^
+   = help: pass arguments by position
+unsupported.wf:12:8: error: `if let` is not supported in Phase 0
+   |
+12 |     if let o = ref { }
+   |        ^^^
+   = help: compare with null instead: `if x != null { … }`

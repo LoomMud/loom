@@ -1,0 +1,17 @@
+fn f() {
+    let list = [
+        "a",
+        "b",
+    ]
+    let m = {
+        "x": 1,
+        "y": 2
+    }
+    let total = 1 +
+        2 +
+        3
+    call_me(
+        list,
+        m,
+    ); other()
+}

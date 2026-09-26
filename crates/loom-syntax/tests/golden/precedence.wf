@@ -1,0 +1,7 @@
+fn f() {
+    let a = 1 + 2 * 3 - -4
+    let b = not x == y and y < z or w
+    let c = p ?? q ?? r + 1
+    let d = ob.get(1, [2, 3], {"k": {:}})[0]
+    let e = "k" in m and s != "long string"
+}

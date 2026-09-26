@@ -1,0 +1,24 @@
+inherit "/std/room"
+
+var ok: int = 1
+var broken: int = = 2
+
+fn f() {
+    let x = 1 +
+    let y = @
+    if x { return }
+    while true return
+    x = 1 2
+    1 + 2 = 3
+    let s = $"a {  } b"
+}
+
+import /x/y
+
+fn g() -> int {
+    return a < b < c
+}
+
+fn h() {
+    let fine = true
+}
