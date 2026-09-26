@@ -4,7 +4,7 @@
 //! The world: object table, program registry, connection bindings, and the
 //! driver ↔ VM seam (`World::boot/connect/input/disconnect`).
 //!
-//! Phase 0 deviations from spec §7.2 (by design, see docs/weft-phase0.md):
+//! Phase 0 deviations from spec §7.2 (by design, see docs/weft-grammar.md, Part 3):
 //! compilation runs on the world thread and reads the mudlib from disk
 //! synchronously; instance upgrade is eager (every object of a recompiled
 //! program switches immediately); there is no `upgrade()` apply.
@@ -174,7 +174,11 @@ impl Exec<'_> {
         if !diags.is_empty() {
             return Err(render_diags(path, &src, &diags));
         }
-        let parent = match &ast.inherit {
+        let gate = crate::subset::phase0_gate(&ast);
+        if !gate.is_empty() {
+            return Err(render_diags(path, &src, &gate));
+        }
+        let parent = match ast.inherits.first() {
             None => None,
             Some(inh) => {
                 let ppath = normalize_path(&inh.path)?;

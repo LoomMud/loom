@@ -1,0 +1,8 @@
+enum A { X = 1, Y }
+
+enum B {
+    P(int
+    Q
+}
+
+enum C { fn }

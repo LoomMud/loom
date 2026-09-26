@@ -1,0 +1,16 @@
+pub private fn a() { }
+atomic var v: int = 1
+final final fn b() { }
+persistent fn c() { }
+protected pub var d: int = 0
+override struct S { }
+pub inherit /x
+fn e() {
+    ob->tell("x")
+    let t = a | b
+    let u = a || b
+    let v = !a && b
+    #include "x"
+}
+
+lightweight

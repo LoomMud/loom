@@ -2,22 +2,25 @@
 // SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
 
 //! Golden tests: every `tests/golden/*.wf` is parsed and compared with the
-//! sibling `.out` file (AST S-expression, or rendered diagnostics).
+//! sibling `.out` file (AST S-expression, or rendered diagnostics). Files
+//! named `*_err.wf` must produce diagnostics; all others must parse cleanly.
+//! The `.wf` files double as the `cargo fuzz` seed corpus (`fuzz/`).
 //! Bless changes with `LOOM_BLESS=1 cargo test -p loom-syntax --test golden`.
 
 use std::fs;
 use std::path::Path;
 
-fn render(name: &str, src: &str) -> String {
+fn render(name: &str, src: &str) -> (String, bool) {
     let (prog, diags) = loom_syntax::parse(src);
     if diags.is_empty() {
-        loom_syntax::pretty::program(&prog)
+        (loom_syntax::pretty::program(&prog), false)
     } else {
-        diags
+        let out = diags
             .iter()
             .map(|d| d.render(name, src))
             .collect::<Vec<_>>()
-            .join("")
+            .join("");
+        (out, true)
     }
 }
 
@@ -36,7 +39,19 @@ fn golden() {
     for path in entries {
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let src = fs::read_to_string(&path).expect("read");
-        let got = render(&name, &src);
+        let (got, has_diags) = render(&name, &src);
+        let wants_diags = name.ends_with("_err.wf");
+        if has_diags != wants_diags {
+            failures.push(format!(
+                "--- {name}: {}\n{got}",
+                if wants_diags {
+                    "an `_err` golden must produce diagnostics"
+                } else {
+                    "a success golden must parse without diagnostics"
+                }
+            ));
+            continue;
+        }
         let out = path.with_extension("out");
         if bless {
             fs::write(&out, &got).expect("write");

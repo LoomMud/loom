@@ -1,0 +1,24 @@
+closure_err.wf:2:13: error: a named function cannot be declared inside an expression
+  |
+2 |     let a = fn named(x) => x
+  |             ^^
+  = help: closures are anonymous: `fn(x) => x + 1`; declare named functions at the top level
+closure_err.wf:3:19: error: expected `=>` or `{` after the closure parameters, found identifier `x`
+  |
+3 |     let b = fn(x) x + 1
+  |                   ^
+  = help: closures are written `fn(x) => x + 1` or `fn(x) { return x + 1 }`
+closure_err.wf:5:1: error: expected `,` or `)` in the parameter list, found `}`
+  |
+5 | }
+  | ^
+closure_err.wf:7:1: error: a top-level function needs a name
+  |
+7 | fn(x) => x
+  | ^^
+  = help: write `fn name(…) { … }`; closures `fn(x) => …` are expressions
+closure_err.wf:8:11: error: function types list parameter types only
+  |
+8 | var t: fn(x: int) -> int = null
+  |           ^
+  = help: drop the parameter name: `fn(int) -> bool`

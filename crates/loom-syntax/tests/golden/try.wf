@@ -1,0 +1,13 @@
+fn risky(ob: object) -> bool {
+    try {
+        ob.explode()
+    } catch e {
+        log(e.message)
+        throw e
+    }
+    try { cleanup() }
+    catch {
+        return false
+    }
+    throw error("fatal", "no way out")
+}

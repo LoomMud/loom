@@ -3,7 +3,7 @@
 
 //! Weft lexer, parser, AST and diagnostics (§5, §10). Owner: Gimli.
 //!
-//! Phase 0 subset: see `docs/weft-phase0.md`. The entry point is [`parse`],
+//! Full v1 grammar (spec v2 §5.3): see `docs/weft-grammar.md`. The entry point is [`parse`],
 //! which never panics and always returns a (possibly partial) AST plus
 //! diagnostics with spans; render them with [`Diagnostic::render`].
 

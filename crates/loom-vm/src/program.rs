@@ -204,6 +204,8 @@ pub fn link(
                 }
                 fns.insert(f.name.name.clone(), Rc::new(f.clone()));
             }
+            // Rejected by `subset::phase0_gate` before linking.
+            Item::Const(_) | Item::Struct(_) | Item::Enum(_) => {}
         }
     }
 
@@ -253,7 +255,6 @@ fn check_type(t: &Type, diags: &mut Vec<Diagnostic>) {
     match &t.kind {
         TypeKind::Named(n) => {
             let hint = match n.as_str() {
-                "float" => "floats arrive in Phase 1; use `int`",
                 "str" | "String" => "did you mean `string`?",
                 "mapping" | "map" => "maps are written `{K: V}`",
                 "array" => "arrays are written `[T]`",
@@ -368,12 +369,10 @@ impl Checker<'_> {
                 self.expr(cond);
                 self.block(body);
             }
-            StmtKind::Return(e) => {
-                if let Some(e) = e {
-                    self.expr(e);
-                }
-            }
-            StmtKind::Expr(e) => self.expr(e),
+            StmtKind::Return(Some(e)) | StmtKind::Expr(e) => self.expr(e),
+            StmtKind::Return(None) => {}
+            // Rejected by `subset::phase0_gate` before linking.
+            _ => {}
         }
     }
 
@@ -395,6 +394,12 @@ impl Checker<'_> {
     fn exprs(&mut self, es: &[Expr]) {
         for e in es {
             self.expr(e);
+        }
+    }
+
+    fn args(&mut self, args: &[Arg]) {
+        for a in args {
+            self.expr(&a.value);
         }
     }
 
@@ -434,7 +439,7 @@ impl Checker<'_> {
                 self.expr(rhs);
             }
             ExprKind::Call { name, args } => {
-                self.exprs(args);
+                self.args(args);
                 let n = name.name.as_str();
                 if self.prog.fns.contains_key(n) || self.prog.find_fn(n).is_some() {
                     return;
@@ -465,8 +470,8 @@ impl Checker<'_> {
                     ),
                 }
             }
-            ExprKind::SuperCall { name, args } => {
-                self.exprs(args);
+            ExprKind::SuperCall { name, args, .. } => {
+                self.args(args);
                 let found = self
                     .prog
                     .parent
@@ -484,8 +489,10 @@ impl Checker<'_> {
             }
             ExprKind::Method { recv, args, .. } => {
                 self.expr(recv);
-                self.exprs(args);
+                self.args(args);
             }
+            // Everything else is rejected by `subset::phase0_gate` first.
+            _ => {}
         }
     }
 }

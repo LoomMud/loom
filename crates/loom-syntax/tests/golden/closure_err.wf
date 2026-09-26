@@ -1,0 +1,8 @@
+fn f() {
+    let a = fn named(x) => x
+    let b = fn(x) x + 1
+    let c = fn(x
+}
+
+fn(x) => x
+var t: fn(x: int) -> int = null

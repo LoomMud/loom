@@ -1,0 +1,9 @@
+fn f() {
+    try {
+        g()
+    }
+    h()
+    catch e { }
+    throw
+    try g() catch e { }
+}

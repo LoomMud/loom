@@ -1,0 +1,30 @@
+match_err.wf:3:11: error: expected `=>` after the pattern, found `->`
+  |
+3 |         1 -> 2
+  |           ^^
+  = help: match arms are written `pattern => result`
+match_err.wf:4:13: error: enum variants are not written with `::`
+  |
+4 |         Kind::A => 3
+  |             ^^
+  = help: write `Kind.Variant` or just `.Variant`
+match_err.wf:5:12: error: `foo(…)` is not a pattern
+  |
+5 |         foo(1) => 4
+  |            ^
+  = help: match an enum variant with `.foo(…)`
+match_err.wf:6:9: error: interpolated strings cannot be patterns
+  |
+6 |         $"x{x}" => 5
+  |         ^^^^^^^
+  = help: match a plain string literal, or bind a name and use an `if` guard
+match_err.wf:7:9: error: expected a pattern, found `+`
+  |
+7 |         + => 6
+  |         ^
+  = help: patterns are `_`, a name, a literal, or an enum variant like `.slash` or `.hit(n)`
+match_err.wf:13:12: error: expected `{` after the `match` value, found end of line
+   |
+13 |     match x
+   |            ^
+   = help: write `match value { pattern => result }`

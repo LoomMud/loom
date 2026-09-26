@@ -1,0 +1,20 @@
+try_err.wf:2:5: error: `try` needs a `catch` block
+  |
+2 |     try {
+  |     ^^^
+  = help: add `catch e { … }` after the `try` block
+try_err.wf:6:5: error: `catch` without a matching `try`
+  |
+6 |     catch e { }
+  |     ^^^^^
+  = help: `catch` must follow the closing `}` of a `try` block
+try_err.wf:7:5: error: `throw` needs an error value
+  |
+7 |     throw
+  |     ^^^^^
+  = help: write `throw e` to rethrow, or `throw error("message")`
+try_err.wf:8:9: error: expected `{` to start the `try` body, found identifier `g`
+  |
+8 |     try g() catch e { }
+  |         ^
+  = help: braces are mandatory: `try … { … }`

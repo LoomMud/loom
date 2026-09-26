@@ -1,0 +1,9 @@
+fn a(...rest, x: int) {
+}
+
+fn b(...rest = []) {
+}
+
+fn c() {
+    f(exclude: [me], "positional")
+}

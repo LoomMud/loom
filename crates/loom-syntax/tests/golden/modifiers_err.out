@@ -1,0 +1,66 @@
+modifiers_err.wf:1:5: error: a declaration cannot be both `pub` and `private`
+  |
+1 | pub private fn a() { }
+  |     ^^^^^^^
+  = help: pick one visibility
+modifiers_err.wf:2:1: error: `atomic` applies to functions, not variables
+  |
+2 | atomic var v: int = 1
+  | ^^^^^^
+modifiers_err.wf:3:7: error: duplicate modifier `final`
+  |
+3 | final final fn b() { }
+  |       ^^^^^
+  = help: remove one of them
+modifiers_err.wf:4:1: error: `persistent` applies to variables, not functions
+  |
+4 | persistent fn c() { }
+  | ^^^^^^^^^^
+modifiers_err.wf:5:11: error: a declaration cannot be both `protected` and `pub`
+  |
+5 | protected pub var d: int = 0
+  |           ^^^
+  = help: pick one visibility
+modifiers_err.wf:6:1: error: `override` applies to functions, not structs
+  |
+6 | override struct S { }
+  | ^^^^^^^^
+modifiers_err.wf:7:5: error: `inherit` takes no modifiers
+  |
+7 | pub inherit /x
+  |     ^^^^^^^
+modifiers_err.wf:9:7: error: `->` is not a call operator in Weft
+  |
+9 |     ob->tell("x")
+  |       ^^
+  = help: call functions on objects with `.`: `ob.fn()`
+modifiers_err.wf:10:15: error: unexpected `|` in an expression
+   |
+10 |     let t = a | b
+   |               ^
+   = help: Weft uses `or` for logical disjunction; `|` separates `match` patterns
+modifiers_err.wf:11:15: error: unexpected `||`
+   |
+11 |     let u = a || b
+   |               ^^
+   = help: Weft uses `or` for logical disjunction
+modifiers_err.wf:12:13: error: unexpected `!`
+   |
+12 |     let v = !a && b
+   |             ^
+   = help: Weft uses `not` for logical negation
+modifiers_err.wf:12:16: error: unexpected `&&`
+   |
+12 |     let v = !a && b
+   |                ^^
+   = help: Weft uses `and` for logical conjunction
+modifiers_err.wf:13:5: error: preprocessor directives are not part of Weft
+   |
+13 |     #include "x"
+   |     ^^^^^^^^^^^^
+   = help: use `import` for shared declarations and `const` for constants
+modifiers_err.wf:16:1: error: `lightweight` must come before any declarations
+   |
+16 | lightweight
+   | ^^^^^^^^^^^
+   = help: move it to the top of the file

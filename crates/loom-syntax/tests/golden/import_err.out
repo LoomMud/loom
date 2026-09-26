@@ -1,0 +1,47 @@
+import_err.wf:1:8: error: import paths are not quoted
+  |
+1 | import "/include/damage"
+  |        ^^^^^^^^^^^^^^^^^
+  = help: write `import /std/room`
+import_err.wf:2:25: error: empty import list
+  |
+2 | import /include/damage.{}
+  |                         ^
+  = help: name what to import, or drop `.{}` to import the whole module
+import_err.wf:3:24: error: import paths have no file extension
+  |
+3 | import /include/damage.wf
+  |                        ^^
+  = help: drop the `.wf`
+import_err.wf:4:27: error: expected `,` or `}` in the import list, found identifier `B`
+  |
+4 | import /include/damage.{A B}
+  |                           ^
+import_err.wf:5:7: error: a constant needs a value
+  |
+5 | const NOVALUE
+  |       ^^^^^^^
+  = help: write `const NOVALUE = …`
+import_err.wf:6:7: error: a constant needs a value
+  |
+6 | const X: int
+  |       ^
+  = help: write `const X = …`
+import_err.wf:7:1: error: `persistent` applies to variables, not constants
+  |
+7 | persistent const Y = 1
+  | ^^^^^^^^^^
+import_err.wf:8:1: error: `override` applies to functions, not constants
+  |
+8 | override const Z = 2
+  | ^^^^^^^^
+import_err.wf:11:5: error: `const` is only allowed at the top level of a file
+   |
+11 |     const LOCAL = 1
+   |     ^^^^^
+   = help: use `let` for a local constant
+import_err.wf:12:5: error: `import` is only allowed at the top level of a file
+   |
+12 |     import /x
+   |     ^^^^^^
+   = help: move it to the top of the file

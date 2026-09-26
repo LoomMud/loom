@@ -1,0 +1,27 @@
+(fn describe (x: any, k: DamageKind) -> string
+  (let n = (match x
+    (0 => "zero")
+    ((| -1 1) => "unit")
+    (2.5 => "two and a half")
+    ("s" => "string")
+    (true => "yes")
+    (null => "nothing")
+    (other if (> other 100) {
+      (call log other)
+      "big"
+    })
+    (_ => "other")))
+  (match k
+    (.slash {
+      (call send self "swish\n")
+    })
+    (DamageKind.blunt => (call send self "thud\n"))
+    (_ {
+    }))
+  (for v in (match n
+    ("zero" => [])
+    (_ => [1]))
+    (call send self (interp v))
+  )
+  (return n)
+)

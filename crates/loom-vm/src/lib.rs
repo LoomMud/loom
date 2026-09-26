@@ -6,13 +6,15 @@
 //! Phase 0: a tree-walking evaluator over the `loom-syntax` AST with live
 //! recompile (`compile_object`). The world is driven by a single world
 //! thread owned by `loom-cli serve`; it talks to the network only through
-//! [`Host`]. See `docs/weft-phase0.md` for the supported subset.
+//! [`Host`]. See `docs/weft-grammar.md` (Part 2) for the supported subset;
+//! everything else is rejected by [`subset::phase0_gate`].
 
 pub mod efuns;
 pub mod host;
 pub mod interp;
 pub mod object;
 pub mod program;
+pub mod subset;
 pub mod value;
 pub mod world;
 

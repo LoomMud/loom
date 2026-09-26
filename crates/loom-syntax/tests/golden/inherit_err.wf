@@ -1,0 +1,11 @@
+inherit combat = "/std/mixins/combat"
+inherit / std/item
+inherit /std/item.wf
+inherit 3 = /std/x
+
+fn f() {
+    combat::roll
+    inherit /std/late
+}
+
+inherit /std/too_late

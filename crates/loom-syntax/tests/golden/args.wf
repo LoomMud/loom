@@ -1,0 +1,13 @@
+fn tell_room(msg: string, exclude: [object] = [], ...rest: [any]) {
+    send_all(msg, ...rest)
+}
+
+fn log(...parts) {
+}
+
+fn f(me: object) {
+    environment(me)?.tell_room($"{me.name()} waves.", exclude: [me])
+    tell_room("x", exclude: [], color: true)
+    format("{} {}", ...[1, 2])
+    log()
+}

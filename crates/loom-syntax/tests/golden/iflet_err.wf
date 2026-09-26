@@ -1,0 +1,6 @@
+fn f(ref: object?) {
+    if let = ref { }
+    if let o ref { }
+    if let o = ref
+    while let o = ref { }
+}

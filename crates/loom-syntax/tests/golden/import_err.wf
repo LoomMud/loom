@@ -1,0 +1,13 @@
+import "/include/damage"
+import /include/damage.{}
+import /include/damage.wf
+import /include/damage.{A B}
+const NOVALUE
+const X: int
+persistent const Y = 1
+override const Z = 2
+
+fn f() {
+    const LOCAL = 1
+    import /x
+}

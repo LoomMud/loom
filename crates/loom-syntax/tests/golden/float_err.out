@@ -1,0 +1,19 @@
+float_err.wf:2:13: error: invalid float literal
+  |
+2 |     let a = 1.5x
+  |             ^^^^
+  = help: numbers are decimal: `42`, `1_000`, `2.5`, `1e-3`
+float_err.wf:3:13: error: float literal is out of range for `float` (64-bit)
+  |
+3 |     let b = 1e999
+  |             ^^^^^
+float_err.wf:4:13: error: integer literal is too large for `int` (64-bit)
+  |
+4 |     let c = 99999999999999999999
+  |             ^^^^^^^^^^^^^^^^^^^^
+  = help: write it as a float (`1e20`) if you need a larger magnitude
+float_err.wf:5:13: error: invalid integer literal
+  |
+5 |     let d = 0x10
+  |             ^^^^
+  = help: numbers are decimal: `42`, `1_000`, `2.5`, `1e-3`

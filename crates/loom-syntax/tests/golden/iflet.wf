@@ -1,0 +1,12 @@
+fn f(ref: object?) {
+    if let o = ref {
+        o.tell("present")
+    } else if let p: object = find_object("/x") {
+        p.tell("fallback")
+    } else if ref == null {
+        send(self, "none\n")
+    } else {
+        send(self, "?\n")
+    }
+    if let env = environment() { env.tell("here") }
+}

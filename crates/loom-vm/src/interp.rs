@@ -383,6 +383,8 @@ impl Exec<'_> {
                 self.eval(f, e)?;
                 Ok(Flow::Next)
             }
+            // Rejected by `subset::phase0_gate` before linking.
+            _ => Err(self.err(f, s.span, "not supported by the Phase 0 evaluator")),
         }
     }
 
@@ -587,7 +589,7 @@ impl Exec<'_> {
                 let argv = self.eval_args(f, args)?;
                 self.call_named(f, name, argv, e.span)
             }
-            ExprKind::SuperCall { name, args } => {
+            ExprKind::SuperCall { name, args, .. } => {
                 let argv = self.eval_args(f, args)?;
                 let found = f.prog.parent.as_ref().and_then(|p| p.find_fn(&name.name));
                 match found {
@@ -631,13 +633,15 @@ impl Exec<'_> {
                 self.call_other(f, id, name, argv, *safe)
             }
             ExprKind::Error => Err(self.err(f, e.span, "internal: error node reached evaluator")),
+            // Rejected by `subset::phase0_gate` before linking.
+            _ => Err(self.err(f, e.span, "not supported by the Phase 0 evaluator")),
         }
     }
 
-    fn eval_args(&mut self, f: &mut Frame, args: &[Expr]) -> R<Vec<Value>> {
+    fn eval_args(&mut self, f: &mut Frame, args: &[Arg]) -> R<Vec<Value>> {
         let mut out = Vec::with_capacity(args.len());
         for a in args {
-            out.push(self.eval(f, a)?);
+            out.push(self.eval(f, &a.value)?);
         }
         Ok(out)
     }

@@ -1,0 +1,16 @@
+(inherit combat = /std/mixins/combat)
+(const MAX = 3)
+(enum Kind A B)
+(var protected p : int = 1)
+(fn f ()
+  (try
+    (call g)
+   catch e
+  )
+  (call atomic_thing)
+  (let c = (closure (x) => (+ x 1)))
+  (field ob field)
+  (. ob tell_room "x" exclude: [me])
+  (if let o = ref
+  )
+)

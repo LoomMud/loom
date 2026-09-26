@@ -1,0 +1,11 @@
+var ratio: float = 0.75
+const BIG = 1e20
+
+fn scale(x: float, by: float = 2.5) -> float {
+    let tiny = 1.5e-3
+    let n = 1_000.25
+    let neg = -0.5
+    let slice_not_float = xs[1..2]
+    let method_on_int = 3.abs()
+    return x * by + tiny + n + neg + 2E3
+}
