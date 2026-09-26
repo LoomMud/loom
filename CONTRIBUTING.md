@@ -13,3 +13,10 @@ Private repository while in development (spec v2 §4.4). Rules from the first co
 - **`unsafe` is denied workspace-wide.** Any exception is local to `loom-vm`, justified in a comment, and CTO-reviewed.
 - Run `scripts/ci-local.sh` before pushing; it runs the same gates as CI.
 - Commits made by Paperclip agents end with `Co-Authored-By: Paperclip <noreply@paperclip.ing>`.
+
+## GitHub flow
+
+- Open PRs against `main` on `https://github.com/LoomMud/loom`.
+- Keep the interim shared bare repo read-only as a migration mirror.
+- For CLI operations, use the short-lived command env pattern without persisting credentials:
+  `GH_TOKEN="$GITHUB_TOKEN" gh <command>`

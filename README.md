@@ -21,6 +21,6 @@ scripts/ci-local.sh       # fmt, clippy, test, cargo-deny, DCO
 
 ## Remotes
 
-Until the GitHub org exists, the interim origin is the shared bare repo
-`/paperclip/instances/default/shared/oberfield/loom.git`. Full history (with DCO sign-offs) gets pushed to
-`github.com/<org>/loom` (private) once it exists.
+- Canonical remote: `https://github.com/LoomMud/loom` (private).
+- Interim mirror (read-only until Phase 1 completes):
+  `/paperclip/instances/default/shared/oberfield/loom.git`.
