@@ -37,7 +37,29 @@ async fn run() -> Result<(), String> {
             let mudlib = parse_mudlib_arg(args)?;
             serve(mudlib).await
         }
+        "check" => {
+            let Some(root) = args.next() else {
+                return Err("usage: loom check <mudlib-root>".to_string());
+            };
+            check(PathBuf::from(root))
+        }
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// `loom check <mudlib-root>`: parse and link every `.wf` file without
+/// running anything; print diagnostics and fail if there are any.
+fn check(root: PathBuf) -> Result<(), String> {
+    let errors = loom_vm::check_mudlib(&root)
+        .map_err(|err| format!("cannot scan {}: {err}", root.display()))?;
+    for e in &errors {
+        eprintln!("{e}\n");
+    }
+    if errors.is_empty() {
+        println!("loom check: {} ok", root.display());
+        Ok(())
+    } else {
+        Err(format!("{} file(s) with errors", errors.len()))
     }
 }
 
@@ -66,12 +88,11 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         .local_addr()
         .map_err(|err| format!("failed to read local addr: {err}"))?;
 
-    let world = World::boot(&mudlib_root).map_err(|err| format!("world boot failed: {err}"))?;
     let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let world_handle = spawn_world_thread(world, event_rx, command_tx.clone());
+    let world_handle = spawn_world_thread(mudlib_root.clone(), event_rx, command_tx.clone())?;
 
     info!(bind = %actual_addr, mudlib = %mudlib_root.display(), "loom server started");
 
@@ -111,14 +132,29 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+/// Spawn the world thread. The `World` is not `Send` (single-threaded heap,
+/// spec §3.3), so it is booted *on* the world thread; boot errors are
+/// reported back before we start accepting connections.
 fn spawn_world_thread(
-    mut world: World,
+    mudlib_root: PathBuf,
     mut event_rx: mpsc::Receiver<NetEvent>,
     command_tx: mpsc::Sender<NetCommand>,
-) -> thread::JoinHandle<()> {
-    thread::Builder::new()
+) -> Result<thread::JoinHandle<()>, String> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let handle = thread::Builder::new()
         .name("loom-world".to_string())
+        .stack_size(loom_vm::WORLD_THREAD_STACK)
         .spawn(move || {
+            let mut world = match World::boot(&mudlib_root) {
+                Ok(world) => {
+                    let _ = ready_tx.send(Ok(()));
+                    world
+                }
+                Err(err) => {
+                    let _ = ready_tx.send(Err(format!("world boot failed: {err}")));
+                    return;
+                }
+            };
             let mut host = NetHost { command_tx };
 
             while let Some(event) = event_rx.blocking_recv() {
@@ -129,7 +165,11 @@ fn spawn_world_thread(
                 }
             }
         })
-        .expect("failed to spawn world thread")
+        .map_err(|err| format!("failed to spawn world thread: {err}"))?;
+    ready_rx
+        .recv()
+        .map_err(|_| "world thread exited during boot".to_string())??;
+    Ok(handle)
 }
 
 struct NetHost {
