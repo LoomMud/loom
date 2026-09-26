@@ -1,9 +1,9 @@
-unclosed_err.wf:2:13: error: this `{` is not closed before the next declaration
+unclosed_err.wf:2:13: error[W0055]: this `{` is not closed before the next declaration
   |
 2 |     if true {
   |             ^
   = help: add a matching `}`
-unclosed_err.wf:6:13: error: `{}` is ambiguous
+unclosed_err.wf:6:13: error[W0071]: `{}` is ambiguous
   |
 6 |     let m = {}
   |             ^^

@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
 
 //! Source spans and builder-facing diagnostics.
+//!
+//! Every diagnostic carries a stable `W####` [code](crate::codes) (OBI-49):
+//! the format is `W` plus a 4-digit number, assigned once and never reused
+//! or renumbered. Severity is a separate field, not part of the code, so
+//! the same code can never appear at two severities.
 
 use std::fmt::Write as _;
 
@@ -29,17 +34,51 @@ impl Span {
     }
 }
 
+/// How seriously a [`Diagnostic`] should be taken. Independent of the code:
+/// the same `W####` code is always emitted at the same severity today, but
+/// the two are stored separately so that is a policy choice, not a format
+/// constraint (spec discussion, OBI-49).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+impl Severity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+        }
+    }
+}
+
 /// A problem found in Weft source: where, what, and (when we know) how to fix it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
+    pub severity: Severity,
+    /// Stable machine-readable code, e.g. `"W0201"`. See [`crate::codes`].
+    pub code: &'static str,
     pub span: Span,
     pub message: String,
     pub hint: Option<String>,
 }
 
 impl Diagnostic {
-    pub fn error(span: Span, message: impl Into<String>) -> Diagnostic {
+    pub fn error(code: &'static str, span: Span, message: impl Into<String>) -> Diagnostic {
         Diagnostic {
+            severity: Severity::Error,
+            code,
+            span,
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    pub fn warning(code: &'static str, span: Span, message: impl Into<String>) -> Diagnostic {
+        Diagnostic {
+            severity: Severity::Warning,
+            code,
             span,
             message: message.into(),
             hint: None,
@@ -56,11 +95,16 @@ impl Diagnostic {
         line_col(src, self.span.start as usize)
     }
 
-    /// Render as `path:line:col: error: message`, the source line, a caret
-    /// underline and the hint, rustc-style.
+    /// Render as `path:line:col: error[W0001]: message`, the source line, a
+    /// caret underline and the hint, rustc-style.
     pub fn render(&self, path: &str, src: &str) -> String {
         let (line, col) = self.line_col(src);
-        let mut out = format!("{path}:{line}:{col}: error: {}\n", self.message);
+        let mut out = format!(
+            "{path}:{line}:{col}: {}[{}]: {}\n",
+            self.severity.label(),
+            self.code,
+            self.message
+        );
         let start = (self.span.start as usize).min(src.len());
         let line_start = src[..start].rfind('\n').map_or(0, |i| i + 1);
         let line_end = src[start..].find('\n').map_or(src.len(), |i| start + i);
@@ -104,10 +148,17 @@ mod tests {
     #[test]
     fn renders_line_col_and_caret() {
         let src = "fn a() {\n  let x = @\n}\n";
-        let d =
-            Diagnostic::error(Span::new(19, 20), "unexpected character '@'").with_hint("remove it");
+        let d = Diagnostic::error(
+            crate::codes::LEX_UNEXPECTED_CHARACTER_LPC_C_STYLE,
+            Span::new(19, 20),
+            "unexpected character '@'",
+        )
+        .with_hint("remove it");
         let r = d.render("/t.wf", src);
-        assert!(r.starts_with("/t.wf:2:11: error: unexpected character '@'\n"));
+        assert!(r.starts_with(&format!(
+            "/t.wf:2:11: error[{}]: unexpected character '@'\n",
+            crate::codes::LEX_UNEXPECTED_CHARACTER_LPC_C_STYLE
+        )));
         assert!(r.contains("2 |   let x = @\n"));
         assert!(r.contains("  |           ^\n"));
         assert!(r.contains("= help: remove it"));

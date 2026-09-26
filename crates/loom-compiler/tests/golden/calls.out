@@ -1,40 +1,40 @@
-/c.wf:8:5: error: `two` takes 1 to 2 arguments, but 0 were given
+/c.wf:8:5: error[W0275]: `two` takes 1 to 2 arguments, but 0 were given
   |
 8 |     two()
   |     ^^^^^
-/c.wf:9:5: error: `two` takes 1 to 2 arguments, but 3 were given
+/c.wf:9:5: error[W0275]: `two` takes 1 to 2 arguments, but 3 were given
   |
 9 |     two(1, "a", 3)
   |     ^^^^^^^^^^^^^^
-/c.wf:10:9: error: mismatched types in argument 1 of `two`: expected `int`, found `string`
+/c.wf:10:9: error[W0226]: mismatched types in argument 1 of `two`: expected `int`, found `string`
    |
 10 |     two("1")
    |         ^^^
-/c.wf:13:7: error: mismatched types in argument 1 of `g`: expected `int`, found `string`
+/c.wf:13:7: error[W0226]: mismatched types in argument 1 of `g`: expected `int`, found `string`
    |
 13 |     g("wrong", "b")
    |       ^^^^^^^
-/c.wf:14:5: error: `n` has type `int`, which is not a function
+/c.wf:14:5: error[W0277]: `n` has type `int`, which is not a function
    |
 14 |     n(1)
    |     ^
    = help: only values of type `fn(…)` can be called
-/c.wf:15:5: error: cannot assign to function `two`
+/c.wf:15:5: error[W0244]: cannot assign to function `two`
    |
 15 |     two = g
    |     ^^^
    = help: functions are not variables
-/c.wf:16:7: error: cannot call `.call()` on a value of type `int`
+/c.wf:16:7: error[W0250]: cannot call `.call()` on a value of type `int`
    |
 16 |     n.call()
    |       ^^^^
    = help: `.fn()` calls a function in another object; it needs an `object`
-/c.wf:17:13: error: cannot index a value of type `int`
+/c.wf:17:13: error[W0267]: cannot index a value of type `int`
    |
 17 |     let i = n[0]
    |             ^
    = help: only arrays, maps and strings can be indexed
-/c.wf:19:5: error: cannot assign into a string
+/c.wf:19:5: error[W0245]: cannot assign into a string
    |
 19 |     s[0] = "x"
    |     ^^^^

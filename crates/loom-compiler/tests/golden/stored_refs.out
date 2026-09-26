@@ -1,9 +1,9 @@
-/s.wf:4:5: error: program variable `owner` stores an object reference, so its type must be `object?`
+/s.wf:4:5: error[W0284]: program variable `owner` stores an object reference, so its type must be `object?`
   |
 4 | var owner: object = self
   |     ^^^^^
   = help: stored object references must be nullable (the object may be destructed); declare `var owner: object?` and narrow before use: `let o = owner; if o != null { … }`
-/s.wf:5:5: error: program variable `home` stores an object reference, so its type must be `object?`
+/s.wf:5:5: error[W0284]: program variable `home` stores an object reference, so its type must be `object?`
   |
 5 | var home = load_object("/room")
   |     ^^^^

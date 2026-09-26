@@ -1,41 +1,41 @@
-/o.wf:4:13: error: cannot apply `+` to `int` and `string`
+/o.wf:4:13: error[W0268]: cannot apply `+` to `int` and `string`
   |
 4 |     let a = n + s
   |             ^^^^^
   = help: build mixed strings with interpolation: `$"{a}{b}"`
-/o.wf:5:13: error: cannot apply `-` to `string` and `string`
+/o.wf:5:13: error[W0268]: cannot apply `-` to `string` and `string`
   |
 5 |     let b = s - s
   |             ^^^^^
-/o.wf:6:13: error: cannot compare `int` and `string` with `<`
+/o.wf:6:13: error[W0271]: cannot compare `int` and `string` with `<`
   |
 6 |     let c = n < s
   |             ^^^^^
   = help: ordering works on two ints, two floats or two strings
-/o.wf:7:13: error: cannot compare `int` with `string` using `==`
+/o.wf:7:13: error[W0274]: cannot compare `int` with `string` using `==`
   |
 7 |     let d = n == s
   |             ^^^^^^
   = help: values of these types are never equal; convert one side first
-/o.wf:8:18: error: `in` needs an array, map or string on the right, found `int`
+/o.wf:8:18: error[W0273]: `in` needs an array, map or string on the right, found `int`
   |
 8 |     let e = 1 in n
   |                  ^
   = help: `x in xs` tests array elements, map keys, or substrings
-/o.wf:9:14: error: cannot negate a value of type `string`
+/o.wf:9:14: error[W0248]: cannot negate a value of type `string`
   |
 9 |     let g = -s
   |              ^
-/o.wf:10:18: error: mismatched types in `??`: the left side is `object?`, the fallback is `int`
+/o.wf:10:18: error[W0270]: mismatched types in `??`: the left side is `object?`, the fallback is `int`
    |
 10 |     let h = o ?? 5
    |                  ^
-/o.wf:11:13: error: cannot apply `+` to `string` and `int`
+/o.wf:11:13: error[W0268]: cannot apply `+` to `string` and `int`
    |
 11 |     let i = s + n
    |             ^^^^^
    = help: build mixed strings with interpolation: `$"{a}{b}"`
-/o.wf:12:13: error: cannot apply `+` to `object?` and `int`
+/o.wf:12:13: error[W0268]: cannot apply `+` to `object?` and `int`
    |
 12 |     let k = o + 1
    |             ^^^^^

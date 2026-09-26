@@ -1,19 +1,19 @@
-/child.wf:5:13: error: `override fn name` must stay `pub` like the inherited function
+/child.wf:5:13: error[W0220]: `override fn name` must stay `pub` like the inherited function
   |
 5 | override fn name() -> string {
   |             ^^^^
   = help: write `pub override fn name(…)`
-/child.wf:9:13: error: `override fn weight` does not match the inherited signature `fn weight(unit: string) -> int` from /std/base
+/child.wf:9:13: error[W0219]: `override fn weight` does not match the inherited signature `fn weight(unit: string) -> int` from /std/base
   |
 9 | override fn weight(unit: int) -> int {
   |             ^^^^^^
   = help: this declaration is `fn weight(unit: int) -> int`; overrides must take the same parameter types and return a compatible type
-/child.wf:13:13: error: `override fn hook` does not match the inherited signature `fn hook()` from /std/base
+/child.wf:13:13: error[W0219]: `override fn hook` does not match the inherited signature `fn hook()` from /std/base
    |
 13 | override fn hook() -> int {
    |             ^^^^
    = help: this declaration is `fn hook() -> int`; overrides must take the same parameter types and return a compatible type
-/child.wf:17:21: error: `private fn secret` cannot be an `override`
+/child.wf:17:21: error[W0215]: `private fn secret` cannot be an `override`
    |
 17 | private override fn secret() {
    |                     ^^^^^^

@@ -1,39 +1,39 @@
-/b.wf:3:5: error: cannot infer a type for `untyped` from `null`
+/b.wf:3:5: error[W0229]: cannot infer a type for `untyped` from `null`
   |
 3 | var untyped = null
   |     ^^^^^^^
   = help: annotate it: `untyped: T? = null`
-/b.wf:4:5: error: `no_init` has type `int` but no initial value
+/b.wf:4:5: error[W0200]: `no_init` has type `int` but no initial value
   |
 4 | var no_init: int
   |     ^^^^^^^
   = help: give it one (`var no_init: int = …`), or make the type nullable (`int?`)
-/b.wf:6:6: error: parameter `p` needs a type
+/b.wf:6:6: error[W0213]: parameter `p` needs a type
   |
 6 | fn f(p) {
   |      ^
   = help: write `p: T`, or `p: any` to opt out of static checking
-/b.wf:7:9: error: cannot infer a type for `a` from `null`
+/b.wf:7:9: error[W0229]: cannot infer a type for `a` from `null`
   |
 7 |     let a = null
   |         ^
   = help: annotate it: `a: T? = null`
-/b.wf:9:18: error: array elements have different types: `int` and `string` (element 2)
+/b.wf:9:18: error[W0263]: array elements have different types: `int` and `string` (element 2)
   |
 9 |     let xs = [1, "two"]
   |                  ^^^^^
   = help: annotate the binding to allow mixed values, e.g. `let xs: [any] = …`
-/b.wf:10:27: error: map values have different types: `int` and `bool`
+/b.wf:10:27: error[W0265]: map values have different types: `int` and `bool`
    |
 10 |     let m = {"a": 1, "b": true}
    |                           ^^^^
    = help: annotate the binding to allow mixed values, e.g. `{string: any}`
-/b.wf:11:16: error: `[int]` cannot be a map key
+/b.wf:11:16: error[W0264]: `[int]` cannot be a map key
    |
 11 |     let bad = {[1]: 2}
    |                ^^^
    = help: map keys must be int, string, bool or object
-/b.wf:12:12: error: unknown type `objekt`
+/b.wf:12:12: error[W0222]: unknown type `objekt`
    |
 12 |     let t: objekt = self
    |            ^^^^^^

@@ -1,36 +1,36 @@
-/t.wf:3:18: error: mismatched types in the initialiser of `count`: expected `int`, found `string`
+/t.wf:3:18: error[W0226]: mismatched types in the initialiser of `count`: expected `int`, found `string`
   |
 3 | var count: int = "zero"
   |                  ^^^^^^
-/t.wf:5:21: error: mismatched types in the initialiser of `label`: expected `string`, found `null`
+/t.wf:5:21: error[W0226]: mismatched types in the initialiser of `label`: expected `string`, found `null`
   |
 5 | var label: string = null
   |                     ^^^^
   = help: `string` cannot hold `null`; declare it as `string?` if null is a valid value
-/t.wf:11:18: error: mismatched types in the initialiser of `a`: expected `int`, found `string`
+/t.wf:11:18: error[W0226]: mismatched types in the initialiser of `a`: expected `int`, found `string`
    |
 11 |     let a: int = "one"
    |                  ^^^^^
-/t.wf:13:9: error: mismatched types in the assignment: expected `int`, found `string`
+/t.wf:13:9: error[W0226]: mismatched types in the assignment: expected `int`, found `string`
    |
 13 |     b = "two"
    |         ^^^^^
-/t.wf:14:11: error: mismatched types in argument 1 of `takes`: expected `string`, found `int`
+/t.wf:14:11: error[W0226]: mismatched types in argument 1 of `takes`: expected `string`, found `int`
    |
 14 |     takes(5, self)
    |           ^
    = help: build strings with interpolation: `$"{x}"`
-/t.wf:15:11: error: mismatched types in argument 1 of `takes`: expected `string`, found `string?`
+/t.wf:15:11: error[W0226]: mismatched types in argument 1 of `takes`: expected `string`, found `string?`
    |
 15 |     takes(maybe, self)
    |           ^^^^^
    = help: this value may be null: check it with `if x != null { … }` first, or give a fallback with `?? value`
-/t.wf:16:20: error: mismatched types in the initialiser of `x`: expected `float`, found `int`
+/t.wf:16:20: error[W0226]: mismatched types in the initialiser of `x`: expected `float`, found `int`
    |
 16 |     let x: float = 1
    |                    ^
    = help: Weft has no implicit int/float conversion
-/t.wf:17:12: error: mismatched types in the return value: expected `string`, found `int`
+/t.wf:17:12: error[W0226]: mismatched types in the return value: expected `string`, found `int`
    |
 17 |     return 42
    |            ^^

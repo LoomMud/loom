@@ -395,6 +395,7 @@ impl Lexer<'_> {
                 None => {
                     self.diags.push(
                         Diagnostic::error(
+                            "W0001",
                             Span::new(start, start + 2),
                             "unterminated block comment",
                         )
@@ -471,7 +472,7 @@ impl Lexer<'_> {
         if junk {
             let what = if is_float { "float" } else { "integer" };
             self.diags.push(
-                Diagnostic::error(span, format!("invalid {what} literal"))
+                Diagnostic::error("W0002", span, format!("invalid {what} literal"))
                     .with_hint("numbers are decimal: `42`, `1_000`, `2.5`, `1e-3`"),
             );
             self.push(
@@ -489,6 +490,7 @@ impl Lexer<'_> {
                 Ok(x) if x.is_finite() => self.push(Tok::Float(x), start),
                 _ => {
                     self.diags.push(Diagnostic::error(
+                        "W0003",
                         span,
                         "float literal is out of range for `float` (64-bit)",
                     ));
@@ -501,8 +503,12 @@ impl Lexer<'_> {
             Ok(n) => self.push(Tok::Int(n), start),
             Err(_) => {
                 self.diags.push(
-                    Diagnostic::error(span, "integer literal is too large for `int` (64-bit)")
-                        .with_hint("write it as a float (`1e20`) if you need a larger magnitude"),
+                    Diagnostic::error(
+                        "W0004",
+                        span,
+                        "integer literal is too large for `int` (64-bit)",
+                    )
+                    .with_hint("write it as a float (`1e20`) if you need a larger magnitude"),
                 );
                 self.push(Tok::Int(0), start);
             }
@@ -541,6 +547,7 @@ impl Lexer<'_> {
                         other => {
                             self.diags.push(
                                 Diagnostic::error(
+                                    "W0005",
                                     Span::new(esc_start, self.pos),
                                     "unknown escape sequence",
                                 )
@@ -566,6 +573,7 @@ impl Lexer<'_> {
                             None | Some('\n') => {
                                 self.diags.push(
                                     Diagnostic::error(
+                                        "W0006",
                                         Span::new(open, open + 1),
                                         "unclosed `{` in interpolated string",
                                     )
@@ -601,6 +609,7 @@ impl Lexer<'_> {
                                     self.bump();
                                     if self.src[code_start..code_end].trim().is_empty() {
                                         self.diags.push(Diagnostic::error(
+                                            "W0007",
                                             Span::new(open, self.pos),
                                             "empty `{}` in interpolated string",
                                         ));
@@ -631,8 +640,12 @@ impl Lexer<'_> {
 
     fn unterminated(&mut self, start: usize) {
         self.diags.push(
-            Diagnostic::error(Span::new(start, self.pos), "unterminated string literal")
-                .with_hint("strings must close with `\"` on the same line"),
+            Diagnostic::error(
+                "W0008",
+                Span::new(start, self.pos),
+                "unterminated string literal",
+            )
+            .with_hint("strings must close with `\"` on the same line"),
         );
     }
 
@@ -738,7 +751,7 @@ impl Lexer<'_> {
                         None,
                     ),
                 };
-                let mut d = Diagnostic::error(Span::new(start, self.pos), msg);
+                let mut d = Diagnostic::error("W0009", Span::new(start, self.pos), msg);
                 if let Some(h) = hint {
                     d = d.with_hint(h);
                 }

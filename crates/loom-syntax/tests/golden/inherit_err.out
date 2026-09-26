@@ -1,33 +1,33 @@
-inherit_err.wf:1:18: error: inherit paths are not quoted
+inherit_err.wf:1:18: error[W0036]: inherit paths are not quoted
   |
 1 | inherit combat = "/std/mixins/combat"
   |                  ^^^^^^^^^^^^^^^^^^^^
   = help: write `inherit /std/room`
-inherit_err.wf:2:11: error: expected a path segment after `/`
+inherit_err.wf:2:11: error[W0037]: expected a path segment after `/`
   |
 2 | inherit / std/item
   |           ^^^
   = help: paths look like `/std/room` (no spaces, no extension)
-inherit_err.wf:3:18: error: inherit paths have no file extension
+inherit_err.wf:3:18: error[W0038]: inherit paths have no file extension
   |
 3 | inherit /std/item.wf
   |                  ^
   = help: drop the `.wf`
-inherit_err.wf:4:9: error: expected a program path like `/std/room`, found integer `3`
+inherit_err.wf:4:9: error[W0030]: expected a program path like `/std/room`, found integer `3`
   |
 4 | inherit 3 = /std/x
   |         ^
-inherit_err.wf:7:13: error: `combat::roll` must be called
+inherit_err.wf:7:13: error[W0074]: `combat::roll` must be called
   |
 7 |     combat::roll
   |             ^^^^
   = help: `::` calls an inherited function, e.g. `combat::roll()`; enum variants are written `Kind.A` or `.A`
-inherit_err.wf:8:5: error: `inherit` is only allowed at the top level of a file
+inherit_err.wf:8:5: error[W0063]: `inherit` is only allowed at the top level of a file
   |
 8 |     inherit /std/late
   |     ^^^^^^^
   = help: move it to the top of the file
-inherit_err.wf:11:1: error: `inherit` must come before any declarations
+inherit_err.wf:11:1: error[W0035]: `inherit` must come before any declarations
    |
 11 | inherit /std/too_late
    | ^^^^^^^

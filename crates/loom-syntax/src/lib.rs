@@ -8,10 +8,11 @@
 //! diagnostics with spans; render them with [`Diagnostic::render`].
 
 pub mod ast;
+pub mod codes;
 pub mod diag;
 pub mod lexer;
 pub mod parser;
 pub mod pretty;
 
-pub use diag::{Diagnostic, Span, line_col};
+pub use diag::{Diagnostic, Severity, Span, line_col};
 pub use parser::parse;

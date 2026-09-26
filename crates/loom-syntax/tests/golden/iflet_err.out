@@ -1,18 +1,18 @@
-iflet_err.wf:2:12: error: expected a name to bind after `if let`, found `=`
+iflet_err.wf:2:12: error[W0030]: expected a name to bind after `if let`, found `=`
   |
 2 |     if let = ref { }
   |            ^
-iflet_err.wf:3:14: error: expected `=` after the `if let` binding, found identifier `ref`
+iflet_err.wf:3:14: error[W0030]: expected `=` after the `if let` binding, found identifier `ref`
   |
 3 |     if let o ref { }
   |              ^^^
   = help: write `if let x = maybe_null { … }`
-iflet_err.wf:4:19: error: expected `{` after the condition, found end of line
+iflet_err.wf:4:19: error[W0066]: expected `{` after the condition, found end of line
   |
 4 |     if let o = ref
   |                   ^
   = help: braces are mandatory: `if cond { … }`
-iflet_err.wf:5:11: error: `while let` is not part of Weft
+iflet_err.wf:5:11: error[W0058]: `while let` is not part of Weft
   |
 5 |     while let o = ref { }
   |           ^^^
