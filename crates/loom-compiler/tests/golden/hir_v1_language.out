@@ -1,0 +1,56 @@
+ok
+program /main
+  inherit combat = /std/a
+  inherit /std/b
+  linearization /std/a /std/b /main
+  fn pub total() -> int
+    return
+      Add Int : int
+        global /std/consts::MAX : int
+        1 : int
+  fn pub greet() -> string
+    return
+      global /std/consts::GREETING : string
+  fn pub tags() -> string
+    return
+      Add Str : string
+        call static /std/a::combat_tag : string
+        call virtual base_tag : string
+  fn pub adder() -> fn(int) -> int
+    local %0 f: fn(int) -> int
+    let %0:f
+      closure(1 params) : fn(int) -> int
+        return
+          Add Int : int
+            %0:x : int
+            1 : int
+    return
+      %0:f : fn(int) -> int
+  fn pub apply_adder() -> int
+    local %0 f: fn(int) -> int
+    let %0:f
+      call virtual adder : fn(int) -> int
+    return
+      callvalue : int
+        %0:f : fn(int) -> int
+        41 : int
+
+program /std/a
+  linearization /std/a
+  fn pub combat_tag() -> string
+    return
+      "combat" : string
+
+program /std/b
+  linearization /std/b
+  fn pub base_tag() -> string
+    return
+      "base" : string
+
+program /std/consts
+  linearization /std/consts
+  const pub MAX: int
+    10 : int
+  const pub GREETING: string
+    "hi" : string
+

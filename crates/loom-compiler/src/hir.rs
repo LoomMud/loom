@@ -52,6 +52,10 @@ pub struct Program {
     pub linearization: Vec<Rc<str>>,
     /// Program variables declared *here*, in declaration order.
     pub vars: Vec<Var>,
+    /// `[vis] const NAME = expr` declared *here* (§5.3): a single value shared
+    /// by every instance, computed once. Not part of the virtual-inherit
+    /// graph and never migrated by hot reload.
+    pub consts: Vec<Const>,
     /// Functions declared here, in declaration order.
     pub fns: Vec<Function>,
 }
@@ -83,6 +87,15 @@ pub struct Var {
     /// Runs with `self` = the object, on creation and when a hot reload
     /// cannot keep the old value. `None` means `null` (only for nullable types).
     pub init: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct Const {
+    pub name: Rc<str>,
+    pub ty: Ty,
+    pub vis: Visibility,
+    pub value: Expr,
     pub span: Span,
 }
 
@@ -249,8 +262,18 @@ pub enum Callee {
 }
 
 #[derive(Clone, Debug)]
+pub struct ClosureFn {
+    pub params: Vec<LocalId>,
+    /// `Ty::Void` when the closure has no `-> T` and no inferred expr body.
+    pub ret: Ty,
+    pub locals: Vec<Local>,
+    pub body: Block,
+}
+
+#[derive(Clone, Debug)]
 pub enum ExprKind {
     Int(i64),
+    Float(f64),
     Str(Rc<str>),
     Bool(bool),
     Null,
@@ -264,6 +287,11 @@ pub enum ExprKind {
     SelfObj,
     /// A function of this program used as a value (`add_verb("x", do_x)`).
     FnRef(Callee),
+    /// A closure literal `fn(params) => …` / `fn(params) { … }`. V1 does not
+    /// capture the enclosing function's locals (a V5 runtime feature,
+    /// OBI-32): the body sees only its own parameters, program globals,
+    /// `self` and named functions.
+    Closure(Rc<ClosureFn>),
     Index {
         base: Box<Expr>,
         index: Box<Expr>,

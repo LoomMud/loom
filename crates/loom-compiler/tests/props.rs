@@ -115,7 +115,7 @@ fn base() -> ParentInfo {
     let src = "pub fn base_fn() -> int {\n    return 1\n}\n";
     let (ast, d) = loom_syntax::parse(src);
     assert!(d.is_empty());
-    let c = loom_compiler::check_program("/base", &ast, vec![]).expect("base");
+    let c = loom_compiler::check_program("/base", &ast, vec![], vec![]).expect("base");
     ParentInfo {
         label: None,
         info: c.info,
@@ -137,7 +137,7 @@ proptest! {
         let src = program(&stmts, ret);
         let (ast, pd) = loom_syntax::parse(&src);
         prop_assume!(pd.is_empty());
-        match loom_compiler::check_program("/p", &ast, vec![base()]) {
+        match loom_compiler::check_program("/p", &ast, vec![base()], vec![]) {
             Ok(c) => {
                 let dump = loom_compiler::dump::program(&c.hir);
                 prop_assert!(!dump.contains("{error}"), "poison in clean HIR:\n{}\n{}", src, dump);

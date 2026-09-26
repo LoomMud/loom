@@ -1,0 +1,75 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// Not clean: V0 (OBI-23) parses the whole v1 grammar, but the OBI-24
+// checker only implements import/const/labelled-inherit/closures so far.
+// Everything below parses and is reported "not implemented ... yet" instead
+// of silently miscompiling or panicking (never a `todo!()` in production).
+struct Point {
+    x: int
+    y: int = 0
+}
+
+enum Color {
+    Red,
+    Blue(int),
+}
+
+pub fn make() -> any {
+    var p = Point { x: 1, y: 2 }
+    p.x += 3
+    return p
+}
+
+pub fn describe(x: any) -> string {
+    let n = match x {
+        0 => "zero"
+        _ => "other",
+    }
+    return n
+}
+
+fn oops() {}
+
+fn risky() -> bool {
+    try {
+        oops()
+    } catch e {
+        return false
+    }
+    throw 1
+}
+
+fn loops() -> int {
+    var z = 0
+    while true {
+        z += 1
+        if z > 10 {
+            break
+        }
+        continue
+    }
+    return z
+}
+
+fn narrow(x: int?) -> int {
+    if let y = x {
+        return y
+    }
+    return 0
+}
+
+fn convert() -> float {
+    return 1 as float
+}
+
+fn slice(s: string) -> string {
+    return s[1..2]
+}
+
+fn variant() -> any {
+    return .A
+}
+
+fn named_and_spread(xs: [int]) -> int {
+    return len(xs: xs)
+}
