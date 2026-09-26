@@ -1,0 +1,10 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+// Spec r5 §5.2.2 rule 4: a `persistent` variable's type cannot be or
+// contain a function type. Function values are never persisted.
+persistent var handler: fn(int) -> int = fn(x: int) -> int { return x }
+persistent var handlers: [fn(int) -> int] = []
+persistent var by_name: {string: fn() -> int} = {:}
+
+// Not persistent: allowed even though it holds a function value.
+var ok_handler: fn(int) -> int = fn(x: int) -> int { return x }

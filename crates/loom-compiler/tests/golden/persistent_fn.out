@@ -1,0 +1,16 @@
+/t.wf:5:16: error[W0287]: a `persistent` variable's type cannot be or contain a function type (`fn(int) -> int`)
+  |
+5 | persistent var handler: fn(int) -> int = fn(x: int) -> int { return x }
+  |                ^^^^^^^
+  = help: `handler` is `persistent`, but its type is `fn(int) -> int`; function values are never saved (they pin a code version and a principal that may not survive a reboot)
+/t.wf:6:16: error[W0287]: a `persistent` variable's type cannot be or contain a function type (`[fn(int) -> int]`)
+  |
+6 | persistent var handlers: [fn(int) -> int] = []
+  |                ^^^^^^^^
+  = help: `handlers` is `persistent`, but its type is `[fn(int) -> int]`; function values are never saved (they pin a code version and a principal that may not survive a reboot)
+/t.wf:7:16: error[W0287]: a `persistent` variable's type cannot be or contain a function type (`{string: fn() -> int}`)
+  |
+7 | persistent var by_name: {string: fn() -> int} = {:}
+  |                ^^^^^^^
+  = help: `by_name` is `persistent`, but its type is `{string: fn() -> int}`; function values are never saved (they pin a code version and a principal that may not survive a reboot)
+
