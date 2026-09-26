@@ -1,0 +1,14 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// D23: program variables holding object references must be `object?`.
+var owner: object = self
+var home = load_object("/room")
+var ok_ref: object? = null
+var ok_list: [object] = []
+
+fn use_ref() {
+    let o = ok_ref
+    if o != null {
+        o.poke()
+    }
+}
