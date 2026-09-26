@@ -1,0 +1,193 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+
+//! SSA-lite IR: the lowering target of the typed HIR, and the input to
+//! bytecode assembly (spec §5.8/§5.9; design notes `docs/hir.md`,
+//! `docs/bytecode.md`).
+//!
+//! "SSA-lite": every *temporary* register is written exactly once along any
+//! execution path (true SSA for expression evaluation), but a register that
+//! backs a mutable local or a branch-join result may be written from more
+//! than one predecessor block — there are no phi nodes. This keeps codegen
+//! a straightforward one-pass lowering (no dominance/phi placement) while
+//! still giving every register a single static type for its whole lifetime,
+//! which is what the verifier (`crate::verify`) checks. A later register
+//! allocator or Cranelift tier can re-derive real SSA from this IR (each
+//! block is already a maximal straight-line unit with one terminator), so
+//! this is not a dead end for a JIT (Q15).
+//!
+//! Control flow is a graph of [`Block`]s ending in one [`Terminator`]; there
+//! is no `break`/`continue` because the V1 HIR does not have them yet.
+//! [`Inst::TickCheck`] marks the two places metering must not skip (§5.9):
+//! the header of every loop (a back-edge target) and immediately before
+//! every call (`Call`, `CallOther`, `CallEfun`) that could re-enter Weft
+//! code or run unboundedly long.
+
+use std::rc::Rc;
+
+pub use crate::efuns::Privilege;
+pub use crate::hir::{GlobalRef, IndexKind, IterKind, OpKind};
+pub use crate::ty::Ty;
+pub use loom_syntax::ast::{BinOp, UnOp};
+
+/// A virtual register: dense, never reused, one static [`Ty`] for its whole
+/// life (see the module docs). Index into [`Function::reg_types`].
+pub type Reg = u32;
+
+/// Index into [`Function::blocks`].
+pub type BlockId = u32;
+
+#[derive(Clone, Debug)]
+pub struct Program {
+    pub path: Rc<str>,
+    pub functions: Vec<Function>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Function {
+    pub name: Rc<str>,
+    /// Registers `0..param_count` are the parameters, in order.
+    pub param_count: u32,
+    pub ret: Ty,
+    /// The static type of every register, indexed by [`Reg`].
+    pub reg_types: Vec<Ty>,
+    pub blocks: Vec<Block>,
+    pub entry: BlockId,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Block {
+    pub insts: Vec<Inst>,
+    pub term: Terminator,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum Terminator {
+    #[default]
+    Unset,
+    Jump(BlockId),
+    Branch {
+        cond: Reg,
+        then_blk: BlockId,
+        else_blk: BlockId,
+    },
+    Return(Option<Reg>),
+}
+
+#[derive(Clone, Debug)]
+pub enum ConstOperand {
+    Int(i64),
+    Float(f64),
+    Str(Rc<str>),
+    Bool(bool),
+    Null,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Callee {
+    Virtual { name: Rc<str> },
+    Static { program: Rc<str>, name: Rc<str> },
+}
+
+#[derive(Clone, Debug)]
+pub enum Inst {
+    Const {
+        dst: Reg,
+        value: ConstOperand,
+    },
+    Copy {
+        dst: Reg,
+        src: Reg,
+    },
+    LoadSelf {
+        dst: Reg,
+    },
+    LoadGlobal {
+        dst: Reg,
+        global: GlobalRef,
+        ty: Ty,
+    },
+    StoreGlobal {
+        global: GlobalRef,
+        ty: Ty,
+        src: Reg,
+    },
+    UnOp {
+        dst: Reg,
+        op: UnOp,
+        kind: OpKind,
+        src: Reg,
+    },
+    BinOp {
+        dst: Reg,
+        op: BinOp,
+        kind: OpKind,
+        a: Reg,
+        b: Reg,
+    },
+    NewArray {
+        dst: Reg,
+        elem_ty: Ty,
+        elems: Vec<Reg>,
+    },
+    NewMap {
+        dst: Reg,
+        key_ty: Ty,
+        val_ty: Ty,
+        entries: Vec<(Reg, Reg)>,
+    },
+    Index {
+        dst: Reg,
+        base: Reg,
+        index: Reg,
+        kind: IndexKind,
+    },
+    IndexSet {
+        base: Reg,
+        index: Reg,
+        kind: IndexKind,
+        src: Reg,
+    },
+    /// The array of elements to walk for a `for` loop (spec §5.3): identity
+    /// for [`IterKind::Array`], `keys(src)` for [`IterKind::MapKeys`], a
+    /// runtime check of `src`'s actual value kind for [`IterKind::Dyn`].
+    IterElems {
+        dst: Reg,
+        src: Reg,
+        kind: IterKind,
+        elem_ty: Ty,
+    },
+    /// `any` → `string`, for interpolation (`$"...{e}..."`).
+    ToStr {
+        dst: Reg,
+        src: Reg,
+    },
+    Call {
+        dst: Option<Reg>,
+        callee: Callee,
+        args: Vec<Reg>,
+    },
+    /// `recv.name(args)`. Always produces `any`; `safe` (`?.`) is already
+    /// lowered to a branch around this instruction by codegen, so by the
+    /// time it reaches IR `recv` is known non-null on this path.
+    CallOther {
+        dst: Reg,
+        recv: Reg,
+        name: Rc<str>,
+        args: Vec<Reg>,
+    },
+    CallEfun {
+        dst: Option<Reg>,
+        name: &'static str,
+        args: Vec<Reg>,
+    },
+    /// Runtime-checked conversion to `ty` (the gradual boundary, HIR
+    /// invariant 3).
+    Cast {
+        dst: Reg,
+        src: Reg,
+        ty: Ty,
+    },
+    /// Tick-metering checkpoint (§5.9); see the module docs for placement.
+    TickCheck,
+}

@@ -1,0 +1,42 @@
+ok
+module /prog
+  const 0 = 0
+  const 1 = 0
+  const 2 = 0
+  const 3 = 0
+  const 4 = 1
+  const 5 = 1
+  fn add(%0, %1) -> int  [regs: %0: int, %1: int, %2: int]
+    0000  BinOp.Int Add %2, %0, %1 : int
+    0001  Return %2
+  fn clamp(%0) -> int  [regs: %0: int, %1: int, %2: bool, %3: int]
+    0000  LoadConst %1, #0 = 0 : int
+    0001  BinOp.Int Lt %2, %0, %1 : bool
+    0002  Branch %2, 0003, 0005
+    0003  LoadConst %3, #1 = 0 : int
+    0004  Return %3
+    0005  Jump 0006
+    0006  Return %0
+  fn sum_upto(%0) -> int  [regs: %0: int, %1: int, %2: int, %3: int, %4: int, %5: bool, %6: int, %7: int, %8: int]
+    0000  LoadConst %3, #2 = 0 : int
+    0001  Copy %1, %3 : int
+    0002  LoadConst %4, #3 = 0 : int
+    0003  Copy %2, %4 : int
+    0004  Jump 0005
+    0005  TickCheck
+    0006  BinOp.Int Lt %5, %1, %0 : bool
+    0007  Branch %5, 0008, 0014
+    0008  BinOp.Int Add %6, %2, %1 : int
+    0009  Copy %2, %6 : int
+    0010  LoadConst %7, #4 = 1 : int
+    0011  BinOp.Int Add %8, %1, %7 : int
+    0012  Copy %1, %8 : int
+    0013  Jump 0005
+    0014  Return %2
+  fn bump() -> no value  [regs: %0: int, %1: int, %2: int]
+    0000  LoadConst %0, #5 = 1 : int
+    0001  LoadGlobal %1, /prog::total : int
+    0002  BinOp.Int Add %2, %1, %0 : int
+    0003  StoreGlobal /prog::total, %2 : int
+    0004  Return
+

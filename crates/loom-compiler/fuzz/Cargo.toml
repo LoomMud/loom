@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+#
+# `cargo fuzz` target for the bytecode trust boundary: `decode` (a Module
+# read from anywhere at rest) followed by `verify` (spec Sec5.8/Sec5.9). Not a
+# workspace member: it needs nightly and libFuzzer. Run with
+#   scripts/fuzz-smoke.sh bytecode        (CI smoke, <= 60 s)
+#   cargo +nightly fuzz run decode_verify (from crates/loom-compiler, open-ended)
+
+[package]
+name = "loom-compiler-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "LicenseRef-Oberfield-Proprietary"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+loom-compiler = { path = ".." }
+
+[[bin]]
+name = "decode_verify"
+path = "fuzz_targets/decode_verify.rs"
+test = false
+doc = false
+bench = false
+
+# Keep this crate out of the main workspace.
+[workspace]
+members = ["."]
