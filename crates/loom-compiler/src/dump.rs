@@ -38,6 +38,10 @@ pub fn program(p: &Program) -> String {
             d.expr(e, 2);
         }
     }
+    for c in &p.consts {
+        let _ = writeln!(d.out, "  const {} {}: {}", vis(c.vis), c.name, c.ty);
+        d.expr(&c.value, 2);
+    }
     for f in &p.fns {
         d.locals = f.locals.iter().map(|l| l.name.to_string()).collect();
         let params: Vec<String> = f
@@ -133,6 +137,9 @@ impl Dump {
                     AssignOp::Set => "=".to_string(),
                     AssignOp::Add => format!("+= {kind:?}"),
                     AssignOp::Sub => format!("-= {kind:?}"),
+                    AssignOp::Mul => format!("*= {kind:?}"),
+                    AssignOp::Div => format!("/= {kind:?}"),
+                    AssignOp::Rem => format!("%= {kind:?}"),
                 };
                 match place {
                     Place::Local(id) => {
@@ -205,6 +212,7 @@ impl Dump {
         let ty = &e.ty;
         match &e.kind {
             ExprKind::Int(n) => self.line(depth, &format!("{n} : {ty}")),
+            ExprKind::Float(x) => self.line(depth, &format!("{x} : {ty}")),
             ExprKind::Str(s) => self.line(depth, &format!("{s:?} : {ty}")),
             ExprKind::Bool(b) => self.line(depth, &format!("{b} : {ty}")),
             ExprKind::Null => self.line(depth, &format!("null : {ty}")),
@@ -302,6 +310,17 @@ impl Dump {
             ExprKind::Cast(inner) => {
                 self.line(depth, &format!("cast : {ty}"));
                 self.expr(inner, depth + 1);
+            }
+            ExprKind::Closure(c) => {
+                self.line(depth, &format!("closure({} params) : {ty}", c.params.len()));
+                let saved = std::mem::replace(
+                    &mut self.locals,
+                    c.locals.iter().map(|l| l.name.to_string()).collect(),
+                );
+                for s in &c.body.stmts {
+                    self.stmt(s, depth + 1);
+                }
+                self.locals = saved;
             }
         }
     }

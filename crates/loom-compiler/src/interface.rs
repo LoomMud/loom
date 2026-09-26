@@ -34,12 +34,24 @@ pub struct ProgramInfo {
     pub fns: HashMap<Rc<str>, Rc<FnInfo>>,
     /// Variables an inheritor sees (non-private).
     pub vars: HashMap<Rc<str>, Rc<VarInfo>>,
+    /// Consts an inheritor sees (non-private), and `import` targets.
+    pub consts: HashMap<Rc<str>, Rc<ConstInfo>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ParentInfo {
     pub label: Option<Rc<str>>,
     pub info: Rc<ProgramInfo>,
+    pub span: Span,
+}
+
+/// One resolved `import /path` or `import /path.{A, B}` (§5.3): the target
+/// program's interface, and the names selected (`None`: everything it
+/// exports).
+#[derive(Debug, Clone)]
+pub struct ImportInfo {
+    pub info: Rc<ProgramInfo>,
+    pub names: Option<Vec<Rc<str>>>,
     pub span: Span,
 }
 
@@ -81,6 +93,15 @@ pub struct VarInfo {
     pub persistent: bool,
 }
 
+/// `[vis] const NAME[: T] = expr` (§5.3). Not part of the virtual-inherit
+/// graph: no dominance/ambiguity, just a plain name clash check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConstInfo {
+    pub name: Rc<str>,
+    pub owner: Rc<str>,
+    pub ty: Ty,
+}
+
 /// What a program inherits, merged from all parents.
 #[derive(Debug, Default)]
 pub struct Inherited {
@@ -91,6 +112,7 @@ pub struct Inherited {
     /// must override them. Value: the competing versions.
     pub ambiguous_fns: HashMap<Rc<str>, Vec<Rc<FnInfo>>>,
     pub vars: HashMap<Rc<str>, Rc<VarInfo>>,
+    pub consts: HashMap<Rc<str>, Rc<ConstInfo>>,
 }
 
 /// Merge the interfaces of `parents` (in source order). Diagnostics are for
@@ -176,6 +198,28 @@ pub fn merge_parents(parents: &[ParentInfo], diags: &mut Vec<Diagnostic>) -> Inh
             }
         }
     }
+    // Consts: same clash rule, own name space (a const and a var may not
+    // share a name either, but that is checked where they are declared).
+    for p in parents {
+        for (name, c) in &p.info.consts {
+            match out.consts.get(name) {
+                Some(prev) if prev.owner != c.owner => diags.push(
+                    Diagnostic::error(
+                        p.span,
+                        format!(
+                            "const `{name}` is inherited from both {} and {}",
+                            prev.owner, c.owner
+                        ),
+                    )
+                    .with_hint("rename the const in one of the parents"),
+                ),
+                Some(_) => {}
+                None => {
+                    out.consts.insert(name.clone(), c.clone());
+                }
+            }
+        }
+    }
     out
 }
 
@@ -245,6 +289,7 @@ mod tests {
             ancestors: inh.ancestors,
             fns: inh.fns,
             vars: inh.vars,
+            consts: inh.consts,
         })
     }
 

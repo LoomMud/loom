@@ -12,7 +12,7 @@ use std::rc::Rc;
 use loom_syntax::{Diagnostic, Span};
 
 use crate::check::{Checked, check_program};
-use crate::interface::{ParentInfo, ProgramInfo};
+use crate::interface::{ImportInfo, ParentInfo, ProgramInfo};
 
 /// Maximum inherit depth (matches the Phase 0 driver).
 pub const MAX_INHERIT_DEPTH: usize = 32;
@@ -131,12 +131,26 @@ impl<L: SourceLoader> Session<L> {
         }
         let mut diags = Vec::new();
         let mut parents = Vec::new();
-        for inh in ast.inherit.iter() {
+        for inh in ast.inherits.iter() {
             match self.parent(path, &inh.path, inh.span) {
                 Ok(info) => parents.push(ParentInfo {
-                    label: None,
+                    label: inh.label.as_ref().map(|l| Rc::from(l.name.as_str())),
                     info,
                     span: inh.span,
+                }),
+                Err(d) => diags.push(d),
+            }
+        }
+        let mut imports = Vec::new();
+        for imp in ast.imports.iter() {
+            match self.import_target(path, &imp.path, imp.span) {
+                Ok(info) => imports.push(ImportInfo {
+                    info,
+                    names: imp
+                        .names
+                        .as_ref()
+                        .map(|ns| ns.iter().map(|n| Rc::from(n.name.as_str())).collect()),
+                    span: imp.span,
                 }),
                 Err(d) => diags.push(d),
             }
@@ -144,25 +158,45 @@ impl<L: SourceLoader> Session<L> {
         if !diags.is_empty() {
             return Outcome::Failed(render(path, &src, &diags));
         }
-        match check_program(path, &ast, parents) {
+        match check_program(path, &ast, parents, imports) {
             Ok(c) => Outcome::Ok(c),
             Err(d) => Outcome::Failed(render(path, &src, &d)),
         }
     }
 
     fn parent(&mut self, path: &str, raw: &str, span: Span) -> Result<Rc<ProgramInfo>, Diagnostic> {
+        self.dependency(path, raw, span, "inherit")
+    }
+
+    fn import_target(
+        &mut self,
+        path: &str,
+        raw: &str,
+        span: Span,
+    ) -> Result<Rc<ProgramInfo>, Diagnostic> {
+        self.dependency(path, raw, span, "import")
+    }
+
+    /// Resolve and compile `raw` (an `inherit` or `import` target of `path`).
+    fn dependency(
+        &mut self,
+        path: &str,
+        raw: &str,
+        span: Span,
+        what: &str,
+    ) -> Result<Rc<ProgramInfo>, Diagnostic> {
         let ppath = normalize_path(raw).map_err(|e| Diagnostic::error(span, e))?;
         if self.stack.len() >= MAX_INHERIT_DEPTH {
             return Err(
-                Diagnostic::error(span, "inherit chain is too deep").with_hint(format!(
-                    "at most {MAX_INHERIT_DEPTH} levels of inherit are allowed"
+                Diagnostic::error(span, format!("{what} chain is too deep")).with_hint(format!(
+                    "at most {MAX_INHERIT_DEPTH} levels of {what} are allowed"
                 )),
             );
         }
         if ppath == path || self.stack.contains(&ppath) {
             return Err(
-                Diagnostic::error(span, format!("inherit cycle through {ppath}"))
-                    .with_hint("a program cannot (indirectly) inherit itself"),
+                Diagnostic::error(span, format!("{what} cycle through {ppath}"))
+                    .with_hint(format!("a program cannot (indirectly) {what} itself")),
             );
         }
         self.stack.push(path.to_string());
@@ -170,15 +204,17 @@ impl<L: SourceLoader> Session<L> {
         let err = match outcome {
             Outcome::Ok(_) => None,
             Outcome::Failed(_) => Some(
-                Diagnostic::error(span, format!("cannot inherit {ppath}: it has errors"))
+                Diagnostic::error(span, format!("cannot {what} {ppath}: it has errors"))
                     .with_hint(format!("fix the errors reported for {ppath}.wf first")),
             ),
             Outcome::Missing(_) => Some(
                 Diagnostic::error(
                     span,
-                    format!("cannot inherit {ppath}: {ppath}.wf does not exist"),
+                    format!("cannot {what} {ppath}: {ppath}.wf does not exist"),
                 )
-                .with_hint("check the path; inherit paths are absolute and have no extension"),
+                .with_hint(format!(
+                    "check the path; {what} paths are absolute and have no extension"
+                )),
             ),
         };
         self.stack.pop();

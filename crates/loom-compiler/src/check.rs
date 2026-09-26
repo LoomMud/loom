@@ -24,7 +24,8 @@ use loom_syntax::{Diagnostic, Span};
 use crate::efuns::{self, Param as EP, Ret as ER};
 use crate::hir::{self, Callee, IndexKind, IterKind, LocalId, OpKind, Visibility};
 use crate::interface::{
-    FnInfo, Inherited, ParamInfo, ParentInfo, ProgramInfo, VarInfo, merge_parents,
+    ConstInfo, FnInfo, ImportInfo, Inherited, ParamInfo, ParentInfo, ProgramInfo, VarInfo,
+    merge_parents,
 };
 use crate::ty::Ty;
 
@@ -34,15 +35,17 @@ pub struct Checked {
     pub info: Rc<ProgramInfo>,
 }
 
-/// Check one program against its (already checked) parents.
+/// Check one program against its (already checked) parents and imports.
 pub fn check_program(
     path: &str,
     ast: &ast::Program,
     parents: Vec<ParentInfo>,
+    imports: Vec<crate::interface::ImportInfo>,
 ) -> Result<Checked, Vec<Diagnostic>> {
     let path: Rc<str> = Rc::from(path);
     let mut diags = Vec::new();
     let inh = merge_parents(&parents, &mut diags);
+    let imported = resolve_imports(&imports, &mut diags);
     let decls = declare(&path, ast, &inh, &parents, &mut diags);
 
     let mut cx = Cx {
@@ -50,6 +53,7 @@ pub fn check_program(
         decls: &decls,
         inh: &inh,
         parents: &parents,
+        imported: &imported,
         diags: &mut diags,
         var_tys: HashMap::new(),
         locals: Vec::new(),
@@ -119,6 +123,41 @@ pub fn check_program(
         cx.var_tys.insert(v.name.clone(), ty);
     }
 
+    let mut consts = Vec::new();
+    for c in &decls.consts {
+        let d = c.decl;
+        cx.reset_fn(Ty::Void, "");
+        let value = cx.expr(&d.value, c.ty.as_ref());
+        let ty = match &c.ty {
+            Some(t) => {
+                let value = cx.coerce(value, t, &format!("the value of `{}`", c.name));
+                consts.push((t.clone(), value));
+                t.clone()
+            }
+            None => {
+                let t = cx.infer_binding(&value, &c.name, d.name.span);
+                consts.push((t.clone(), value));
+                t
+            }
+        };
+        // D23 (OBI-24 CTO review): applies to consts too, since one value is
+        // shared by every instance across executions.
+        if ty == Ty::Object {
+            cx.err_hint(
+                d.name.span,
+                format!(
+                    "const `{}` stores an object reference, so its type must be `object?`",
+                    c.name
+                ),
+                format!(
+                    "stored object references must be nullable (the object may be destructed); \
+                     declare `const {n}: object?` and narrow before use",
+                    n = c.name
+                ),
+            );
+        }
+    }
+
     let mut fns = Vec::new();
     for f in &decls.fns {
         fns.push(cx.function(f));
@@ -143,6 +182,19 @@ pub fn check_program(
         })
         .collect::<Vec<_>>();
 
+    let hir_consts = decls
+        .consts
+        .iter()
+        .zip(consts)
+        .map(|(c, (ty, value))| hir::Const {
+            name: c.name.clone(),
+            ty,
+            vis: c.vis,
+            value,
+            span: c.decl.span,
+        })
+        .collect::<Vec<_>>();
+
     // Export: inherited interface overlaid with our own non-private items.
     let mut efns = inh.fns.clone();
     for f in &decls.fns {
@@ -164,6 +216,19 @@ pub fn check_program(
             );
         }
     }
+    let mut econsts = inh.consts.clone();
+    for c in &hir_consts {
+        if c.vis != Visibility::Private {
+            econsts.insert(
+                c.name.clone(),
+                Rc::new(ConstInfo {
+                    name: c.name.clone(),
+                    owner: path.clone(),
+                    ty: c.ty.clone(),
+                }),
+            );
+        }
+    }
     let mut linearization = inh.linearization.clone();
     linearization.push(path.clone());
     let info = Rc::new(ProgramInfo {
@@ -173,6 +238,7 @@ pub fn check_program(
         ancestors: inh.ancestors.clone(),
         fns: efns,
         vars: evars,
+        consts: econsts,
     });
     let hir = hir::Program {
         path,
@@ -186,9 +252,70 @@ pub fn check_program(
             .collect(),
         linearization,
         vars: hir_vars,
+        consts: hir_consts,
         fns,
     };
     Ok(Checked { hir, info })
+}
+
+// ---- imports ---------------------------------------------------------
+
+/// Merge `import` targets into one name table (`import`'s own resolver;
+/// separate from the inherit graph in `interface.rs`). A name clash between
+/// two imports, or an explicitly named import that the target does not
+/// export as a `const`, is an error here.
+fn resolve_imports(
+    imports: &[ImportInfo],
+    diags: &mut Vec<Diagnostic>,
+) -> HashMap<Rc<str>, Rc<ConstInfo>> {
+    let mut out: HashMap<Rc<str>, Rc<ConstInfo>> = HashMap::new();
+    for imp in imports {
+        match &imp.names {
+            Some(names) => {
+                for n in names {
+                    match imp.info.consts.get(n) {
+                        Some(c) => insert_import(&mut out, c.clone(), imp.span, diags),
+                        None => diags.push(
+                            Diagnostic::error(
+                                imp.span,
+                                format!("`{}` does not export a const named `{n}`", imp.info.path),
+                            )
+                            .with_hint("only `pub const` declarations can be imported"),
+                        ),
+                    }
+                }
+            }
+            None => {
+                for c in imp.info.consts.values() {
+                    insert_import(&mut out, c.clone(), imp.span, diags);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn insert_import(
+    out: &mut HashMap<Rc<str>, Rc<ConstInfo>>,
+    c: Rc<ConstInfo>,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match out.get(&c.name) {
+        Some(prev) if prev.owner != c.owner => diags.push(
+            Diagnostic::error(
+                span,
+                format!(
+                    "`{}` is imported from both {} and {}",
+                    c.name, prev.owner, c.owner
+                ),
+            )
+            .with_hint("import it with `.{Name as Alias}` from one of them (not yet supported: rename at the source)"),
+        ),
+        _ => {
+            out.insert(c.name.clone(), c);
+        }
+    }
 }
 
 // ---- pass 1: declarations -------------------------------------------------
@@ -201,6 +328,13 @@ struct VarDecl<'a> {
     vis: Visibility,
 }
 
+struct ConstDeclI<'a> {
+    name: Rc<str>,
+    decl: &'a ast::ConstDecl,
+    ty: Option<Ty>,
+    vis: Visibility,
+}
+
 struct FnDecl<'a> {
     decl: &'a ast::FnDecl,
     info: Rc<FnInfo>,
@@ -208,9 +342,11 @@ struct FnDecl<'a> {
 
 struct Decls<'a> {
     vars: Vec<VarDecl<'a>>,
+    consts: Vec<ConstDeclI<'a>>,
     fns: Vec<FnDecl<'a>>,
     fn_index: HashMap<Rc<str>, usize>,
     var_index: HashMap<Rc<str>, usize>,
+    const_index: HashMap<Rc<str>, usize>,
 }
 
 fn visibility(m: &ast::Modifiers) -> Visibility {
@@ -232,9 +368,11 @@ fn declare<'a>(
 ) -> Decls<'a> {
     let mut d = Decls {
         vars: Vec::new(),
+        consts: Vec::new(),
         fns: Vec::new(),
         fn_index: HashMap::new(),
         var_index: HashMap::new(),
+        const_index: HashMap::new(),
     };
     let mut names: HashSet<&str> = HashSet::new();
     for item in &ast.items {
@@ -268,6 +406,56 @@ fn declare<'a>(
                     ty,
                     vis: visibility(&v.mods),
                 });
+            }
+            ast::Item::Const(c) => {
+                if !names.insert(&c.name.name) {
+                    diags.push(Diagnostic::error(
+                        c.name.span,
+                        format!("`{}` is declared twice in this program", c.name.name),
+                    ));
+                    continue;
+                }
+                if let Some(prev) = inh.consts.get(c.name.name.as_str()) {
+                    diags.push(
+                        Diagnostic::error(
+                            c.name.span,
+                            format!(
+                                "const `{}` is already declared in {}",
+                                c.name.name, prev.owner
+                            ),
+                        )
+                        .with_hint("use the inherited const, or pick another name"),
+                    );
+                }
+                let ty = c.ty.as_ref().map(|t| lower_type(t, diags));
+                let name: Rc<str> = Rc::from(c.name.name.as_str());
+                d.const_index.insert(name.clone(), d.consts.len());
+                d.consts.push(ConstDeclI {
+                    name,
+                    decl: c,
+                    ty,
+                    vis: visibility(&c.mods),
+                });
+            }
+            ast::Item::Struct(s) => {
+                names.insert(&s.name.name);
+                diags.push(
+                    Diagnostic::error(
+                        s.name.span,
+                        "`struct` is not implemented by the type checker yet",
+                    )
+                    .with_hint("use a map `{string: any}` for now; struct support is future work"),
+                );
+            }
+            ast::Item::Enum(e) => {
+                names.insert(&e.name.name);
+                diags.push(
+                    Diagnostic::error(
+                        e.name.span,
+                        "`enum` is not implemented by the type checker yet",
+                    )
+                    .with_hint("use strings or ints for now; enum support is future work"),
+                );
             }
             ast::Item::Fn(f) => {
                 if !names.insert(&f.name.name) {
@@ -482,6 +670,7 @@ pub fn lower_type(t: &ast::Type, diags: &mut Vec<Diagnostic>) -> Ty {
     use ast::TypeKind as T;
     match &t.kind {
         T::Int => Ty::Int,
+        T::Float => Ty::Float,
         T::Bool => Ty::Bool,
         T::String => Ty::String,
         T::Object => Ty::Object,
@@ -490,6 +679,20 @@ pub fn lower_type(t: &ast::Type, diags: &mut Vec<Diagnostic>) -> Ty {
         T::Array(e) => Ty::array(lower_type(e, diags)),
         T::Map(k, v) => Ty::map(lower_type(k, diags), lower_type(v, diags)),
         T::Optional(e) => Ty::optional(lower_type(e, diags)),
+        T::Fn { params, ret } => Ty::Fn(Rc::new(crate::ty::FnTy {
+            params: params.iter().map(|p| lower_type(p, diags)).collect(),
+            ret: ret
+                .as_ref()
+                .map(|r| lower_type(r, diags))
+                .unwrap_or(Ty::Void),
+        })),
+        T::Error => {
+            diags.push(
+                Diagnostic::error(t.span, "the `error` type is not implemented yet")
+                    .with_hint("it is reserved for `try`/`catch` (planned for a later phase)"),
+            );
+            Ty::Error
+        }
         T::Named(n) if n == "float" => Ty::Float,
         T::Named(n) => {
             let hint = match n.as_str() {
@@ -578,6 +781,7 @@ struct Cx<'a> {
     decls: &'a Decls<'a>,
     inh: &'a Inherited,
     parents: &'a [ParentInfo],
+    imported: &'a HashMap<Rc<str>, Rc<ConstInfo>>,
     diags: &'a mut Vec<Diagnostic>,
     /// Final types of own program variables (filled in declaration order).
     var_tys: HashMap<Rc<str>, Ty>,
@@ -591,6 +795,7 @@ struct Cx<'a> {
 enum Resolved {
     Local(LocalId),
     Global(hir::GlobalRef, Ty),
+    Const(hir::GlobalRef, Ty),
     SelfObj,
     Fn(Callee, Rc<FnInfo>),
 }
@@ -729,6 +934,17 @@ impl Cx<'_> {
         if let Some(id) = self.lookup_local(name) {
             return Some(Resolved::Local(id));
         }
+        if let Some(&i) = self.decls.const_index.get(name) {
+            let c = &self.decls.consts[i];
+            let ty = c.ty.clone().unwrap_or(Ty::Error);
+            return Some(Resolved::Const(
+                hir::GlobalRef {
+                    owner: self.path.clone(),
+                    name: c.name.clone(),
+                },
+                ty,
+            ));
+        }
         if let Some(&i) = self.decls.var_index.get(name) {
             let v = &self.decls.vars[i];
             let ty = self
@@ -745,6 +961,15 @@ impl Cx<'_> {
                 ty,
             ));
         }
+        if let Some(c) = self.inh.consts.get(name) {
+            return Some(Resolved::Const(
+                hir::GlobalRef {
+                    owner: c.owner.clone(),
+                    name: c.name.clone(),
+                },
+                c.ty.clone(),
+            ));
+        }
         if let Some(v) = self.inh.vars.get(name) {
             return Some(Resolved::Global(
                 hir::GlobalRef {
@@ -752,6 +977,15 @@ impl Cx<'_> {
                     name: v.name.clone(),
                 },
                 v.ty.clone(),
+            ));
+        }
+        if let Some(c) = self.imported.get(name) {
+            return Some(Resolved::Const(
+                hir::GlobalRef {
+                    owner: c.owner.clone(),
+                    name: c.name.clone(),
+                },
+                c.ty.clone(),
             ));
         }
         if name == "self" {
@@ -1118,6 +1352,61 @@ impl Cx<'_> {
                 (hir::StmtKind::Return(v), true)
             }
             S::Expr(e) => (hir::StmtKind::Expr(self.expr(e, None)), false),
+            S::IfLet {
+                ty,
+                value,
+                then,
+                els,
+                ..
+            } => {
+                self.expr(value, None);
+                if let Some(t) = ty {
+                    lower_type(t, self.diags);
+                }
+                self.block(then);
+                match els.as_deref() {
+                    Some(ast::Else::Block(b)) => {
+                        self.block(b);
+                    }
+                    Some(ast::Else::If(s)) => {
+                        self.stmt(s);
+                    }
+                    None => {}
+                }
+                self.err_hint(
+                    span,
+                    "`if let` is not implemented by the type checker yet",
+                    "compare with null instead: `if x != null { let y = x; ... }`",
+                );
+                (hir::StmtKind::Expr(Self::poison(span)), false)
+            }
+            S::Break | S::Continue => {
+                self.err_hint(
+                    span,
+                    "`break` and `continue` are not implemented by the type checker yet",
+                    "use a flag in the `while` condition, or `return`",
+                );
+                (hir::StmtKind::Expr(Self::poison(span)), false)
+            }
+            S::Try { body, handler, .. } => {
+                self.block(body);
+                self.block(handler);
+                self.err_hint(
+                    span,
+                    "`try`/`catch` is not implemented by the type checker yet",
+                    "tracked under OBI-32 (atomic rollback + try/catch/throw)",
+                );
+                (hir::StmtKind::Expr(Self::poison(span)), false)
+            }
+            S::Throw(e) => {
+                self.expr(e, None);
+                self.err_hint(
+                    span,
+                    "`throw` is not implemented by the type checker yet",
+                    "tracked under OBI-32 (atomic rollback + try/catch/throw)",
+                );
+                (hir::StmtKind::Expr(Self::poison(span)), false)
+            }
         };
         (hir::Stmt { kind, span }, diverges)
     }
@@ -1146,6 +1435,14 @@ impl Cx<'_> {
                     (hir::Place::Local(id), ty, Some(id))
                 }
                 Some(Resolved::Global(g, ty)) => (hir::Place::Global(g), ty, None),
+                Some(Resolved::Const(..)) => {
+                    self.err_hint(
+                        target.span,
+                        format!("cannot assign to `{n}`: it is a `const`"),
+                        "consts are set once at their declaration and never reassigned",
+                    );
+                    (hir::Place::Local(0), Ty::Error, None)
+                }
                 Some(Resolved::SelfObj) => {
                     self.err(target.span, "cannot assign to `self`");
                     (hir::Place::Local(0), Ty::Error, None)
@@ -1225,10 +1522,13 @@ impl Cx<'_> {
             let v = self.expr(value, Some(&pty));
             (self.coerce(v, &pty, "the assignment"), OpKind::Dyn)
         } else {
-            let bop = if op == ast::AssignOp::Add {
-                BinOp::Add
-            } else {
-                BinOp::Sub
+            let bop = match op {
+                ast::AssignOp::Add => BinOp::Add,
+                ast::AssignOp::Sub => BinOp::Sub,
+                ast::AssignOp::Mul => BinOp::Mul,
+                ast::AssignOp::Div => BinOp::Div,
+                ast::AssignOp::Rem => BinOp::Rem,
+                ast::AssignOp::Set => unreachable!("handled above"),
             };
             let v = self.expr(value, Some(&pty));
             let v = self.value(v);
@@ -1348,6 +1648,7 @@ impl Cx<'_> {
         let span = e.span;
         match &e.kind {
             E::Int(n) => Self::mk(H::Int(*n), Ty::Int, span),
+            E::Float(f) => Self::mk(H::Float(*f), Ty::Float, span),
             E::Str(s) => Self::mk(H::Str(Rc::from(s.as_str())), Ty::String, span),
             E::Bool(b) => Self::mk(H::Bool(*b), Ty::Bool, span),
             E::Null => Self::mk(H::Null, Ty::Null, span),
@@ -1370,6 +1671,7 @@ impl Cx<'_> {
             E::Ident(n) => match self.resolve(n) {
                 Some(Resolved::Local(id)) => Self::mk(H::Local(id), self.local_ty(id), span),
                 Some(Resolved::Global(g, ty)) => Self::mk(H::Global(g), ty, span),
+                Some(Resolved::Const(g, ty)) => Self::mk(H::Global(g), ty, span),
                 Some(Resolved::SelfObj) => Self::mk(H::SelfObj, Ty::Object, span),
                 Some(Resolved::Fn(c, f)) => Self::mk(H::FnRef(c), f.fn_ty(), span),
                 None => {
@@ -1421,8 +1723,14 @@ impl Cx<'_> {
                 }
             },
             E::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, span, expected),
-            E::Call { name, args } => self.call(name, args, span),
-            E::SuperCall { name, args } => self.super_call(name, args, span),
+            E::Call { name, args } => {
+                let args = self.plain_args(args);
+                self.call(name, &args, span)
+            }
+            E::SuperCall { label, name, args } => {
+                let args = self.plain_args(args);
+                self.super_call(label.as_ref(), name, &args, span)
+            }
             E::Method {
                 recv,
                 name,
@@ -1458,6 +1766,7 @@ impl Cx<'_> {
                         );
                     }
                 }
+                let args = self.plain_args(args);
                 let args = args
                     .iter()
                     .map(|a| {
@@ -1476,7 +1785,236 @@ impl Cx<'_> {
                     span,
                 )
             }
+            E::Slice { base, lo, hi } => {
+                self.expr(base, None);
+                if let Some(x) = lo {
+                    self.expr(x, Some(&Ty::Int));
+                }
+                if let Some(x) = hi {
+                    self.expr(x, Some(&Ty::Int));
+                }
+                self.err_hint(
+                    span,
+                    "slices (`a[lo..hi]`) are not implemented by the type checker yet",
+                    "index elements one at a time for now",
+                );
+                Self::poison(span)
+            }
+            E::Field { base, name, .. } => {
+                self.expr(base, None);
+                self.err_hint(
+                    name.span,
+                    "field access is not implemented by the type checker yet",
+                    "structs are future work; objects have no fields (use `.fn()` to call another object)",
+                );
+                Self::poison(span)
+            }
+            E::Cast { expr, ty } => self.cast_expr(expr, ty, span),
+            E::Apply { callee, args } => {
+                let c = self.expr(callee, None);
+                let args = self.plain_args(args);
+                self.call_value(c, &args, span)
+            }
+            E::Closure(c) => self.closure(c, span),
+            E::Match { scrutinee, arms } => {
+                self.expr(scrutinee, None);
+                for arm in arms {
+                    if let Some(g) = &arm.guard {
+                        self.expr(g, Some(&Ty::Bool));
+                    }
+                    match &arm.body {
+                        ast::Body::Expr(e) => {
+                            self.expr(e, None);
+                        }
+                        ast::Body::Block(b) => {
+                            self.block(b);
+                        }
+                    }
+                }
+                self.err_hint(
+                    span,
+                    "`match` is not implemented by the type checker yet",
+                    "use `if` / `else if` for now",
+                );
+                Self::poison(span)
+            }
+            E::StructLit { name, fields } => {
+                for f in fields {
+                    self.expr(&f.value, None);
+                }
+                self.err_hint(
+                    name.span,
+                    "struct literals are not implemented by the type checker yet",
+                    "use a map `{string: any}` for now",
+                );
+                Self::poison(span)
+            }
+            E::Variant { name, args } => {
+                if let Some(args) = args {
+                    for a in args {
+                        self.expr(&a.value, None);
+                    }
+                }
+                self.err_hint(
+                    name.span,
+                    "enum variants are not implemented by the type checker yet",
+                    "use strings or ints for now",
+                );
+                Self::poison(span)
+            }
         }
+    }
+
+    /// `args`, extracted positionally. Named and spread arguments are
+    /// accepted by the parser (§5.3) but the checker does not implement
+    /// them yet.
+    fn plain_args(&mut self, args: &[ast::Arg]) -> Vec<ast::Expr> {
+        args.iter()
+            .map(|a| {
+                if let Some(n) = &a.name {
+                    self.err_hint(
+                        n.span,
+                        "named arguments are not implemented by the type checker yet",
+                        "pass arguments by position",
+                    );
+                }
+                if a.spread {
+                    self.err_hint(
+                        a.span,
+                        "spread arguments (`...expr`) are not implemented by the type checker yet",
+                        "pass arguments by position",
+                    );
+                }
+                a.value.clone()
+            })
+            .collect()
+    }
+
+    /// `expr as T`: a user-requested gradual-boundary check, either widening
+    /// (same rule as assignment) or narrowing from a less precise type.
+    /// Reuses the same runtime tag check as an implicit [`hir::ExprKind::Cast`]
+    /// (C1, `docs/hir.md`); it is not a numeric conversion.
+    fn cast_expr(&mut self, e: &ast::Expr, ty: &ast::Type, span: Span) -> hir::Expr {
+        let x = self.expr(e, None);
+        let x = self.value(x);
+        let to = lower_type(ty, self.diags);
+        if matches!((&x.ty, &to), (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int)) {
+            self.err_hint(
+                span,
+                format!("cannot cast `{}` as `{to}`", x.ty),
+                "Weft has no implicit or explicit int/float conversion yet",
+            );
+            return Self::poison(span);
+        }
+        if x.ty.assignable_to(&to) || to.assignable_to(&x.ty) {
+            return Self::mk(hir::ExprKind::Cast(Box::new(x)), to, span);
+        }
+        let from = x.ty.clone();
+        self.err_hint(
+            span,
+            format!("cannot cast `{from}` as `{to}`"),
+            "`as` only converts between related types (e.g. `any` and a precise type)",
+        );
+        Self::poison(span)
+    }
+
+    /// A closure literal `fn(params) => expr` / `fn(params) { … }` (§5.3).
+    /// V1 does not capture the enclosing function's locals: the body sees
+    /// only its own parameters, program globals, `self` and named functions.
+    /// (Capture is a V5 runtime feature, OBI-32.)
+    fn closure(&mut self, c: &ast::Closure, span: Span) -> hir::Expr {
+        let mut param_tys = Vec::new();
+        for p in &c.params {
+            match &p.ty {
+                Some(t) => param_tys.push(lower_type(t, self.diags)),
+                None => {
+                    self.err_hint(
+                        p.name.span,
+                        format!(
+                            "closure parameter `{}` needs a type annotation",
+                            p.name.name
+                        ),
+                        format!(
+                            "write `fn({}: T) …`; closures are not inferred from call sites",
+                            p.name.name
+                        ),
+                    );
+                    param_tys.push(Ty::Error);
+                }
+            }
+            if p.default.is_some() {
+                self.err_hint(
+                    p.span,
+                    "closure parameters cannot have defaults",
+                    "give every argument at the call site",
+                );
+            }
+        }
+        let declared_ret = c.ret.as_ref().map(|t| lower_type(t, self.diags));
+
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_scopes = std::mem::take(&mut self.scopes);
+        let saved_facts = std::mem::take(&mut self.facts);
+        let saved_ret = std::mem::replace(&mut self.ret, declared_ret.clone().unwrap_or(Ty::Void));
+        let saved_name = std::mem::replace(&mut self.fn_name, Rc::from("<closure>"));
+
+        self.scopes.push(Vec::new());
+        let mut params = Vec::new();
+        for (p, ty) in c.params.iter().zip(&param_tys) {
+            params.push(self.declare(&p.name.name, ty.clone(), false, p.name.span));
+        }
+        let (ret, body) = match &c.body {
+            ast::Body::Expr(e) => {
+                let x = self.expr(e, declared_ret.as_ref());
+                let x = self.value(x);
+                let ret = declared_ret.clone().unwrap_or_else(|| x.ty.clone());
+                let x = self.coerce(x, &ret, "the closure body");
+                let ret_span = x.span;
+                (
+                    ret,
+                    hir::Block {
+                        stmts: vec![hir::Stmt {
+                            kind: hir::StmtKind::Return(Some(x)),
+                            span: ret_span,
+                        }],
+                        span: ret_span,
+                    },
+                )
+            }
+            ast::Body::Block(b) => {
+                let ret = declared_ret.clone().unwrap_or(Ty::Void);
+                let (body, diverges) = self.block(b);
+                if ret != Ty::Void && !diverges {
+                    self.err_hint(
+                        span,
+                        "this closure may reach its end without returning a value",
+                        format!("it is declared `-> {ret}`; add a `return` on every path"),
+                    );
+                }
+                (ret, body)
+            }
+        };
+        self.scopes.pop();
+        let locals = std::mem::replace(&mut self.locals, saved_locals);
+        self.scopes = saved_scopes;
+        self.facts = saved_facts;
+        self.ret = saved_ret;
+        self.fn_name = saved_name;
+
+        let fn_ty = Ty::Fn(Rc::new(crate::ty::FnTy {
+            params: param_tys,
+            ret: ret.clone(),
+        }));
+        Self::mk(
+            hir::ExprKind::Closure(Rc::new(hir::ClosureFn {
+                params,
+                ret,
+                locals,
+                body,
+            })),
+            fn_ty,
+            span,
+        )
     }
 
     fn array_lit(&mut self, es: &[ast::Expr], expected: Option<&Ty>, span: Span) -> hir::Expr {
@@ -2096,9 +2634,40 @@ impl Cx<'_> {
         )
     }
 
-    fn super_call(&mut self, name: &ast::Ident, args: &[ast::Expr], span: Span) -> hir::Expr {
+    fn super_call(
+        &mut self,
+        label: Option<&ast::Ident>,
+        name: &ast::Ident,
+        args: &[ast::Expr],
+        span: Span,
+    ) -> hir::Expr {
+        let qualifier = |l: Option<&ast::Ident>| match l {
+            Some(l) => format!("{}::", l.name),
+            None => "super::".to_string(),
+        };
+        if let Some(l) = label
+            && !self
+                .parents
+                .iter()
+                .any(|p| p.label.as_deref() == Some(l.name.as_str()))
+        {
+            self.err_hint(
+                l.span,
+                format!("no inherit is labelled `{}`", l.name),
+                "labelled inherits are written `inherit label = /path`",
+            );
+            for a in args {
+                self.expr(a, None);
+            }
+            return Self::poison(span);
+        }
         let mut found: Vec<Rc<FnInfo>> = Vec::new();
         for p in self.parents {
+            if let Some(l) = label
+                && p.label.as_deref() != Some(l.name.as_str())
+            {
+                continue;
+            }
             if let Some(f) = p.info.fns.get(name.name.as_str())
                 && !found.iter().any(|g| g.owner == f.owner)
             {
@@ -2110,7 +2679,8 @@ impl Cx<'_> {
                 self.err(
                     name.span,
                     format!(
-                        "`super::{}`: no inherited function with this name",
+                        "`{}{}`: no inherited function with this name",
+                        qualifier(label),
                         name.name
                     ),
                 );
@@ -2121,7 +2691,12 @@ impl Cx<'_> {
             }
             1 => {
                 let f = found.remove(0);
-                let args = self.check_args(&format!("super::{}", name.name), &f, args, span);
+                let args = self.check_args(
+                    &format!("{}{}", qualifier(label), name.name),
+                    &f,
+                    args,
+                    span,
+                );
                 Self::mk(
                     hir::ExprKind::Call {
                         callee: Callee::Static {
@@ -2139,7 +2714,8 @@ impl Cx<'_> {
                 self.err_hint(
                     name.span,
                     format!(
-                        "`super::{}` is ambiguous: it is inherited from {}",
+                        "`{}{}` is ambiguous: it is inherited from {}",
+                        qualifier(label),
                         name.name,
                         owners.join(" and ")
                     ),

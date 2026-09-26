@@ -1,0 +1,81 @@
+/main.wf:7:8: error: `struct` is not implemented by the type checker yet
+  |
+7 | struct Point {
+  |        ^^^^^
+  = help: use a map `{string: any}` for now; struct support is future work
+/main.wf:12:6: error: `enum` is not implemented by the type checker yet
+   |
+12 | enum Color {
+   |      ^^^^^
+   = help: use strings or ints for now; enum support is future work
+/main.wf:18:13: error: struct literals are not implemented by the type checker yet
+   |
+18 |     var p = Point { x: 1, y: 2 }
+   |             ^^^^^
+   = help: use a map `{string: any}` for now
+/main.wf:19:5: error: cannot assign to this expression
+   |
+19 |     p.x += 3
+   |     ^^^
+   = help: assign to a variable (`x = …`) or an element (`xs[i] = …`)
+/main.wf:24:13: error: `match` is not implemented by the type checker yet
+   |
+24 |     let n = match x {
+   |             ^^^^^^^^^
+   = help: use `if` / `else if` for now
+/main.wf:33:4: error: `risky` may reach its end without returning a value
+   |
+33 | fn risky() -> bool {
+   |    ^^^^^
+   = help: it is declared `-> bool`; add a `return` on every path
+/main.wf:34:5: error: `try`/`catch` is not implemented by the type checker yet
+   |
+34 |     try {
+   |     ^^^^^
+   = help: tracked under OBI-32 (atomic rollback + try/catch/throw)
+/main.wf:39:5: error: `throw` is not implemented by the type checker yet
+   |
+39 |     throw 1
+   |     ^^^^^^^
+   = help: tracked under OBI-32 (atomic rollback + try/catch/throw)
+/main.wf:47:13: error: `break` and `continue` are not implemented by the type checker yet
+   |
+47 |             break
+   |             ^^^^^
+   = help: use a flag in the `while` condition, or `return`
+/main.wf:49:9: error: `break` and `continue` are not implemented by the type checker yet
+   |
+49 |         continue
+   |         ^^^^^^^^
+   = help: use a flag in the `while` condition, or `return`
+/main.wf:55:5: error: `if let` is not implemented by the type checker yet
+   |
+55 |     if let y = x {
+   |     ^^^^^^^^^^^^^^
+   = help: compare with null instead: `if x != null { let y = x; ... }`
+/main.wf:56:16: error: unknown variable `y`
+   |
+56 |         return y
+   |                ^
+   = help: did you mean `x`?
+/main.wf:62:12: error: cannot cast `int` as `float`
+   |
+62 |     return 1 as float
+   |            ^^^^^^^^^^
+   = help: Weft has no implicit or explicit int/float conversion yet
+/main.wf:66:12: error: slices (`a[lo..hi]`) are not implemented by the type checker yet
+   |
+66 |     return s[1..2]
+   |            ^^^^^^^
+   = help: index elements one at a time for now
+/main.wf:70:13: error: enum variants are not implemented by the type checker yet
+   |
+70 |     return .A
+   |             ^
+   = help: use strings or ints for now
+/main.wf:74:16: error: named arguments are not implemented by the type checker yet
+   |
+74 |     return len(xs: xs)
+   |                ^^
+   = help: pass arguments by position
+

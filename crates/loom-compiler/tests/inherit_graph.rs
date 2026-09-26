@@ -28,7 +28,8 @@ fn compile(
             span: Span::default(),
         })
         .collect();
-    check_program(path, &ast, parents).map_err(|ds| ds.into_iter().map(|d| d.message).collect())
+    check_program(path, &ast, parents, Vec::new())
+        .map_err(|ds| ds.into_iter().map(|d| d.message).collect())
 }
 
 fn ok(path: &str, src: &str, parents: &[(Option<&str>, &Rc<ProgramInfo>)]) -> Checked {
