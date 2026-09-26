@@ -1,159 +1,159 @@
-v1_constructs.wf:1:1: error: `lightweight` programs: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:1:1: error[W0400]: `lightweight` programs: not yet supported by the Phase 0 evaluator
   |
 1 | lightweight
   | ^^^^^^^^^^^
   = help: it parses, and runs once the Phase 1 VM lands
-v1_constructs.wf:3:1: error: multiple inheritance: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:3:1: error[W0402]: multiple inheritance: not yet supported by the Phase 0 evaluator
   |
 3 | inherit combat = /std/combat
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   = help: Phase 0 runs one `inherit` per program
-v1_constructs.wf:3:9: error: labelled `inherit`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:3:9: error[W0401]: labelled `inherit`: not yet supported by the Phase 0 evaluator
   |
 3 | inherit combat = /std/combat
   |         ^^^^^^
   = help: write `inherit /path/to/program` and call it with `super::`
-v1_constructs.wf:4:1: error: `import`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:4:1: error[W0403]: `import`: not yet supported by the Phase 0 evaluator
   |
 4 | import /include/damage.{Damage}
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   = help: use `inherit` for code reuse in Phase 0
-v1_constructs.wf:6:7: error: `const`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:6:7: error[W0407]: `const`: not yet supported by the Phase 0 evaluator
   |
 6 | const MAX = 3
   |       ^^^
   = help: use a `var` for now
-v1_constructs.wf:7:8: error: `struct`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:7:8: error[W0408]: `struct`: not yet supported by the Phase 0 evaluator
   |
 7 | struct P { x: int }
   |        ^
   = help: use a map `{string: any}` for now
-v1_constructs.wf:8:6: error: `enum`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:8:6: error[W0409]: `enum`: not yet supported by the Phase 0 evaluator
   |
 8 | enum K { A, B(int) }
   |      ^
   = help: use strings or ints for now
-v1_constructs.wf:9:1: error: `protected` visibility: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:9:1: error[W0404]: `protected` visibility: not yet supported by the Phase 0 evaluator
   |
 9 | protected var p: int = 1
   | ^^^^^^^^^
   = help: use the default (internal) visibility or `private`
-v1_constructs.wf:10:8: error: the `float` type: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:10:8: error[W0411]: the `float` type: not yet supported by the Phase 0 evaluator
    |
 10 | var r: float = 1.5
    |        ^^^^^
    = help: use `int`
-v1_constructs.wf:10:16: error: float literals: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:10:16: error[W0421]: float literals: not yet supported by the Phase 0 evaluator
    |
 10 | var r: float = 1.5
    |                ^^^
    = help: use `int`
-v1_constructs.wf:11:1: error: `final`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:11:1: error[W0405]: `final`: not yet supported by the Phase 0 evaluator
    |
 11 | final fn fin() { }
    | ^^^^^
    = help: drop it for now
-v1_constructs.wf:12:1: error: `atomic` functions: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:12:1: error[W0406]: `atomic` functions: not yet supported by the Phase 0 evaluator
    |
 12 | atomic fn at(...rest: [any]) { }
    | ^^^^^^
    = help: runtime errors abort the whole execution in Phase 0
-v1_constructs.wf:12:14: error: `...rest` parameters: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:12:14: error[W0410]: `...rest` parameters: not yet supported by the Phase 0 evaluator
    |
 12 | atomic fn at(...rest: [any]) { }
    |              ^^^^^^^^^^^^^^
    = help: take an array parameter instead
-v1_constructs.wf:14:23: error: function types: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:14:23: error[W0413]: function types: not yet supported by the Phase 0 evaluator
    |
 14 | fn f(ob: object?, cb: fn(int) -> int, e: error?) {
    |                       ^^^^^^^^^^^^^^
    = help: it parses, and runs once the Phase 1 VM lands
-v1_constructs.wf:14:42: error: the `error` type: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:14:42: error[W0412]: the `error` type: not yet supported by the Phase 0 evaluator
    |
 14 | fn f(ob: object?, cb: fn(int) -> int, e: error?) {
    |                                          ^^^^^
    = help: it parses, and runs once the Phase 1 VM lands
-v1_constructs.wf:15:5: error: `try`/`catch`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:15:5: error[W0417]: `try`/`catch`: not yet supported by the Phase 0 evaluator
    |
 15 |     try { g() } catch e { }
    |     ^^^
    = help: runtime errors abort the execution in Phase 0
-v1_constructs.wf:16:5: error: `throw`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:16:5: error[W0418]: `throw`: not yet supported by the Phase 0 evaluator
    |
 16 |     throw e
    |     ^^^^^
    = help: runtime errors abort the execution in Phase 0
-v1_constructs.wf:17:13: error: closures: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:17:13: error[W0427]: closures: not yet supported by the Phase 0 evaluator
    |
 17 |     let c = fn(x) => x + 1
    |             ^^
    = help: call a named function instead
-v1_constructs.wf:18:8: error: field access: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:18:8: error[W0423]: field access: not yet supported by the Phase 0 evaluator
    |
 18 |     ob.field
    |        ^^^^^
    = help: objects have no fields; to call a function write `.field()`
-v1_constructs.wf:19:23: error: named arguments: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:19:23: error[W0419]: named arguments: not yet supported by the Phase 0 evaluator
    |
 19 |     ob.tell_room("x", exclude: [ob])
    |                       ^^^^^^^
    = help: pass arguments by position
-v1_constructs.wf:20:7: error: `...` spread arguments: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:20:7: error[W0420]: `...` spread arguments: not yet supported by the Phase 0 evaluator
    |
 20 |     g(...[1])
    |       ^^^^^^
    = help: it parses, and runs once the Phase 1 VM lands
-v1_constructs.wf:21:5: error: `if let`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:21:5: error[W0415]: `if let`: not yet supported by the Phase 0 evaluator
    |
 21 |     if let o = ob { }
    |     ^^
    = help: compare with null instead: `if x != null { … }`
-v1_constructs.wf:22:13: error: slices: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:22:13: error[W0422]: slices: not yet supported by the Phase 0 evaluator
    |
 22 |     let s = "abc"[1..2]
    |             ^^^^^^^^^^^
    = help: it parses, and runs once the Phase 1 VM lands
-v1_constructs.wf:23:13: error: `match`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:23:13: error[W0428]: `match`: not yet supported by the Phase 0 evaluator
    |
 23 |     let m = match 1 { _ => 0 }
    |             ^^^^^
    = help: use `if` / `else if` for now
-v1_constructs.wf:24:13: error: struct literals: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:24:13: error[W0429]: struct literals: not yet supported by the Phase 0 evaluator
    |
 24 |     let q = P { x: 1 }
    |             ^
    = help: use a map `{string: any}` for now
-v1_constructs.wf:25:13: error: enum variants: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:25:13: error[W0430]: enum variants: not yet supported by the Phase 0 evaluator
    |
 25 |     let k = .A
    |             ^^
    = help: use strings or ints for now
-v1_constructs.wf:26:13: error: `as` casts: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:26:13: error[W0424]: `as` casts: not yet supported by the Phase 0 evaluator
    |
 26 |     let n = 1 as float
    |             ^^^^^^^^^^
    = help: it parses, and runs once the Phase 1 VM lands
-v1_constructs.wf:26:18: error: the `float` type: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:26:18: error[W0411]: the `float` type: not yet supported by the Phase 0 evaluator
    |
 26 |     let n = 1 as float
    |                  ^^^^^
    = help: use `int`
-v1_constructs.wf:27:5: error: labelled calls `label::fn()`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:27:5: error[W0425]: labelled calls `label::fn()`: not yet supported by the Phase 0 evaluator
    |
 27 |     combat::roll()
    |     ^^^^^^
    = help: use `super::fn()`
-v1_constructs.wf:29:5: error: calling a computed value: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:29:5: error[W0426]: calling a computed value: not yet supported by the Phase 0 evaluator
    |
 29 |     handlers[0](1)
    |     ^^^^^^^^^^^^^^
    = help: call a named function instead
-v1_constructs.wf:31:5: error: `*=`, `/=` and `%=`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:31:5: error[W0414]: `*=`, `/=` and `%=`: not yet supported by the Phase 0 evaluator
    |
 31 |     z *= 2
    |     ^^^^^^
    = help: write `x = x * y`
-v1_constructs.wf:32:18: error: `break` and `continue`: not yet supported by the Phase 0 evaluator
+v1_constructs.wf:32:18: error[W0416]: `break` and `continue`: not yet supported by the Phase 0 evaluator
    |
 32 |     while true { break }
    |                  ^^^^^

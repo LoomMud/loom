@@ -1,45 +1,45 @@
-recovery_err.wf:1:9: error: inherit paths are not quoted
+recovery_err.wf:1:9: error[W0036]: inherit paths are not quoted
   |
 1 | inherit "/std/room"
   |         ^^^^^^^^^^^
   = help: write `inherit /std/room`
-recovery_err.wf:4:19: error: expected an expression, found `=`
+recovery_err.wf:4:19: error[W0073]: expected an expression, found `=`
   |
 4 | var broken: int = = 2
   |                   ^
-recovery_err.wf:8:5: error: expected an expression, found `let`
+recovery_err.wf:8:5: error[W0073]: expected an expression, found `let`
   |
 8 |     let y = @
   |     ^^^
-recovery_err.wf:8:13: error: unexpected character `@`
+recovery_err.wf:8:13: error[W0009]: unexpected character `@`
   |
 8 |     let y = @
   |             ^
-recovery_err.wf:10:16: error: expected `{` to start the `while` body, found `return`
+recovery_err.wf:10:16: error[W0065]: expected `{` to start the `while` body, found `return`
    |
 10 |     while true return
    |                ^^^^^^
    = help: braces are mandatory: `while … { … }`
-recovery_err.wf:11:11: error: expected end of statement, found integer `2`
+recovery_err.wf:11:11: error[W0056]: expected end of statement, found integer `2`
    |
 11 |     x = 1 2
    |           ^
    = help: put each statement on its own line or separate them with `;`
-recovery_err.wf:12:5: error: cannot assign to this expression
+recovery_err.wf:12:5: error[W0064]: cannot assign to this expression
    |
 12 |     1 + 2 = 3
    |     ^^^^^
    = help: assign to a variable (`x = …`), an element (`a[i] = …`) or a field (`p.x = …`)
-recovery_err.wf:13:17: error: empty `{}` in interpolated string
+recovery_err.wf:13:17: error[W0007]: empty `{}` in interpolated string
    |
 13 |     let s = $"a {  } b"
    |                 ^^^^
-recovery_err.wf:16:1: error: `import` must come before any declarations
+recovery_err.wf:16:1: error[W0035]: `import` must come before any declarations
    |
 16 | import /x/y
    | ^^^^^^
    = help: move it to the top of the file
-recovery_err.wf:19:18: error: comparison operators cannot be chained
+recovery_err.wf:19:18: error[W0070]: comparison operators cannot be chained
    |
 19 |     return a < b < c
    |                  ^

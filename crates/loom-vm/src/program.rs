@@ -118,6 +118,7 @@ pub fn link(
             Item::Var(v) => {
                 if !names.insert(&v.name.name) {
                     diags.push(Diagnostic::error(
+                        "W0300",
                         v.name.span,
                         format!("`{}` is declared twice in this program", v.name.name),
                     ));
@@ -128,6 +129,7 @@ pub fn link(
                 {
                     diags.push(
                         Diagnostic::error(
+                            "W0301",
                             v.name.span,
                             format!(
                                 "variable `{}` is already declared in {}",
@@ -145,6 +147,7 @@ pub fn link(
             Item::Fn(f) => {
                 if !names.insert(&f.name.name) {
                     diags.push(Diagnostic::error(
+                        "W0302",
                         f.name.span,
                         format!("`{}` is declared twice in this program", f.name.name),
                     ));
@@ -154,6 +157,7 @@ pub fn link(
                 match (&inherited, f.mods.is_override) {
                     (Some((owner, _)), false) => diags.push(
                         Diagnostic::error(
+                            "W0303",
                             f.name.span,
                             format!(
                                 "`{}` redefines a function inherited from {}",
@@ -164,6 +168,7 @@ pub fn link(
                     ),
                     (None, true) => diags.push(
                         Diagnostic::error(
+                            "W0304",
                             f.name.span,
                             format!("`override fn {}` overrides nothing", f.name.name),
                         )
@@ -180,6 +185,7 @@ pub fn link(
                 for p in &f.params {
                     if !pnames.insert(&p.name.name) {
                         diags.push(Diagnostic::error(
+                            "W0305",
                             p.name.span,
                             format!("parameter `{}` is declared twice", p.name.name),
                         ));
@@ -192,6 +198,7 @@ pub fn link(
                     } else if seen_default {
                         diags.push(
                             Diagnostic::error(
+                                "W0306",
                                 p.name.span,
                                 "a parameter without a default follows one with a default",
                             )
@@ -260,7 +267,9 @@ fn check_type(t: &Type, diags: &mut Vec<Diagnostic>) {
                 "array" => "arrays are written `[T]`",
                 _ => "Phase 0 types: int, bool, string, object, any, null, [T], {K: V}, T?",
             };
-            diags.push(Diagnostic::error(t.span, format!("unknown type `{n}`")).with_hint(hint));
+            diags.push(
+                Diagnostic::error("W0307", t.span, format!("unknown type `{n}`")).with_hint(hint),
+            );
         }
         TypeKind::Array(e) | TypeKind::Optional(e) => check_type(e, diags),
         TypeKind::Map(k, v) => {
@@ -335,14 +344,17 @@ impl Checker<'_> {
                     ExprKind::Ident(n) => match self.lookup(n) {
                         Some(Name::Local(false)) => self.diags.push(
                             Diagnostic::error(
+                                "W0308",
                                 target.span,
                                 format!("cannot assign to `{n}`: it was declared with `let`"),
                             )
                             .with_hint(format!("declare it with `var {n}` to make it mutable")),
                         ),
-                        Some(Name::SelfObj) => self
-                            .diags
-                            .push(Diagnostic::error(target.span, "cannot assign to `self`")),
+                        Some(Name::SelfObj) => self.diags.push(Diagnostic::error(
+                            "W0309",
+                            target.span,
+                            "cannot assign to `self`",
+                        )),
                         Some(_) => {}
                         None => self.unknown_var(n, target.span),
                     },
@@ -377,7 +389,7 @@ impl Checker<'_> {
     }
 
     fn unknown_var(&mut self, n: &str, span: loom_syntax::Span) {
-        let mut d = Diagnostic::error(span, format!("unknown variable `{n}`"));
+        let mut d = Diagnostic::error("W0310", span, format!("unknown variable `{n}`"));
         if self.prog.find_fn(n).is_some()
             || self.prog.fns.contains_key(n)
             || efuns::arity(n).is_some()
@@ -453,6 +465,7 @@ impl Checker<'_> {
                                 format!("{min} to {max}")
                             };
                             self.diags.push(Diagnostic::error(
+                                "W0311",
                                 e.span,
                                 format!(
                                     "`{n}` takes {want} argument{}, but {} were given",
@@ -463,10 +476,11 @@ impl Checker<'_> {
                         }
                     }
                     None => self.diags.push(
-                        Diagnostic::error(name.span, format!("unknown function `{n}`")).with_hint(
-                            "it is not declared in this program, inherited, or an efun; \
+                        Diagnostic::error("W0312", name.span, format!("unknown function `{n}`"))
+                            .with_hint(
+                                "it is not declared in this program, inherited, or an efun; \
                                  to call another object use `ob.fn()`",
-                        ),
+                            ),
                     ),
                 }
             }
@@ -479,6 +493,7 @@ impl Checker<'_> {
                     .and_then(|p| p.find_fn(&name.name));
                 if found.is_none() {
                     self.diags.push(Diagnostic::error(
+                        "W0313",
                         name.span,
                         format!(
                             "`super::{}`: no inherited function with this name",

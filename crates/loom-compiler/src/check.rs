@@ -78,6 +78,7 @@ pub fn check_program(
                 if !t.is_nullable() {
                     cx.diags.push(
                         Diagnostic::error(
+                            "W0200",
                             d.name.span,
                             format!("`{}` has type `{t}` but no initial value", v.name),
                         )
@@ -97,7 +98,7 @@ pub fn check_program(
             }
             (None, None) => {
                 cx.diags.push(
-                    Diagnostic::error(d.name.span, format!("`{}` needs a type", v.name))
+                    Diagnostic::error("W0201", d.name.span, format!("`{}` needs a type", v.name))
                         .with_hint(format!("write `var {}: T`", v.name)),
                 );
                 vars.push((Ty::Error, None));
@@ -108,6 +109,7 @@ pub fn check_program(
         // an object it holds may be destructed by the time it is read.
         if ty == Ty::Object {
             cx.err_hint(
+                "W0284",
                 d.name.span,
                 format!(
                     "program variable `{}` stores an object reference, so its type must be `object?`",
@@ -144,6 +146,7 @@ pub fn check_program(
         // shared by every instance across executions.
         if ty == Ty::Object {
             cx.err_hint(
+                "W0285",
                 d.name.span,
                 format!(
                     "const `{}` stores an object reference, so its type must be `object?`",
@@ -277,6 +280,7 @@ fn resolve_imports(
                         Some(c) => insert_import(&mut out, c.clone(), imp.span, diags),
                         None => diags.push(
                             Diagnostic::error(
+                                "W0202",
                                 imp.span,
                                 format!("`{}` does not export a const named `{n}`", imp.info.path),
                             )
@@ -303,7 +307,7 @@ fn insert_import(
 ) {
     match out.get(&c.name) {
         Some(prev) if prev.owner != c.owner => diags.push(
-            Diagnostic::error(
+            Diagnostic::error("W0203", 
                 span,
                 format!(
                     "`{}` is imported from both {} and {}",
@@ -380,6 +384,7 @@ fn declare<'a>(
             ast::Item::Var(v) => {
                 if !names.insert(&v.name.name) {
                     diags.push(Diagnostic::error(
+                        "W0204",
                         v.name.span,
                         format!("`{}` is declared twice in this program", v.name.name),
                     ));
@@ -388,6 +393,7 @@ fn declare<'a>(
                 if let Some(prev) = inh.vars.get(v.name.name.as_str()) {
                     diags.push(
                         Diagnostic::error(
+                            "W0205",
                             v.name.span,
                             format!(
                                 "variable `{}` is already declared in {}",
@@ -410,6 +416,7 @@ fn declare<'a>(
             ast::Item::Const(c) => {
                 if !names.insert(&c.name.name) {
                     diags.push(Diagnostic::error(
+                        "W0206",
                         c.name.span,
                         format!("`{}` is declared twice in this program", c.name.name),
                     ));
@@ -418,6 +425,7 @@ fn declare<'a>(
                 if let Some(prev) = inh.consts.get(c.name.name.as_str()) {
                     diags.push(
                         Diagnostic::error(
+                            "W0207",
                             c.name.span,
                             format!(
                                 "const `{}` is already declared in {}",
@@ -441,6 +449,7 @@ fn declare<'a>(
                 names.insert(&s.name.name);
                 diags.push(
                     Diagnostic::error(
+                        "W0208",
                         s.name.span,
                         "`struct` is not implemented by the type checker yet",
                     )
@@ -451,6 +460,7 @@ fn declare<'a>(
                 names.insert(&e.name.name);
                 diags.push(
                     Diagnostic::error(
+                        "W0209",
                         e.name.span,
                         "`enum` is not implemented by the type checker yet",
                     )
@@ -460,6 +470,7 @@ fn declare<'a>(
             ast::Item::Fn(f) => {
                 if !names.insert(&f.name.name) {
                     diags.push(Diagnostic::error(
+                        "W0210",
                         f.name.span,
                         format!("`{}` is declared twice in this program", f.name.name),
                     ));
@@ -483,7 +494,7 @@ fn declare<'a>(
         let span = parents.first().map(|p| p.span).unwrap_or_default();
         let owners: Vec<&str> = versions.iter().map(|f| &*f.owner).collect();
         diags.push(
-            Diagnostic::error(
+            Diagnostic::error("W0211", 
                 span,
                 format!(
                     "function `{name}` is inherited from both {}",
@@ -505,6 +516,7 @@ fn fn_info(path: &Rc<str>, f: &ast::FnDecl, diags: &mut Vec<Diagnostic>) -> FnIn
     for p in &f.params {
         if !pnames.insert(&p.name.name) {
             diags.push(Diagnostic::error(
+                "W0212",
                 p.name.span,
                 format!("parameter `{}` is declared twice", p.name.name),
             ));
@@ -514,6 +526,7 @@ fn fn_info(path: &Rc<str>, f: &ast::FnDecl, diags: &mut Vec<Diagnostic>) -> FnIn
             None => {
                 diags.push(
                     Diagnostic::error(
+                        "W0213",
                         p.name.span,
                         format!("parameter `{}` needs a type", p.name.name),
                     )
@@ -530,6 +543,7 @@ fn fn_info(path: &Rc<str>, f: &ast::FnDecl, diags: &mut Vec<Diagnostic>) -> FnIn
         } else if seen_default {
             diags.push(
                 Diagnostic::error(
+                    "W0214",
                     p.name.span,
                     "a parameter without a default follows one with a default",
                 )
@@ -570,8 +584,12 @@ fn check_override(
     if info.vis == Visibility::Private {
         if f.mods.is_override {
             diags.push(
-                Diagnostic::error(span, format!("`private fn {name}` cannot be an `override`"))
-                    .with_hint("private functions are not virtual; remove `private` or `override`"),
+                Diagnostic::error(
+                    "W0215",
+                    span,
+                    format!("`private fn {name}` cannot be an `override`"),
+                )
+                .with_hint("private functions are not virtual; remove `private` or `override`"),
             );
         }
         return;
@@ -579,12 +597,16 @@ fn check_override(
     let Some(parent) = inherited else {
         if f.mods.is_override {
             diags.push(
-                Diagnostic::error(span, format!("`override fn {name}` overrides nothing"))
-                    .with_hint(if parents.is_empty() {
-                        "this program has no `inherit`; remove `override`"
-                    } else {
-                        "no inherited function has this name; remove `override`"
-                    }),
+                Diagnostic::error(
+                    "W0216",
+                    span,
+                    format!("`override fn {name}` overrides nothing"),
+                )
+                .with_hint(if parents.is_empty() {
+                    "this program has no `inherit`; remove `override`"
+                } else {
+                    "no inherited function has this name; remove `override`"
+                }),
             );
         }
         return;
@@ -592,6 +614,7 @@ fn check_override(
     if !f.mods.is_override {
         diags.push(
             Diagnostic::error(
+                "W0217",
                 span,
                 format!(
                     "`{name}` redefines a function inherited from {}",
@@ -605,6 +628,7 @@ fn check_override(
     if parent.is_final {
         diags.push(
             Diagnostic::error(
+                "W0218",
                 span,
                 format!(
                     "`{name}` is `final` in {} and cannot be overridden",
@@ -627,7 +651,7 @@ fn check_override(
     };
     if !same_params || !ret_ok {
         diags.push(
-            Diagnostic::error(
+            Diagnostic::error("W0219", 
                 span,
                 format!(
                     "`override fn {name}` does not match the inherited signature `{}` from {}",
@@ -644,6 +668,7 @@ fn check_override(
     if parent.vis == Visibility::Public && info.vis != Visibility::Public {
         diags.push(
             Diagnostic::error(
+                "W0220",
                 span,
                 format!("`override fn {name}` must stay `pub` like the inherited function"),
             )
@@ -688,7 +713,7 @@ pub fn lower_type(t: &ast::Type, diags: &mut Vec<Diagnostic>) -> Ty {
         })),
         T::Error => {
             diags.push(
-                Diagnostic::error(t.span, "the `error` type is not implemented yet")
+                Diagnostic::error("W0221", t.span, "the `error` type is not implemented yet")
                     .with_hint("it is reserved for `try`/`catch` (planned for a later phase)"),
             );
             Ty::Error
@@ -707,7 +732,9 @@ pub fn lower_type(t: &ast::Type, diags: &mut Vec<Diagnostic>) -> Ty {
                         .to_string(),
                 },
             };
-            diags.push(Diagnostic::error(t.span, format!("unknown type `{n}`")).with_hint(hint));
+            diags.push(
+                Diagnostic::error("W0222", t.span, format!("unknown type `{n}`")).with_hint(hint),
+            );
             Ty::Error
         }
     }
@@ -818,13 +845,19 @@ fn arity_text(min: usize, max: usize) -> String {
 }
 
 impl Cx<'_> {
-    fn err(&mut self, span: Span, msg: impl Into<String>) {
-        self.diags.push(Diagnostic::error(span, msg));
+    fn err(&mut self, code: &'static str, span: Span, msg: impl Into<String>) {
+        self.diags.push(Diagnostic::error(code, span, msg));
     }
 
-    fn err_hint(&mut self, span: Span, msg: impl Into<String>, hint: impl Into<String>) {
+    fn err_hint(
+        &mut self,
+        code: &'static str,
+        span: Span,
+        msg: impl Into<String>,
+        hint: impl Into<String>,
+    ) {
         self.diags
-            .push(Diagnostic::error(span, msg).with_hint(hint));
+            .push(Diagnostic::error(code, span, msg).with_hint(hint));
     }
 
     fn reset_fn(&mut self, ret: Ty, name: &str) {
@@ -861,6 +894,7 @@ impl Cx<'_> {
         if f.info.ret != Ty::Void && !diverges {
             let ret = f.info.ret.clone();
             self.err_hint(
+                "W0223",
                 d.name.span,
                 format!(
                     "`{}` may reach its end without returning a value",
@@ -1021,7 +1055,7 @@ impl Cx<'_> {
     }
 
     fn unknown_var(&mut self, n: &str, span: Span) {
-        let mut d = Diagnostic::error(span, format!("unknown variable `{n}`"));
+        let mut d = Diagnostic::error("W0224", span, format!("unknown variable `{n}`"));
         let names = self.value_names();
         if efuns::lookup(n).is_some() {
             d = d.with_hint(format!(
@@ -1047,6 +1081,7 @@ impl Cx<'_> {
     fn value(&mut self, e: hir::Expr) -> hir::Expr {
         if e.ty == Ty::Void {
             self.err_hint(
+                "W0225",
                 e.span,
                 "this call returns no value",
                 "the function has no `-> T`, so its result cannot be used",
@@ -1085,8 +1120,8 @@ impl Cx<'_> {
             _ => None,
         };
         match hint {
-            Some(h) => self.err_hint(e.span, msg, h),
-            None => self.err(e.span, msg),
+            Some(h) => self.err_hint("W0226", e.span, msg, h),
+            None => self.err("W0226", e.span, msg),
         }
         Self::poison(e.span)
     }
@@ -1110,7 +1145,12 @@ impl Cx<'_> {
             _ => "conditions must be `bool`",
         };
         let ty = x.ty.clone();
-        self.err_hint(x.span, format!("{what} must be `bool`, found `{ty}`"), hint);
+        self.err_hint(
+            "W0228",
+            x.span,
+            format!("{what} must be `bool`, found `{ty}`"),
+            hint,
+        );
         Self::poison(x.span)
     }
 
@@ -1118,6 +1158,7 @@ impl Cx<'_> {
         match &e.ty {
             Ty::Null => {
                 self.err_hint(
+                    "W0229",
                     span,
                     format!("cannot infer a type for `{name}` from `null`"),
                     format!("annotate it: `{name}: T? = null`"),
@@ -1177,7 +1218,7 @@ impl Cx<'_> {
                 let lty = match (&declared, &init) {
                     (Some(t), _) => {
                         if init.is_none() && !t.is_nullable() {
-                            self.err_hint(
+                            self.err_hint("W0230", 
                                 name.span,
                                 format!("`{}` has type `{t}` but no initial value", name.name),
                                 format!(
@@ -1195,6 +1236,7 @@ impl Cx<'_> {
                     }
                     (None, None) => {
                         self.err_hint(
+                            "W0231",
                             name.span,
                             format!("`{}` needs a type or an initial value", name.name),
                             format!("write `var {}: T` or `var {} = …`", name.name, name.name),
@@ -1278,6 +1320,7 @@ impl Cx<'_> {
                     Ty::Optional(_) => {
                         let t = it.ty.clone();
                         self.err_hint(
+                            "W0232",
                             it.span,
                             format!("cannot iterate over `{t}`: it may be null"),
                             "check it with `if xs != null { … }` first",
@@ -1287,6 +1330,7 @@ impl Cx<'_> {
                     t => {
                         let t = t.clone();
                         self.err_hint(
+                            "W0233",
                             it.span,
                             format!("cannot iterate over `{t}`"),
                             "`for` works on arrays (elements) and maps (keys)",
@@ -1319,9 +1363,10 @@ impl Cx<'_> {
                         let x = self.expr(e, None);
                         let ty = x.ty.clone();
                         if fname.is_empty() {
-                            self.err(x.span, "`return` outside a function");
+                            self.err("W0234", x.span, "`return` outside a function");
                         } else {
                             self.err_hint(
+                                "W0235",
                                 x.span,
                                 format!(
                                     "`{fname}` has no return type, so it cannot return a value"
@@ -1338,6 +1383,7 @@ impl Cx<'_> {
                     (None, Ty::Void) => None,
                     (None, t) => {
                         self.err_hint(
+                            "W0236",
                             span,
                             format!("`{fname}` must return a value of type `{t}`"),
                             if t.is_nullable() {
@@ -1374,6 +1420,7 @@ impl Cx<'_> {
                     None => {}
                 }
                 self.err_hint(
+                    "W0237",
                     span,
                     "`if let` is not implemented by the type checker yet",
                     "compare with null instead: `if x != null { let y = x; ... }`",
@@ -1382,6 +1429,7 @@ impl Cx<'_> {
             }
             S::Break | S::Continue => {
                 self.err_hint(
+                    "W0238",
                     span,
                     "`break` and `continue` are not implemented by the type checker yet",
                     "use a flag in the `while` condition, or `return`",
@@ -1392,6 +1440,7 @@ impl Cx<'_> {
                 self.block(body);
                 self.block(handler);
                 self.err_hint(
+                    "W0239",
                     span,
                     "`try`/`catch` is not implemented by the type checker yet",
                     "tracked under OBI-32 (atomic rollback + try/catch/throw)",
@@ -1401,6 +1450,7 @@ impl Cx<'_> {
             S::Throw(e) => {
                 self.expr(e, None);
                 self.err_hint(
+                    "W0240",
                     span,
                     "`throw` is not implemented by the type checker yet",
                     "tracked under OBI-32 (atomic rollback + try/catch/throw)",
@@ -1422,6 +1472,7 @@ impl Cx<'_> {
                 Some(Resolved::Local(id)) => {
                     if !self.locals[id as usize].mutable {
                         self.err_hint(
+                            "W0241",
                             target.span,
                             format!("cannot assign to `{n}`: it was declared with `let`"),
                             format!("declare it with `var {n}` to make it mutable"),
@@ -1437,6 +1488,7 @@ impl Cx<'_> {
                 Some(Resolved::Global(g, ty)) => (hir::Place::Global(g), ty, None),
                 Some(Resolved::Const(..)) => {
                     self.err_hint(
+                        "W0242",
                         target.span,
                         format!("cannot assign to `{n}`: it is a `const`"),
                         "consts are set once at their declaration and never reassigned",
@@ -1444,11 +1496,12 @@ impl Cx<'_> {
                     (hir::Place::Local(0), Ty::Error, None)
                 }
                 Some(Resolved::SelfObj) => {
-                    self.err(target.span, "cannot assign to `self`");
+                    self.err("W0243", target.span, "cannot assign to `self`");
                     (hir::Place::Local(0), Ty::Error, None)
                 }
                 Some(Resolved::Fn(..)) => {
                     self.err_hint(
+                        "W0244",
                         target.span,
                         format!("cannot assign to function `{n}`"),
                         "functions are not variables",
@@ -1487,6 +1540,7 @@ impl Cx<'_> {
                     Ty::String => {
                         let i = self.expr(index, None);
                         self.err_hint(
+                            "W0245",
                             target.span,
                             "cannot assign into a string",
                             "strings are immutable; build a new one with interpolation or `+`",
@@ -1511,6 +1565,7 @@ impl Cx<'_> {
             }
             _ => {
                 self.err_hint(
+                    "W0246",
                     target.span,
                     "cannot assign to this expression",
                     "assign to a variable (`x = …`) or an element (`xs[i] = …`)",
@@ -1536,6 +1591,7 @@ impl Cx<'_> {
             let (kind, rty) = self.arith(bop, &lhs, &v, target.span.to(v.span));
             if !rty.assignable_to(&pty) {
                 self.err(
+                    "W0247",
                     target.span.to(v.span),
                     format!("mismatched types in the assignment: expected `{pty}`, found `{rty}`"),
                 );
@@ -1707,7 +1763,11 @@ impl Cx<'_> {
                         t if t.is_lenient() => (OpKind::Dyn, t.clone()),
                         t => {
                             let t = t.clone();
-                            self.err(x.span, format!("cannot negate a value of type `{t}`"));
+                            self.err(
+                                "W0248",
+                                x.span,
+                                format!("cannot negate a value of type `{t}`"),
+                            );
                             (OpKind::Dyn, Ty::Error)
                         }
                     };
@@ -1744,7 +1804,7 @@ impl Cx<'_> {
                     t if t.is_lenient() => {}
                     Ty::Optional(t) if **t == Ty::Object || t.is_lenient() => {
                         if !safe {
-                            self.err_hint(
+                            self.err_hint("W0249", 
                                 name.span,
                                 format!(
                                     "cannot call `.{}()` on a value that may be null (`object?`)",
@@ -1760,6 +1820,7 @@ impl Cx<'_> {
                     t => {
                         let t = t.clone();
                         self.err_hint(
+                            "W0250",
                             name.span,
                             format!("cannot call `.{}()` on a value of type `{t}`", name.name),
                             "`.fn()` calls a function in another object; it needs an `object`",
@@ -1794,6 +1855,7 @@ impl Cx<'_> {
                     self.expr(x, Some(&Ty::Int));
                 }
                 self.err_hint(
+                    "W0251",
                     span,
                     "slices (`a[lo..hi]`) are not implemented by the type checker yet",
                     "index elements one at a time for now",
@@ -1802,7 +1864,7 @@ impl Cx<'_> {
             }
             E::Field { base, name, .. } => {
                 self.expr(base, None);
-                self.err_hint(
+                self.err_hint("W0252", 
                     name.span,
                     "field access is not implemented by the type checker yet",
                     "structs are future work; objects have no fields (use `.fn()` to call another object)",
@@ -1832,6 +1894,7 @@ impl Cx<'_> {
                     }
                 }
                 self.err_hint(
+                    "W0253",
                     span,
                     "`match` is not implemented by the type checker yet",
                     "use `if` / `else if` for now",
@@ -1843,6 +1906,7 @@ impl Cx<'_> {
                     self.expr(&f.value, None);
                 }
                 self.err_hint(
+                    "W0254",
                     name.span,
                     "struct literals are not implemented by the type checker yet",
                     "use a map `{string: any}` for now",
@@ -1856,6 +1920,7 @@ impl Cx<'_> {
                     }
                 }
                 self.err_hint(
+                    "W0255",
                     name.span,
                     "enum variants are not implemented by the type checker yet",
                     "use strings or ints for now",
@@ -1873,6 +1938,7 @@ impl Cx<'_> {
             .map(|a| {
                 if let Some(n) = &a.name {
                     self.err_hint(
+                        "W0256",
                         n.span,
                         "named arguments are not implemented by the type checker yet",
                         "pass arguments by position",
@@ -1880,6 +1946,7 @@ impl Cx<'_> {
                 }
                 if a.spread {
                     self.err_hint(
+                        "W0257",
                         a.span,
                         "spread arguments (`...expr`) are not implemented by the type checker yet",
                         "pass arguments by position",
@@ -1900,6 +1967,7 @@ impl Cx<'_> {
         let to = lower_type(ty, self.diags);
         if matches!((&x.ty, &to), (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int)) {
             self.err_hint(
+                "W0258",
                 span,
                 format!("cannot cast `{}` as `{to}`", x.ty),
                 "Weft has no implicit or explicit int/float conversion yet",
@@ -1911,6 +1979,7 @@ impl Cx<'_> {
         }
         let from = x.ty.clone();
         self.err_hint(
+            "W0259",
             span,
             format!("cannot cast `{from}` as `{to}`"),
             "`as` only converts between related types (e.g. `any` and a precise type)",
@@ -1929,6 +1998,7 @@ impl Cx<'_> {
                 Some(t) => param_tys.push(lower_type(t, self.diags)),
                 None => {
                     self.err_hint(
+                        "W0260",
                         p.name.span,
                         format!(
                             "closure parameter `{}` needs a type annotation",
@@ -1944,6 +2014,7 @@ impl Cx<'_> {
             }
             if p.default.is_some() {
                 self.err_hint(
+                    "W0261",
                     p.span,
                     "closure parameters cannot have defaults",
                     "give every argument at the call site",
@@ -1986,6 +2057,7 @@ impl Cx<'_> {
                 let (body, diverges) = self.block(b);
                 if ret != Ty::Void && !diverges {
                     self.err_hint(
+                        "W0262",
                         span,
                         "this closure may reach its end without returning a value",
                         format!("it is declared `-> {ret}`; add a `return` on every path"),
@@ -2036,7 +2108,7 @@ impl Cx<'_> {
                             Some(j) => Some(j),
                             None => {
                                 let t = x.ty.clone();
-                                self.err_hint(
+                                self.err_hint("W0263", 
                                     x.span,
                                     format!(
                                         "array elements have different types: `{prev}` and `{t}` (element {})",
@@ -2099,6 +2171,7 @@ impl Cx<'_> {
             ) {
                 let t = k.ty.clone();
                 self.err_hint(
+                    "W0264",
                     k.span,
                     format!("`{t}` cannot be a map key"),
                     "map keys must be int, string, bool or object",
@@ -2120,6 +2193,7 @@ impl Cx<'_> {
                 None => {
                     let t = x.ty.clone();
                     self.err_hint(
+                        "W0265",
                         x.span,
                         format!("{what} have different types: `{prev}` and `{t}`"),
                         "annotate the binding to allow mixed values, e.g. `{string: any}`",
@@ -2133,12 +2207,14 @@ impl Cx<'_> {
     fn index_error(&mut self, t: &Ty, span: Span) {
         if let Ty::Optional(_) = t {
             self.err_hint(
+                "W0266",
                 span,
                 format!("cannot index a value that may be null (`{t}`)"),
                 "check it with `if x != null { … }` first",
             );
         } else {
             self.err_hint(
+                "W0267",
                 span,
                 format!("cannot index a value of type `{t}`"),
                 "only arrays, maps and strings can be indexed",
@@ -2233,8 +2309,8 @@ impl Cx<'_> {
                     _ => None,
                 };
                 match hint {
-                    Some(h) => self.err_hint(span, msg, h),
-                    None => self.err(span, msg),
+                    Some(h) => self.err_hint("W0268", span, msg, h),
+                    None => self.err("W0268", span, msg),
                 }
                 (OpKind::Dyn, Error)
             }
@@ -2280,7 +2356,7 @@ impl Cx<'_> {
                     Some(_) => l.ty.clone(),
                     None => {
                         let (lt, rt) = (l.ty.clone(), r.ty.clone());
-                        self.err(
+                        self.err("W0270", 
                             r.span,
                             format!("mismatched types in `??`: the left side is `{lt}`, the fallback is `{rt}`"),
                         );
@@ -2320,6 +2396,7 @@ impl Cx<'_> {
                         let msg =
                             format!("cannot compare `{a}` and `{b}` with `{}`", binop_sym(op));
                         self.err_hint(
+                            "W0271",
                             span,
                             msg,
                             "ordering works on two ints, two floats or two strings",
@@ -2373,6 +2450,7 @@ impl Cx<'_> {
                         if !l.ty.is_lenient() && l.ty != Ty::String {
                             let t = l.ty.clone();
                             self.err(
+                                "W0272",
                                 l.span,
                                 format!("`in` on a string needs a string on the left, found `{t}`"),
                             );
@@ -2382,6 +2460,7 @@ impl Cx<'_> {
                     t if t.is_lenient() => OpKind::Dyn,
                     t => {
                         self.err_hint(
+                            "W0273",
                             r.span,
                             format!("`in` needs an array, map or string on the right, found `{t}`"),
                             if t.is_nullable() {
@@ -2430,6 +2509,7 @@ impl Cx<'_> {
             || b.assignable_to(a);
         if !comparable {
             self.err_hint(
+                "W0274",
                 span,
                 format!("cannot compare `{a}` with `{b}` using `{sym}`"),
                 "values of these types are never equal; convert one side first",
@@ -2448,6 +2528,7 @@ impl Cx<'_> {
         let (min, max) = (f.required_args(), f.params.len());
         if args.len() < min || args.len() > max {
             self.err(
+                "W0275",
                 span,
                 format!(
                     "`{fname}` takes {}, but {}",
@@ -2493,7 +2574,7 @@ impl Cx<'_> {
                      to call another object use `ob.fn()`"
                 .to_string(),
         };
-        self.err_hint(name.span, format!("unknown function `{n}`"), hint);
+        self.err_hint("W0276", name.span, format!("unknown function `{n}`"), hint);
         for a in args {
             self.expr(a, None);
         }
@@ -2534,6 +2615,7 @@ impl Cx<'_> {
             t => {
                 let what = self.describe(&callee);
                 self.err_hint(
+                    "W0277",
                     callee.span,
                     format!("`{what}` has type `{t}`, which is not a function"),
                     "only values of type `fn(…)` can be called",
@@ -2567,6 +2649,7 @@ impl Cx<'_> {
         let (min, max) = (sig.min_args, sig.params.len());
         if args.len() < min || args.len() > max {
             self.err(
+                "W0278",
                 span,
                 format!(
                     "`{n}` takes {}, but {}",
@@ -2590,7 +2673,7 @@ impl Cx<'_> {
                         && !x.ty.is_lenient()
                     {
                         let t = x.ty.clone();
-                        self.err(x.span, format!("mismatched types in {what}: expected a string, array or map, found `{t}`"));
+                        self.err("W0279", x.span, format!("mismatched types in {what}: expected a string, array or map, found `{t}`"));
                     }
                     x
                 }
@@ -2600,6 +2683,7 @@ impl Cx<'_> {
                     if !matches!(x.ty, Ty::Map(..)) && !x.ty.is_lenient() {
                         let t = x.ty.clone();
                         self.err(
+                            "W0280",
                             x.span,
                             format!("mismatched types in {what}: expected a map, found `{t}`"),
                         );
@@ -2652,6 +2736,7 @@ impl Cx<'_> {
                 .any(|p| p.label.as_deref() == Some(l.name.as_str()))
         {
             self.err_hint(
+                "W0281",
                 l.span,
                 format!("no inherit is labelled `{}`", l.name),
                 "labelled inherits are written `inherit label = /path`",
@@ -2677,6 +2762,7 @@ impl Cx<'_> {
         match found.len() {
             0 => {
                 self.err(
+                    "W0282",
                     name.span,
                     format!(
                         "`{}{}`: no inherited function with this name",
@@ -2712,6 +2798,7 @@ impl Cx<'_> {
             _ => {
                 let owners: Vec<&str> = found.iter().map(|f| &*f.owner).collect();
                 self.err_hint(
+                    "W0283",
                     name.span,
                     format!(
                         "`{}{}` is ambiguous: it is inherited from {}",

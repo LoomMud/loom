@@ -1,80 +1,80 @@
-/obj/root.wf:3:13: error: `override fn create` overrides nothing
+/obj/root.wf:3:13: error[W0216]: `override fn create` overrides nothing
   |
 3 | override fn create() {
   |             ^^^^^^
   = help: this program has no `inherit`; remove `override`
 
-/obj/thing.wf:5:5: error: variable `hp` is already declared in /std/base
+/obj/thing.wf:5:5: error[W0205]: variable `hp` is already declared in /std/base
   |
 5 | var hp: int = 3
   |     ^^
   = help: use the inherited variable, or pick another name
-/obj/thing.wf:7:4: error: `dup` is declared twice in this program
+/obj/thing.wf:7:4: error[W0210]: `dup` is declared twice in this program
   |
 7 | fn dup() {
   |    ^^^
-/obj/thing.wf:10:4: error: `create` redefines a function inherited from /std/base
+/obj/thing.wf:10:4: error[W0217]: `create` redefines a function inherited from /std/base
    |
 10 | fn create() {
    |    ^^^^^^
    = help: write `override fn create(…)`
-/obj/thing.wf:13:13: error: `override fn nothing` overrides nothing
+/obj/thing.wf:13:13: error[W0216]: `override fn nothing` overrides nothing
    |
 13 | override fn nothing() {
    |             ^^^^^^^
    = help: no inherited function has this name; remove `override`
-/obj/thing.wf:16:19: error: parameter `a` is declared twice
+/obj/thing.wf:16:19: error[W0212]: parameter `a` is declared twice
    |
 16 | fn params(a: int, a: int) {
    |                   ^
-/obj/thing.wf:19:25: error: a parameter without a default follows one with a default
+/obj/thing.wf:19:25: error[W0214]: a parameter without a default follows one with a default
    |
 19 | fn defaults(a: int = 1, b: int) {
    |                         ^
    = help: put parameters with defaults last
-/obj/thing.wf:22:13: error: unknown type `strng`
+/obj/thing.wf:22:13: error[W0222]: unknown type `strng`
    |
 22 | fn types(x: strng, y: mapping) {
    |             ^^^^^
    = help: did you mean `string`?
-/obj/thing.wf:22:23: error: unknown type `mapping`
+/obj/thing.wf:22:23: error[W0222]: unknown type `mapping`
    |
 22 | fn types(x: strng, y: mapping) {
    |                       ^^^^^^^
    = help: maps are written `{K: V}`
-/obj/thing.wf:27:5: error: cannot assign to `fixed`: it was declared with `let`
+/obj/thing.wf:27:5: error[W0241]: cannot assign to `fixed`: it was declared with `let`
    |
 27 |     fixed = 2
    |     ^^^^^
    = help: declare it with `var fixed` to make it mutable
-/obj/thing.wf:28:5: error: cannot assign to `self`
+/obj/thing.wf:28:5: error[W0243]: cannot assign to `self`
    |
 28 |     self = self
    |     ^^^^
-/obj/thing.wf:29:5: error: unknown variable `missing`
+/obj/thing.wf:29:5: error[W0224]: unknown variable `missing`
    |
 29 |     missing = 3
    |     ^^^^^^^
    = help: declare it with `let`, `var`, or as a program variable
-/obj/thing.wf:30:13: error: unknown function `lenn`
+/obj/thing.wf:30:13: error[W0276]: unknown function `lenn`
    |
 30 |     let n = lenn("x")
    |             ^^^^
    = help: did you mean `len`?
-/obj/thing.wf:31:13: error: `len` takes 1 argument, but 2 were given
+/obj/thing.wf:31:13: error[W0278]: `len` takes 1 argument, but 2 were given
    |
 31 |     let m = len("a", "b")
    |             ^^^^^^^^^^^^^
-/obj/thing.wf:32:12: error: `super::nope`: no inherited function with this name
+/obj/thing.wf:32:12: error[W0282]: `super::nope`: no inherited function with this name
    |
 32 |     super::nope()
    |            ^^^^
-/obj/thing.wf:33:5: error: unknown function `undefined_fn`
+/obj/thing.wf:33:5: error[W0276]: unknown function `undefined_fn`
    |
 33 |     undefined_fn()
    |     ^^^^^^^^^^^^
    = help: it is not declared in this program, inherited, or an efun; to call another object use `ob.fn()`
-/obj/thing.wf:34:5: error: `send` takes 2 arguments, but 1 was given
+/obj/thing.wf:34:5: error[W0278]: `send` takes 2 arguments, but 1 was given
    |
 34 |     send(self)
    |     ^^^^^^^^^^

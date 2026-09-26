@@ -1,19 +1,19 @@
-/c.wf:4:8: error: an `if` condition must be `bool`, found `int`
+/c.wf:4:8: error[W0228]: an `if` condition must be `bool`, found `int`
   |
 4 |     if n {
   |        ^
   = help: Weft has no truthiness; compare explicitly, e.g. `x != 0`
-/c.wf:6:11: error: a `while` condition must be `bool`, found `string`
+/c.wf:6:11: error[W0228]: a `while` condition must be `bool`, found `string`
   |
 6 |     while s {
   |           ^
   = help: Weft has no truthiness; compare explicitly, e.g. `s != ""`
-/c.wf:8:8: error: an operand of `and` must be `bool`, found `[int]`
+/c.wf:8:8: error[W0228]: an operand of `and` must be `bool`, found `[int]`
   |
 8 |     if xs and true {
   |        ^^
   = help: Weft has no truthiness; compare explicitly, e.g. `len(xs) > 0`
-/c.wf:10:12: error: the operand of `not` must be `bool`, found `object?`
+/c.wf:10:12: error[W0228]: the operand of `not` must be `bool`, found `object?`
    |
 10 |     if not o {
    |            ^

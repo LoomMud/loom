@@ -185,17 +185,17 @@ impl<L: SourceLoader> Session<L> {
         span: Span,
         what: &str,
     ) -> Result<Rc<ProgramInfo>, Diagnostic> {
-        let ppath = normalize_path(raw).map_err(|e| Diagnostic::error(span, e))?;
+        let ppath = normalize_path(raw).map_err(|e| Diagnostic::error("W0110", span, e))?;
         if self.stack.len() >= MAX_INHERIT_DEPTH {
             return Err(
-                Diagnostic::error(span, format!("{what} chain is too deep")).with_hint(format!(
-                    "at most {MAX_INHERIT_DEPTH} levels of {what} are allowed"
-                )),
+                Diagnostic::error("W0111", span, format!("{what} chain is too deep")).with_hint(
+                    format!("at most {MAX_INHERIT_DEPTH} levels of {what} are allowed"),
+                ),
             );
         }
         if ppath == path || self.stack.contains(&ppath) {
             return Err(
-                Diagnostic::error(span, format!("{what} cycle through {ppath}"))
+                Diagnostic::error("W0112", span, format!("{what} cycle through {ppath}"))
                     .with_hint(format!("a program cannot (indirectly) {what} itself")),
             );
         }
@@ -204,11 +204,16 @@ impl<L: SourceLoader> Session<L> {
         let err = match outcome {
             Outcome::Ok(_) => None,
             Outcome::Failed(_) => Some(
-                Diagnostic::error(span, format!("cannot {what} {ppath}: it has errors"))
-                    .with_hint(format!("fix the errors reported for {ppath}.wf first")),
+                Diagnostic::error(
+                    "W0113",
+                    span,
+                    format!("cannot {what} {ppath}: it has errors"),
+                )
+                .with_hint(format!("fix the errors reported for {ppath}.wf first")),
             ),
             Outcome::Missing(_) => Some(
                 Diagnostic::error(
+                    "W0114",
                     span,
                     format!("cannot {what} {ppath}: {ppath}.wf does not exist"),
                 )

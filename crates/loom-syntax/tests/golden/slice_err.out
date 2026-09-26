@@ -1,17 +1,17 @@
-slice_err.wf:2:16: error: expected `]` or `..` in the index, found `...`
+slice_err.wf:2:16: error[W0030]: expected `]` or `..` in the index, found `...`
   |
 2 |     let b = s[1...3]
   |                ^^^
-slice_err.wf:3:19: error: expected `]` to close the slice, found `..`
+slice_err.wf:3:19: error[W0030]: expected `]` to close the slice, found `..`
   |
 3 |     let c = s[1..2..3]
   |                   ^^
-slice_err.wf:4:5: error: cannot assign to this expression
+slice_err.wf:4:5: error[W0064]: cannot assign to this expression
   |
 4 |     s[1..2] = "x"
   |     ^^^^^^^
   = help: assign to a variable (`x = …`), an element (`a[i] = …`) or a field (`p.x = …`)
-slice_err.wf:6:1: error: expected `]` to close the slice, found `}`
+slice_err.wf:6:1: error[W0030]: expected `]` to close the slice, found `}`
   |
 6 | }
   | ^

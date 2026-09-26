@@ -1,26 +1,26 @@
-struct_err.wf:2:5: error: struct field `x` needs a type
+struct_err.wf:2:5: error[W0078]: struct field `x` needs a type
   |
 2 |     x
   |     ^
   = help: write `x: int`
-struct_err.wf:4:5: error: expected an expression, found `persistent`
+struct_err.wf:4:5: error[W0073]: expected an expression, found `persistent`
   |
 4 |     persistent z: int
   |     ^^^^^^^^^^
-struct_err.wf:7:1: error: `persistent` applies to variables, not structs
+struct_err.wf:7:1: error[W0043]: `persistent` applies to variables, not structs
   |
 7 | persistent struct Worse { a: int }
   | ^^^^^^^^^^
-struct_err.wf:10:21: error: expected `:` after field `x`
+struct_err.wf:10:21: error[W0082]: expected `:` after field `x`
    |
 10 |     let p = Point { x }
    |                     ^
    = help: write `x: x` to use a variable of the same name
-struct_err.wf:11:26: error: expected `,` or `}` in the struct literal, found identifier `y`
+struct_err.wf:11:26: error[W0030]: expected `,` or `}` in the struct literal, found identifier `y`
    |
 11 |     let q = Point { x: 1 y: 2 }
    |                          ^
-struct_err.wf:12:5: error: `struct` is only allowed at the top level of a file
+struct_err.wf:12:5: error[W0063]: `struct` is only allowed at the top level of a file
    |
 12 |     struct Inner { a: int }
    |     ^^^^^^

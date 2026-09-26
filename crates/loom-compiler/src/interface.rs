@@ -128,14 +128,22 @@ pub fn merge_parents(parents: &[ParentInfo], diags: &mut Vec<Diagnostic>) -> Inh
             && !labels.insert(l.clone())
         {
             diags.push(
-                Diagnostic::error(p.span, format!("inherit label `{l}` is used twice"))
-                    .with_hint("give each labelled inherit a distinct label"),
+                Diagnostic::error(
+                    "W0100",
+                    p.span,
+                    format!("inherit label `{l}` is used twice"),
+                )
+                .with_hint("give each labelled inherit a distinct label"),
             );
         }
         if !direct.insert(p.info.path.clone()) {
             diags.push(
-                Diagnostic::error(p.span, format!("`{}` is inherited twice", p.info.path))
-                    .with_hint("remove the duplicate `inherit`"),
+                Diagnostic::error(
+                    "W0101",
+                    p.span,
+                    format!("`{}` is inherited twice", p.info.path),
+                )
+                .with_hint("remove the duplicate `inherit`"),
             );
         }
         collect(&p.info, &mut by_path);
@@ -183,6 +191,7 @@ pub fn merge_parents(parents: &[ParentInfo], diags: &mut Vec<Diagnostic>) -> Inh
             match out.vars.get(name) {
                 Some(prev) if prev.owner != v.owner => diags.push(
                     Diagnostic::error(
+                        "W0102",
                         p.span,
                         format!(
                             "variable `{name}` is inherited from both {} and {}",
@@ -205,6 +214,7 @@ pub fn merge_parents(parents: &[ParentInfo], diags: &mut Vec<Diagnostic>) -> Inh
             match out.consts.get(name) {
                 Some(prev) if prev.owner != c.owner => diags.push(
                     Diagnostic::error(
+                        "W0103",
                         p.span,
                         format!(
                             "const `{name}` is inherited from both {} and {}",

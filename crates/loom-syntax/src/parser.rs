@@ -151,27 +151,45 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn error(&mut self, span: Span, msg: impl Into<String>) -> Fail {
-        self.diags.push(Diagnostic::error(span, msg));
+    fn error(&mut self, code: &'static str, span: Span, msg: impl Into<String>) -> Fail {
+        self.diags.push(Diagnostic::error(code, span, msg));
         Fail
     }
 
-    fn error_hint(&mut self, span: Span, msg: impl Into<String>, hint: impl Into<String>) -> Fail {
+    fn error_hint(
+        &mut self,
+        code: &'static str,
+        span: Span,
+        msg: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Fail {
         self.diags
-            .push(Diagnostic::error(span, msg).with_hint(hint));
+            .push(Diagnostic::error(code, span, msg).with_hint(hint));
         Fail
     }
 
+    /// `expected X, found Y`: one diagnostic kind reused at every parse
+    /// point (like rustc's "mismatched types"), so every call site shares
+    /// one code rather than minting a fresh one per grammar production.
     fn expected(&mut self, what: &str) -> Fail {
         let found = self.peek().describe();
         let span = self.span();
-        self.error(span, format!("expected {what}, found {found}"))
+        self.error(
+            crate::codes::PARSE_EXPECTED,
+            span,
+            format!("expected {what}, found {found}"),
+        )
     }
 
     fn expected_hint(&mut self, what: &str, hint: &str) -> Fail {
         let found = self.peek().describe();
         let span = self.span();
-        self.error_hint(span, format!("expected {what}, found {found}"), hint)
+        self.error_hint(
+            crate::codes::PARSE_EXPECTED,
+            span,
+            format!("expected {what}, found {found}"),
+            hint,
+        )
     }
 
     fn expect(&mut self, t: &Tok, what: &str) -> PResult<Span> {
@@ -191,6 +209,7 @@ impl<'a> Parser<'a> {
             let kw = self.peek().describe();
             let span = self.span();
             Err(self.error_hint(
+                "W0032",
                 span,
                 format!("expected {what}, found keyword {kw}"),
                 "keywords cannot be used as names; pick another name",
@@ -204,6 +223,7 @@ impl<'a> Parser<'a> {
         if self.depth >= MAX_DEPTH {
             let span = self.span();
             return Err(self.error_hint(
+                "W0033",
                 span,
                 "code is nested too deeply",
                 "split it into smaller functions",
@@ -328,7 +348,7 @@ impl<'a> Parser<'a> {
                 Tok::Lightweight => {
                     let sp = self.bump().span;
                     if prog.lightweight.is_some() {
-                        self.error(sp, "`lightweight` is declared twice");
+                        self.error("W0034", sp, "`lightweight` is declared twice");
                     }
                     prog.lightweight = Some(sp);
                     Some(Ok(()))
@@ -340,6 +360,7 @@ impl<'a> Parser<'a> {
                     if !prog.items.is_empty() {
                         let what = self.src[start.start as usize..start.end as usize].to_string();
                         self.error_hint(
+                            "W0035",
                             start,
                             format!("`{what}` must come before any declarations"),
                             "move it to the top of the file",
@@ -390,6 +411,7 @@ impl<'a> Parser<'a> {
         if let Tok::Str(_) = self.peek() {
             let span = self.span();
             return Err(self.error_hint(
+                "W0036",
                 span,
                 format!("{what} paths are not quoted"),
                 format!("write `{what} /std/room`"),
@@ -415,6 +437,7 @@ impl<'a> Parser<'a> {
             }
             if !any {
                 return Err(self.error_hint(
+                    "W0037",
                     seg_start,
                     "expected a path segment after `/`",
                     "paths look like `/std/room` (no spaces, no extension)",
@@ -446,6 +469,7 @@ impl<'a> Parser<'a> {
         if self.at(&Tok::Dot) && self.adjacent(0, path_span) {
             let span = self.span();
             return Err(self.error_hint(
+                "W0038",
                 span,
                 "inherit paths have no file extension",
                 "drop the `.wf`",
@@ -474,6 +498,7 @@ impl<'a> Parser<'a> {
                     if list.is_empty() {
                         let sp = self.prev_span();
                         return Err(self.error_hint(
+                            "W0039",
                             sp,
                             "empty import list",
                             "name what to import, or drop `.{}` to import the whole module",
@@ -484,6 +509,7 @@ impl<'a> Parser<'a> {
                 Tok::Ident(n) if n == "wf" => {
                     let span = self.span();
                     return Err(self.error_hint(
+                        "W0040",
                         span,
                         "import paths have no file extension",
                         "drop the `.wf`",
@@ -522,6 +548,7 @@ impl<'a> Parser<'a> {
             if *flag {
                 self.bump();
                 return Err(self.error_hint(
+                    "W0041",
                     sp,
                     format!("duplicate modifier `{name}`"),
                     "remove one of them",
@@ -540,6 +567,7 @@ impl<'a> Parser<'a> {
             let (second, sp) = *vis[1];
             let (first, _) = *vis[0];
             return Err(self.error_hint(
+                "W0042",
                 sp,
                 format!("a declaration cannot be both `{first}` and `{second}`"),
                 "pick one visibility",
@@ -562,6 +590,7 @@ impl<'a> Parser<'a> {
                     "functions"
                 };
                 return Err(self.error(
+                    "W0043",
                     sp,
                     format!("`{name}` applies to {applies}, not {}", kind.plural()),
                 ));
@@ -588,6 +617,7 @@ impl<'a> Parser<'a> {
                 if ty.is_none() && init.is_none() {
                     let sp = name.span;
                     return Err(self.error_hint(
+                        "W0044",
                         sp,
                         "a program variable needs a type or an initial value",
                         format!("write `var {}: int = 0`", name.name),
@@ -611,6 +641,7 @@ impl<'a> Parser<'a> {
                 if !self.eat(&Tok::Eq) {
                     let sp = name.span;
                     return Err(self.error_hint(
+                        "W0045",
                         sp,
                         "a constant needs a value",
                         format!("write `const {} = …`", name.name),
@@ -633,6 +664,7 @@ impl<'a> Parser<'a> {
                 let fn_span = self.bump().span;
                 if self.at(&Tok::LParen) {
                     return Err(self.error_hint(
+                        "W0046",
                         fn_span,
                         "a top-level function needs a name",
                         "write `fn name(…) { … }`; closures `fn(x) => …` are expressions",
@@ -669,6 +701,7 @@ impl<'a> Parser<'a> {
                     if !p.eat(&Tok::Colon) {
                         let sp = name.span;
                         return Err(p.error_hint(
+                            "W0078",
                             sp,
                             format!("struct field `{}` needs a type", name.name),
                             format!("write `{}: int`", name.name),
@@ -712,6 +745,7 @@ impl<'a> Parser<'a> {
                     } else if p.at(&Tok::Eq) {
                         let sp = p.span();
                         return Err(p.error_hint(
+                            "W0079",
                             sp,
                             "enum variants have no explicit values",
                             "use a `const` for a numeric value, or a payload: `Heavy(int)`",
@@ -736,12 +770,13 @@ impl<'a> Parser<'a> {
             Tok::Inherit | Tok::Import | Tok::Lightweight if !seen.is_empty() => {
                 let sp = self.span();
                 let what = self.peek().describe();
-                Err(self.error(sp, format!("{what} takes no modifiers")))
+                Err(self.error("W0047", sp, format!("{what} takes no modifiers")))
             }
             Tok::Let => {
                 let sp = self.span();
                 self.bump();
                 Err(self.error_hint(
+                    "W0048",
                     sp,
                     "`let` is only allowed inside functions",
                     "program variables are declared with `var`, constants with `const`",
@@ -750,7 +785,7 @@ impl<'a> Parser<'a> {
             Tok::RBrace => {
                 let sp = self.span();
                 self.bump();
-                Err(self.error(sp, "unmatched `}`"))
+                Err(self.error("W0049", sp, "unmatched `}`"))
             }
             Tok::Ident(_) | Tok::If | Tok::For | Tok::While | Tok::Return if seen.is_empty() => {
                 Err(self.expected_hint(
@@ -792,6 +827,7 @@ impl<'a> Parser<'a> {
                 Tok::Eof => {
                     self.abort_block = true;
                     return Err(self.error_hint(
+                        "W0050",
                         open,
                         "this `{` is never closed",
                         "add a matching `}`",
@@ -806,6 +842,7 @@ impl<'a> Parser<'a> {
                     }
                     self.abort_block = true;
                     return Err(self.error_hint(
+                        "W0051",
                         open,
                         "this `{` is not closed before the next declaration",
                         "add a matching `}`",
@@ -856,6 +893,7 @@ impl<'a> Parser<'a> {
             {
                 let sp = self.span();
                 return Err(self.error_hint(
+                    "W0052",
                     sp,
                     format!("the `...{}` parameter must be last", last.name.name),
                     "move the rest parameter to the end of the list",
@@ -869,6 +907,7 @@ impl<'a> Parser<'a> {
                 if rest {
                     let sp = self.span();
                     return Err(self.error_hint(
+                        "W0053",
                         sp,
                         "a `...rest` parameter cannot have a default",
                         "it is an empty array when no extra arguments are passed",
@@ -952,6 +991,7 @@ impl<'a> Parser<'a> {
                     if let (Tok::Ident(_), Tok::Colon) = (p.peek(), p.peek_at(1)) {
                         let sp = p.span();
                         return Err(p.error_hint(
+                            "W0080",
                             sp,
                             "function types list parameter types only",
                             "drop the parameter name: `fn(int) -> bool`",
@@ -1018,6 +1058,7 @@ impl<'a> Parser<'a> {
                     }
                     self.abort_block = true;
                     return Err(self.error_hint(
+                        "W0054",
                         open,
                         "this `{` is never closed",
                         "add a matching `}`",
@@ -1030,6 +1071,7 @@ impl<'a> Parser<'a> {
                     }
                     self.abort_block = true;
                     return Err(self.error_hint(
+                        "W0055",
                         open,
                         "this `{` is not closed before the next declaration",
                         "add a matching `}`",
@@ -1084,6 +1126,7 @@ impl<'a> Parser<'a> {
                 let found = self.peek().describe();
                 let span = self.span();
                 self.error_hint(
+                    "W0056",
                     span,
                     format!("expected end of statement, found {found}"),
                     "put each statement on its own line or separate them with `;`",
@@ -1110,6 +1153,7 @@ impl<'a> Parser<'a> {
                 if init.is_none() && !mutable {
                     let sp = name.span;
                     return Err(self.error_hint(
+                        "W0057",
                         sp,
                         "`let` needs an initial value",
                         "write `let x = …`, or use `var` for a variable assigned later",
@@ -1128,6 +1172,7 @@ impl<'a> Parser<'a> {
                 if self.at(&Tok::Let) {
                     let sp = self.span();
                     return Err(self.error_hint(
+                        "W0058",
                         sp,
                         "`while let` is not part of Weft",
                         "use `while true { if let x = … { … } else { break } }`",
@@ -1165,6 +1210,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 if self.at_stmt_end() {
                     return Err(self.error_hint(
+                        "W0059",
                         start,
                         "`throw` needs an error value",
                         "write `throw e` to rethrow, or `throw error(\"message\")`",
@@ -1180,6 +1226,7 @@ impl<'a> Parser<'a> {
                 if !self.eat(&Tok::Catch) {
                     self.pos = save;
                     return Err(self.error_hint(
+                        "W0060",
                         start,
                         "`try` needs a `catch` block",
                         "add `catch e { … }` after the `try` block",
@@ -1199,6 +1246,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Catch => {
                 return Err(self.error_hint(
+                    "W0061",
                     start,
                     "`catch` without a matching `try`",
                     "`catch` must follow the closing `}` of a `try` block",
@@ -1206,6 +1254,7 @@ impl<'a> Parser<'a> {
             }
             Tok::Else => {
                 return Err(self.error_hint(
+                    "W0062",
                     start,
                     "`else` without a matching `if`",
                     "`else` must follow the closing `}` of an `if` block",
@@ -1219,6 +1268,7 @@ impl<'a> Parser<'a> {
             | Tok::Enum => {
                 let what = self.peek().describe();
                 return Err(self.error_hint(
+                    "W0063",
                     start,
                     format!("{what} is only allowed at the top level of a file"),
                     if *self.peek() == Tok::Const {
@@ -1251,6 +1301,7 @@ impl<'a> Parser<'a> {
                         );
                         if !assignable {
                             return Err(self.error_hint(
+                                "W0064",
                                 target.span,
                                 "cannot assign to this expression",
                                 "assign to a variable (`x = …`), an element (`a[i] = …`) \
@@ -1276,6 +1327,7 @@ impl<'a> Parser<'a> {
             let found = self.peek().describe();
             let span = self.span();
             return Err(self.error_hint(
+                "W0065",
                 span,
                 format!("expected `{{` to start the `{kw}` body, found {found}"),
                 format!("braces are mandatory: `{kw} … {{ … }}`"),
@@ -1302,6 +1354,7 @@ impl<'a> Parser<'a> {
         };
         if !self.at(&Tok::LBrace) {
             return Err(self.error_hint(
+                "W0066",
                 self.span(),
                 format!(
                     "expected `{{` after the condition, found {}",
@@ -1320,6 +1373,7 @@ impl<'a> Parser<'a> {
             } else {
                 if !self.at(&Tok::LBrace) {
                     return Err(self.error_hint(
+                        "W0067",
                         self.span(),
                         format!(
                             "expected `{{` or `if` after `else`, found {}",
@@ -1402,6 +1456,7 @@ impl<'a> Parser<'a> {
                 Tok::Arrow => {
                     let sp = self.span();
                     return Err(self.error_hint(
+                        "W0068",
                         sp,
                         "`->` is not a call operator in Weft",
                         "call functions on objects with `.`: `ob.fn()`",
@@ -1410,6 +1465,7 @@ impl<'a> Parser<'a> {
                 Tok::Pipe => {
                     let sp = self.span();
                     return Err(self.error_hint(
+                        "W0069",
                         sp,
                         "unexpected `|` in an expression",
                         "Weft uses `or` for logical disjunction; `|` separates `match` patterns",
@@ -1435,6 +1491,7 @@ impl<'a> Parser<'a> {
             if lbp == 7 && is_comparison_tok(self.peek()) {
                 let sp = self.span();
                 return Err(self.error_hint(
+                    "W0070",
                     sp,
                     "comparison operators cannot be chained",
                     "combine comparisons with `and`: `a < b and b < c`",
@@ -1588,6 +1645,7 @@ impl<'a> Parser<'a> {
             let value = p.inner_expr()?;
             if seen_named.is_some() {
                 return Err(p.error_hint(
+                    "W0081",
                     start.to(value.span),
                     "positional argument after a named argument",
                     "put named arguments after all positional ones",
@@ -1717,6 +1775,7 @@ impl<'a> Parser<'a> {
                 } else if self.at(&Tok::RBrace) {
                     let sp = self.bump().span;
                     return Err(self.error_hint(
+                        "W0071",
                         start.to(sp),
                         "`{}` is ambiguous",
                         "write the empty map as `{:}`",
@@ -1746,6 +1805,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 if !self.at(&Tok::LParen) {
                     return Err(self.error_hint(
+                        "W0072",
                         start,
                         "a named function cannot be declared inside an expression",
                         "closures are anonymous: `fn(x) => x + 1`; declare named functions \
@@ -1762,7 +1822,7 @@ impl<'a> Parser<'a> {
             _ => {
                 let msg = format!("expected an expression, found {}", tok.describe());
                 let sp = self.span();
-                self.diags.push(Diagnostic::error(sp, msg));
+                self.diags.push(Diagnostic::error("W0073", sp, msg));
                 return Err(Fail);
             }
         };
@@ -1778,6 +1838,7 @@ impl<'a> Parser<'a> {
         if !self.at(&Tok::LParen) {
             let sp = name.span;
             return Err(self.error_hint(
+                "W0074",
                 sp,
                 format!("`{scope}::{}` must be called", name.name),
                 "`::` calls an inherited function, e.g. `combat::roll()`; enum variants \
@@ -1795,6 +1856,7 @@ impl<'a> Parser<'a> {
             if !p.eat(&Tok::Colon) {
                 let sp = fname.span;
                 return Err(p.error_hint(
+                    "W0082",
                     sp,
                     format!("expected `:` after field `{}`", fname.name),
                     format!(
@@ -1927,6 +1989,7 @@ impl<'a> Parser<'a> {
                     Tok::ColonColon => {
                         let sp = self.span();
                         return Err(self.error_hint(
+                            "W0075",
                             sp,
                             "enum variants are not written with `::`",
                             format!("write `{n}.Variant` or just `.Variant`"),
@@ -1935,6 +1998,7 @@ impl<'a> Parser<'a> {
                     Tok::LParen => {
                         let sp = self.span();
                         return Err(self.error_hint(
+                            "W0076",
                             sp,
                             format!("`{n}(…)` is not a pattern"),
                             format!("match an enum variant with `.{n}(…)`"),
@@ -1994,6 +2058,7 @@ impl<'a> Parser<'a> {
             Tok::Interp(_) => {
                 let sp = self.span();
                 return Err(self.error_hint(
+                    "W0077",
                     sp,
                     "interpolated strings cannot be patterns",
                     "match a plain string literal, or bind a name and use an `if` guard",

@@ -1,14 +1,14 @@
-args_err.wf:1:15: error: the `...rest` parameter must be last
+args_err.wf:1:15: error[W0052]: the `...rest` parameter must be last
   |
 1 | fn a(...rest, x: int) {
   |               ^
   = help: move the rest parameter to the end of the list
-args_err.wf:4:14: error: a `...rest` parameter cannot have a default
+args_err.wf:4:14: error[W0053]: a `...rest` parameter cannot have a default
   |
 4 | fn b(...rest = []) {
   |              ^
   = help: it is an empty array when no extra arguments are passed
-args_err.wf:8:22: error: positional argument after a named argument
+args_err.wf:8:22: error[W0081]: positional argument after a named argument
   |
 8 |     f(exclude: [me], "positional")
   |                      ^^^^^^^^^^^^
