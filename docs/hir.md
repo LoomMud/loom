@@ -1,7 +1,8 @@
-# Typed HIR (loom-compiler → V2 codegen) — r2
+# Typed HIR (loom-compiler → V2 codegen) — r3
 
 Status: **agreed** (CTO review on OBI-24, r1 approved 2026-09-26; r2 applies
-decision D23 and conditions C1–C4 from that review). Source of truth for the Rust types: `crates/loom-compiler/src/hir.rs`.
+decision D23 and conditions C1–C4 from that review; r3 updates C1 and C3 for
+design spec r5 §5.2.1/§5.2.2, D24/D25, delivered by OBI-53). Source of truth for the Rust types: `crates/loom-compiler/src/hir.rs`.
 Run `loom-cli check <mudlib> --dump-hir` to see the HIR of real programs;
 `crates/loom-compiler/tests/golden/hir_*.out` are checked-in examples.
 
@@ -47,10 +48,21 @@ recompile when a parent's interface changes.
 2. A program with diagnostics produces **no HIR**; `Ty::Error` never appears in
    emitted HIR (property-tested in `tests/props.rs`).
 3. **Static types are an optimisation contract, not a memory-safety
-   guarantee (C1).** Containers have reference semantics and are invariant
-   only up to `any`, so an `[any]` alias can store an `int` into an array
-   that was cast to `[string]`. Codegen therefore emits **tag-safe** typed
-   instructions (`AddInt`, `IndexArr`, …): the fast path assumes the static
+   guarantee (C1).** Arrays, maps and structs are **value types with
+   copy-on-write storage** (spec r5 §5.2.1, D24): assignment, argument
+   passing, `return`, closure capture, storing into a container and storing
+   into an object variable each produce a logical copy, so a write through
+   one name is never visible through another. This closes the aliasing
+   route the earlier (reference-semantics) design relied on for its main
+   soundness gap: an `[any]` alias of a `[string]` can no longer write an
+   `int` into the typed view, because the write lands in a copy, not the
+   original buffer. `copy()` is removed from the efun table (r5.5) — it has
+   no meaning once containers are values, and it must not be re-added.
+   Codegen's **tag-safe** typed instructions (`AddInt`, `IndexArr`, …) stay
+   as defence in depth regardless: `Cast` is shallow (it checks the
+   value's kind and nullability only, O(1); element types are not walked),
+   so a value nested inside a container can still carry an unexpected tag
+   after a cast at a shallow boundary. The fast path assumes the static
    kind, and a value with the wrong tag raises a runtime error — never a
    panic, never undefined behaviour. The *points where a well-typed program
    is expected to need a check* are `Cast`, `IndexKind::MapPresent`,
@@ -59,6 +71,13 @@ recompile when a parent's interface changes.
    a tag mismatch indicates an `any` alias and is still caught by the
    typed instruction. (Integer overflow, index bounds, destructed objects
    stay runtime errors.)
+   **Codegen must not create spurious sharing**: an element write
+   (`a[i] = v`, `m[k] op= v`, a nested `a[i][j] = v`) lowers as *take →
+   mutate → put back* through every level of the path down to its root
+   local or program variable (spec r5 §5.2.1 rule 3, OBI-53); a lowering
+   that reads a container into a register and mutates that register
+   without writing it back would silently lose the write under value
+   semantics (see `FnLower::take_place`/`put_back_place` in `codegen.rs`).
    **`Cast` is shallow**: it checks the value's kind and nullability only
    (`[string]` ⇒ "is an array"), O(1). Element types are not walked; element
    reads are covered by the tag-safe instructions above.
@@ -70,14 +89,38 @@ recompile when a parent's interface changes.
 ## Function values (C3)
 
 Evaluating `FnRef(callee)` (and, with V0, a closure literal) creates a value
-that binds **(creator object, callee)** at creation time. Invoking it — from
-any object, e.g. an `add_verb` callback run by the player object — executes
-with `self` = the creator and the creator's program privileges, **not** the
-caller's. For `Callee::Virtual` the name is looked up at call time on the
-creator's *current* program (hot-reload friendly); `Static` runs the fixed
-body. If the creator has been destructed, the call raises `object was
-destructed`. A function value is therefore a capability: its runtime
-representation and invocation path are a V3/VM security review item.
+that binds **(creator object, callee)** at creation time. Spec r5 §5.2.2
+(D25) supersedes the simpler "creator rights only" rule this section
+previously described:
+
+- Invoking a function value pushes a synthetic **creator frame** carrying
+  the principal captured at creation time onto the privilege stack, below
+  the callee's own frame. The effective principal for the call is
+  `min(creator principal, every frame currently on the stack)` — the lower
+  of the creator's and the caller's rights, not the creator's alone. A
+  closure never lends its creator's rights to a lower-privileged caller
+  (closes the callback confused-deputy hole `secure_stack_check` alone
+  does not cover). A scheduled call (`call_out`, a `db_query` callback) has
+  no other frames, so it runs with exactly the creator principal.
+- For `Callee::Virtual` the name is still looked up at call time on the
+  creator's *current* program (hot-reload friendly); `Static` still runs
+  the fixed body.
+- **Version pinning.** An anonymous closure keeps running the code version
+  it was created with after its creator's program is upgraded (with a
+  warning on first use per site, `loom_stale_closure_calls_total`); the old
+  program version is kept alive by a refcount from its closures. A named
+  reference re-resolves on the creator's current program, as before.
+- If the creator has been destructed, the call raises `object was
+  destructed`.
+- **Never persisted (r5 rule 4, OBI-53):** the checker rejects a
+  `persistent` variable whose type is or contains `fn(...)` — directly, in
+  an array/map, or (once structs are checked) in a struct field — with
+  `W0287`. A function value pins a code version and a principal that may
+  not survive a reboot.
+
+A function value is therefore a capability: its runtime representation and
+invocation path (the synthetic creator frame, version pinning) are a V3/VM
+security review item.
 
 ## Defaults are callee-side
 

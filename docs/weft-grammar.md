@@ -281,8 +281,22 @@ The driver calls applies (`create`, `connect`, `logon`, `process_input`,
   types of arrays/maps are not checked.
 - **No truthiness.** `if`/`while` conditions and `and`/`or`/`not` operands must
   be `bool`. Write `x != null`, `len(xs) > 0`.
-- Arrays and maps have reference semantics. Maps keep insertion order; keys must
-  be `int`, `string`, `bool` or `object`.
+- **Value semantics (spec r5 §5.2.1, D24).** Arrays, maps and structs are
+  value types with copy-on-write storage: assignment, argument passing,
+  `return`, closure capture, storing into a container and storing into an
+  object variable each produce a logical copy, so a write through one name
+  is never visible through another. `a[i] = v`, `m[k] op= v` and nested
+  paths (`a[i][j] = v`) write to a *place* (a variable, or an element path
+  rooted in one) and change only that place; `==`/`!=` on containers is
+  structural, not identity. `copy()` does not exist (there is nothing to
+  copy explicitly — every store already does). The **Phase 0
+  tree-walking evaluator still has reference-semantics containers**
+  (`Rc<RefCell<_>>`); it has not been migrated to this rule yet (tracked
+  under OBI-31, the V3 VM core). V2 (`loom-compiler`'s codegen/verifier) is
+  already built for it: element writes lower as take → mutate → put back
+  (OBI-53) so a program compiled today has the right *shape* of bytecode
+  once the VM value representation lands. Maps keep insertion order; keys
+  must be `int`, `string`, `bool` or `object`.
 
 ## Statements
 
