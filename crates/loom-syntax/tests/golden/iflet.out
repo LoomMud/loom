@@ -1,0 +1,18 @@
+(fn f (ref: object?)
+  (if let o = ref
+    (. o tell "present")
+   else
+    (if let p : object = (call find_object "/x")
+      (. p tell "fallback")
+     else
+      (if (== ref null)
+        (call send self "none\n")
+       else
+        (call send self "?\n")
+      )
+    )
+  )
+  (if let env = (call environment)
+    (. env tell "here")
+  )
+)

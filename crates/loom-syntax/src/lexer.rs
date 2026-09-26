@@ -16,10 +16,11 @@ pub enum Piece {
     Code(Span),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Ident(String),
     Int(i64),
+    Float(f64),
     Str(String),
     Interp(Vec<Piece>),
     // keywords
@@ -44,6 +45,21 @@ pub enum Tok {
     Or,
     Not,
     Super,
+    Import,
+    Const,
+    Struct,
+    Enum,
+    Match,
+    Try,
+    Catch,
+    Throw,
+    Protected,
+    Final,
+    Atomic,
+    As,
+    Break,
+    Continue,
+    Lightweight,
     // punctuation
     LParen,
     RParen,
@@ -56,10 +72,14 @@ pub enum Tok {
     ColonColon,
     Semi,
     Dot,
+    DotDot,
+    Ellipsis,
     QDot,
     QQ,
     Question,
     Arrow,
+    FatArrow,
+    Pipe,
     Plus,
     Minus,
     Star,
@@ -68,6 +88,9 @@ pub enum Tok {
     Eq,
     PlusEq,
     MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
     EqEq,
     NotEq,
     Lt,
@@ -79,11 +102,39 @@ pub enum Tok {
 }
 
 impl Tok {
+    /// Is this a reserved word (not usable as a name)?
+    pub fn is_keyword(&self) -> bool {
+        keyword(self.text()).as_ref() == Some(self)
+    }
+
+    /// Can this token start a top-level declaration (used for recovery)?
+    pub fn starts_item(&self) -> bool {
+        matches!(
+            self,
+            Tok::Fn
+                | Tok::Var
+                | Tok::Const
+                | Tok::Struct
+                | Tok::Enum
+                | Tok::Import
+                | Tok::Inherit
+                | Tok::Lightweight
+                | Tok::Pub
+                | Tok::Protected
+                | Tok::Private
+                | Tok::Persistent
+                | Tok::Override
+                | Tok::Final
+                | Tok::Atomic
+        )
+    }
+
     /// Human-readable description for "expected X, found Y" messages.
     pub fn describe(&self) -> String {
         match self {
             Tok::Ident(s) => format!("identifier `{s}`"),
             Tok::Int(n) => format!("integer `{n}`"),
+            Tok::Float(x) => format!("float `{x:?}`"),
             Tok::Str(_) => "string literal".into(),
             Tok::Interp(_) => "interpolated string".into(),
             Tok::Newline => "end of line".into(),
@@ -115,6 +166,21 @@ impl Tok {
             Tok::Or => "or",
             Tok::Not => "not",
             Tok::Super => "super",
+            Tok::Import => "import",
+            Tok::Const => "const",
+            Tok::Struct => "struct",
+            Tok::Enum => "enum",
+            Tok::Match => "match",
+            Tok::Try => "try",
+            Tok::Catch => "catch",
+            Tok::Throw => "throw",
+            Tok::Protected => "protected",
+            Tok::Final => "final",
+            Tok::Atomic => "atomic",
+            Tok::As => "as",
+            Tok::Break => "break",
+            Tok::Continue => "continue",
+            Tok::Lightweight => "lightweight",
             Tok::LParen => "(",
             Tok::RParen => ")",
             Tok::LBracket => "[",
@@ -126,10 +192,14 @@ impl Tok {
             Tok::ColonColon => "::",
             Tok::Semi => ";",
             Tok::Dot => ".",
+            Tok::DotDot => "..",
+            Tok::Ellipsis => "...",
             Tok::QDot => "?.",
             Tok::QQ => "??",
             Tok::Question => "?",
             Tok::Arrow => "->",
+            Tok::FatArrow => "=>",
+            Tok::Pipe => "|",
             Tok::Plus => "+",
             Tok::Minus => "-",
             Tok::Star => "*",
@@ -138,6 +208,9 @@ impl Tok {
             Tok::Eq => "=",
             Tok::PlusEq => "+=",
             Tok::MinusEq => "-=",
+            Tok::StarEq => "*=",
+            Tok::SlashEq => "/=",
+            Tok::PercentEq => "%=",
             Tok::EqEq => "==",
             Tok::NotEq => "!=",
             Tok::Lt => "<",
@@ -149,7 +222,7 @@ impl Tok {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Token {
     pub tok: Tok,
     pub span: Span,
@@ -178,6 +251,21 @@ fn keyword(s: &str) -> Option<Tok> {
         "or" => Tok::Or,
         "not" => Tok::Not,
         "super" => Tok::Super,
+        "import" => Tok::Import,
+        "const" => Tok::Const,
+        "struct" => Tok::Struct,
+        "enum" => Tok::Enum,
+        "match" => Tok::Match,
+        "try" => Tok::Try,
+        "catch" => Tok::Catch,
+        "throw" => Tok::Throw,
+        "protected" => Tok::Protected,
+        "final" => Tok::Final,
+        "atomic" => Tok::Atomic,
+        "as" => Tok::As,
+        "break" => Tok::Break,
+        "continue" => Tok::Continue,
+        "lightweight" => Tok::Lightweight,
         _ => return None,
     })
 }
@@ -336,26 +424,86 @@ impl Lexer<'_> {
     }
 
     fn number(&mut self, start: usize) {
+        let digits = |lx: &mut Self| {
+            while lx.peek().is_some_and(|c| c.is_ascii_digit() || c == '_') {
+                lx.bump();
+            }
+        };
+        digits(self);
+        let mut is_float = false;
+        // `1.5` is a float; `1..3` (slice) and `1.foo()` are not.
+        if self.peek() == Some('.') && self.peek2().is_some_and(|c| c.is_ascii_digit()) {
+            is_float = true;
+            self.bump();
+            digits(self);
+        }
+        if matches!(self.peek(), Some('e' | 'E')) {
+            let rest = &self.src[self.pos + 1..self.end];
+            let mut it = rest.chars();
+            let exp_ok = match it.next() {
+                Some(c) if c.is_ascii_digit() => true,
+                Some('+' | '-') => it.next().is_some_and(|c| c.is_ascii_digit()),
+                _ => false,
+            };
+            if exp_ok {
+                is_float = true;
+                self.bump();
+                if matches!(self.peek(), Some('+' | '-')) {
+                    self.bump();
+                }
+                digits(self);
+            }
+        }
+        // Swallow trailing identifier characters so `12abc` is one bad token.
+        let mut junk = false;
         while self
             .peek()
             .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         {
+            junk = true;
             self.bump();
         }
+        let span = Span::new(start, self.pos);
         let text: String = self.src[start..self.pos]
             .chars()
             .filter(|&c| c != '_')
             .collect();
+        if junk {
+            let what = if is_float { "float" } else { "integer" };
+            self.diags.push(
+                Diagnostic::error(span, format!("invalid {what} literal"))
+                    .with_hint("numbers are decimal: `42`, `1_000`, `2.5`, `1e-3`"),
+            );
+            self.push(
+                if is_float {
+                    Tok::Float(0.0)
+                } else {
+                    Tok::Int(0)
+                },
+                start,
+            );
+            return;
+        }
+        if is_float {
+            match text.parse::<f64>() {
+                Ok(x) if x.is_finite() => self.push(Tok::Float(x), start),
+                _ => {
+                    self.diags.push(Diagnostic::error(
+                        span,
+                        "float literal is out of range for `float` (64-bit)",
+                    ));
+                    self.push(Tok::Float(0.0), start);
+                }
+            }
+            return;
+        }
         match text.parse::<i64>() {
             Ok(n) => self.push(Tok::Int(n), start),
             Err(_) => {
-                let msg = if text.chars().all(|c| c.is_ascii_digit()) {
-                    "integer literal is too large for `int` (64-bit)"
-                } else {
-                    "invalid integer literal"
-                };
-                self.diags
-                    .push(Diagnostic::error(Span::new(start, self.pos), msg));
+                self.diags.push(
+                    Diagnostic::error(span, "integer literal is too large for `int` (64-bit)")
+                        .with_hint("write it as a float (`1e20`) if you need a larger magnitude"),
+                );
                 self.push(Tok::Int(0), start);
             }
         }
@@ -502,6 +650,14 @@ impl Lexer<'_> {
             ('}', _) => one(Tok::RBrace),
             (',', _) => one(Tok::Comma),
             (';', _) => one(Tok::Semi),
+            ('.', Some('.')) => {
+                self.bump();
+                if self.peek() == Some('.') {
+                    two(Tok::Ellipsis)
+                } else {
+                    one(Tok::DotDot)
+                }
+            }
             ('.', _) => one(Tok::Dot),
             (':', Some(':')) => two(Tok::ColonColon),
             (':', _) => one(Tok::Colon),
@@ -513,29 +669,83 @@ impl Lexer<'_> {
             ('-', _) => one(Tok::Minus),
             ('+', Some('=')) => two(Tok::PlusEq),
             ('+', _) => one(Tok::Plus),
+            ('*', Some('=')) => two(Tok::StarEq),
             ('*', _) => one(Tok::Star),
+            ('/', Some('=')) => two(Tok::SlashEq),
             ('/', _) => one(Tok::Slash),
+            ('%', Some('=')) => two(Tok::PercentEq),
             ('%', _) => one(Tok::Percent),
             ('=', Some('=')) => two(Tok::EqEq),
+            ('=', Some('>')) => two(Tok::FatArrow),
             ('=', _) => one(Tok::Eq),
             ('!', Some('=')) => two(Tok::NotEq),
             ('<', Some('=')) => two(Tok::Le),
             ('<', _) => one(Tok::Lt),
             ('>', Some('=')) => two(Tok::Ge),
             ('>', _) => one(Tok::Gt),
+            ('|', Some(c)) if c != '|' => one(Tok::Pipe),
+            ('|', None) => one(Tok::Pipe),
             _ => {
-                let mut d = Diagnostic::error(
-                    Span::new(start, self.pos),
-                    format!("unexpected character `{}`", c.escape_default()),
-                );
-                d = match c {
-                    '!' => d.with_hint("Weft uses `not` for logical negation"),
-                    '&' => d.with_hint("Weft uses `and` for logical conjunction"),
-                    '|' => d.with_hint("Weft uses `or` for logical disjunction"),
-                    '\'' => d.with_hint("strings use double quotes: \"text\""),
-                    _ => d,
+                // LPC/C-isms: report once, then substitute the Weft token so
+                // parsing continues without a cascade.
+                let (msg, hint, subst): (String, Option<&str>, Option<Tok>) = match (c, next) {
+                    ('!', _) => (
+                        "unexpected `!`".into(),
+                        Some("Weft uses `not` for logical negation"),
+                        Some(Tok::Not),
+                    ),
+                    ('&', Some('&')) | ('|', Some('|')) => {
+                        self.bump();
+                        let (op, word, tok) = if c == '&' {
+                            ("&&", "and", Tok::And)
+                        } else {
+                            ("||", "or", Tok::Or)
+                        };
+                        (
+                            format!("unexpected `{op}`"),
+                            Some(if word == "and" {
+                                "Weft uses `and` for logical conjunction"
+                            } else {
+                                "Weft uses `or` for logical disjunction"
+                            }),
+                            Some(tok),
+                        )
+                    }
+                    ('&', _) => (
+                        "unexpected `&`".into(),
+                        Some("Weft uses `and` for logical conjunction"),
+                        Some(Tok::And),
+                    ),
+                    ('#', _) => {
+                        // Swallow the whole would-be directive line.
+                        while self.peek().is_some_and(|c| c != '\n') {
+                            self.bump();
+                        }
+                        (
+                            "preprocessor directives are not part of Weft".into(),
+                            Some("use `import` for shared declarations and `const` for constants"),
+                            None,
+                        )
+                    }
+                    ('\'', _) => (
+                        "unexpected character `'`".into(),
+                        Some("strings use double quotes: \"text\""),
+                        None,
+                    ),
+                    _ => (
+                        format!("unexpected character `{}`", c.escape_default()),
+                        None,
+                        None,
+                    ),
                 };
+                let mut d = Diagnostic::error(Span::new(start, self.pos), msg);
+                if let Some(h) = hint {
+                    d = d.with_hint(h);
+                }
                 self.diags.push(d);
+                if let Some(t) = subst {
+                    self.push(t, start);
+                }
                 return;
             }
         };

@@ -1,0 +1,13 @@
+struct Bad {
+    x
+    y: int = 
+    persistent z: int
+}
+
+persistent struct Worse { a: int }
+
+fn f() {
+    let p = Point { x }
+    let q = Point { x: 1 y: 2 }
+    struct Inner { a: int }
+}

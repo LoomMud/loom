@@ -1,0 +1,30 @@
+lightweight
+inherit /std/object
+
+protected var kind: int = 0
+persistent var wear: int = 0
+private persistent var secret: string = ""
+
+final fn id() -> string {
+    return "x"
+}
+
+atomic fn transfer_to(dest: object) {
+    move_to(dest)
+}
+
+pub final override atomic fn go() {
+    var n = 10
+    n *= 2
+    n /= 3
+    n %= 4
+    while true {
+        if n > 3 {
+            break
+        }
+        continue
+    }
+    let f = n as float
+    let g = -n as float * 2.0
+    let h = (old["durability"] as int)
+}

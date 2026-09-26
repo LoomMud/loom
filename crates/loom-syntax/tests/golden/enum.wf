@@ -1,0 +1,20 @@
+enum DamageKind { slash, pierce, blunt }
+
+pub enum Hit {
+    Miss
+    Graze(int)
+    Crit(int, string),
+}
+
+protected var kind: DamageKind = .slash
+
+fn classify(h: Hit) -> string {
+    let k = DamageKind.pierce
+    let made = .Crit(10, "head")
+    let also = Hit.Graze(2)
+    return match h {
+        .Miss => "miss"
+        .Graze(n) if n < 3 => "scratch"
+        .Graze(_) | Hit.Crit(_, _) => "hit",
+    }
+}

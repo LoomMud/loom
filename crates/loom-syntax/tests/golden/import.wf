@@ -1,0 +1,13 @@
+import /include/damage.{DamageKind, Damage}
+inherit /std/item
+import /include/colors
+import /include/limits.MAX_WEAR
+
+const MAX_WEAR = 100
+pub const GREETING: string = "hello"
+private const LIMITS = [1, 2, 3]
+const TAU = 6.283
+
+fn f() -> int {
+    return MAX_WEAR
+}

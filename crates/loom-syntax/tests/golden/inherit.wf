@@ -1,0 +1,9 @@
+inherit /std/item
+inherit combat = /std/mixins/combat
+inherit /domains/tower-2/lib_v2
+
+override fn create() {
+    super::create()
+    combat::create()
+    let r = combat::roll(6, bonus: 2)
+}

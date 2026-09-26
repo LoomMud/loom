@@ -1,0 +1,14 @@
+(fn risky (ob: object) -> bool
+  (try
+    (. ob explode)
+   catch e
+    (call log (field e message))
+    (throw e)
+  )
+  (try
+    (call cleanup)
+   catch
+    (return false)
+  )
+  (throw (call error "fatal" "no way out"))
+)

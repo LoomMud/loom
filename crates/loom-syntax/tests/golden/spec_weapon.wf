@@ -1,0 +1,52 @@
+// /std/weapon.wf
+inherit /std/item                       // file = program; path literal, no quotes
+inherit combat = /std/mixins/combat     // labelled inherit: combat::roll()
+
+import /include/damage.{DamageKind, Damage}   // typed module import (replaces #include)
+
+const MAX_WEAR = 100
+
+private var base_damage: int = 5
+protected var kind: DamageKind = .slash
+persistent var wear: int = 0            // saved by save/restore and snapshots
+var last_swing: int = 0                 // plain vars are runtime-only (never saved)
+
+override fn create() {                  // apply: runs on load/clone
+    super::create()
+    set_name("sword")
+    set_short("a plain iron sword")
+    add_ids(["sword", "blade"])
+    add_verb("wield", do_wield)         // function reference, not a string name
+}
+
+fn do_wield(args: string) -> bool {
+    let me = this_player()
+    if environment() != me {
+        me.tell("You need to be holding it first.")
+        return false
+    }
+    me.wield(self)                      // call_other: late-bound by name
+    environment(me)?.tell_room($"{me.name()} wields {short()}.", exclude: [me])
+    return true
+}
+
+pub fn damage(target: object) -> int {
+    var dmg = base_damage + random(4) - wear / 10
+    for ench in enchantments() {
+        dmg = ench.modify_damage(dmg, target) ?? dmg
+    }
+    return max(dmg, 0)
+}
+
+// DGD-style atomic: an error anywhere inside rolls back every state change.
+atomic fn transfer_to(dest: object) {
+    environment()?.remove_item(self)
+    move_to(dest)
+}
+
+// Hot-reload / save-migration hook (§7.3)
+fn upgrade(from_version: int, old: {string: any}) {
+    if from_version < 3 and "durability" in old {
+        wear = MAX_WEAR - (old["durability"] as int)
+    }
+}

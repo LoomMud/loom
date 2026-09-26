@@ -1,0 +1,14 @@
+enum_err.wf:1:12: error: enum variants have no explicit values
+  |
+1 | enum A { X = 1, Y }
+  |            ^
+  = help: use a `const` for a numeric value, or a payload: `Heavy(int)`
+enum_err.wf:5:5: error: expected `,` or `)` in the payload types, found identifier `Q`
+  |
+5 |     Q
+  |     ^
+enum_err.wf:8:10: error: expected a variant name, found keyword `fn`
+  |
+8 | enum C { fn }
+  |          ^^
+  = help: keywords cannot be used as names; pick another name

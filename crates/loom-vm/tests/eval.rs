@@ -202,7 +202,7 @@ fn link_time_diagnostics() {
         "{e}"
     );
     let e = err("var x: float = 1\nfn main() {\n}\n");
-    assert!(e.contains("unknown type `float`"), "{e}");
+    assert!(e.contains("the `float` type: not yet supported"), "{e}");
     let e = err("override fn main() {\n}\n");
     assert!(e.contains("overrides nothing"), "{e}");
     let e = err("fn main() {\n}\nfn main() {\n}\n");
