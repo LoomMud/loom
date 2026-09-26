@@ -214,6 +214,25 @@ pub fn check_program(
                 ),
             );
         }
+        // Spec r5 §5.2.2 rule 4: a function value is never persisted (it
+        // pins a code version and a principal that may not survive a
+        // reboot). Reject the type here rather than at save time, so the
+        // mistake is caught at compile time on every `persistent` variable
+        // whose type is or contains `fn(...)`.
+        if d.mods.persistent && ty.contains_fn() {
+            cx.err_hint(
+                "W0287",
+                d.name.span,
+                format!(
+                    "a `persistent` variable's type cannot be or contain a function type (`{ty}`)"
+                ),
+                format!(
+                    "`{}` is `persistent`, but its type is `{ty}`; function values are never saved \
+                     (they pin a code version and a principal that may not survive a reboot)",
+                    v.name
+                ),
+            );
+        }
         cx.var_tys.insert(v.name.clone(), ty);
     }
 
@@ -1276,6 +1295,13 @@ fn const_hir(v: &ConstVal, ty: &Ty, span: Span) -> hir::Expr {
     }
 }
 
+/// Can `e` be resolved to a [`hir::Place`] if it appears as the base of an
+/// element write (`e[i] = …`)? Only a name or a nested index on one has
+/// somewhere to write the mutated container back to (spec r5 §5.2.1 rule 3).
+fn is_place_expr(e: &ast::Expr) -> bool {
+    matches!(&e.kind, E::Ident(_) | E::Index { .. })
+}
+
 fn given(n: usize) -> String {
     if n == 1 {
         "1 was given".to_string()
@@ -1939,13 +1965,16 @@ impl Cx<'_> {
         (hir::Stmt { kind, span }, diverges)
     }
 
-    fn assign(
+    /// Resolve an lvalue ast expression into a [`hir::Place`] recursively:
+    /// a name, or an element path rooted in one (spec r5 §5.2.1 rule 1).
+    /// `op` is only used for the leaf-mutability diagnostic on `let` locals
+    /// (`Set` and compound ops are both writes).
+    fn resolve_place(
         &mut self,
         target: &ast::Expr,
         op: ast::AssignOp,
-        value: &ast::Expr,
-    ) -> hir::StmtKind {
-        let (place, pty, local) = match &target.kind {
+    ) -> (hir::Place, Ty, Option<LocalId>) {
+        match &target.kind {
             E::Ident(n) => match self.resolve(n) {
                 Some(Resolved::Local(id)) => {
                     if !self.locals[id as usize].mutable {
@@ -1963,7 +1992,7 @@ impl Cx<'_> {
                     };
                     (hir::Place::Local(id), ty, Some(id))
                 }
-                Some(Resolved::Global(g, ty)) => (hir::Place::Global(g), ty, None),
+                Some(Resolved::Global(g, ty)) => (hir::Place::Global(g, ty.clone()), ty, None),
                 Some(Resolved::Const(..)) => {
                     self.err_hint(
                         "W0242",
@@ -1992,9 +2021,25 @@ impl Cx<'_> {
                 }
             },
             E::Index { base, index } => {
-                let b = self.expr(base, None);
-                let b = self.value(b);
-                let (i, kind, ety) = match b.ty.clone() {
+                // The base must itself be a place: a variable, or another
+                // element of one. Anything else (a call, a literal, …) is a
+                // temporary with nowhere to write the mutated container
+                // back to (§5.2.1 rule 3 needs the whole chain down to the
+                // root variable).
+                if !is_place_expr(base) {
+                    let b = self.expr(base, None);
+                    let _b = self.value(b);
+                    self.err_hint(
+                        "W0286",
+                        target.span,
+                        "cannot write into an element of this expression",
+                        "index into a variable, not the result of an expression",
+                    );
+                    let _ = self.expr(index, None);
+                    return (hir::Place::Local(0), Ty::Error, None);
+                }
+                let (base_place, base_ty, local) = self.resolve_place(base, op);
+                let (i, kind, ety) = match base_ty.clone() {
                     Ty::Array(t) => {
                         let i = self.expr(index, Some(&Ty::Int));
                         (
@@ -2027,18 +2072,18 @@ impl Cx<'_> {
                     }
                     t => {
                         let i = self.expr(index, None);
-                        self.index_error(&t, b.span);
+                        self.index_error(&t, base.span);
                         (i, IndexKind::Dyn, Ty::Error)
                     }
                 };
                 (
                     hir::Place::Index {
-                        base: Box::new(b),
+                        base: Box::new(base_place),
                         index: Box::new(i),
                         kind,
                     },
                     ety,
-                    None,
+                    local,
                 )
             }
             _ => {
@@ -2050,7 +2095,16 @@ impl Cx<'_> {
                 );
                 (hir::Place::Local(0), Ty::Error, None)
             }
-        };
+        }
+    }
+
+    fn assign(
+        &mut self,
+        target: &ast::Expr,
+        op: ast::AssignOp,
+        value: &ast::Expr,
+    ) -> hir::StmtKind {
+        let (place, pty, local) = self.resolve_place(target, op);
         let (v, kind) = if op == ast::AssignOp::Set {
             let v = self.expr(value, Some(&pty));
             (self.coerce(v, &pty, "the assignment"), OpKind::Dyn)
@@ -2076,7 +2130,7 @@ impl Cx<'_> {
             }
             (v, kind)
         };
-        if let hir::Place::Global(g) = &place {
+        if let hir::Place::Global(g, _) = &place {
             let m = MapRef::Global(g.clone());
             self.facts.present.retain(|(pm, _)| *pm != m);
         }

@@ -646,6 +646,36 @@ impl Cx<'_> {
                     self.reg(b)?;
                     self.expect(dst, &Ty::Any)
                 }
+                // Array concatenation (`xs += [x]`, spec r5 §5.2.1): the
+                // checker's `arith()` only allows `Add` between two arrays
+                // with consistent element types, so the verifier need only
+                // confirm the operand and result *shapes* line up, the same
+                // looseness `Dyn` gets above (element-type consistency was
+                // already checked when this bytecode was produced).
+                OpKind::Array if matches!(op, BinOp::Add) => {
+                    match self.reg(a)? {
+                        Ty::Array(_) => {}
+                        t => {
+                            return Err(VerifyError(format!(
+                                "%{a} has type {t}, expected an array"
+                            )));
+                        }
+                    }
+                    match self.reg(b)? {
+                        Ty::Array(_) => {}
+                        t => {
+                            return Err(VerifyError(format!(
+                                "%{b} has type {t}, expected an array"
+                            )));
+                        }
+                    }
+                    match self.reg(dst)? {
+                        Ty::Array(_) => Ok(()),
+                        t => Err(VerifyError(format!(
+                            "%{dst} has type {t}, expected an array"
+                        ))),
+                    }
+                }
                 _ => Err(VerifyError(format!("{op:?} is not defined for {kind:?}"))),
             },
             BinOp::In => {
@@ -772,6 +802,50 @@ mod tests {
             capture_targets: vec![],
         };
         // dst is typed `string` but Add.Int must produce `int`.
+        assert!(verify(&m1(f)).is_err());
+    }
+
+    #[test]
+    fn accepts_array_concatenation_xs_plus_eq() {
+        // `xs += [x]` (spec r5 §5.2.1): Add.Array between two arrays,
+        // producing an array.
+        let f = FunctionCode {
+            name: 0,
+            params: 0,
+            ret: Ty::Void,
+            reg_types: vec![Ty::array(Ty::Int), Ty::array(Ty::Int), Ty::array(Ty::Int)],
+            code: vec![
+                Op::BinOp {
+                    dst: 2,
+                    op: BinOp::Add,
+                    kind: OpKind::Array,
+                    a: 0,
+                    b: 1,
+                },
+                Op::Return { src: None },
+            ],
+        };
+        assert!(verify(&m1(f)).is_ok());
+    }
+
+    #[test]
+    fn rejects_array_add_with_a_non_array_operand() {
+        let f = FunctionCode {
+            name: 0,
+            params: 0,
+            ret: Ty::Void,
+            reg_types: vec![Ty::array(Ty::Int), Ty::Int, Ty::array(Ty::Int)],
+            code: vec![
+                Op::BinOp {
+                    dst: 2,
+                    op: BinOp::Add,
+                    kind: OpKind::Array,
+                    a: 0,
+                    b: 1,
+                },
+                Op::Return { src: None },
+            ],
+        };
         assert!(verify(&m1(f)).is_err());
     }
 

@@ -292,3 +292,205 @@ fn default_params_reject_wrong_arity_at_verify() {
     // rejects it up front.
     assert!(crate::check::check_program("/t", &ast, Vec::new(), Vec::new()).is_err());
 }
+
+// ---------------------------------------------------------------------
+// Place-write lowering (OBI-53, spec r5 §5.2.1 rule 3): `a[i] = v`,
+// `m[k] op= v`, nested `a[i][j] = v` and `xs += [x]` must lower as
+// take → mutate → put back, one test per path, on both a local and a
+// program variable. Assertions read the disassembly rather than counting
+// registers, so they stay robust to register-allocation changes but still
+// catch the original bug: a `LoadGlobal` (or nested `Index` read) with no
+// matching `StoreGlobal` (or outer `IndexSet`) writing the mutation back.
+
+fn disasm_fn(m: &crate::bytecode::Module, name: &str) -> String {
+    let f = m
+        .functions
+        .iter()
+        .find(|f| &*m.strings[f.name as usize] == name)
+        .unwrap_or_else(|| panic!("no function {name}"));
+    crate::disasm::function(m, f)
+}
+
+#[test]
+fn element_write_array_index_on_local() {
+    let m = compile_one(
+        r#"
+        fn f() {
+            var xs = [1, 2, 3]
+            xs[0] = 9
+        }
+        "#,
+    );
+    verify(&m).expect("verify");
+    let text = disasm_fn(&m, "f");
+    // The local's own register is mutated directly: one `IndexSet` and no
+    // `LoadGlobal`/`StoreGlobal` (there is nowhere to load from or store
+    // to — it is a local, not a program variable).
+    assert!(text.contains("IndexSet.Array"), "{text}");
+    assert!(!text.contains("LoadGlobal"), "{text}");
+    assert!(!text.contains("StoreGlobal"), "{text}");
+}
+
+#[test]
+fn element_write_array_index_on_global() {
+    let m = compile_one(
+        r#"
+        var xs: [int] = [1, 2, 3]
+        pub fn f() {
+            xs[0] = 9
+        }
+        "#,
+    );
+    verify(&m).expect("verify");
+    let text = disasm_fn(&m, "f");
+    // Take → mutate → put back: a `LoadGlobal` to take the array out, the
+    // `IndexSet` mutation, then a `StoreGlobal` writing the same register
+    // back — the bug this closes left out exactly that last step.
+    let load_reg = text
+        .lines()
+        .find(|l| l.contains("LoadGlobal"))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .map(|s| s.trim_end_matches(','))
+        .expect("a LoadGlobal")
+        .to_string();
+    assert!(text.contains("IndexSet.Array"), "{text}");
+    let store_line = text
+        .lines()
+        .find(|l| l.contains("StoreGlobal"))
+        .unwrap_or_else(|| panic!("a StoreGlobal in:\n{text}"));
+    assert!(
+        store_line.contains(&load_reg),
+        "StoreGlobal must write back the same register LoadGlobal took: {store_line}"
+    );
+}
+
+#[test]
+fn compound_element_write_map_key_on_local() {
+    let m = compile_one(
+        r#"
+        fn f() {
+            var m = {"a": 1}
+            m["a"] += 1
+        }
+        "#,
+    );
+    verify(&m).expect("verify");
+    let text = disasm_fn(&m, "f");
+    assert!(text.contains("Index.Map"), "{text}");
+    assert!(text.contains("BinOp.Int Add"), "{text}");
+    assert!(text.contains("IndexSet.Map"), "{text}");
+    assert!(!text.contains("LoadGlobal"), "{text}");
+    assert!(!text.contains("StoreGlobal"), "{text}");
+}
+
+#[test]
+fn compound_element_write_map_key_on_global() {
+    let m = compile_one(
+        r#"
+        var m: {string: int} = {"a": 1}
+        pub fn f() {
+            m["a"] += 1
+        }
+        "#,
+    );
+    verify(&m).expect("verify");
+    let text = disasm_fn(&m, "f");
+    assert!(text.contains("LoadGlobal"), "{text}");
+    assert!(text.contains("Index.Map"), "{text}");
+    assert!(text.contains("IndexSet.Map"), "{text}");
+    assert!(text.contains("StoreGlobal"), "{text}");
+}
+
+#[test]
+fn nested_element_write_on_local() {
+    let m = compile_one(
+        r#"
+        fn f() {
+            var a = [[1, 2], [3, 4]]
+            a[0][1] = 9
+        }
+        "#,
+    );
+    verify(&m).expect("verify");
+    let text = disasm_fn(&m, "f");
+    // Take the inner array out of `a[0]` (an `Index` read), mutate it, put
+    // it back with an `IndexSet` into `a` — `a` itself is a local, so that
+    // is the end of the chain, no `LoadGlobal`/`StoreGlobal` anywhere.
+    let index_reads = text.matches("Index.Array %").count();
+    let index_sets = text.matches("IndexSet.Array").count();
+    assert_eq!(index_reads, 1, "exactly one read of a[0]:\n{text}");
+    assert_eq!(
+        index_sets, 2,
+        "one IndexSet for a[0][1]=9, one put-back into a[0]:\n{text}"
+    );
+    assert!(!text.contains("LoadGlobal"), "{text}");
+    assert!(!text.contains("StoreGlobal"), "{text}");
+}
+
+#[test]
+fn nested_element_write_on_global() {
+    let m = compile_one(
+        r#"
+        var a: [[int]] = [[1, 2], [3, 4]]
+        pub fn f() {
+            a[0][1] = 9
+        }
+        "#,
+    );
+    verify(&m).expect("verify");
+    let text = disasm_fn(&m, "f");
+    // Take `a` out (LoadGlobal), take `a[0]` out (Index), mutate, put
+    // `a[0]` back into `a` (IndexSet), put `a` back (StoreGlobal): every
+    // level of the chain writes back up to the root variable.
+    assert!(text.contains("LoadGlobal"), "{text}");
+    assert_eq!(
+        text.matches("Index.Array %").count(),
+        1,
+        "exactly one read of a[0]:\n{text}"
+    );
+    assert_eq!(
+        text.matches("IndexSet.Array").count(),
+        2,
+        "one IndexSet for a[0][1]=9, one put-back into a:\n{text}"
+    );
+    assert!(text.contains("StoreGlobal"), "{text}");
+}
+
+#[test]
+fn compound_assign_whole_array_on_local() {
+    // `xs += [x]` reassigns the whole local (array concatenation), not an
+    // element write — `Place::Local`/`Place::Global` directly, already
+    // correct before this change; kept as a regression test for the path
+    // named explicitly in the ticket.
+    let m = compile_one(
+        r#"
+        fn f() -> [int] {
+            var xs = [1]
+            xs += [2]
+            return xs
+        }
+        "#,
+    );
+    verify(&m).expect("verify");
+    let text = disasm_fn(&m, "f");
+    assert!(text.contains("BinOp.Array Add"), "{text}");
+    assert!(!text.contains("LoadGlobal"), "{text}");
+    assert!(!text.contains("StoreGlobal"), "{text}");
+}
+
+#[test]
+fn compound_assign_whole_array_on_global() {
+    let m = compile_one(
+        r#"
+        var xs: [int] = [1]
+        pub fn f() {
+            xs += [2]
+        }
+        "#,
+    );
+    verify(&m).expect("verify");
+    let text = disasm_fn(&m, "f");
+    assert!(text.contains("BinOp.Array Add"), "{text}");
+    assert!(text.contains("LoadGlobal"), "{text}");
+    assert!(text.contains("StoreGlobal"), "{text}");
+}

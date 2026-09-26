@@ -232,12 +232,22 @@ pub enum IterKind {
     Dyn,
 }
 
+/// A writable location: a local, a program variable, or an element path
+/// rooted in one (spec r5 §5.2.1 rule 1). `Index::base` is itself a
+/// `Place`, not a plain `Expr`: under value semantics an element write must
+/// be lowered as *take → mutate → put back* through every level of a
+/// nested path (§5.2.1 rule 3), which needs the whole chain down to the
+/// root variable, not just a value read of the immediate container.
 #[derive(Clone, Debug)]
 pub enum Place {
     Local(LocalId),
-    Global(GlobalRef),
+    /// The type is the checker's current type for this variable at this
+    /// assignment site (its declared type, or narrower — HIR invariant 1);
+    /// codegen needs it to `LoadGlobal`/`StoreGlobal` when this place is
+    /// the root of a nested element write (§5.2.1 rule 3).
+    Global(GlobalRef, Ty),
     Index {
-        base: Box<Expr>,
+        base: Box<Place>,
         index: Box<Expr>,
         kind: IndexKind,
     },

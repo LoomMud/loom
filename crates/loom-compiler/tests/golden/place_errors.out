@@ -1,0 +1,6 @@
+/t.wf:10:5: error[W0286]: cannot write into an element of this expression
+   |
+10 |     make()[0] = 9
+   |     ^^^^^^^^^
+   = help: index into a variable, not the result of an expression
+
