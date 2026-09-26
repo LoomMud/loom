@@ -1,6 +1,15 @@
 # Contributing to Loom
 
-Private repository while in development (spec v2 §4.4). Rules from the first commit:
+## Status and licence
+
+This repository is **public but not open source (yet)**. The project licence is still being decided, so
+every file is `LicenseRef-Oberfield-Proprietary` (all rights reserved). **External contributions are not
+accepted** until a licence is chosen; please do not open pull requests from forks. Issues and feedback
+are welcome.
+
+## Rules
+
+Applied from the first commit (spec v2 §4.4):
 
 - **DCO sign-off on every commit.** Use `git commit -s` (or `git config format.signOff true`).
   The trailer must match the commit author. CI (`scripts/check-dco.sh`) enforces it.
