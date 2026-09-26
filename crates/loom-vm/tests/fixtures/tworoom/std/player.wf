@@ -5,23 +5,23 @@ persistent var moves: int = 0
 pub fn logon() {
     send(self, "Welcome to Loom!\n")
     move_to(load_object("/domains/start/hall"))
-    send(self, environment().look())
+    send(self, environment()?.look())
 }
 
 pub fn process_input(line: string) {
     let words = split(trim(line), " ")
     let verb = words[0]
     if verb == "look" {
-        send(self, environment().look())
+        send(self, environment()?.look())
     } else if verb == "go" and len(words) == 2 {
-        let dest = environment().exit_dest(words[1])
+        let dest = environment()?.exit_dest(words[1])
         if dest == null {
             send(self, "You can't go that way.\n")
             return
         }
         move_to(load_object(dest))
         moves += 1
-        send(self, environment().look())
+        send(self, environment()?.look())
     } else if verb == "update" and len(words) == 2 {
         let err = compile_object(words[1])
         if err == null {

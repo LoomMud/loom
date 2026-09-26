@@ -5,6 +5,6 @@ override fn create() {
     add_exit("south", "/domains/start/hall")
 }
 
-override fn long() -> string {
+pub override fn long() -> string {
     return "A muddy yard under an open sky."
 }
