@@ -14,8 +14,10 @@
 //! the V1 HIR/checker) into `loom_compiler::bytecode::Module`, which is the
 //! next slice of OBI-31.
 
+pub mod compile;
 pub mod heap;
 pub mod vm;
 
+pub use compile::{CompileError, compile_and_verify};
 pub use heap::{HeapObj, MapData, Value};
 pub use vm::{Host, Interpreter, Limits, RtError};

@@ -395,6 +395,23 @@ impl FnLower {
                     kind: *ik,
                     src: final_r,
                 });
+                // Value semantics (spec r5 D24): `IndexSet` mutates
+                // `base_r`'s own register in place (copy-on-write), which
+                // is *a copy* of whatever `base` read from, not a shared
+                // reference back to it. If `base` is directly a program
+                // global (`exits[dir] = dest`, not e.g. a local array),
+                // the mutated container must be written back or the edit
+                // is invisible outside this function. This only covers the
+                // one-level case (`global[i] = v`); a chain rooted in a
+                // global two or more levels down (`global[i][j] = v`) needs
+                // the fuller place-write lowering tracked on OBI-53.
+                if let hir::ExprKind::Global(g) = &base.kind {
+                    self.emit(Inst::StoreGlobal {
+                        global: g.clone(),
+                        ty: base.ty.clone(),
+                        src: base_r,
+                    });
+                }
                 Ok(())
             }
         }
