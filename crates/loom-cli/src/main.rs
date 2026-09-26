@@ -38,20 +38,37 @@ async fn run() -> Result<(), String> {
             serve(mudlib).await
         }
         "check" => {
-            let Some(root) = args.next() else {
-                return Err("usage: loom check <mudlib-root>".to_string());
+            let mut root = None;
+            let mut dump_hir = false;
+            for a in args {
+                match a.as_str() {
+                    "--dump-hir" => dump_hir = true,
+                    _ if root.is_none() => root = Some(PathBuf::from(a)),
+                    _ => return Err(format!("unexpected argument: {a}")),
+                }
+            }
+            let Some(root) = root else {
+                return Err("usage: loom check <mudlib-root> [--dump-hir]".to_string());
             };
-            check(PathBuf::from(root))
+            check(root, dump_hir)
         }
         other => Err(format!("unknown command: {other}")),
     }
 }
 
-/// `loom check <mudlib-root>`: parse and link every `.wf` file without
-/// running anything; print diagnostics and fail if there are any.
-fn check(root: PathBuf) -> Result<(), String> {
-    let errors = loom_vm::check_mudlib(&root)
+/// `loom check <mudlib-root>`: resolve and type-check every `.wf` file with
+/// the Phase 1 compiler front end (`loom-compiler`) without running anything;
+/// print diagnostics and fail if there are any. `--dump-hir` prints the
+/// typed HIR of every clean program.
+fn check(root: PathBuf, dump_hir: bool) -> Result<(), String> {
+    let report = loom_compiler::check_mudlib(&root)
         .map_err(|err| format!("cannot scan {}: {err}", root.display()))?;
+    if dump_hir {
+        for c in report.programs.values() {
+            println!("{}", loom_compiler::dump::program(&c.hir));
+        }
+    }
+    let errors = report.errors;
     for e in &errors {
         eprintln!("{e}\n");
     }
