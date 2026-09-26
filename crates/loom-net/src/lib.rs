@@ -609,36 +609,38 @@ mod tests {
         fast.write_all(b"fast\n").await.unwrap();
 
         let mut slow_conn = None;
-        let mut fast_conn = None;
         let mut saw_slow_disconnect = false;
+        let mut replied_fast = false;
 
-        for _ in 0..30 {
-            if let Some(event) = event_rx.recv().await {
-                match event {
-                    NetEvent::Connected(id) => {
-                        if slow_conn.is_none() {
-                            slow_conn = Some(id);
-                        } else if fast_conn.is_none() {
-                            fast_conn = Some(id);
+        // Identify the clients by the line they sent, not by accept order:
+        // the two connects race, and guessing wrong spams the client that
+        // is never read from while the test waits forever (flake seen in CI).
+        // Also keep going until the fast client got its reply: its line can
+        // arrive after the slow client has already been dropped.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !(saw_slow_disconnect && replied_fast) {
+            let event = tokio::time::timeout_at(deadline, event_rx.recv())
+                .await
+                .expect("timed out waiting for the slow-client disconnect and the fast-client line")
+                .expect("event channel closed");
+            match event {
+                NetEvent::Connected(_) => {}
+                NetEvent::Line(id, line) => {
+                    if line == "slow" {
+                        slow_conn = Some(id);
+                        for i in 0..200 {
+                            let _ = cmd_tx
+                                .send(NetCommand::Send(id, format!("spam-{i}\n")))
+                                .await;
                         }
+                    } else if line == "fast" {
+                        let _ = cmd_tx.send(NetCommand::Send(id, "ok\n".to_string())).await;
+                        replied_fast = true;
                     }
-                    NetEvent::Line(id, _) => {
-                        if Some(id) == slow_conn {
-                            for i in 0..200 {
-                                let _ = cmd_tx
-                                    .send(NetCommand::Send(id, format!("spam-{i}\n")))
-                                    .await;
-                            }
-                        }
-                        if Some(id) == fast_conn {
-                            let _ = cmd_tx.send(NetCommand::Send(id, "ok\n".to_string())).await;
-                        }
-                    }
-                    NetEvent::Disconnected(id) => {
-                        if Some(id) == slow_conn {
-                            saw_slow_disconnect = true;
-                            break;
-                        }
+                }
+                NetEvent::Disconnected(id) => {
+                    if Some(id) == slow_conn {
+                        saw_slow_disconnect = true;
                     }
                 }
             }
