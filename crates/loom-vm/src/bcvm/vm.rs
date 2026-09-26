@@ -27,7 +27,7 @@ use loom_compiler::bytecode::{
     BinOp, CalleeOp, ConstValue, IndexKind, IterKind, Module, Op, OpKind, Reg, Ty, UnOp,
 };
 
-use crate::bcvm::heap::{Map, Value};
+use crate::bcvm::heap::{MapData, Value};
 use crate::object::ObjectId;
 
 /// A Weft runtime error: message (with `path.wf:line:col` when available)
@@ -127,8 +127,10 @@ impl<'a, H: Host> Interpreter<'a, H> {
         }
     }
 
-    /// Every [`Value`] currently reachable from live frames: a GC root set
-    /// for [`crate::bcvm::heap::collect_cycles`].
+    /// Every [`Value`] currently reachable from live frames. Not needed by
+    /// the value-semantics heap here (r5: no cycle collector, see the
+    /// `heap` module docs), but useful for anything that wants to walk the
+    /// live register set — e.g. future per-object memory accounting.
     pub fn roots(&self) -> impl Iterator<Item = &Value> {
         self.stack.iter().flat_map(|f| f.regs.iter())
     }
@@ -304,7 +306,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 Ok(None)
             }
             Op::NewMap { dst, entries, .. } => {
-                let mut m = Map::default();
+                let mut m = MapData::default();
                 for (k, v) in entries {
                     m.insert(reg!(k), reg!(v));
                 }
@@ -327,7 +329,19 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 kind,
                 src,
             } => {
-                self.index_set(kind, reg!(base), reg!(index), reg!(src))?;
+                // Copy-on-write (r5 D24): mutate the container living in
+                // `base`'s own register directly (via `Rc::make_mut`), not a
+                // clone pulled out through `reg!`. That is what makes an
+                // index-assign on a local visible to the rest of that local's
+                // lifetime without any aliasing games — the register *is*
+                // the value. Whether the same edit must also be written back
+                // to a program variable/other place this register was read
+                // from is the place-write lowering codegen must emit
+                // (OBI-53); this instruction only ever owns one register.
+                let key = reg!(index);
+                let val = reg!(src);
+                let frame = self.stack.last_mut().unwrap();
+                Self::index_set(kind, &mut frame.regs[base as usize], key, val)?;
                 Ok(None)
             }
             Op::IterElems { dst, src, kind, .. } => {
@@ -468,20 +482,23 @@ impl<'a, H: Host> Interpreter<'a, H> {
     /// `len` backs every `for` loop's bound check (see codegen's `IterElems`
     /// lowering), so it is on the hot path.
     fn call_efun(&self, name: &str, args: &[Value]) -> Option<R<Value>> {
+        fn len_of(v: &Value) -> Option<i64> {
+            if let Some(s) = v.as_str() {
+                Some(s.chars().count() as i64)
+            } else if let Some(a) = v.as_array() {
+                Some(a.len() as i64)
+            } else {
+                v.as_map().map(|m| m.entries.len() as i64)
+            }
+        }
         match name {
             "len" => Some(match args.first() {
-                Some(v) if v.as_str().is_some() => {
-                    Ok(Value::Int(v.as_str().unwrap().chars().count() as i64))
-                }
-                Some(v) if v.as_array().is_some() => {
-                    Ok(Value::Int(v.as_array().unwrap().borrow().len() as i64))
-                }
-                Some(v) if v.as_map().is_some() => {
-                    Ok(Value::Int(v.as_map().unwrap().borrow().entries.len() as i64))
-                }
-                Some(v) => {
-                    Err(self.err_with_trace(format!("len(): {} has no length", v.type_name())))
-                }
+                Some(v) => match len_of(v) {
+                    Some(n) => Ok(Value::Int(n)),
+                    None => {
+                        Err(self.err_with_trace(format!("len(): {} has no length", v.type_name())))
+                    }
+                },
                 None => Err(self.err_with_trace("len(): missing argument")),
             }),
             _ => None,
@@ -526,8 +543,8 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 Value::str(&s)
             }
             (BinOp::Add, a, b) if a.as_array().is_some() && b.as_array().is_some() => {
-                let mut v = a.as_array().unwrap().borrow().clone();
-                v.extend(b.as_array().unwrap().borrow().iter().cloned());
+                let mut v = a.as_array().unwrap().to_vec();
+                v.extend(b.as_array().unwrap().iter().cloned());
                 Value::array(v)
             }
             (BinOp::Eq, _, _) => Bool(l.equals(&r)),
@@ -541,11 +558,9 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 cmp_bool(op, a.as_str().unwrap().cmp(b.as_str().unwrap()))
             }
             (BinOp::In, k, v) if v.as_array().is_some() => {
-                Bool(v.as_array().unwrap().borrow().iter().any(|x| x.equals(k)))
+                Bool(v.as_array().unwrap().iter().any(|x| x.equals(k)))
             }
-            (BinOp::In, k, v) if v.as_map().is_some() => {
-                Bool(v.as_map().unwrap().borrow().contains(k))
-            }
+            (BinOp::In, k, v) if v.as_map().is_some() => Bool(v.as_map().unwrap().contains(k)),
             (BinOp::In, a, b) if a.as_str().is_some() && b.as_str().is_some() => {
                 Bool(b.as_str().unwrap().contains(a.as_str().unwrap()))
             }
@@ -577,7 +592,6 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 let a = base
                     .as_array()
                     .ok_or_else(|| self.err_with_trace("internal: Index(Array) on non-array"))?;
-                let a = a.borrow();
                 let i = self.array_index(&key, a.len())?;
                 Ok(a[i].clone())
             }
@@ -595,15 +609,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 let m = base
                     .as_map()
                     .ok_or_else(|| self.err_with_trace("internal: Index(Map) on non-map"))?;
-                Ok(m.borrow().get(&key).cloned().unwrap_or(Value::Null))
+                Ok(m.get(&key).cloned().unwrap_or(Value::Null))
             }
             IndexKind::Dyn => {
                 if let Some(a) = base.as_array() {
-                    let a = a.borrow();
                     let i = self.array_index(&key, a.len())?;
                     Ok(a[i].clone())
                 } else if let Some(m) = base.as_map() {
-                    Ok(m.borrow().get(&key).cloned().unwrap_or(Value::Null))
+                    Ok(m.get(&key).cloned().unwrap_or(Value::Null))
                 } else if let Some(s) = base.as_str() {
                     let n = s.chars().count();
                     let i = self.array_index(&key, n)?;
@@ -617,41 +630,43 @@ impl<'a, H: Host> Interpreter<'a, H> {
         }
     }
 
-    fn index_set(&self, kind: IndexKind, base: Value, key: Value, val: Value) -> R<()> {
+    /// Copy-on-write index-assign (r5 D24): `place` is the exact register
+    /// slot holding the container (see the `Op::IndexSet` dispatch above),
+    /// mutated in place via `Value::array_mut`/`map_mut` (`Rc::make_mut`
+    /// under the hood — clones the buffer only if it is shared).
+    fn index_set(kind: IndexKind, place: &mut Value, key: Value, val: Value) -> R<()> {
+        let err = |msg: String| RtError::new(msg);
         match kind {
-            IndexKind::Array | IndexKind::Dyn if base.as_array().is_some() => {
-                let a = base.as_array().unwrap();
-                let len = a.borrow().len();
-                let i = self.array_index(&key, len)?;
-                a.borrow_mut()[i] = val;
+            IndexKind::Array | IndexKind::Dyn if place.as_array().is_some() => {
+                let len = place.as_array().unwrap().len();
+                let i = match &key {
+                    Value::Int(i) if *i >= 0 && (*i as u64) < len as u64 => *i as usize,
+                    Value::Int(i) => {
+                        return Err(err(format!("index {i} out of range (length {len})")));
+                    }
+                    v => {
+                        return Err(err(format!(
+                            "array index must be int, got {}",
+                            v.type_name()
+                        )));
+                    }
+                };
+                place.array_mut().unwrap()[i] = val;
                 Ok(())
             }
-            IndexKind::Map | IndexKind::MapPresent => {
+            IndexKind::Map | IndexKind::MapPresent | IndexKind::Dyn if place.as_map().is_some() => {
                 if !key.is_valid_key() {
-                    return Err(self.err_with_trace(format!(
+                    return Err(err(format!(
                         "map keys must be int, string, bool or object, got {}",
                         key.type_name()
                     )));
                 }
-                base.as_map()
-                    .ok_or_else(|| self.err_with_trace("internal: IndexSet(Map) on non-map"))?
-                    .borrow_mut()
-                    .insert(key, val);
+                place.map_mut().unwrap().insert(key, val);
                 Ok(())
             }
-            IndexKind::Dyn if base.as_map().is_some() => {
-                if !key.is_valid_key() {
-                    return Err(self.err_with_trace(format!(
-                        "map keys must be int, string, bool or object, got {}",
-                        key.type_name()
-                    )));
-                }
-                base.as_map().unwrap().borrow_mut().insert(key, val);
-                Ok(())
-            }
-            _ => Err(self.err_with_trace(format!(
+            _ => Err(err(format!(
                 "cannot assign into {} (need array or map)",
-                base.type_name()
+                place.type_name()
             ))),
         }
     }
@@ -661,13 +676,11 @@ impl<'a, H: Host> Interpreter<'a, H> {
             IterKind::Array => Ok(Value::array(
                 src.as_array()
                     .ok_or_else(|| self.err_with_trace("`for` needs an array"))?
-                    .borrow()
-                    .clone(),
+                    .to_vec(),
             )),
             IterKind::MapKeys => Ok(Value::array(
                 src.as_map()
                     .ok_or_else(|| self.err_with_trace("`for` needs a map"))?
-                    .borrow()
                     .entries
                     .iter()
                     .map(|(k, _)| k.clone())
@@ -675,10 +688,10 @@ impl<'a, H: Host> Interpreter<'a, H> {
             )),
             IterKind::Dyn => {
                 if let Some(a) = src.as_array() {
-                    Ok(Value::array(a.borrow().clone()))
+                    Ok(Value::array(a.to_vec()))
                 } else if let Some(m) = src.as_map() {
                     Ok(Value::array(
-                        m.borrow().entries.iter().map(|(k, _)| k.clone()).collect(),
+                        m.entries.iter().map(|(k, _)| k.clone()).collect(),
                     ))
                 } else {
                     Err(self.err_with_trace(format!(
@@ -902,5 +915,55 @@ mod tests {
         let err = interp.call("countdown", vec![Value::Int(10)]).unwrap_err();
         assert!(!err.trace.is_empty());
         assert!(err.trace.iter().all(|t| t.contains("countdown")));
+    }
+
+    /// r5 D24: `IndexSet` writes into the exact register that holds the
+    /// container (copy-on-write, in place once uniquely owned) rather than
+    /// through a shared `RefCell`. A one-function module keeps a local
+    /// array in reg 0, a second array in reg 1 that starts out sharing the
+    /// same buffer, writes `arr[0] = 99` into reg 0, and returns both so
+    /// the test can check the aliased copy in reg 1 was not mutated.
+    #[test]
+    fn index_set_is_copy_on_write_not_shared_mutation() {
+        // Registers: 0 = arr (built fresh), 1 = alias (Copy of 0), 2 = index 0,
+        // 3 = new value 99.
+        let code = vec![
+            Op::LoadConst { dst: 2, idx: 0 }, // index 0
+            Op::LoadConst { dst: 3, idx: 1 }, // value 99
+            Op::NewArray {
+                dst: 0,
+                elem_ty: Ty::Int,
+                elems: vec![2],
+            }, // arr = [0]
+            Op::Copy { dst: 1, src: 0 },      // alias = arr (shares the buffer)
+            Op::IndexSet {
+                base: 0,
+                index: 2,
+                kind: IndexKind::Array,
+                src: 3,
+            }, // arr[0] = 99
+            Op::Return { src: Some(1) },      // return the alias, unaffected if COW works
+        ];
+        let module = Module {
+            path: std::rc::Rc::from("/test/cow"),
+            strings: vec![std::rc::Rc::from("/test/cow"), std::rc::Rc::from("run")],
+            consts: vec![ConstValue::Int(0), ConstValue::Int(99)],
+            functions: vec![FunctionCode {
+                name: 1,
+                params: 0,
+                ret: Ty::array(Ty::Int),
+                reg_types: vec![Ty::array(Ty::Int), Ty::array(Ty::Int), Ty::Int, Ty::Int],
+                code,
+            }],
+        };
+        let mut host = NoHost;
+        let limits = Limits::default();
+        let mut ticks = 1000u64;
+        let mut interp = Interpreter::new(&module, &mut host, &limits, &mut ticks);
+        let alias = interp.call("run", vec![]).unwrap();
+        assert!(
+            alias.as_array().unwrap()[0].equals(&Value::Int(0)),
+            "the alias must not observe the write made through `arr`"
+        );
     }
 }

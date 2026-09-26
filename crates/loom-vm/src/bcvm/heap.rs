@@ -2,56 +2,74 @@
 // SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
 
 //! Bytecode-VM runtime values: a 16-byte tagged [`Value`] (spec §5.8: "16
-//! byte values"), backed by a per-object-kind `Rc` for reference counting
-//! plus a simple stop-the-world cycle collector on top (spec §5.8: "RC +
-//! cycle collector").
+//! byte values"), with **copy-on-write value semantics** for containers
+//! (spec r5 §5.2.1, D24, [OBI-52]).
+//!
+//! [OBI-52]: /OBI/issues/OBI-52
 //!
 //! Strings/arrays/maps are boxed behind one [`Rc<HeapObj>`] *thin* pointer
-//! (as opposed to `Rc<str>`/`Rc<RefCell<Vec<_>>>`, which are fat pointers),
-//! so [`Value`] stays one tag word plus one payload word regardless of
-//! which heap kind it holds — see [`SIZE_IS_16_BYTES`] below.
+//! (as opposed to `Rc<str>`/`Rc<Vec<_>>`, which are fat pointers), so
+//! [`Value`] stays one tag word plus one payload word regardless of which
+//! heap kind it holds — see [`SIZE_IS_16_BYTES`] below.
 //!
-//! **RC**: ordinary `Rc` clone/drop reclaims acyclic garbage immediately,
-//! same as Phase 0. **Cycle collector**: [`collect_cycles`] is a full
-//! mark-sweep over every live allocation (tracked in a thread-local
-//! registry, since a World runs on one deterministic thread — no
-//! cross-thread sharing to worry about). It marks everything reachable from
-//! the given roots, then clears the *contents* of every unreached
-//! allocation still in the registry. Clearing (not freeing directly) is
-//! what makes this safe: it drops each unreached object's outgoing `Rc`
-//! edges through ordinary `Drop`, which is exactly what breaks a cycle and
-//! lets `Rc`'s own refcount take every member of the cycle to zero. This is
-//! a full-heap mark-sweep rather than Bacon-Rajan trial deletion (which
-//! would only re-examine objects whose refcount was decremented since the
-//! last collection); trial deletion is the natural next optimization once
-//! the driver has enough live objects for full-heap sweeps to show up in a
-//! profile.
+//! **Value semantics, not reference semantics (r5 D24).** There is no
+//! `RefCell` here: an array/map's contents are immutable once built, and
+//! every in-place-looking mutation ([`Value::array_mut`],
+//! [`Value::map_mut`]) goes through `Rc::make_mut`, which clones the buffer
+//! the first time it is shared (refcount > 1) and mutates in place after
+//! that (refcount == 1). Two consequences fall out of this for free,
+//! matching r5 exactly:
+//! - **Aliasing is copy semantics.** Assigning, passing, returning, or
+//!   capturing a container shares the buffer (cheap `Rc` clone) until
+//!   someone writes through one of the copies, at which point that copy's
+//!   buffer becomes independent. `==` is therefore defined structurally
+//!   (element/entry equality), not by identity — two arrays holding equal
+//!   elements are equal even if they started life as unrelated
+//!   allocations.
+//! - **No reference cycles are constructible.** Building a value cannot
+//!   observe or capture a handle to the container currently being built (there is no
+//!   `RefCell`/interior mutability to store a self-reference through), so
+//!   the heap here is a DAG by construction and needs no cycle collector.
+//!   (The collector spec r5 defers is for the *object* heap once
+//!   lightweight objects exist — tracked on the issue that adds them, not
+//!   this one.)
 
-use std::cell::RefCell;
-use std::collections::HashSet;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 use loom_syntax::ast::{Type, TypeKind};
 
 use crate::object::ObjectId;
 
 /// A heap-allocated Weft value: string, array, or map. Always reached
-/// through [`Value::Heap`].
-#[derive(Debug)]
+/// through [`Value::Heap`]. No field here is interior-mutable; see the
+/// module docs for why that is exactly what makes containers value types.
+#[derive(Clone, Debug)]
 pub enum HeapObj {
     Str(Box<str>),
-    Array(RefCell<Vec<Value>>),
-    Map(RefCell<Map>),
+    Array(Vec<Value>),
+    Map(MapData),
 }
 
-/// Insertion-ordered map (§5.1 determinism); linear lookup, same tradeoff as
-/// the Phase 0 evaluator's `value::Map`.
+/// Insertion-ordered entries backing a Weft map value. Order is preserved
+/// for iteration/display (§5.1 determinism) but is **not** significant to
+/// `==` (r5): two maps are equal iff they have the same key set and the
+/// same value for every key.
 #[derive(Clone, Debug, Default)]
-pub struct Map {
+pub struct MapData {
     pub entries: Vec<(Value, Value)>,
 }
 
-impl Map {
+impl PartialEq for MapData {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries.len() == other.entries.len()
+            && self
+                .entries
+                .iter()
+                .all(|(k, v)| other.get(k).is_some_and(|ov| ov.equals(v)))
+    }
+}
+
+impl MapData {
     pub fn get(&self, k: &Value) -> Option<&Value> {
         self.entries
             .iter()
@@ -81,7 +99,8 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Object(ObjectId),
-    /// String, array, or map: see [`HeapObj`].
+    /// String, array, or map: see [`HeapObj`]. Always logically a *value*
+    /// (see module docs) even though the representation is a shared `Rc`.
     Heap(Rc<HeapObj>),
 }
 
@@ -94,15 +113,15 @@ const SIZE_IS_16_BYTES: () = assert!(std::mem::size_of::<Value>() == 16);
 
 impl Value {
     pub fn str(s: &str) -> Value {
-        Value::Heap(alloc(HeapObj::Str(s.into())))
+        Value::Heap(Rc::new(HeapObj::Str(s.into())))
     }
 
     pub fn array(v: Vec<Value>) -> Value {
-        Value::Heap(alloc(HeapObj::Array(RefCell::new(v))))
+        Value::Heap(Rc::new(HeapObj::Array(v)))
     }
 
-    pub fn map(m: Map) -> Value {
-        Value::Heap(alloc(HeapObj::Map(RefCell::new(m))))
+    pub fn map(m: MapData) -> Value {
+        Value::Heap(Rc::new(HeapObj::Map(m)))
     }
 
     pub fn as_str(&self) -> Option<&str> {
@@ -115,7 +134,7 @@ impl Value {
         }
     }
 
-    pub fn as_array(&self) -> Option<&RefCell<Vec<Value>>> {
+    pub fn as_array(&self) -> Option<&[Value]> {
         match self {
             Value::Heap(h) => match &**h {
                 HeapObj::Array(a) => Some(a),
@@ -125,9 +144,33 @@ impl Value {
         }
     }
 
-    pub fn as_map(&self) -> Option<&RefCell<Map>> {
+    pub fn as_map(&self) -> Option<&MapData> {
         match self {
             Value::Heap(h) => match &**h {
+                HeapObj::Map(m) => Some(m),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Mutable access to this value's array buffer, cloning it first if it
+    /// is shared (`Rc::make_mut`: copy-on-write, r5 D24). `None` if this
+    /// value is not an array.
+    pub fn array_mut(&mut self) -> Option<&mut Vec<Value>> {
+        match self {
+            Value::Heap(h) => match Rc::make_mut(h) {
+                HeapObj::Array(a) => Some(a),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Mutable access to this value's map buffer; see [`Value::array_mut`].
+    pub fn map_mut(&mut self) -> Option<&mut MapData> {
+        match self {
+            Value::Heap(h) => match Rc::make_mut(h) {
                 HeapObj::Map(m) => Some(m),
                 _ => None,
             },
@@ -150,8 +193,10 @@ impl Value {
         }
     }
 
-    /// `==` semantics: primitives and strings by value, objects by
-    /// identity, arrays and maps by reference (spec §5.2).
+    /// `==` semantics (spec r5 §5.2.1): primitives and strings by value,
+    /// objects by identity, arrays and maps **structurally** (not by
+    /// reference/identity — value semantics means two unrelated arrays
+    /// with equal elements are equal).
     pub fn equals(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Null, Value::Null) => true,
@@ -161,9 +206,10 @@ impl Value {
             (Value::Object(a), Value::Object(b)) => a == b,
             (Value::Heap(a), Value::Heap(b)) => match (&**a, &**b) {
                 (HeapObj::Str(x), HeapObj::Str(y)) => x == y,
-                (HeapObj::Array(_), HeapObj::Array(_)) | (HeapObj::Map(_), HeapObj::Map(_)) => {
-                    Rc::ptr_eq(a, b)
+                (HeapObj::Array(x), HeapObj::Array(y)) => {
+                    x.len() == y.len() && x.iter().zip(y).all(|(a, b)| a.equals(b))
                 }
+                (HeapObj::Map(x), HeapObj::Map(y)) => x == y,
                 _ => false,
             },
             _ => false,
@@ -193,90 +239,6 @@ impl Value {
             _ => false,
         }
     }
-}
-
-// ---------------------------------------------------------------------
-// Allocation registry + cycle collector.
-// ---------------------------------------------------------------------
-
-thread_local! {
-    /// Every live heap allocation, as a weak handle. A World runs on one
-    /// deterministic thread (spec §5.1), so a thread-local registry is the
-    /// whole heap for that World; nothing here needs to be `Send`/`Sync`.
-    static REGISTRY: RefCell<Vec<Weak<HeapObj>>> = const { RefCell::new(Vec::new()) };
-}
-
-fn alloc(obj: HeapObj) -> Rc<HeapObj> {
-    let rc = Rc::new(obj);
-    REGISTRY.with(|r| r.borrow_mut().push(Rc::downgrade(&rc)));
-    rc
-}
-
-/// Number of live allocations still tracked (includes ones only reachable
-/// through a cycle). Exposed for tests and memory-quota accounting.
-pub fn live_allocations() -> usize {
-    REGISTRY.with(|r| {
-        let mut reg = r.borrow_mut();
-        reg.retain(|w| w.strong_count() > 0);
-        reg.len()
-    })
-}
-
-/// Trace-and-clear cycle collection (see module docs). `roots` should cover
-/// every [`Value`] the collector cannot otherwise reach: object variables,
-/// and every register of every live VM frame. Returns the number of
-/// allocations whose contents were cleared (an upper bound on cycles
-/// broken, since some may not have been part of a true cycle — e.g. an
-/// array that was simply unreachable acyclic garbage nobody dropped yet is
-/// swept the same way).
-pub fn collect_cycles<'a>(roots: impl IntoIterator<Item = &'a Value>) -> usize {
-    let mut reached: HashSet<*const HeapObj> = HashSet::new();
-    let mut stack: Vec<Value> = roots.into_iter().cloned().collect();
-    while let Some(v) = stack.pop() {
-        if let Value::Heap(rc) = &v {
-            let ptr = Rc::as_ptr(rc);
-            if reached.insert(ptr) {
-                match &**rc {
-                    HeapObj::Str(_) => {}
-                    HeapObj::Array(a) => stack.extend(a.borrow().iter().cloned()),
-                    HeapObj::Map(m) => {
-                        for (k, val) in &m.borrow().entries {
-                            stack.push(k.clone());
-                            stack.push(val.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut cleared = 0usize;
-    REGISTRY.with(|r| {
-        let mut reg = r.borrow_mut();
-        for w in reg.iter() {
-            let Some(rc) = w.upgrade() else { continue };
-            if reached.contains(&Rc::as_ptr(&rc)) {
-                continue;
-            }
-            match &*rc {
-                HeapObj::Str(_) => {}
-                HeapObj::Array(a) => {
-                    if !a.borrow().is_empty() {
-                        a.borrow_mut().clear();
-                        cleared += 1;
-                    }
-                }
-                HeapObj::Map(m) => {
-                    if !m.borrow().entries.is_empty() {
-                        m.borrow_mut().entries.clear();
-                        cleared += 1;
-                    }
-                }
-            }
-        }
-        reg.retain(|w| w.strong_count() > 0);
-    });
-    cleared
 }
 
 /// Render a value for interpolation / display. `name` resolves object
@@ -318,7 +280,7 @@ fn write_value(
             HeapObj::Str(s) => out.push_str(s),
             HeapObj::Array(a) => {
                 out.push('[');
-                for (i, e) in a.borrow().iter().enumerate() {
+                for (i, e) in a.iter().enumerate() {
                     if i > 0 {
                         out.push_str(", ");
                     }
@@ -327,7 +289,6 @@ fn write_value(
                 out.push(']');
             }
             HeapObj::Map(m) => {
-                let m = m.borrow();
                 if m.entries.is_empty() {
                     out.push_str("{:}");
                     return;
@@ -358,60 +319,85 @@ mod tests {
     }
 
     #[test]
-    fn equals_semantics() {
-        assert!(Value::str("a").equals(&Value::str("a")));
-        let a = Value::array(vec![Value::Int(1)]);
-        assert!(!a.equals(&Value::array(vec![Value::Int(1)])));
-        assert!(a.equals(&a.clone()));
-    }
-
-    #[test]
-    fn acyclic_garbage_is_reclaimed_immediately_by_rc() {
-        let before = live_allocations();
-        {
-            let _a = Value::array(vec![Value::str("x")]);
-        }
-        assert_eq!(live_allocations(), before);
-    }
-
-    #[test]
-    fn cyclic_garbage_is_reclaimed_by_collect_cycles() {
-        let a = Value::array(vec![Value::Null]);
-        let b = Value::array(vec![Value::Null]);
-        let (wa, wb) = match (&a, &b) {
-            (Value::Heap(ra), Value::Heap(rb)) => (Rc::downgrade(ra), Rc::downgrade(rb)),
-            _ => unreachable!(),
-        };
-        a.as_array().unwrap().borrow_mut()[0] = b.clone();
-        b.as_array().unwrap().borrow_mut()[0] = a.clone();
-        drop(a);
-        drop(b);
-
-        // Nothing points at either array from the outside anymore, but the
-        // cycle keeps both alive: plain `Rc` never reclaims this.
-        assert!(wa.upgrade().is_some());
-        assert!(wb.upgrade().is_some());
-
-        let cleared = collect_cycles(std::iter::empty());
-        assert!(cleared >= 1, "expected at least one cleared allocation");
-        assert!(wa.upgrade().is_none(), "a should be reclaimed");
-        assert!(wb.upgrade().is_none(), "b should be reclaimed");
-    }
-
-    #[test]
-    fn reachable_values_survive_collection() {
-        let kept = Value::array(vec![Value::str("keep me")]);
-        let garbage_a = Value::array(vec![Value::Null]);
-        let garbage_b = Value::array(vec![Value::Null]);
-        garbage_a.as_array().unwrap().borrow_mut()[0] = garbage_b.clone();
-        garbage_b.as_array().unwrap().borrow_mut()[0] = garbage_a.clone();
-        drop(garbage_a);
-        drop(garbage_b);
-
-        collect_cycles(std::iter::once(&kept));
-        assert_eq!(
-            kept.as_array().unwrap().borrow()[0].as_str(),
-            Some("keep me")
+    fn structural_equality_for_arrays() {
+        let a = Value::array(vec![Value::Int(1), Value::str("x")]);
+        let b = Value::array(vec![Value::Int(1), Value::str("x")]);
+        assert!(
+            a.equals(&b),
+            "equal elements, unrelated allocations: must be =="
         );
+        let c = Value::array(vec![Value::Int(2)]);
+        assert!(!a.equals(&c));
+    }
+
+    #[test]
+    fn structural_equality_for_maps_ignores_insertion_order() {
+        let mut m1 = MapData::default();
+        m1.insert(Value::str("a"), Value::Int(1));
+        m1.insert(Value::str("b"), Value::Int(2));
+        let mut m2 = MapData::default();
+        m2.insert(Value::str("b"), Value::Int(2));
+        m2.insert(Value::str("a"), Value::Int(1));
+        assert!(Value::map(m1).equals(&Value::map(m2)));
+    }
+
+    /// r5 D24: assign / mutate-the-copy, the original is unchanged
+    /// (aliasing test).
+    #[test]
+    fn assigning_a_copy_and_mutating_it_leaves_the_original_unchanged() {
+        let original = Value::array(vec![Value::Int(1), Value::Int(2)]);
+        let mut copy = original.clone(); // a plain assignment: shares the Rc
+        copy.array_mut().unwrap().push(Value::Int(3)); // make-unique-on-write
+        assert_eq!(
+            original.as_array().unwrap().len(),
+            2,
+            "original must be unaffected by mutating the copy"
+        );
+        assert_eq!(copy.as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn make_mut_is_in_place_once_uniquely_owned() {
+        let mut v = Value::array(vec![Value::Int(1), Value::Int(2)]);
+        // Nothing else holds this Rc: make_mut must not allocate a new
+        // buffer, it must mutate the existing one in place. (Mutating an
+        // existing element, not pushing, so a `Vec` capacity reallocation
+        // can't be mistaken for the thing under test.)
+        let ptr_before = v.as_array().unwrap().as_ptr();
+        v.array_mut().unwrap()[0] = Value::Int(9);
+        let ptr_after = v.as_array().unwrap().as_ptr();
+        assert_eq!(
+            ptr_before, ptr_after,
+            "uniquely-owned buffer should be mutated in place, not reallocated"
+        );
+    }
+
+    /// r5: containers can no longer form reference cycles, because nothing
+    /// in `HeapObj` is interior-mutable — there is no way, while building a
+    /// value, to obtain and store a handle back to the very container being
+    /// built. This test is the closest thing to a runtime witness of that
+    /// static property: it exhaustively builds arrays-of-arrays through the
+    /// only public constructors ([`Value::array`]/[`Value::array_mut`]) and
+    /// checks that a bounded-depth walk always terminates (a walk over a
+    /// true cycle would not, since nothing here caps recursion by has-seen
+    /// tracking — it relies purely on the graph being acyclic).
+    #[test]
+    fn containers_built_through_the_public_api_cannot_contain_a_cycle() {
+        fn depth(v: &Value, budget: u32) -> u32 {
+            assert!(budget > 0, "walk did not terminate: would indicate a cycle");
+            match v.as_array() {
+                Some(a) => 1 + a.iter().map(|e| depth(e, budget - 1)).max().unwrap_or(0),
+                None => 0,
+            }
+        }
+        let mut v = Value::array(vec![Value::Int(1)]);
+        for _ in 0..64 {
+            let inner = v.clone();
+            v = Value::array(vec![inner]);
+        }
+        // Bounded budget: if this ever looped forever instead of hitting
+        // the assertion above, that would itself be evidence of a cycle.
+        let d = depth(&v, 1_000);
+        assert_eq!(d, 65);
     }
 }
