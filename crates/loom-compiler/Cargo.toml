@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+
+[package]
+name = "loom-compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+loom-syntax = { version = "0.0.1", path = "../loom-syntax" }
+
+[dev-dependencies]
+loom-vm = { path = "../loom-vm" }
+proptest = { version = "1", default-features = false, features = ["std"] }

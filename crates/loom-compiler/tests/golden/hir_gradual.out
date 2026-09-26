@@ -1,0 +1,48 @@
+ok
+program /g
+  inherit /std/base
+  linearization /std/base /g
+  fn pub override describe(%0 extra: string = …) -> string
+    default %0
+      "" : string
+    local %1 dyn: any
+    local %2 n: int
+    local %3 names: [string]
+    local %4 parts: [any]
+    let %1:dyn
+      callother .query : any
+        efun load_object P0 : object
+          "/x" : string
+    let %2:n
+      cast : int
+        %1:dyn : any
+    let %3:names
+      efun keys P0 : [string]
+        map : {string: any}
+          "a" : string
+            %1:dyn : any
+    let %4:parts
+      array : [any]
+        1 : int
+        "two" : string
+    return
+      call static /std/base::describe : string
+        interp : string
+          %2:n : int
+          " "
+          efun len P0 : int
+            %3:names : [string]
+          " "
+          efun len P0 : int
+            %4:parts : [any]
+
+program /std/base
+  linearization /std/base
+  fn pub describe(%0 extra: string = …) -> string
+    default %0
+      "" : string
+    return
+      interp : string
+        "base"
+        %0:extra : string
+

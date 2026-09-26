@@ -1,0 +1,23 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// Clean: flow narrowing, map-key presence, callee kinds.
+var exits: {string: string} = {"north": "/r/n"}
+
+pub fn dest(dir: string) -> string? {
+    if dir in exits {
+        return exits[dir]
+    }
+    return null
+}
+
+private fn helper(o: object) -> string {
+    return object_name(o)
+}
+
+pub fn where_am_i() -> string {
+    let env = environment()
+    if env == null {
+        return "nowhere"
+    }
+    return helper(env)
+}

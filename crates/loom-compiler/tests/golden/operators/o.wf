@@ -1,0 +1,14 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+fn f(n: int, s: string, o: object?) {
+    let a = n + s
+    let b = s - s
+    let c = n < s
+    let d = n == s
+    let e = 1 in n
+    let g = -s
+    let h = o ?? 5
+    let i = s + n
+    let k = o + 1
+    let ok = s in "haystack"
+}

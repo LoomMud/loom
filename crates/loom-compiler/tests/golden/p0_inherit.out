@@ -1,0 +1,34 @@
+/obj/a.wf:3:1: error: cannot inherit /obj/b: it has errors
+  |
+3 | inherit /obj/b
+  | ^^^^^^^^^^^^^^
+  = help: fix the errors reported for /obj/b.wf first
+
+/obj/b.wf:3:1: error: inherit cycle through /obj/a
+  |
+3 | inherit /obj/a
+  | ^^^^^^^^^^^^^^
+  = help: a program cannot (indirectly) inherit itself
+
+/obj/broken.wf:4:12: error: mismatched types in the return value: expected `int`, found `string`
+  |
+4 |     return "x"
+  |            ^^^
+
+/obj/c.wf:3:1: error: cannot inherit /obj/nowhere: /obj/nowhere.wf does not exist
+  |
+3 | inherit /obj/nowhere
+  | ^^^^^^^^^^^^^^^^^^^^
+  = help: check the path; inherit paths are absolute and have no extension
+
+/obj/d.wf:3:1: error: cannot inherit /obj/broken: it has errors
+  |
+3 | inherit /obj/broken
+  | ^^^^^^^^^^^^^^^^^^^
+  = help: fix the errors reported for /obj/broken.wf first
+
+/obj/e.wf:3:9: error: expected a program path like `/std/room`, found identifier `obj`
+  |
+3 | inherit obj/relative
+  |         ^^^
+

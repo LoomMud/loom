@@ -1,0 +1,26 @@
+/r.wf:4:12: error: `nothing` has no return type, so it cannot return a value
+  |
+4 |     return 1
+  |            ^
+  = help: declare one: `fn nothing(…) -> int`
+/r.wf:8:5: error: `needs` must return a value of type `int`
+  |
+8 |     return
+  |     ^^^^^^
+  = help: return a value of the declared type
+/r.wf:11:4: error: `falls_off` may reach its end without returning a value
+   |
+11 | fn falls_off(b: bool) -> string {
+   |    ^^^^^^^^^
+   = help: it is declared `-> string`; add a `return` on every path
+/r.wf:31:13: error: this call returns no value
+   |
+31 |     let x = nothing2()
+   |             ^^^^^^^^^^
+   = help: the function has no `-> T`, so its result cannot be used
+/r.wf:32:16: error: this call returns no value
+   |
+32 |     send(self, nothing2())
+   |                ^^^^^^^^^^
+   = help: the function has no `-> T`, so its result cannot be used
+

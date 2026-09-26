@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+inherit /std/base
+
+override fn name() -> string {
+    return "child"
+}
+
+override fn weight(unit: int) -> int {
+    return 2
+}
+
+override fn hook() -> int {
+    return 1
+}
+
+private override fn secret() {
+}

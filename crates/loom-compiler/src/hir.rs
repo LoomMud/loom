@@ -1,0 +1,316 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+
+//! Typed HIR: the output of name resolution + type checking, and the input
+//! of V2 lowering (IR → register bytecode). Design notes: `docs/hir.md`.
+//!
+//! Invariants a well-formed HIR guarantees to its consumer:
+//!
+//! 1. **Every name is resolved.** Locals are dense [`LocalId`]s into
+//!    [`Function::locals`]; program variables are [`GlobalRef`]s keyed by
+//!    *(declaring program, name)*, the hot-reload migration key (§7.3);
+//!    calls carry a [`Callee`] that says whether dispatch is virtual (by name
+//!    on the object's current program) or static (a fixed program's body).
+//! 2. **Every expression has a type** ([`Expr::ty`]); `Ty::Error` never
+//!    appears (a program with diagnostics produces no HIR).
+//! 3. **The gradual boundary is explicit.** Wherever a value flows from a
+//!    less precise type (`any`, `[any]`, …) into a precise one, the checker
+//!    wraps it in [`ExprKind::Cast`]; codegen emits a runtime check exactly
+//!    there and nowhere else is a type check needed for soundness.
+//! 4. **Operators are resolved to operand kinds** ([`OpKind`]), so codegen
+//!    can pick typed instructions (`AddInt`, `AddStr`, …) and only
+//!    [`OpKind::Dyn`] needs a dynamic dispatch.
+//! 5. **Sugar is gone:** `else if` is a nested `If`, compound assignment
+//!    keeps its operator but the place is evaluated once.
+//!
+//! Default arguments are filled **callee-side**: a call passes only the
+//! arguments written at the call site and the callee's prologue evaluates
+//! [`Param::default`] for the rest. That keeps defaults out of callers, so a
+//! recompile that changes a default does not require re-linking callers.
+
+use std::rc::Rc;
+
+use loom_syntax::Span;
+pub use loom_syntax::ast::{AssignOp, BinOp, UnOp};
+
+use crate::efuns::Privilege;
+use crate::ty::Ty;
+
+/// Index into [`Function::locals`] (parameters first, in order).
+pub type LocalId = u32;
+
+/// One checked program (one source file).
+#[derive(Clone, Debug)]
+pub struct Program {
+    /// Mudlib path without extension, e.g. `/std/room`.
+    pub path: Rc<str>,
+    /// Direct parents in source order.
+    pub inherits: Vec<Inherit>,
+    /// Every program whose variables an instance of this program holds, root
+    /// first, each exactly once (virtual inheritance: a diamond shares one
+    /// copy), ending with this program. Instance layout is per entry.
+    pub linearization: Vec<Rc<str>>,
+    /// Program variables declared *here*, in declaration order.
+    pub vars: Vec<Var>,
+    /// Functions declared here, in declaration order.
+    pub fns: Vec<Function>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Inherit {
+    /// `label` in `inherit label = /path`; `None` for an unlabelled inherit.
+    pub label: Option<Rc<str>>,
+    pub path: Rc<str>,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    /// `pub`: callable from other objects via `ob.f()`.
+    Public,
+    /// Default: this program and inheritors.
+    Internal,
+    /// `private`: this program only; not inherited, not overridable.
+    Private,
+}
+
+#[derive(Clone, Debug)]
+pub struct Var {
+    pub name: Rc<str>,
+    pub ty: Ty,
+    pub vis: Visibility,
+    pub persistent: bool,
+    /// Runs with `self` = the object, on creation and when a hot reload
+    /// cannot keep the old value. `None` means `null` (only for nullable types).
+    pub init: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct Function {
+    pub name: Rc<str>,
+    pub vis: Visibility,
+    pub is_override: bool,
+    pub params: Vec<Param>,
+    /// `Ty::Void` when the function has no `-> T`.
+    pub ret: Ty,
+    /// All locals of the body: parameters first, then every `let`/`var`/`for`
+    /// binding in order of appearance. Ids are never reused, so the register
+    /// allocator is free to share slots of disjoint scopes.
+    pub locals: Vec<Local>,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct Param {
+    pub local: LocalId,
+    pub default: Option<Expr>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Local {
+    pub name: Rc<str>,
+    /// Declared (or inferred) type. Flow narrowing never changes this; a
+    /// narrowed *use* has the narrower type on its [`Expr`].
+    pub ty: Ty,
+    pub mutable: bool,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct Block {
+    pub stmts: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct Stmt {
+    pub kind: StmtKind,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum StmtKind {
+    /// Initialise a local. `None` initialises it to `null`.
+    Let {
+        local: LocalId,
+        init: Option<Expr>,
+    },
+    /// `place = value` or `place op= value` (place evaluated once).
+    Assign {
+        place: Place,
+        op: AssignOp,
+        /// Operand kind of `op` for compound assignment (`Set` ignores it).
+        kind: OpKind,
+        value: Expr,
+    },
+    If {
+        cond: Expr,
+        then: Block,
+        els: Option<Block>,
+    },
+    While {
+        cond: Expr,
+        body: Block,
+    },
+    /// Iterates a snapshot of `iter`.
+    For {
+        local: LocalId,
+        iter: Expr,
+        kind: IterKind,
+        body: Block,
+    },
+    Return(Option<Expr>),
+    Expr(Expr),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IterKind {
+    /// Elements of an array.
+    Array,
+    /// Keys of a map, in insertion order.
+    MapKeys,
+    /// Static type `any`: array or map decided at runtime.
+    Dyn,
+}
+
+#[derive(Clone, Debug)]
+pub enum Place {
+    Local(LocalId),
+    Global(GlobalRef),
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        kind: IndexKind,
+    },
+}
+
+/// A program variable, keyed the way hot reload migrates state.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GlobalRef {
+    /// The program that declares the variable (not the one using it).
+    pub owner: Rc<str>,
+    pub name: Rc<str>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub ty: Ty,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub enum InterpPart {
+    Lit(Rc<str>),
+    /// Any type; codegen converts to string.
+    Expr(Expr),
+}
+
+/// Operand kind of an operator, resolved from the operand types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpKind {
+    Int,
+    Float,
+    Str,
+    Bool,
+    Array,
+    Map,
+    Object,
+    /// `==`/`!=` between values of different static kinds that may still be
+    /// equal (e.g. `object?` vs `null`): compare by value/identity at runtime.
+    Generic,
+    /// At least one operand is `any`: dispatch on the runtime values.
+    Dyn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexKind {
+    Array,
+    String,
+    /// Missing key reads as `null` (the expression has type `V?`).
+    Map,
+    /// The key was proven present by an enclosing `k in m` test (both plain
+    /// locals, unassigned since). Type `V`; codegen must still raise a
+    /// runtime error if the key vanished (e.g. removed by a call).
+    MapPresent,
+    Dyn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Callee {
+    /// Look `name` up on the running object's *current* program (virtual
+    /// dispatch; hot-reload friendly).
+    Virtual { name: Rc<str> },
+    /// A specific program's body: private functions and `super::`/`label::`
+    /// calls.
+    Static { program: Rc<str>, name: Rc<str> },
+}
+
+#[derive(Clone, Debug)]
+pub enum ExprKind {
+    Int(i64),
+    Str(Rc<str>),
+    Bool(bool),
+    Null,
+    Interp(Vec<InterpPart>),
+    Array(Vec<Expr>),
+    Map(Vec<(Expr, Expr)>),
+    /// A local, with the flow-narrowed type on the expression.
+    Local(LocalId),
+    Global(GlobalRef),
+    /// `self` / `self()`.
+    SelfObj,
+    /// A function of this program used as a value (`add_verb("x", do_x)`).
+    FnRef(Callee),
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+        kind: IndexKind,
+    },
+    Unary {
+        op: UnOp,
+        kind: OpKind,
+        expr: Box<Expr>,
+    },
+    /// Arithmetic, comparison, `in`. `and`/`or`/`??` are separate nodes
+    /// because they short-circuit.
+    Binary {
+        op: BinOp,
+        kind: OpKind,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+    /// `lhs ?? rhs`: `rhs` is evaluated only if `lhs` is null.
+    Coalesce(Box<Expr>, Box<Expr>),
+    /// Call a function of this program (or an ancestor). Only the written
+    /// arguments are passed; see the module docs on defaults.
+    Call {
+        callee: Callee,
+        args: Vec<Expr>,
+    },
+    /// Call a function value (a local of type `fn(...)` or `any`).
+    CallValue {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    /// Driver built-in. `privilege` is the efun's class (§5.5); the VM gates it.
+    CallEfun {
+        name: &'static str,
+        privilege: Privilege,
+        args: Vec<Expr>,
+    },
+    /// `recv.name(args)` / `recv?.name(args)`: late-bound call_other to a
+    /// `pub` function. Result type is `any`.
+    CallOther {
+        recv: Box<Expr>,
+        name: Rc<str>,
+        args: Vec<Expr>,
+        safe: bool,
+    },
+    /// Runtime-checked conversion to [`Expr::ty`] (the gradual boundary).
+    Cast(Box<Expr>),
+}

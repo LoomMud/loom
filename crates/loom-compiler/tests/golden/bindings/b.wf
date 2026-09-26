@@ -1,0 +1,13 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+var untyped = null
+var no_init: int
+
+fn f(p) {
+    let a = null
+    var c: object?
+    let xs = [1, "two"]
+    let m = {"a": 1, "b": true}
+    let bad = {[1]: 2}
+    let t: objekt = self
+}

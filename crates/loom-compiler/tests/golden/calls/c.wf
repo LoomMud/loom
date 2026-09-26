@@ -1,0 +1,22 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+fn two(a: int, b: string = "x") -> int {
+    return a
+}
+
+fn f(n: int) {
+    two()
+    two(1, "a", 3)
+    two("1")
+    let g = two
+    let r: int = g(1, "b")
+    g("wrong", "b")
+    n(1)
+    two = g
+    n.call()
+    let i = n[0]
+    var s = "abc"
+    s[0] = "x"
+    let o: object = self
+    let x = o.anything(1, 2)
+}

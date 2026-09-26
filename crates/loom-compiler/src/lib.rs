@@ -1,0 +1,24 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+
+//! Weft compiler front half (spec §5.3, §5.4, §5.9): name resolution, the
+//! inherit graph, and the strict-by-default gradual type checker, producing
+//! the typed HIR that codegen (V2) lowers. Owner: Gimli.
+//!
+//! Entry points: [`check_program`] for one program against its parents'
+//! interfaces, [`Session`] to compile programs in inherit order from a
+//! [`SourceLoader`], and [`check_mudlib`] for `loom check`.
+//! The HIR contract is documented in [`hir`] and `docs/hir.md`.
+
+pub mod check;
+pub mod dump;
+pub mod efuns;
+pub mod hir;
+pub mod interface;
+pub mod mudlib;
+pub mod ty;
+
+pub use check::{Checked, check_program};
+pub use interface::ProgramInfo;
+pub use mudlib::{FsLoader, MudlibReport, Outcome, Session, SourceLoader, check_mudlib};
+pub use ty::Ty;

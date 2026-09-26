@@ -1,0 +1,26 @@
+/n.wf:7:9: error: cannot call `.tell()` on a value that may be null (`object?`)
+  |
+7 |     env.tell("hi")
+  |         ^^^^
+  = help: use `?.tell()` to skip the call when it is null, or check `!= null` first
+/n.wf:16:10: error: cannot call `.tell()` on a value that may be null (`object?`)
+   |
+16 |     here.tell("program variables are not narrowed")
+   |          ^^^^
+   = help: use `?.tell()` to skip the call when it is null, or check `!= null` first
+/n.wf:17:17: error: cannot index a value that may be null (`[string]?`)
+   |
+17 |     let first = xs[0]
+   |                 ^^
+   = help: check it with `if x != null { … }` first
+/n.wf:18:14: error: cannot iterate over `[string]?`: it may be null
+   |
+18 |     for x in xs {
+   |              ^^
+   = help: check it with `if xs != null { … }` first
+/n.wf:28:11: error: cannot call `.tell()` on a value that may be null (`object?`)
+   |
+28 |         o.tell("assignment ends narrowing")
+   |           ^^^^
+   = help: use `?.tell()` to skip the call when it is null, or check `!= null` first
+

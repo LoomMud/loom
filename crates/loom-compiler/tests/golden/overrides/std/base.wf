@@ -1,0 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+pub fn name() -> string {
+    return "base"
+}
+
+fn weight(unit: string) -> int {
+    return 1
+}
+
+fn hook() {
+}
