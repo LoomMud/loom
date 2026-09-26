@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Bytecode verifier: the last gate before a [`Module`] may run (spec
 //! §5.8/§5.9). Checks, per function: every register index and jump target

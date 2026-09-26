@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Multiple, labelled and virtual (diamond) inheritance through the
 //! resolver. The Phase 0 parser only produces a single unlabelled `inherit`,

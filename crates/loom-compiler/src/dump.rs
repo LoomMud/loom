@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Stable text dump of the typed HIR, for golden tests and `loom check
 //! --dump-hir`. One node per line, indented; every expression shows its type.

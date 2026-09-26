@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Register bytecode: the assembled form of [`crate::ir`], and the trust
 //! boundary [`crate::verify`] guards (spec §5.8/§5.9, `docs/bytecode.md`).

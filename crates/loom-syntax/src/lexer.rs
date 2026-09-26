@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Hand-written Weft lexer. Newlines are significant (statement terminators),
 //! so they are emitted as [`Tok::Newline`]; the parser skips them where a

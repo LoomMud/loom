@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Weft compiler front half (spec §5.3, §5.4, §5.9): name resolution, the
 //! inherit graph, and the strict-by-default gradual type checker, producing

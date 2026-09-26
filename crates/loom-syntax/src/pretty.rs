@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Compact S-expression rendering of the AST, used by golden tests and
 //! `loom check --ast`. Spans are omitted; the format is stable-ish but not a

@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! `docs/reference/weft/diagnostics.md` is generated from
 //! [`loom_syntax::codes::REGISTRY`] so the code table can never drift from

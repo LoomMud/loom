@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Fuzz the whole front end: lexer + parser + diagnostic renderer + AST
 //! pretty-printer. Properties: no panic, no stack overflow, no hang, and

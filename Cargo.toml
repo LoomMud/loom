@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Oberfield
-# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+# SPDX-License-Identifier: AGPL-3.0-only
 
 [workspace]
 resolver = "3"
@@ -9,7 +9,7 @@ members = ["crates/*"]
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.98"
-license = "LicenseRef-Oberfield-Proprietary"
+license = "AGPL-3.0-only"
 publish = false
 
 [workspace.lints.rust]

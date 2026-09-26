@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Oberfield
-# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # `cargo fuzz` targets for the Weft parser (trust boundary: builder source).
 # Not a workspace member: it needs nightly and libFuzzer. Run with
@@ -10,7 +10,7 @@
 name = "loom-syntax-fuzz"
 version = "0.0.0"
 edition = "2024"
-license = "LicenseRef-Oberfield-Proprietary"
+license = "AGPL-3.0-only"
 publish = false
 
 [package.metadata]

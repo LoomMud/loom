@@ -1,5 +1,7 @@
 # Loom
 
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
+
 Loom is Oberfield's LPMud-style MUD driver, written in Rust. It hosts **Weft**, a sandboxed scripting
 language, and runs the **Warp** mudlib. The authoritative design is Loom spec v2 (Paperclip OBI-4, `design`).
 
@@ -21,6 +23,11 @@ scripts/ci-local.sh       # fmt, clippy, test, cargo-deny, DCO
 
 ## Remotes
 
-- Canonical remote: `https://github.com/LoomMud/loom` (private).
+- Canonical remote: `https://github.com/LoomMud/loom` (public).
 - Interim mirror (read-only until Phase 1 completes):
   `/paperclip/instances/default/shared/oberfield/loom.git`.
+
+## Licence
+
+Copyright 2026 Oberfield. Licensed under the [GNU Affero General Public License v3.0 only](LICENSE)
+(`AGPL-3.0-only`). See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution policy.

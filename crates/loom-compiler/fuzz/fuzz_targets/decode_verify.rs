@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Fuzz the bytecode trust boundary: decode arbitrary bytes into a
 //! [`loom_compiler::bytecode::Module`], then verify it. Properties: `decode`

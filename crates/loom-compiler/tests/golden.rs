@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Golden tests: every directory under `tests/golden/` is a mini mudlib.
 //! It is checked with [`loom_compiler::check_mudlib`] and the rendered

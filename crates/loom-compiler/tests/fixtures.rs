@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The Phase 0 mudlibs in the workspace (Warp Phase 0 and the VM test
 //! fixtures) type-check clean under the strict checker, and the checker's

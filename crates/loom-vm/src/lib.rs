@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Weft values, object table, program registry and evaluator/VM (§3.4, §5.9, §7). Owner: Gimli.
 //!

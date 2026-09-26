@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The Phase 0 gate: `loom-syntax` parses the whole v1 grammar (OBI-23), but
 //! the tree-walking evaluator only runs the Phase 0 subset. Every construct

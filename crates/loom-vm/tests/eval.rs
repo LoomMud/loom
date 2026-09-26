@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Evaluator unit tests: each case is a tiny mudlib whose master defines
 //! `main()`; the result is rendered as Weft interpolation would.
