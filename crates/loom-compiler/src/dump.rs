@@ -172,7 +172,7 @@ impl Dump {
                         let l = self.local(*id);
                         self.line(depth, &format!("assign {l} {op}"));
                     }
-                    Place::Global(g) => {
+                    Place::Global(g, _) => {
                         self.line(
                             depth,
                             &format!("assign global {}::{} {op}", g.owner, g.name),
@@ -180,7 +180,7 @@ impl Dump {
                     }
                     Place::Index { base, index, kind } => {
                         self.line(depth, &format!("assign index {kind:?} {op}"));
-                        self.expr(base, depth + 1);
+                        self.place(base, depth + 1);
                         self.expr(index, depth + 1);
                     }
                 }
@@ -251,6 +251,23 @@ impl Dump {
         match c {
             Callee::Virtual { name } => format!("virtual {name}"),
             Callee::Static { program, name } => format!("static {program}::{name}"),
+        }
+    }
+
+    fn place(&mut self, p: &Place, depth: usize) {
+        match p {
+            Place::Local(id) => {
+                let l = self.local(*id);
+                self.line(depth, &format!("place {l}"));
+            }
+            Place::Global(g, _) => {
+                self.line(depth, &format!("place global {}::{}", g.owner, g.name));
+            }
+            Place::Index { base, index, kind } => {
+                self.line(depth, &format!("place index {kind:?}"));
+                self.place(base, depth + 1);
+                self.expr(index, depth + 1);
+            }
         }
     }
 

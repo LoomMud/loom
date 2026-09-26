@@ -153,6 +153,21 @@ struct FnLower<'e> {
     extra: &'e mut Vec<ir::Function>,
 }
 
+/// The result of [`FnLower::take_place`]: exactly the registers used to
+/// read a place's current container value, so [`FnLower::put_back_place`]
+/// can write the mutated value back without re-evaluating anything (no
+/// index expression or global load runs twice per assignment).
+enum TakenPlace {
+    Local,
+    Global(hir::GlobalRef, Ty),
+    Index {
+        base: Box<TakenPlace>,
+        base_reg: Reg,
+        index_reg: Reg,
+        kind: hir::IndexKind,
+    },
+}
+
 impl FnLower<'_> {
     fn new_reg(&mut self, ty: Ty) -> Reg {
         self.reg_types.push(ty);
@@ -420,7 +435,7 @@ impl FnLower<'_> {
                 });
                 Ok(())
             }
-            hir::Place::Global(g) => {
+            hir::Place::Global(g, _) => {
                 let v = self.expr(value)?;
                 // `Set` stores exactly `value`'s type; a compound op reads
                 // the global back first, at the type `kind` operates on
@@ -464,7 +479,7 @@ impl FnLower<'_> {
                 index,
                 kind: ik,
             } => {
-                if let hir::ExprKind::Global(g) = &base.kind {
+                if let hir::Place::Global(g, gty) = base.as_ref() {
                     // Real "take" (OBI-108 CTO review of PR #8): do not
                     // materialize the container into an ordinary register
                     // at all for the write side. The old codegen emitted
@@ -480,7 +495,13 @@ impl FnLower<'_> {
                     // so the one clone the interpreter's COW check can
                     // still trigger is a real one — something else
                     // actually held a second reference — not this pattern
-                    // itself.
+                    // itself. This is the one-level case only
+                    // (`global[i] = v`); a chain rooted in a global two or
+                    // more levels down (`global[i][j] = v`) falls through
+                    // to the general take/put-back lowering below, which
+                    // still keeps every level's own copy-on-write ownership
+                    // (§5.2.1 rule 3), just without this fast path's single
+                    // VM step for the outermost global.
                     let index_r = self.expr(index)?;
                     let v = self.expr(value)?;
                     let final_r = if matches!(op, hir::AssignOp::Set) {
@@ -493,11 +514,11 @@ impl FnLower<'_> {
                         // ordinary read-only global load is fine here —
                         // it is never followed by a mutation of that
                         // register.
-                        let base_r = self.new_reg(base.ty.clone());
+                        let base_r = self.new_reg(gty.clone());
                         self.emit(Inst::LoadGlobal {
                             dst: base_r,
                             global: g.clone(),
-                            ty: base.ty.clone(),
+                            ty: gty.clone(),
                         });
                         let elem_ty = elem_type_of(&self.reg_types[base_r as usize]);
                         let cur = self.new_reg(elem_ty.clone());
@@ -525,9 +546,22 @@ impl FnLower<'_> {
                     });
                     return Ok(());
                 }
-                let base_r = self.expr(base)?;
                 let index_r = self.expr(index)?;
                 let v = self.expr(value)?;
+                // Take → mutate → put back (spec r5 §5.2.1 rule 3): read the
+                // container out of `base` (its own register for a local, a
+                // fresh load for a global or a nested element — see
+                // `take_place`), mutate that one register in place, then
+                // write it back through every level up to the root
+                // variable. No level is left holding a second, stale
+                // reference to the container after this returns, and
+                // nothing with side effects (a call in an index expression)
+                // is evaluated more than once. The direct single-level
+                // global case (`global[i] = v`) never reaches here — it
+                // takes the `Op::IndexSetGlobal` fast path above; this
+                // covers locals and any chain nested two or more levels
+                // deep, including one rooted in a global.
+                let (base_r, taken) = self.take_place(base)?;
                 let final_r = if matches!(op, hir::AssignOp::Set) {
                     v
                 } else {
@@ -558,12 +592,88 @@ impl FnLower<'_> {
                 // Value semantics (spec r5 D24): `IndexSet` mutates
                 // `base_r`'s own register in place (copy-on-write), which
                 // is *a copy* of whatever `base` read from, not a shared
-                // reference back to it. The single-level global case is
-                // handled above (`Op::IndexSetGlobal`, OBI-108); a chain
-                // rooted in a global two or more levels down
-                // (`global[i][j] = v`) still needs the fuller place-write
-                // lowering tracked on OBI-53.
+                // reference back to it. `put_back_place` writes that copy
+                // back through every level up to the root variable.
+                self.put_back_place(&taken, base_r);
                 Ok(())
+            }
+        }
+    }
+
+    /// The "take" half of §5.2.1 rule 3: a register holding `place`'s
+    /// current container value, ready to mutate in place, plus a
+    /// [`TakenPlace`] recording exactly the registers used to get there (so
+    /// `put_back_place` never re-evaluates an index expression or reloads a
+    /// global — each place component is read at most once per assignment,
+    /// matching "place evaluated once", §5.2.1 rule 1). A local's own
+    /// register is reused directly: mutating it needs no write-back at all.
+    fn take_place(&mut self, place: &hir::Place) -> Result<(Reg, TakenPlace), Unsupported> {
+        match place {
+            hir::Place::Local(id) => Ok((*id, TakenPlace::Local)),
+            hir::Place::Global(g, ty) => {
+                let dst = self.new_reg(ty.clone());
+                self.emit(Inst::LoadGlobal {
+                    dst,
+                    global: g.clone(),
+                    ty: ty.clone(),
+                });
+                Ok((dst, TakenPlace::Global(g.clone(), ty.clone())))
+            }
+            hir::Place::Index { base, index, kind } => {
+                let index_r = self.expr(index)?;
+                let (base_r, base_taken) = self.take_place(base)?;
+                let elem_ty = elem_type_of(&self.reg_types[base_r as usize]);
+                let dst = self.new_reg(elem_ty);
+                self.emit(Inst::Index {
+                    dst,
+                    base: base_r,
+                    index: index_r,
+                    kind: *kind,
+                });
+                Ok((
+                    dst,
+                    TakenPlace::Index {
+                        base: Box::new(base_taken),
+                        base_reg: base_r,
+                        index_reg: index_r,
+                        kind: *kind,
+                    },
+                ))
+            }
+        }
+    }
+
+    /// The "put back" half: after `reg` (the register `take_place` handed
+    /// back for `taken`) has been mutated, write it back to wherever it
+    /// needs to end up so the write is visible through the place's name. A
+    /// local needs nothing (its own register was mutated in place, and is
+    /// still that same local); a global needs a `StoreGlobal`; a nested
+    /// element needs an `IndexSet` into its own taken base register,
+    /// followed by that base's own put-back — one instruction per level,
+    /// however deep the path is, and no re-reads.
+    fn put_back_place(&mut self, taken: &TakenPlace, reg: Reg) {
+        match taken {
+            TakenPlace::Local => {}
+            TakenPlace::Global(g, ty) => {
+                self.emit(Inst::StoreGlobal {
+                    global: g.clone(),
+                    ty: ty.clone(),
+                    src: reg,
+                });
+            }
+            TakenPlace::Index {
+                base,
+                base_reg,
+                index_reg,
+                kind,
+            } => {
+                self.emit(Inst::IndexSet {
+                    base: *base_reg,
+                    index: *index_reg,
+                    kind: *kind,
+                    src: reg,
+                });
+                self.put_back_place(base, *base_reg);
             }
         }
     }

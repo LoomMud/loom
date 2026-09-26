@@ -78,7 +78,7 @@ fn diamond_shares_variables_and_dominant_override_wins() {
     let body = &d.hir.fns[0].body.stmts;
     match &body[0].kind {
         StmtKind::Assign {
-            place: loom_compiler::hir::Place::Global(g),
+            place: loom_compiler::hir::Place::Global(g, _),
             ..
         } => assert_eq!(&*g.owner, "/a"),
         other => panic!("{other:?}"),

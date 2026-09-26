@@ -1,0 +1,11 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+fn make() -> [int] {
+    return [1, 2, 3]
+}
+
+fn f() {
+    // no place to write the mutated array back to: `make()` returns a
+    // temporary, not a variable (spec r5 §5.2.1 rule 3).
+    make()[0] = 9
+}
