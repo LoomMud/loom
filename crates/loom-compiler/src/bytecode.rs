@@ -250,11 +250,19 @@ pub enum Op {
 // ---------------------------------------------------------------------
 
 const MAGIC: [u8; 4] = *b"WFBC";
+/// Bytecode format version (spec r5 §5.9.1 rule 4): bumped whenever the
+/// on-disk encoding changes shape (a new op, a new field, a reordering),
+/// so a future format change is a version bump the decoder rejects, never
+/// a silent reinterpretation of old bytes under a new meaning. Not the
+/// same thing as a program's semantic version (§7.3); this is the byte
+/// format only.
+const FORMAT_VERSION: u32 = 1;
 const MAX_TY_DEPTH: u32 = 64;
 
 pub fn encode(m: &Module) -> Vec<u8> {
     let mut w = Writer::default();
     w.buf.extend_from_slice(&MAGIC);
+    w.put_varu32(FORMAT_VERSION);
     w.put_str(&m.path);
     w.put_varu32(m.strings.len() as u32);
     for s in &m.strings {
@@ -307,6 +315,12 @@ pub fn decode(bytes: &[u8]) -> Result<Module, DecodeError> {
     let magic = r.take(4)?;
     if magic != MAGIC {
         return Err(DecodeError("bad magic".into()));
+    }
+    let version = r.get_varu32()?;
+    if version != FORMAT_VERSION {
+        return Err(DecodeError(format!(
+            "unsupported bytecode format version {version} (this driver reads version {FORMAT_VERSION})"
+        )));
     }
     let path: Rc<str> = Rc::from(r.get_str()?);
     let n_strings = r.get_varu32()? as usize;
@@ -1378,6 +1392,31 @@ mod tests {
     fn decode_rejects_bad_magic() {
         assert!(decode(b"xxxx").is_err());
         assert!(decode(b"").is_err());
+    }
+
+    #[test]
+    fn decode_rejects_unknown_format_version() {
+        // Spec r5 §5.9.1 rule 4: a version field follows `WFBC`; the decoder
+        // must reject a version it does not understand rather than
+        // silently reinterpreting the bytes that follow.
+        let m = Module {
+            path: Rc::from("/x"),
+            strings: vec![],
+            consts: vec![],
+            functions: vec![],
+        };
+        let mut bytes = encode(&m);
+        // Byte 4 is the (single-byte varu32) format version right after the
+        // 4-byte magic; bump it to a version this build does not know.
+        assert_eq!(bytes[4], FORMAT_VERSION as u8);
+        bytes[4] = (FORMAT_VERSION as u8) + 1;
+        let err = decode(&bytes).expect_err("unknown version must be rejected");
+        assert!(
+            err.0.contains("version"),
+            "error should mention the version: {err:?}"
+        );
+        // The valid version still decodes.
+        assert!(decode(&encode(&m)).is_ok());
     }
 
     #[test]
