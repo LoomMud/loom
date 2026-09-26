@@ -55,6 +55,22 @@ pub enum NetCommand {
     Close(ConnId),
 }
 
+/// Output framing: the world sends text verbatim and owns its line breaks
+/// (`send(ob, "...\n")`); on the wire every `\n` becomes telnet's `\r\n`.
+/// Nothing is appended, so prompts without a newline stay on the same line.
+fn to_wire(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 8);
+    let mut prev = 0_u8;
+    for &b in text.as_bytes() {
+        if b == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(b);
+        prev = b;
+    }
+    out
+}
+
 #[derive(Debug)]
 enum ConnControl {
     Send(String),
@@ -176,10 +192,7 @@ async fn run_connection(
             Some(control) = control_rx.recv() => {
                 match control {
                     ConnControl::Send(text) => {
-                        if writer.write_all(text.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        if writer.write_all(b"\r\n").await.is_err() {
+                        if writer.write_all(&to_wire(&text)).await.is_err() {
                             break;
                         }
                     }
@@ -426,6 +439,14 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
+    fn output_translates_newlines_and_appends_nothing() {
+        assert_eq!(to_wire("a\nb\n"), b"a\r\nb\r\n");
+        assert_eq!(to_wire("already\r\n"), b"already\r\n");
+        assert_eq!(to_wire("> "), b"> ");
+        assert_eq!(to_wire(""), b"");
+    }
+
+    #[test]
     fn strips_negotiation_bytes_and_refuses() {
         let mut codec = TelnetCodec::new(4096, 20, 5.0);
         let outcome = codec.feed(&[IAC, WILL, 1, b'h', b'i', b'\n']);
@@ -502,7 +523,9 @@ mod tests {
         let echo = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 if let NetEvent::Line(conn, line) = event {
-                    let _ = cmd_tx.send(NetCommand::Send(conn, line)).await;
+                    let _ = cmd_tx
+                        .send(NetCommand::Send(conn, format!("{line}\n")))
+                        .await;
                 }
             }
         });
@@ -534,7 +557,9 @@ mod tests {
         let echo = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 if let NetEvent::Line(conn, line) = event {
-                    let _ = cmd_tx.send(NetCommand::Send(conn, line)).await;
+                    let _ = cmd_tx
+                        .send(NetCommand::Send(conn, format!("{line}\n")))
+                        .await;
                 }
             }
         });
@@ -600,12 +625,13 @@ mod tests {
                     NetEvent::Line(id, _) => {
                         if Some(id) == slow_conn {
                             for i in 0..200 {
-                                let _ =
-                                    cmd_tx.send(NetCommand::Send(id, format!("spam-{i}"))).await;
+                                let _ = cmd_tx
+                                    .send(NetCommand::Send(id, format!("spam-{i}\n")))
+                                    .await;
                             }
                         }
                         if Some(id) == fast_conn {
-                            let _ = cmd_tx.send(NetCommand::Send(id, "ok".to_string())).await;
+                            let _ = cmd_tx.send(NetCommand::Send(id, "ok\n".to_string())).await;
                         }
                     }
                     NetEvent::Disconnected(id) => {
