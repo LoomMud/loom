@@ -166,6 +166,50 @@ fn compound_assign_to_global() {
     verify(&m).expect("verify");
 }
 
+/// r5 D24: containers are copy-on-write values, so `IndexSet` mutates a
+/// register that is *a copy* of what `LoadGlobal` produced, not the global
+/// storage itself. An index-assign into a global container (`exits[dir] =
+/// dest`) must therefore also `StoreGlobal` the mutated register back, or
+/// the edit is invisible to every other read of that global (found by the
+/// `loom-vm` end-to-end test running this exact shape against the VM).
+#[test]
+fn index_assign_into_a_global_container_writes_it_back() {
+    let m = compile_one(
+        r#"
+        var exits: {string: string} = {:}
+        pub fn add_exit(dir: string, dest: string) {
+            exits[dir] = dest
+        }
+        "#,
+    );
+    verify(&m).expect("verify");
+    let f = m
+        .functions
+        .iter()
+        .find(|f| &*m.strings[f.name as usize] == "add_exit")
+        .unwrap();
+    let has_index_set = f
+        .code
+        .iter()
+        .any(|op| matches!(op, crate::bytecode::Op::IndexSet { .. }));
+    let store_global_after_index_set = f
+        .code
+        .iter()
+        .position(|op| matches!(op, crate::bytecode::Op::IndexSet { .. }))
+        .and_then(|i| f.code.get(i + 1))
+        .is_some_and(|op| matches!(op, crate::bytecode::Op::StoreGlobal { .. }));
+    assert!(
+        has_index_set,
+        "expected an IndexSet op:\n{}",
+        crate::disasm::module(&m)
+    );
+    assert!(
+        store_global_after_index_set,
+        "IndexSet into a global must be followed by a StoreGlobal to write the mutated copy back:\n{}",
+        crate::disasm::module(&m)
+    );
+}
+
 #[test]
 fn safe_call_other() {
     let files = [

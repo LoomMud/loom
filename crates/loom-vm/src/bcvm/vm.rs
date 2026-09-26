@@ -480,7 +480,11 @@ impl<'a, H: Host> Interpreter<'a, H> {
     /// Efuns fundamental enough (no privilege gate, pure over values) to
     /// inline in the interpreter rather than round-trip through [`Host`]:
     /// `len` backs every `for` loop's bound check (see codegen's `IterElems`
-    /// lowering), so it is on the hot path.
+    /// lowering), so it is on the hot path; `split`/`join`/`keys`/`trim` are
+    /// the same handful of pure string/map efuns the Phase 0 evaluator
+    /// implements inline (`crate::efuns`), kept here so a self-contained
+    /// program (no `World`/`Host` needed) can still run real `.wf` string
+    /// processing end to end — see the `bcvm::compile` integration test.
     fn call_efun(&self, name: &str, args: &[Value]) -> Option<R<Value>> {
         fn len_of(v: &Value) -> Option<i64> {
             if let Some(s) = v.as_str() {
@@ -500,6 +504,51 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     }
                 },
                 None => Err(self.err_with_trace("len(): missing argument")),
+            }),
+            "split" => Some((|| {
+                let s = args[0]
+                    .as_str()
+                    .ok_or_else(|| self.err_with_trace("split(): expected string"))?;
+                let sep = args[1]
+                    .as_str()
+                    .ok_or_else(|| self.err_with_trace("split(): expected string"))?;
+                if sep.is_empty() {
+                    return Err(self.err_with_trace("split(): separator must not be empty"));
+                }
+                Ok(Value::array(s.split(sep).map(Value::str).collect()))
+            })()),
+            "join" => Some((|| {
+                let a = args[0].as_array().ok_or_else(|| {
+                    self.err_with_trace(format!(
+                        "join(): expected array, got {}",
+                        args[0].type_name()
+                    ))
+                })?;
+                let sep = args[1]
+                    .as_str()
+                    .ok_or_else(|| self.err_with_trace("join(): expected string"))?;
+                let mut parts = Vec::with_capacity(a.len());
+                for v in a {
+                    let s = v.as_str().ok_or_else(|| {
+                        self.err_with_trace(format!(
+                            "join(): expected an array of strings, found {}",
+                            v.type_name()
+                        ))
+                    })?;
+                    parts.push(s.to_string());
+                }
+                Ok(Value::str(&parts.join(sep)))
+            })()),
+            "keys" => Some(match args[0].as_map() {
+                Some(m) => Ok(Value::array(
+                    m.entries.iter().map(|(k, _)| k.clone()).collect(),
+                )),
+                None => Err(self
+                    .err_with_trace(format!("keys(): expected map, got {}", args[0].type_name()))),
+            }),
+            "trim" => Some(match args[0].as_str() {
+                Some(s) => Ok(Value::str(s.trim())),
+                None => Err(self.err_with_trace("trim(): expected string")),
             }),
             _ => None,
         }
