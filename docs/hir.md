@@ -1,7 +1,7 @@
-# Typed HIR (loom-compiler → V2 codegen) — draft r1
+# Typed HIR (loom-compiler → V2 codegen) — r2
 
-Status: **draft for review** (OBI-24 → Aragorn, and the V2 owner before codegen
-starts). Source of truth for the Rust types: `crates/loom-compiler/src/hir.rs`.
+Status: **agreed** (CTO review on OBI-24, r1 approved 2026-09-26; r2 applies
+decision D23 and conditions C1–C4 from that review). Source of truth for the Rust types: `crates/loom-compiler/src/hir.rs`.
 Run `loom-cli check <mudlib> --dump-hir` to see the HIR of real programs;
 `crates/loom-compiler/tests/golden/hir_*.out` are checked-in examples.
 
@@ -33,9 +33,9 @@ recompile when a parent's interface changes.
 | `GlobalRef { owner, name }` | A program variable keyed by **(declaring program, name)** — the §7.3 state-migration key. |
 | `Callee::Virtual { name }` | Unqualified call to a non-private function: look up `name` on the running object's *current* program (hot-reload friendly). |
 | `Callee::Static { program, name }` | Private functions, `super::f()`, `label::f()`: a fixed program's body. `program` is the *declaring* program (e.g. `super::g()` reaching `/a` through `/b` is `Static{/a, g}`). |
-| `CallEfun { name, privilege, args }` | `privilege` is the efun's class (§5.5); the VM gate goes here. |
+| `CallEfun { name, privilege, args }` | `privilege` is **advisory** (C2): diagnostics and tooling only. The VM gate looks the class up in its own efun registry by efun identity and never reads it from HIR or bytecode; the verifier checks the two agree. |
 | `CallOther { recv, name, args, safe }` | `ob.f()` / `ob?.f()`; late-bound by name, result `any`. |
-| `CallValue { callee, args }`, `FnRef(Callee)` | Function values (`add_verb("wield", do_wield)`); type `fn(A) -> R`. |
+| `CallValue { callee, args }`, `FnRef(Callee)` | Function values (`add_verb("wield", do_wield)`); type `fn(A) -> R`. Semantics in "Function values" below. |
 | `Cast(expr)` | Runtime-checked conversion to `Expr::ty`: **the gradual boundary**. |
 | `Index { kind: Array \| String \| Map \| MapPresent \| Dyn }` | `Map`: missing key reads `null`, type `V?`. `MapPresent`: key proven by an enclosing `k in m`; type `V`, but codegen must still raise if the key vanished. |
 | `Unary/Binary { op, kind: OpKind }` | Operand kind resolved (`Int`, `Float`, `Str`, `Bool`, `Array`, `Map`, `Object`, `Generic`, `Dyn`) so codegen picks typed instructions; only `Dyn` dispatches at runtime. `And`/`Or`/`Coalesce` are separate short-circuit nodes. |
@@ -46,15 +46,38 @@ recompile when a parent's interface changes.
    and `CallOther` (both intentionally late-bound, §5.4).
 2. A program with diagnostics produces **no HIR**; `Ty::Error` never appears in
    emitted HIR (property-tested in `tests/props.rs`).
-3. Soundness needs runtime checks only at `Cast`, `IndexKind::MapPresent`,
+3. **Static types are an optimisation contract, not a memory-safety
+   guarantee (C1).** Containers have reference semantics and are invariant
+   only up to `any`, so an `[any]` alias can store an `int` into an array
+   that was cast to `[string]`. Codegen therefore emits **tag-safe** typed
+   instructions (`AddInt`, `IndexArr`, …): the fast path assumes the static
+   kind, and a value with the wrong tag raises a runtime error — never a
+   panic, never undefined behaviour. The *points where a well-typed program
+   is expected to need a check* are `Cast`, `IndexKind::MapPresent`,
    `OpKind::Dyn`/`IterKind::Dyn`/`IndexKind::Dyn`, `CallOther` (missing
-   function / non-`pub`), and `CallValue` on an `any` callee. Everything
-   else is statically typed: codegen may emit unchecked typed instructions.
-   (Integer overflow, index bounds, destructed objects stay runtime errors.)
+   function / non-`pub`) and `CallValue` on an `any` callee; everywhere else
+   a tag mismatch indicates an `any` alias and is still caught by the
+   typed instruction. (Integer overflow, index bounds, destructed objects
+   stay runtime errors.)
+   **`Cast` is shallow**: it checks the value's kind and nullability only
+   (`[string]` ⇒ "is an array"), O(1). Element types are not walked; element
+   reads are covered by the tag-safe instructions above.
 4. Control flow: a non-void function's body never falls off the end (checked),
    so codegen needs no implicit `return null` for typed functions.
 5. `LocalId`s are dense per function; `Function::locals[i].ty` is the declared
    type (narrowing never changes a slot's type, only the type of a *use*).
+
+## Function values (C3)
+
+Evaluating `FnRef(callee)` (and, with V0, a closure literal) creates a value
+that binds **(creator object, callee)** at creation time. Invoking it — from
+any object, e.g. an `add_verb` callback run by the player object — executes
+with `self` = the creator and the creator's program privileges, **not** the
+caller's. For `Callee::Virtual` the name is looked up at call time on the
+creator's *current* program (hot-reload friendly); `Static` runs the fixed
+body. If the creator has been destructed, the call raises `object was
+destructed`. A function value is therefore a capability: its runtime
+representation and invocation path are a V3/VM security review item.
 
 ## Defaults are callee-side
 
@@ -82,27 +105,28 @@ means the caller cannot know which override's defaults apply.
   names the explicit comparison for the offending type.
 - Overrides: `override` required and checked (Phase 0 rules), plus: same
   parameter types, compatible return type, may not narrow `pub`.
+- **Stored object references (D23):** a program variable (later also struct
+  fields) whose type would be `object` is an error — it must be `object?`,
+  because it outlives the execution and the object may be destructed.
+  Locals, parameters, return values and container elements may be `object`.
+  VM semantics: a stale handle compares `== null` as true anywhere;
+  dereferencing it through an `object`-typed value (CallOther, an efun object
+  argument) raises `object was destructed`, never a panic.
 
-## Decisions requested (Aragorn)
+## Decisions (CTO review, OBI-24)
 
-1. **Stored `object` references.** Spec §5.2 says the static type of any
-   stored reference is `object?` because destructed objects read as `null`.
-   Implemented instead: a declared `object` stays `object`; destructed
-   references are a runtime error at use (call/efun), not a static one.
-   Treating every stored reference as `object?` would reject most of Warp
-   (`for ob in inventory(env) { ob.visible() }`). Proposal: keep this, and
-   make the VM raise "object was destructed" when a destructed ref is read
-   from an `object`-typed slot. Needs your call.
-2. **`m[k]` is `V?`** (matches runtime: missing key reads `null`), softened
-   by `MapPresent` after `k in m`. Alternative: `V` with a runtime error on a
-   missing key. I prefer `V?` (strict, honest).
-3. **Override visibility**: an override of a `pub` function must be `pub`.
-   Needed because `ob.f()` only reaches `pub`; the VM tworoom fixture had
-   this bug (`override fn long` in rooms) and was fixed in this change.
-4. **Efun signatures** live in `loom-compiler::efuns` until V6 (OBI-33)
-   builds the unified registry (types + tick cost + privilege). A test keeps
-   names/arity in sync with `loom-vm`. This is the "efun metadata" seam —
-   confirming it is OK for V1 to own the compile-time half until V6.
+1. **D23 stored `object` references** — see the type-system section;
+   supersedes the spec §5.2 wording "every stored reference is `object?`"
+   (spec text update tracked by the CTO).
+2. **`m[k]` is `V?`**, with `IndexKind::MapPresent` after `k in m`.
+3. **An override of a `pub` function must be `pub`.**
+4. **Efun metadata seam:** `loom-compiler::efuns` owns the compile-time half
+   (types, privilege for diagnostics) until V6 (OBI-33) builds the unified
+   registry, subject to C2 (the VM registry is authoritative).
+5. **C4 (planned for V7 hot reload):** `Program` gains an interface
+   fingerprint (hash of the exported `ProgramInfo`: function signatures,
+   variable types, linearization) so "a child recompiles only when a parent's
+   interface changes" is checkable mechanically. Not implemented in r2.
 
 ## Pending the V0 grammar (OBI-23)
 

@@ -100,6 +100,22 @@ pub fn check_program(
                 Ty::Error
             }
         };
+        // D23 (OBI-24 CTO review): a program variable outlives executions, so
+        // an object it holds may be destructed by the time it is read.
+        if ty == Ty::Object {
+            cx.err_hint(
+                d.name.span,
+                format!(
+                    "program variable `{}` stores an object reference, so its type must be `object?`",
+                    v.name
+                ),
+                format!(
+                    "stored object references must be nullable (the object may be destructed); \
+                     declare `var {n}: object?` and narrow before use: `let o = {n}; if o != null {{ … }}`",
+                    n = v.name
+                ),
+            );
+        }
         cx.var_tys.insert(v.name.clone(), ty);
     }
 
