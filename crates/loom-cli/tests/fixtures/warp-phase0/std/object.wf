@@ -1,0 +1,29 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+//
+// /std/object: base of everything in the world.
+
+var name: string = "object"
+
+// Apply: runs once after load/clone. Not re-run on update.
+fn create() {
+}
+
+pub fn set_name(new_name: string) {
+    name = new_name
+}
+
+pub fn query_name() -> string {
+    return name
+}
+
+// One-line description used in room listings.
+pub fn short() -> string {
+    return name
+}
+
+// Whether `look` lists this object. Players override this so that
+// disconnected players (Phase 0 has no destruct) are not shown.
+pub fn visible() -> bool {
+    return true
+}

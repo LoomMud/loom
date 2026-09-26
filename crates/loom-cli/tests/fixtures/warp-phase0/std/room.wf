@@ -1,0 +1,50 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+//
+// /std/room: base room. Rooms override short(), describe() and exits().
+// These are functions, not variables set in create(), so `update` of a room
+// changes its text and exits immediately (create() is not re-run on reload).
+
+inherit /std/object
+
+pub override fn short() -> string {
+    return "A featureless room"
+}
+
+pub fn describe() -> string {
+    return "Nothing to see here."
+}
+
+// Direction -> destination room path.
+pub fn exits() -> {string: string} {
+    return {:}
+}
+
+pub fn exit_dest(dir: string) -> string? {
+    let ex = exits()
+    if dir in ex {
+        return ex[dir]
+    }
+    return null
+}
+
+pub fn long() -> string {
+    let sep = ", "
+    let dirs = keys(exits())
+    var text = $"{short()}\n{describe()}"
+    if len(dirs) == 0 {
+        text += "\nThere are no obvious exits."
+    } else {
+        text += $"\nObvious exits: {join(dirs, sep)}."
+    }
+    return text
+}
+
+// Send text to everything in the room except `exclude`.
+pub fn tell(text: string, exclude: object? = null) {
+    for ob in inventory(self()) {
+        if ob != exclude {
+            send(ob, $"{text}\n")
+        }
+    }
+}

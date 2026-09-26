@@ -1,0 +1,16 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+//
+// /secure/master: the master object. Phase 0 only answers connect().
+// No login yet: every connection gets a fresh guest player (guest1, guest2, ...).
+
+var guests: int = 0
+
+// Apply: called by the driver for each new connection. The driver binds the
+// connection to the returned object and then calls logon() on it.
+fn connect() -> object {
+    guests += 1
+    let player = clone_object("/std/player")
+    player.set_name($"guest{guests}")
+    return player
+}

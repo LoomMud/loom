@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+//
+// /domains/start/garden: north of the hall.
+
+inherit /std/room
+
+pub override fn short() -> string {
+    return "A Walled Garden"
+}
+
+pub override fn describe() -> string {
+    return "Neat beds of herbs line a gravel path. Old brick walls keep the wind out. The archway back into the hall lies to the south."
+}
+
+pub override fn exits() -> {string: string} {
+    return {"south": "/domains/start/hall"}
+}

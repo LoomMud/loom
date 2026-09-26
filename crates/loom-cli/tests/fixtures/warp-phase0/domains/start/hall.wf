@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+//
+// /domains/start/hall: where new connections arrive.
+
+inherit /std/room
+
+pub override fn short() -> string {
+    return "The Entrance Hall"
+}
+
+pub override fn describe() -> string {
+    return "A high-ceilinged hall of pale stone. Morning light spills in through an open archway to the north, and you can smell cut grass."
+}
+
+pub override fn exits() -> {string: string} {
+    return {"north": "/domains/start/garden"}
+}
