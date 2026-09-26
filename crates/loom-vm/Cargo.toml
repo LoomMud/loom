@@ -13,4 +13,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-thiserror = "2.0.17"
+loom-syntax = { version = "0.0.1", path = "../loom-syntax" }

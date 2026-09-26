@@ -1,0 +1,52 @@
+// Minimal player: a handful of verbs, enough to walk and update.
+var name: string = "guest"
+persistent var moves: int = 0
+
+pub fn logon() {
+    send(self, "Welcome to Loom!\n")
+    move_to(load_object("/domains/start/hall"))
+    send(self, environment().look())
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "look" {
+        send(self, environment().look())
+    } else if verb == "go" and len(words) == 2 {
+        let dest = environment().exit_dest(words[1])
+        if dest == null {
+            send(self, "You can't go that way.\n")
+            return
+        }
+        move_to(load_object(dest))
+        moves += 1
+        send(self, environment().look())
+    } else if verb == "update" and len(words) == 2 {
+        let err = compile_object(words[1])
+        if err == null {
+            send(self, $"Updated {words[1]}.\n")
+        } else {
+            send(self, $"{err}\n")
+        }
+    } else if verb == "name" and len(words) == 2 {
+        name = words[1]
+        send(self, $"You are now {name}.\n")
+    } else if verb == "loop" {
+        var i = 0
+        while true {
+            i += 1
+        }
+    } else if verb == "recurse" {
+        dive(0)
+    } else {
+        send(self, "What?\n")
+    }
+}
+
+fn dive(n: int) -> int {
+    return dive(n + 1)
+}
+
+pub fn net_dead() {
+}

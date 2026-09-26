@@ -1,0 +1,11 @@
+inherit /std/room
+
+override fn create() {
+    super::create()
+    set_short("The Great Hall")
+    add_exit("north", "/domains/start/yard")
+}
+
+override fn long() -> string {
+    return "A vast hall with a vaulted ceiling."
+}
