@@ -32,11 +32,23 @@ jobs:
         with:
           fetch-depth: 0
       - name: DCO sign-off
+        # Check only the commits this event introduces. On push, a scan of all
+        # history would re-flag commits already on main (OBI-57). A zero or
+        # unknown `before` (new branch / force push) falls back to HEAD.
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            scripts/check-dco.sh "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          if [ "$EVENT" = "pull_request" ]; then
+            scripts/check-dco.sh "$PR_BASE..$PR_HEAD"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+              && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            scripts/check-dco.sh "$BEFORE..$AFTER"
           else
-            scripts/check-dco.sh
+            scripts/check-dco.sh HEAD
           fi
   hygiene:
     runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
