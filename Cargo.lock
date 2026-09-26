@@ -709,6 +709,7 @@ dependencies = [
 name = "loom-vm"
 version = "0.0.1"
 dependencies = [
+ "loom-compiler",
  "loom-syntax",
 ]
 

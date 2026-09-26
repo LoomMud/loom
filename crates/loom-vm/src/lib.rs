@@ -9,6 +9,7 @@
 //! [`Host`]. See `docs/weft-grammar.md` (Part 2) for the supported subset;
 //! everything else is rejected by [`subset::phase0_gate`].
 
+pub mod bcvm;
 pub mod efuns;
 pub mod host;
 pub mod interp;
