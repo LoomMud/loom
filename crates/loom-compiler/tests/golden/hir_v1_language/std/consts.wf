@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 // Clean: consts other programs import (OBI-24 V0 wiring).
 pub const MAX: int = 10
 pub const GREETING = "hi"

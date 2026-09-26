@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 Oberfield
-# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Fails if any non-merge commit in RANGE lacks a Signed-off-by trailer that
 # matches its author (spec §4.4). Usage: scripts/check-dco.sh [RANGE]

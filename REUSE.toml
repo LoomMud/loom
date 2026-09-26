@@ -3,4 +3,4 @@ version = 1
 [[annotations]]
 path = ["Cargo.lock", "README.md", "CONTRIBUTING.md", ".gitignore", "crates/*/fuzz/Cargo.lock", "crates/*/fuzz/.gitignore", ".github/**", "docs/**", "crates/*/tests/golden/**", "crates/*/tests/fixtures/**"]
 SPDX-FileCopyrightText = "2026 Oberfield"
-SPDX-License-Identifier = "LicenseRef-Oberfield-Proprietary"
+SPDX-License-Identifier = "AGPL-3.0-only"

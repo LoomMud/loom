@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Object table: a slab of objects addressed by generational ids (§3.4).
 

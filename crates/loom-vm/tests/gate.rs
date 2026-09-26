@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The Phase 0 gate (OBI-23): every v1 construct that `loom-syntax` parses
 //! but the Phase 0 evaluator cannot run is a spanned `not yet supported`

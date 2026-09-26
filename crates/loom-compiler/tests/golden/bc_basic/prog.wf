@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 // A small program exercising arithmetic, a branch, a loop and a call, for
 // the disassembler golden test (`bc_*` in tests/golden/).
 

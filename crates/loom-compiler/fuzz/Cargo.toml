@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Oberfield
-# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # `cargo fuzz` target for the bytecode trust boundary: `decode` (a Module
 # read from anywhere at rest) followed by `verify` (spec Sec5.8/Sec5.9). Not a
@@ -11,7 +11,7 @@
 name = "loom-compiler-fuzz"
 version = "0.0.0"
 edition = "2024"
-license = "LicenseRef-Oberfield-Proprietary"
+license = "AGPL-3.0-only"
 publish = false
 
 [package.metadata]

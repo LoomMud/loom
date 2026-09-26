@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Recursive-descent + Pratt parser for the Weft v1 grammar (spec v2 §5.3,
 //! reference: `docs/weft-grammar.md`).

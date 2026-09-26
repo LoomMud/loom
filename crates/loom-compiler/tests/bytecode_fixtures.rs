@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Acceptance criterion: every Phase 0 mudlib program compiles to verified
 //! bytecode (codegen → assemble → verify, and a decode/encode round trip).

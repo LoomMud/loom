@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 //
 // /secure/master: the master object. Phase 0 only answers connect().
 // No login yet: every connection gets a fresh guest player (guest1, guest2, ...).

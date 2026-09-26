@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Oberfield
-# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+# SPDX-License-Identifier: AGPL-3.0-only
 # libFuzzer dictionary: Weft keywords and multi-char punctuation.
 kw_696e68657269740a="inherit"
 kw_696d706f72740a="import"

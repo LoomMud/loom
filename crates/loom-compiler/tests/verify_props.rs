@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Property tests at the bytecode trust boundary (spec: "fuzz the trust
 //! boundary"). `decode` sees bytes from anywhere a `Module` might one day

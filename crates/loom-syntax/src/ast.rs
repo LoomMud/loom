@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Weft abstract syntax tree (spec v2 §5.3, v1 grammar). Every node carries a
 //! [`Span`]. The tree is purely syntactic: names are not resolved and types

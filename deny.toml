@@ -1,9 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Oberfield
-# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+# SPDX-License-Identifier: AGPL-3.0-only
 #
-# Licence gate (spec §4.4): OSI-approved, compatible with both Apache-2.0 and
-# AGPL-3.0 outbound. No GPL/LGPL/AGPL until the board picks the licence; never
-# non-OSI (SSPL, BSL, CC-NC, "source-available"). Changing this list needs CTO review.
+# Licence gate (spec §4.4, board decision OBI-44): Loom is AGPL-3.0-only, so
+# every dependency must be OSI-approved AND compatible with AGPL-3.0 outbound.
+# Allowed: permissive (MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, BSL-1.0,
+# CC0-1.0), weak copyleft MPL-2.0 (GPL-compatible via §3.3), and the v3
+# GPL family (AGPL-3.0, GPL-3.0, LGPL-3.0; AGPL-3.0 §13 permits combining
+# with GPL-3.0). Never: GPL-2.0-only / LGPL-2.x-only, EPL, CDDL, SSPL, BUSL,
+# CC-NC, or other "source-available" terms. Changing this list needs CTO review.
 
 [graph]
 all-features = true
@@ -11,33 +15,33 @@ all-features = true
 [licenses]
 allow = [
     "MIT",
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "0BSD",
     "ISC",
     "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
     "Unicode-3.0",
+    "Unicode-DFS-2016",
     "MPL-2.0",
+    "LGPL-3.0-only",
+    "LGPL-3.0-or-later",
+    "GPL-3.0-only",
+    "GPL-3.0-or-later",
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
 ]
 confidence-threshold = 0.9
 unused-allowed-license = "allow"
-# Our own crates are proprietary until relicensing.
-[[licenses.exceptions]]
-allow = ["LicenseRef-Oberfield-Proprietary"]
-crate = "loom-syntax"
-[[licenses.exceptions]]
-allow = ["LicenseRef-Oberfield-Proprietary"]
-crate = "loom-vm"
-[[licenses.exceptions]]
-allow = ["LicenseRef-Oberfield-Proprietary"]
-crate = "loom-net"
-[[licenses.exceptions]]
-allow = ["LicenseRef-Oberfield-Proprietary"]
-crate = "loom-cli"
 
+# Also check our own (unpublished) workspace crates: each must declare
+# AGPL-3.0-only via `license.workspace = true`.
 [licenses.private]
-ignore = true
+ignore = false
 
 [bans]
 multiple-versions = "warn"

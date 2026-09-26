@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 // Clean: `import`/`const`, labelled + multiple inherit, and closure literals
 // (OBI-24 V0 wiring: the remaining V1 acceptance-criteria gaps).
 import /std/consts.{MAX, GREETING}

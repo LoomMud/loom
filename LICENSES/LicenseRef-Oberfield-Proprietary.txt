@@ -1,6 +1,0 @@
-Copyright (c) 2026 Oberfield. All rights reserved.
-
-This software is proprietary and confidential while in development. No licence
-is granted to use, copy, modify or distribute it without written permission
-from Oberfield. The company intends to relicense it under an OSI-approved
-licence before public release (Loom spec v2, §4.4).
