@@ -52,8 +52,40 @@ async fn run() -> Result<(), String> {
             };
             check(root, dump_hir)
         }
+        "disasm" => {
+            let args: Vec<String> = args.collect();
+            let (Some(root), Some(program)) = (args.first(), args.get(1)) else {
+                return Err("usage: loom disasm <mudlib-root> <program-path>".to_string());
+            };
+            disasm(PathBuf::from(root), program)
+        }
         other => Err(format!("unknown command: {other}")),
     }
+}
+
+/// `loom disasm <mudlib-root> <program-path>`: compile one program (and its
+/// ancestors) to verified bytecode and print its disassembly (spec §5.8;
+/// `crate::` here is `loom_compiler::disasm`). Exits non-zero (without a
+/// disassembly) if the program does not check, does not lower yet (a V2
+/// gap such as closures), or the assembled bytecode fails verification --
+/// that last case is a compiler bug, not a user error, and is reported as
+/// such.
+fn disasm(root: PathBuf, program: &str) -> Result<(), String> {
+    let normalized = loom_compiler::mudlib::normalize_path(program)?;
+    let mut session = loom_compiler::Session::new(loom_compiler::FsLoader { root });
+    let outcome = session.compile(&normalized);
+    let checked = match outcome {
+        loom_compiler::Outcome::Ok(c) => c,
+        loom_compiler::Outcome::Failed(r) => return Err(format!("{normalized}: has errors:\n{r}")),
+        loom_compiler::Outcome::Missing(r) => return Err(format!("{normalized}: {r}")),
+    };
+    let module =
+        loom_compiler::codegen::compile(&checked.hir).map_err(|e| format!("{normalized}: {e}"))?;
+    loom_compiler::verify::verify(&module).map_err(|e| {
+        format!("{normalized}: compiler bug: assembled bytecode failed verification: {e}")
+    })?;
+    print!("{}", loom_compiler::disasm::module(&module));
+    Ok(())
 }
 
 /// `loom check <mudlib-root>`: resolve and type-check every `.wf` file with

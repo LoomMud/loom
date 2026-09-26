@@ -26,6 +26,14 @@ fn render(dir: &Path, name: &str) -> String {
             out.push('\n');
         }
     }
+    if name.starts_with("bc_") {
+        for c in report.programs.values() {
+            let module = loom_compiler::codegen::compile(&c.hir).expect("codegen");
+            loom_compiler::verify::verify(&module).expect("verify");
+            out.push_str(&loom_compiler::disasm::module(&module));
+            out.push('\n');
+        }
+    }
     out
 }
 

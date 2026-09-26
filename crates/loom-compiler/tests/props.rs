@@ -141,6 +141,23 @@ proptest! {
             Ok(c) => {
                 let dump = loom_compiler::dump::program(&c.hir);
                 prop_assert!(!dump.contains("{error}"), "poison in clean HIR:\n{}\n{}", src, dump);
+                // Whatever the checker accepts, codegen either lowers it to
+                // *verified* bytecode, or declines with `Unsupported` (a
+                // known V2 gap, e.g. function values) - it must never
+                // produce bytecode the verifier rejects.
+                match loom_compiler::codegen::compile(&c.hir) {
+                    Ok(module) => {
+                        if let Err(e) = loom_compiler::verify::verify(&module) {
+                            prop_assert!(
+                                false,
+                                "codegen produced unverifiable bytecode: {e}\n{}\n{}",
+                                src,
+                                loom_compiler::disasm::module(&module)
+                            );
+                        }
+                    }
+                    Err(_unsupported) => {}
+                }
             }
             Err(diags) => {
                 prop_assert!(!diags.is_empty());

@@ -10,13 +10,18 @@
 //! [`SourceLoader`], and [`check_mudlib`] for `loom check`.
 //! The HIR contract is documented in [`hir`] and `docs/hir.md`.
 
+pub mod bytecode;
 pub mod check;
+pub mod codegen;
+pub mod disasm;
 pub mod dump;
 pub mod efuns;
 pub mod hir;
 pub mod interface;
+pub mod ir;
 pub mod mudlib;
 pub mod ty;
+pub mod verify;
 
 pub use check::{Checked, check_program};
 pub use interface::ProgramInfo;

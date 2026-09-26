@@ -1,0 +1,31 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// A small program exercising arithmetic, a branch, a loop and a call, for
+// the disassembler golden test (`bc_*` in tests/golden/).
+
+var total: int = 0
+
+pub fn add(a: int, b: int) -> int {
+    return a + b
+}
+
+pub fn clamp(x: int) -> int {
+    if x < 0 {
+        return 0
+    }
+    return x
+}
+
+pub fn sum_upto(n: int) -> int {
+    var i = 0
+    var s = 0
+    while i < n {
+        s += i
+        i += 1
+    }
+    return s
+}
+
+pub fn bump() {
+    total += 1
+}
