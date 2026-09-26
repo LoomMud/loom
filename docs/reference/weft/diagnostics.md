@@ -36,6 +36,7 @@ or retiring a code in `crates/loom-syntax/src/codes.rs`.
 | `W0007` | empty `{}` in interpolated string |
 | `W0008` | unterminated string literal |
 | `W0009` | unexpected character (LPC/C-style syntax not used by Weft) |
+| `W0010` | `{word}` is reserved for future use and cannot be used as a name |
 | `W0030` | expected one syntactic construct but found another token |
 | `W0032` | expected {what}, found keyword {kw} |
 | `W0033` | code is nested too deeply |
@@ -195,6 +196,8 @@ or retiring a code in `crates/loom-syntax/src/codes.rs`.
 | `W0290` | a field's default must be a constant literal |
 | `W0291` | const `{}`'s value must be a compile-time constant expression |
 | `W0292` | `{}` is imported from both {} and {} |
+| `W0293` | cannot write into an element of this expression |
+| `W0294` | a `persistent` variable's type cannot be or contain a function type (`{t}`) |
 
 ### `03xx` — link (efun arity, applies, unknown names)
 

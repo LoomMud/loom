@@ -1,0 +1,10 @@
+reserved_words_err.wf:1:4: error[W0010]: `async` is reserved for future use and cannot be used as a name
+  |
+1 | fn async() {
+  |    ^^^^^
+  = help: pick a different name; `async`/`await` are reserved for a future language feature (spec r5 §5.3)
+reserved_words_err.wf:2:9: error[W0010]: `await` is reserved for future use and cannot be used as a name
+  |
+2 |     let await = 1
+  |         ^^^^^
+  = help: pick a different name; `async`/`await` are reserved for a future language feature (spec r5 §5.3)

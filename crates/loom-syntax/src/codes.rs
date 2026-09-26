@@ -49,6 +49,7 @@ codes! {
     LEX_EMPTY_INTERPOLATED_STRING = "W0007", "empty `{}` in interpolated string";
     LEX_UNTERMINATED_STRING_LITERAL = "W0008", "unterminated string literal";
     LEX_UNEXPECTED_CHARACTER_LPC_C_STYLE = "W0009", "unexpected character (LPC/C-style syntax not used by Weft)";
+    LEX_RESERVED_WORD = "W0010", "`{word}` is reserved for future use and cannot be used as a name";
     PARSE_EXPECTED = "W0030", "expected one syntactic construct but found another token";
     PARSE_EXPECTED_WHAT_FOUND_KEYWORD_KW = "W0032", "expected {what}, found keyword {kw}";
     PARSE_CODE_NESTED_TOO_DEEPLY = "W0033", "code is nested too deeply";
@@ -202,6 +203,8 @@ codes! {
     CHECK_STRUCT_DEFAULT_NOT_A_CONSTANT = "W0290", "a field's default must be a constant literal";
     CHECK_CONST_VALUE_NOT_COMPILE_TIME_CONSTANT = "W0291", "const `{}`'s value must be a compile-time constant expression";
     CHECK_TYPE_IMPORTED_FROM_BOTH_AND = "W0292", "`{}` is imported from both {} and {}";
+    CHECK_CANNOT_WRITE_INTO_ELEMENT_OF_TEMPORARY = "W0293", "cannot write into an element of this expression";
+    CHECK_PERSISTENT_VARIABLE_CANNOT_HOLD_FUNCTION = "W0294", "a `persistent` variable's type cannot be or contain a function type (`{t}`)";
 
     // 03xx -- link (efun arity, applies, unknown names)
     LINK_DECLARED_TWICE_PROGRAM = "W0300", "`{}` is declared twice in this program";

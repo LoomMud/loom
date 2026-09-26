@@ -1,0 +1,3 @@
+fn async() {
+    let await = 1
+}
