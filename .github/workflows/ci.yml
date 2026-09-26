@@ -48,7 +48,9 @@ jobs:
         run: |
           set -euo pipefail
           version=8.24.2
-          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" -o gitleaks.tar.gz
-          tar -xzf gitleaks.tar.gz gitleaks
-          ./gitleaks git --redact --exit-code 1
+          workdir="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$workdir"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" -o "$workdir/gitleaks.tar.gz"
+          tar -xzf "$workdir/gitleaks.tar.gz" -C "$workdir" gitleaks
+          "$workdir/gitleaks" git --source . --redact --exit-code 1
       - uses: fsfe/reuse-action@v5
