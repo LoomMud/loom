@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.98"
+license = "LicenseRef-Oberfield-Proprietary"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"   # loom-vm may later opt out locally with a CTO-reviewed justification
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
