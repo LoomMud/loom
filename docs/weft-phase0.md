@@ -10,8 +10,12 @@ keeps this syntax.
 Check a mudlib without running it:
 
 ```
-loom-cli check <mudlib-root>     # parses + links every .wf file, exit 1 on errors
+loom-cli check <mudlib-root>     # resolves + type-checks every .wf file, exit 1 on errors
 ```
+
+Since OBI-24, `check` runs the Phase 1 static checker (`loom-compiler`, see
+`docs/hir.md`): strict types, nullability with flow narrowing, `bool`-only
+conditions. It is stricter than the Phase 0 runtime, so check-clean code runs.
 
 ## Programs and objects
 
