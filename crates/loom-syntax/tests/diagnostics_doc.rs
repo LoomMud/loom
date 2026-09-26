@@ -66,7 +66,8 @@ fn generate_table() -> String {
 
 #[test]
 fn diagnostics_doc_matches_the_registry() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/weft/diagnostics.md");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/weft/diagnostics.md");
     let table = generate_table();
 
     let existing = fs::read_to_string(&path).unwrap_or_default();
