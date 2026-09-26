@@ -4,7 +4,7 @@
 
 This repository is public and licensed under the **GNU Affero General Public License v3.0 only**
 (`AGPL-3.0-only`). The full text is in [`LICENSE`](LICENSE) (REUSE copy: `LICENSES/AGPL-3.0-only.txt`).
-Every file carries `SPDX-License-Identifier: AGPL-3.0-only`.
+Every file carries an SPDX header naming `AGPL-3.0-only` as its licence identifier.
 
 **External pull requests are not accepted for now.** Please do not open pull requests from forks; they
 will be closed unmerged. Issues, bug reports and feedback are welcome. We will revisit this (most likely
@@ -21,7 +21,7 @@ Applied from the first commit (spec v2 §4.4):
   Adding a licence to the allow-list requires CTO review.
 - **SPDX headers** on every source file:
   `SPDX-FileCopyrightText: 2026 Oberfield` and
-  `SPDX-License-Identifier: AGPL-3.0-only`. `reuse lint` gates CI.
+  an `SPDX-License-Identifier` tag with value `AGPL-3.0-only`. `reuse lint` gates CI.
 - **No secrets, credentials or unlicensed third-party assets.** `gitleaks` gates CI.
 - **`unsafe` is denied workspace-wide.** Any exception is local to `loom-vm`, justified in a comment, and CTO-reviewed.
 - Run `scripts/ci-local.sh` before pushing; it runs the same gates as CI.
