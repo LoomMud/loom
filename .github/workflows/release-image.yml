@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+
+name: release-image
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    env:
+      IMAGE: ghcr.io/loommud/loom
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny --version 0.18.5
+
+      - name: cargo deny (licenses, bans, sources, advisories)
+        run: cargo deny check licenses bans sources advisories
+
+      - name: Install syft
+        run: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$HOME/.local/bin" v1.30.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install cosign
+        run: |
+          set -euo pipefail
+          COSIGN_VERSION=v2.6.1
+          curl -sSfL "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" -o "$HOME/.local/bin/cosign"
+          chmod +x "$HOME/.local/bin/cosign"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up buildx
+        run: |
+          set -euo pipefail
+          docker buildx create --name loom-builder --driver docker-container --use
+          docker buildx inspect --bootstrap
+
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          tags=("-t" "${IMAGE}:${TAG}")
+          if [[ "${TAG}" != *-* ]]; then
+            tags+=("-t" "${IMAGE}:latest")
+          fi
+          docker buildx build \
+            --file Dockerfile \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --push \
+            "${tags[@]}" \
+            --metadata-file "$RUNNER_TEMP/build-metadata.json" \
+            .
+          digest=$(jq -r '.["containerimage.digest"]' "$RUNNER_TEMP/build-metadata.json")
+          if [[ -z "$digest" || "$digest" == "null" ]]; then
+            echo "missing image digest in build metadata" >&2
+            cat "$RUNNER_TEMP/build-metadata.json" >&2
+            exit 1
+          fi
+          echo "IMAGE_DIGEST=$digest" >> "$GITHUB_ENV"
+
+      - name: Generate image SBOM
+        run: |
+          set -euo pipefail
+          syft "${IMAGE}@${IMAGE_DIGEST}" -o cyclonedx-json="loom-${TAG}-sbom.cdx.json"
+
+      - name: Check image SBOM licenses
+        run: scripts/check-image-sbom-licenses.sh "loom-${TAG}-sbom.cdx.json"
+
+      - name: Sign image with cosign keyless
+        run: cosign sign --yes "${IMAGE}@${IMAGE_DIGEST}"
+
+      - name: Verify image signature
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp "^https://github.com/LoomMud/loom/.github/workflows/release-image.yml@refs/tags/${TAG}$" \
+            "${IMAGE}@${IMAGE_DIGEST}"
+
+      - name: Publish pre-release / release
+        run: |
+          set -euo pipefail
+          if [[ "${TAG}" == *-* ]]; then
+            gh release create "${TAG}" --prerelease --generate-notes || gh release edit "${TAG}" --prerelease --title "${TAG}"
+          else
+            gh release create "${TAG}" --generate-notes || gh release edit "${TAG}" --latest --title "${TAG}"
+          fi
+          gh release upload "${TAG}" "loom-${TAG}-sbom.cdx.json" --clobber
