@@ -128,3 +128,47 @@ jobs:
           workspaces: crates/loom-compiler/fuzz
       - run: cargo install cargo-fuzz --locked
       - run: FUZZ_SECONDS=45 scripts/fuzz-smoke.sh bytecode
+  loadtest-smoke:
+    # R4 load-bot smoke (OBI-40): 20 simulated players, 60s, against a real
+    # `loom serve` on this checkout's fixture mudlib driven by Warp's
+    # loadbot/mix.tsv contract. Not a required check on `main`; the full
+    # E1.1 (150 players) and stretch (500 players) runs are done by hand
+    # and their reports committed under `results/` (see loom-loadtest's
+    # README and OBI-40).
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4
+        with:
+          repository: LoomMud/warp
+          path: warp
+      - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
+      - name: run loom serve + loadtest smoke
+        run: |
+          set -euo pipefail
+          ./target/release/loom-cli serve --mudlib warp > /tmp/loom-serve.log 2>&1 &
+          echo $! > /tmp/loom-serve.pid
+          for i in $(seq 1 50); do
+            python3 -c "import socket; socket.create_connection(('127.0.0.1',4000),timeout=1).close()" 2>/dev/null && break
+            sleep 0.2
+          done
+          ./target/release/loom-loadtest \
+            --addr 127.0.0.1:4000 \
+            --mix warp/loadbot/mix.tsv \
+            --players 20 \
+            --duration-secs 60 \
+            --ramp-per-sec 10 \
+            --out results/ci-smoke
+          kill "$(cat /tmp/loom-serve.pid)" || true
+          cat /tmp/loom-serve.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loadtest-smoke-report
+          path: results/ci-smoke.*
+

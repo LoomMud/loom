@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Warp alpha command mix for the R4 load bot (OBI-40). See loadbot/README.md.
+# Format: <weight> TAB <step>[;<step>...]. Lines starting with # are comments.
+# A multi-step entry is sent one step at a time, waiting for the prompt after
+# each step. {peer} = another bot's character name, {n} = a random 1..999.
+# Weights are relative (sum 100 here). Every entry starts and ends in the
+# Entrance Hall, so bots stay in the peaceful start zone plus the NPC-free
+# Edge of the Wood, and never meet the aggressive wolf.
+25	look
+12	say hello from bot {n}
+6	'quick chat {n}
+5	emote stretches.
+8	who
+6	score
+6	inventory
+4	help
+4	tell {peer} ping {n}
+8	north;look;south
+8	east;look;west
+4	get torch;drop torch
+2	east;get stick;wield stick;drop stick;west
+2	look at torch

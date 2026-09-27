@@ -1,0 +1,38 @@
+{
+  "players": 150,
+  "slow_reader_fraction": 0.1,
+  "requested_duration_secs": 90,
+  "actual_duration_secs": 90.949913444,
+  "login_failures": 0,
+  "disconnects": 0,
+  "commands_sent": 9764,
+  "sla_p99_ms": 50.0,
+  "command_latency": {
+    "count": 9764,
+    "p50_ms": 41.06,
+    "p95_ms": 44.841,
+    "p99_ms": 46.906,
+    "max_ms": 59.094,
+    "mean_ms": 41.84901556739042
+  },
+  "slow_reader_command_latency": {
+    "count": 788,
+    "p50_ms": 401.192,
+    "p95_ms": 802.523,
+    "p99_ms": 803.538,
+    "max_ms": 1204.032,
+    "mean_ms": 488.1718845177665
+  },
+  "login_latency": {
+    "count": 150,
+    "p50_ms": 170.043,
+    "p95_ms": 200.148,
+    "p99_ms": 218.699,
+    "max_ms": 220.74,
+    "mean_ms": 170.99793333333332
+  },
+  "e1_1_pass": true,
+  "notes": [
+    "R3 server-side metrics (loom-http /metrics) are not scraped by this run: loom-http/loom-obs are not yet on main (OBI-28); this report is bot-side latency only."
+  ]
+}
