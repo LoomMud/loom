@@ -371,8 +371,8 @@ struct Frame {
 
 /// Per-execution limits (spec §5.9): every tick-metered op consumes one
 /// tick; the call stack cannot exceed `max_depth` frames; a single
-/// program-variable write cannot push its owning object's (shallow,
-/// see `bcvm::heap::shallow_bytes`) accounted memory past `mem_quota_bytes`
+/// program-variable write cannot push its owning object's (deep, see
+/// `bcvm::heap::cost`) accounted memory past `mem_quota_bytes`
 /// (spec r5 §5.2.1 "memory quotas with per-object accounting").
 /// **Flat default, not yet per-tier:** builder/privilege tiers are the
 /// CTO's security-model policy and are not modeled in `loom-vm` yet; this
@@ -387,7 +387,8 @@ impl Default for Limits {
     fn default() -> Self {
         Limits {
             max_depth: 512,
-            // 8 MiB of (shallow) var storage per object: generous enough
+            // 8 MiB of (deep, transitively-accounted) var storage per
+            // object: generous enough
             // that no existing test/benchmark workload trips it by
             // accident, small enough to be a real backstop.
             mem_quota_bytes: 8 * 1024 * 1024,
@@ -1435,7 +1436,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                         )));
                     }
                 };
-                place.array_mut().unwrap()[i] = val;
+                place.array_mut().unwrap().set(i, val);
                 Ok(())
             }
             IndexKind::Map | IndexKind::MapPresent | IndexKind::Dyn if place.as_map().is_some() => {

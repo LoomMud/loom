@@ -120,7 +120,7 @@ pub struct FunctionValue {
 #[derive(Clone, Debug)]
 pub enum HeapObj {
     Str(Box<str>),
-    Array(Vec<Value>),
+    Array(ArrayData),
     Map(MapData),
     /// A `struct` value (spec r5 §7.3, D27, [OBI-52]). Fields are stored
     /// positionally (declaration order, matching [`loom_compiler::ty::StructTy::fields`])
@@ -170,10 +170,70 @@ pub struct EnumVal {
     pub payload: Vec<Value>,
 }
 
-/// Insertion-ordered entries backing a Weft map value. Order is preserved
-/// for iteration/display (§5.1 determinism) but is **not** significant to
-/// `==` (r5): two maps are equal iff they have the same key set and the
-/// same value for every key.
+/// A Weft array's backing buffer, plus a cached **deep** byte count (spec
+/// r5 §5.2.1) that [`ArrayData::new`]/[`ArrayData::set`]/[`ArrayData::push`]
+/// keep in sync with `items` incrementally, so nothing ever has to walk
+/// `items` to answer "how many bytes does this array (transitively) cost".
+/// See the module-level docs on [`cost`] for what "deep" means and why
+/// shared substructure is charged in full to every holder.
+#[derive(Clone, Debug, Default)]
+pub struct ArrayData {
+    items: Vec<Value>,
+    deep_bytes: u64,
+}
+
+impl ArrayData {
+    /// Build from a freshly-assembled buffer, computing `deep_bytes` once
+    /// (O(n) in the buffer just built, not in anything it might share).
+    pub fn new(items: Vec<Value>) -> ArrayData {
+        let deep_bytes = items
+            .iter()
+            .map(cost)
+            .fold(0u64, |acc, c| acc.saturating_add(c));
+        ArrayData { items, deep_bytes }
+    }
+
+    pub fn items(&self) -> &[Value] {
+        &self.items
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn deep_bytes(&self) -> u64 {
+        self.deep_bytes
+    }
+
+    /// Element-write, O(1): adjust the cached total by `cost(new) -
+    /// cost(old)` instead of re-summing `items`.
+    pub fn set(&mut self, i: usize, val: Value) {
+        let old = cost(&self.items[i]);
+        let new = cost(&val);
+        self.deep_bytes = self.deep_bytes.saturating_sub(old).saturating_add(new);
+        self.items[i] = val;
+    }
+
+    /// Append, O(1): grows the cached total by `cost(val)`. Used by
+    /// concatenation (`+`) and by tests exercising `array_mut` directly;
+    /// the interpreter itself never resizes an array through this path
+    /// (see the module docs' "remaining nesting" note in `registry.rs`
+    /// for the one write op, `IndexSet`, that does not resize).
+    pub fn push(&mut self, val: Value) {
+        self.deep_bytes = self.deep_bytes.saturating_add(cost(&val));
+        self.items.push(val);
+    }
+}
+
+/// Insertion-ordered entries backing a Weft map value, plus a cached
+/// **deep** byte count maintained the same way as [`ArrayData`]'s. Order
+/// is preserved for iteration/display (§5.1 determinism) but is **not**
+/// significant to `==` (r5): two maps are equal iff they have the same key
+/// set and the same value for every key.
 ///
 /// `index`/`unindexed` (OBI-74) are a lookup accelerator, not part of the
 /// map's logical state: rebuilt implicitly as entries are inserted, and
@@ -187,6 +247,7 @@ pub struct EnumVal {
 #[derive(Clone, Debug, Default)]
 pub struct MapData {
     pub entries: Vec<(Value, Value)>,
+    deep_bytes: u64,
     /// `hash(key) -> entry indices` sharing that hash bucket (chained;
     /// disambiguated by `Value::equals` on lookup, so a hash collision is
     /// only ever a (rare) extra `equals` check, never a wrong answer).
@@ -228,11 +289,27 @@ impl MapData {
         self.find_index(k).map(|i| &self.entries[i].1)
     }
 
+    pub fn deep_bytes(&self) -> u64 {
+        self.deep_bytes
+    }
+
+    /// O(1) amortised (`find_index` is the same O(1)-expected hash lookup
+    /// `MapData` always did to find/replace a key, OBI-74; the byte
+    /// accounting added here is O(1) on top of that, not an extra walk):
+    /// adjust the cached total by the entry's cost delta instead of
+    /// re-summing `entries`.
     pub fn insert(&mut self, k: Value, v: Value) {
         if let Some(i) = self.find_index(&k) {
+            let old = cost(&self.entries[i].1);
+            let new = cost(&v);
+            self.deep_bytes = self.deep_bytes.saturating_sub(old).saturating_add(new);
             self.entries[i].1 = v;
             return;
         }
+        self.deep_bytes = self
+            .deep_bytes
+            .saturating_add(cost(&k))
+            .saturating_add(cost(&v));
         let idx = self.entries.len() as u32;
         match k.index_hash() {
             Some(h) => self.index.entry(h).or_default().push(idx),
@@ -273,7 +350,7 @@ impl Value {
     }
 
     pub fn array(v: Vec<Value>) -> Value {
-        Value::Heap(Rc::new(HeapObj::Array(v)))
+        Value::Heap(Rc::new(HeapObj::Array(ArrayData::new(v))))
     }
 
     pub fn map(m: MapData) -> Value {
@@ -326,7 +403,7 @@ impl Value {
     pub fn as_array(&self) -> Option<&[Value]> {
         match self {
             Value::Heap(h) => match &**h {
-                HeapObj::Array(a) => Some(a),
+                HeapObj::Array(a) => Some(a.items()),
                 _ => None,
             },
             _ => None,
@@ -355,8 +432,10 @@ impl Value {
 
     /// Mutable access to this value's array buffer, cloning it first if it
     /// is shared (`Rc::make_mut`: copy-on-write, r5 D24). `None` if this
-    /// value is not an array.
-    pub fn array_mut(&mut self) -> Option<&mut Vec<Value>> {
+    /// value is not an array. Returns [`ArrayData`] (not a raw `Vec`) so
+    /// every write goes through [`ArrayData::set`]/[`ArrayData::push`],
+    /// which keep the cached `deep_bytes` total correct incrementally.
+    pub fn array_mut(&mut self) -> Option<&mut ArrayData> {
         match self {
             Value::Heap(h) => match Rc::make_mut(h) {
                 HeapObj::Array(a) => Some(a),
@@ -390,6 +469,47 @@ impl Value {
     /// program-agnostic heap module to metrics or program identity.
     pub fn is_shared(&self) -> bool {
         matches!(self, Value::Heap(h) if Rc::strong_count(h) > 1)
+    }
+
+    /// This value's cached, transitive byte cost (spec r5 §5.2.1): for a
+    /// string, its length; for an array/map, the O(1) cached total
+    /// [`ArrayData::deep_bytes`]/[`MapData::deep_bytes`] already keeps in
+    /// sync (see those types and [`cost`]); for a struct/enum, the sum of
+    /// its fields'/payload's own cost, recomputed on the fly (no cached
+    /// total — struct/enum fields have no in-place element-write path
+    /// yet, unlike array/map, so there is nothing to keep incrementally in
+    /// sync); for a closure, the sum of its captures' own cost (a `Named`
+    /// function value captures nothing, so it costs `0` here — the same
+    /// reasoning as struct/enum: nothing mutates a closure's captures in
+    /// place after creation, so there is nothing to cache); `0` for
+    /// anything else (a primitive lives in its var slot, not a separate
+    /// heap allocation).
+    pub fn deep_bytes(&self) -> u64 {
+        match self {
+            Value::Heap(h) => match &**h {
+                HeapObj::Str(s) => s.len() as u64,
+                HeapObj::Array(a) => a.deep_bytes(),
+                HeapObj::Map(m) => m.deep_bytes(),
+                HeapObj::Struct(s) => s
+                    .fields
+                    .iter()
+                    .map(|(_, v)| cost(v))
+                    .fold(0u64, |a, b| a.saturating_add(b)),
+                HeapObj::Enum(e) => e
+                    .payload
+                    .iter()
+                    .map(cost)
+                    .fold(0u64, |a, b| a.saturating_add(b)),
+                HeapObj::Fn(f) => match &f.body {
+                    FnBody::Named(_) => 0,
+                    FnBody::Closure { captures, .. } => captures
+                        .iter()
+                        .map(cost)
+                        .fold(0u64, |a, b| a.saturating_add(b)),
+                },
+            },
+            _ => 0,
+        }
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -432,7 +552,8 @@ impl Value {
             (Value::Heap(a), Value::Heap(b)) => match (&**a, &**b) {
                 (HeapObj::Str(x), HeapObj::Str(y)) => x == y,
                 (HeapObj::Array(x), HeapObj::Array(y)) => {
-                    x.len() == y.len() && x.iter().zip(y).all(|(a, b)| a.equals(b))
+                    x.items().len() == y.items().len()
+                        && x.items().iter().zip(y.items()).all(|(a, b)| a.equals(b))
                 }
                 (HeapObj::Map(x), HeapObj::Map(y)) => x == y,
                 (HeapObj::Struct(x), HeapObj::Struct(y)) => {
@@ -537,41 +658,59 @@ impl Value {
     }
 }
 
-/// Approximate byte cost of one [`Value`], used for per-object memory
-/// quota accounting (spec r5 §5.2.1). **Shallow, not deep/transitive**: a
-/// container's own spine is counted (string bytes; array length ×
-/// `size_of::<Value>()`; map entry count × 2 × `size_of::<Value>()`), but
-/// an element/entry that is itself a container is counted only as its own
-/// 16-byte [`Value`] slot — its contents are not walked into and re-summed.
-/// This is a deliberate boundary, not an oversight: containers are
-/// copy-on-write value types that freely share their backing `Rc<HeapObj>`
-/// (see the module docs), so a deep byte count would either double-count a
-/// substructure shared between two objects' vars or attribute it
-/// arbitrarily to whichever object happened to write it last — neither is
-/// a meaningful "how much memory does this object own" answer. Shallow
-/// accounting charges exactly the allocation(s) an object's own write just
-/// touched, and is O(size of the value just written), not O(everything the
-/// object holds).
-pub fn shallow_bytes(v: &Value) -> u64 {
+/// One [`Value`]'s contribution to a container's cached [`ArrayData`]/
+/// [`MapData`] `deep_bytes` total (spec r5 §5.2.1): a 16-byte slot (the
+/// `Value` itself, however it is stored — inline for primitives, a
+/// pointer for a heap value) plus that value's own [`Value::deep_bytes`]
+/// (`0` for a primitive, the cached transitive total for a container).
+/// `deep_bytes(container) = sum(cost(element))`, and every container
+/// caches its own total, so computing this is always O(1) regardless of
+/// how deep `v` nests.
+///
+/// **Shared substructure is charged in full to every holder, not
+/// deduplicated or attributed to a single owner (deliberate, spec r5
+/// §5.2.1 CTO decision on OBI-80):** containers are copy-on-write value
+/// types that freely share their backing `Rc<HeapObj>` (see the module
+/// docs), so there is no well-defined single owner to charge instead —
+/// whichever object happened to write a shared substructure last is
+/// arbitrary, and would *undercount* the moment that object released it
+/// while another still held it. For a quota (a security boundary, not an
+/// exact accounting ledger) over-counting shared data is the safe
+/// direction: `a = [big]; b = [big]` really can turn into 2x `big`'s bytes
+/// of *pressure* even though only one allocation backs it, and a quota
+/// that didn't charge for that would let `data = [huge_local]` bypass it
+/// entirely (the bug this replaces, OBI-78's shallow accounting: nesting
+/// one level deep was free).
+///
+/// Saturating on purpose: exponential sharing (`a = [a, a]`, repeated)
+/// can only grow this number, never overflow-wrap it into something that
+/// looks small and passes a quota check it should fail — an overflowed
+/// count saturates at `u64::MAX`, which stays rejected by any real quota,
+/// rather than silently wrapping back down to something under quota.
+pub fn cost(v: &Value) -> u64 {
+    #[cfg(test)]
+    COST_CALLS.with(|c| c.set(c.get() + 1));
     const SLOT: u64 = std::mem::size_of::<Value>() as u64;
-    match v {
-        Value::Heap(h) => match &**h {
-            HeapObj::Str(s) => s.len() as u64,
-            HeapObj::Array(a) => a.len() as u64 * SLOT,
-            HeapObj::Map(m) => m.entries.len() as u64 * 2 * SLOT,
-            HeapObj::Struct(s) => s.fields.len() as u64 * SLOT,
-            HeapObj::Enum(e) => e.payload.len() as u64 * SLOT,
-            // A function value's captures already sat in the creator's
-            // own vars/regs before capture (or are `Copy` primitives), so
-            // memory-quota accounting on this heap slot only charges the
-            // fixed cost of the value itself — already covered by `SLOT`
-            // at the call site, nothing extra here.
-            HeapObj::Fn(_) => 0,
-        },
-        // Primitives live in the var slot itself, not a separate heap
-        // allocation; nothing extra to charge.
-        _ => 0,
-    }
+    SLOT.saturating_add(v.deep_bytes())
+}
+
+// Test-only call counter for [`cost`]: an O(1)-per-write regression to an
+// O(n) re-walk (recomputing every element's cost on every write) shows up
+// directly as an O(n) vs O(n²) call count, not as a wall-clock ratio a
+// slow CI runner can blur past a loose threshold (OBI-80 CTO review).
+#[cfg(test)]
+thread_local! {
+    static COST_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub fn reset_cost_calls() {
+    COST_CALLS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub fn cost_calls() -> u64 {
+    COST_CALLS.with(|c| c.get())
 }
 
 /// Render a value for interpolation / display. `name` resolves object
@@ -613,7 +752,7 @@ fn write_value(
             HeapObj::Str(s) => out.push_str(s),
             HeapObj::Array(a) => {
                 out.push('[');
-                for (i, e) in a.iter().enumerate() {
+                for (i, e) in a.items().iter().enumerate() {
                     if i > 0 {
                         out.push_str(", ");
                     }
@@ -725,7 +864,7 @@ mod tests {
         // existing element, not pushing, so a `Vec` capacity reallocation
         // can't be mistaken for the thing under test.)
         let ptr_before = v.as_array().unwrap().as_ptr();
-        v.array_mut().unwrap()[0] = Value::Int(9);
+        v.array_mut().unwrap().set(0, Value::Int(9));
         let ptr_after = v.as_array().unwrap().as_ptr();
         assert_eq!(
             ptr_before, ptr_after,
@@ -760,5 +899,86 @@ mod tests {
         // the assertion above, that would itself be evidence of a cycle.
         let d = depth(&v, 1_000);
         assert_eq!(d, 65);
+    }
+
+    /// OBI-80: nesting a container inside another must be charged for the
+    /// nested container's own contents, not just the 16-byte slot holding
+    /// it — the exact bypass shallow accounting (OBI-78) had.
+    #[test]
+    fn deep_bytes_counts_nested_containers_not_just_their_slot() {
+        let inner = Value::array(vec![Value::str(&"x".repeat(1000))]);
+        let inner_cost = cost(&inner);
+        assert!(
+            inner_cost > 1000,
+            "a 1000-byte string nested one level in must cost more than a bare slot"
+        );
+        let outer = Value::array(vec![inner]);
+        assert_eq!(
+            outer.deep_bytes(),
+            inner_cost,
+            "outer array's one element costs exactly the inner value's full cost"
+        );
+    }
+
+    /// OBI-80: `ArrayData::set`/`MapData::insert` must adjust the cached
+    /// total by the delta, not recompute it by re-walking every element —
+    /// this is the property that makes filling an n-element array by index
+    /// O(n) instead of O(n²). We can't directly observe "didn't walk", so
+    /// this checks the *result* is correct after many incremental writes,
+    /// which a delta-only implementation gets right and a buggy "recompute
+    /// from a stale base" implementation would not.
+    #[test]
+    fn incremental_array_set_matches_a_full_recompute() {
+        let n = 500usize;
+        let mut v = Value::array(vec![Value::Int(0); n]);
+        for i in 0..n {
+            v.array_mut()
+                .unwrap()
+                .set(i, Value::str(&"y".repeat(i % 7)));
+        }
+        let expected: u64 = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(cost)
+            .fold(0u64, |a, b| a.saturating_add(b));
+        assert_eq!(v.deep_bytes(), expected);
+    }
+
+    /// OBI-80: shared substructure is charged in full to *every* holder
+    /// (not deduplicated), and releasing it from one holder does not
+    /// affect the other's cached total — each container's `deep_bytes` is
+    /// its own independent cache, not a shared ledger.
+    #[test]
+    fn shared_substructure_is_charged_to_every_holder_independently() {
+        let shared = Value::array(vec![Value::str(&"z".repeat(200))]);
+        let shared_cost = cost(&shared);
+        let mut a = Value::array(vec![shared.clone()]);
+        let b = Value::array(vec![shared]);
+        assert_eq!(a.deep_bytes(), shared_cost);
+        assert_eq!(b.deep_bytes(), shared_cost, "both holders charged in full");
+        // Release it from `a` (overwrite with something cheap): `b`'s
+        // total must be unaffected.
+        a.array_mut().unwrap().set(0, Value::Int(0));
+        assert!(a.deep_bytes() < shared_cost);
+        assert_eq!(
+            b.deep_bytes(),
+            shared_cost,
+            "releasing from one holder must not free the other's charged share"
+        );
+    }
+
+    #[test]
+    fn saturating_arithmetic_does_not_overflow_on_exponential_sharing() {
+        // a = [big]; a = [a, a]; a = [a, a]; ... must saturate, not wrap.
+        let mut a = Value::array(vec![Value::str(&"w".repeat(1_000_000))]);
+        for _ in 0..80 {
+            a = Value::array(vec![a.clone(), a.clone()]);
+        }
+        assert_eq!(
+            a.deep_bytes(),
+            u64::MAX,
+            "exponential sharing must saturate at u64::MAX, never wrap"
+        );
     }
 }

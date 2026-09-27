@@ -787,10 +787,11 @@ pub struct BcObject {
     pub inventory: Vec<ObjectId>,
     /// Connection bound to this object (interactive), if any.
     pub conn: Option<u64>,
-    /// Sum of [`heap::shallow_bytes`] over every value currently in `vars`
-    /// (spec r5 §5.2.1 "memory quotas with per-object accounting"),
-    /// maintained incrementally by [`RegistryHost::store_global`] so a
-    /// quota check never has to re-walk `vars`.
+    /// Sum of [`heap::cost`] over every value currently in `vars` (spec
+    /// r5 §5.2.1 "memory quotas with per-object accounting", deep
+    /// accounting per OBI-80), maintained incrementally by
+    /// [`RegistryHost::store_global`] so a quota check never has to
+    /// re-walk `vars`.
     pub mem_bytes: u64,
     /// [`Registry::install_generation`] as of the last time
     /// [`RegistryHost::ensure_current`] checked whether this object's
@@ -835,7 +836,7 @@ impl BcObject {
     /// rollback), or the incremental count drifts: vars dropped by a
     /// migration would stay charged forever.
     pub fn recompute_mem_bytes(&mut self) {
-        self.mem_bytes = self.vars.values().map(heap::shallow_bytes).sum();
+        self.mem_bytes = self.vars.values().map(heap::cost).sum();
     }
 }
 
@@ -3380,15 +3381,18 @@ impl Host for RegistryHost<'_> {
         let self_id = self.self_object();
         let quota = self.limits.mem_quota_bytes;
         let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
-        let new_bytes = heap::shallow_bytes(&v);
+        let new_bytes = heap::cost(&v);
         let Some(o) = self.registry.get_mut(self_id) else {
             // OBI-85 CTO review: writing a field on a destructed `self`
             // is a runtime error, same as reading one (`load_global`
             // above), not a silent no-op.
             return Err(RtError::new("self was destructed"));
         };
-        let old_bytes = o.vars.get(&key).map(heap::shallow_bytes).unwrap_or(0);
-        let new_total = o.mem_bytes.saturating_sub(old_bytes) + new_bytes;
+        let old_bytes = o.vars.get(&key).map(heap::cost).unwrap_or(0);
+        let new_total = o
+            .mem_bytes
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes);
         if new_total > quota {
             return Err(RtError::new(format!(
                 "{}: memory quota exceeded writing `{name}` ({new_total} bytes of vars would be \
@@ -3964,7 +3968,11 @@ var other: int = 1
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
         let obj = host.instantiate(v1).expect("instantiate");
-        assert_eq!(registry.get(obj).unwrap().mem_bytes, 40);
+        // OBI-80 deep accounting: a var's cost is its own 16-byte slot plus
+        // the value's cached `deep_bytes` (here just the 40-byte string;
+        // primitives/short containers still stay under any real quota, but
+        // there is no such thing as a *free* var slot any more).
+        assert_eq!(registry.get(obj).unwrap().mem_bytes, 56);
 
         let v2 = Rc::new(compile_program(
             "/obj/thing",
@@ -3977,8 +3985,10 @@ var other: int = 1
         host.upgrade(obj, v2).expect("upgrade");
         assert_eq!(
             registry.get(obj).unwrap().mem_bytes,
-            0,
-            "`blob` was dropped by the upgrade; it must no longer be charged"
+            16,
+            "`blob` was dropped by the upgrade (freeing its 56 bytes) and replaced by \
+             `other: int = 1`, whose own slot still costs 16 — it must not still be carrying \
+             `blob`'s share"
         );
     }
 
@@ -5034,7 +5044,7 @@ pub fn get_n() -> int {
                 if let Some(arr) = xs.array_mut()
                     && !arr.is_empty()
                 {
-                    arr[0] = Value::Int(-1);
+                    arr.set(0, Value::Int(-1));
                     host.store_global("/t/obj", "xs", xs).unwrap();
                 }
             }
@@ -5110,5 +5120,177 @@ pub fn get_n() -> int {
                 prop_assert_eq!(got_inv, &snapshot_inv[i]);
             }
         }
+    }
+
+    /// OBI-80 acceptance criterion: nesting a large local container one
+    /// level inside a global-var write must count against the quota. This
+    /// is exactly the bypass OBI-78's shallow accounting had (`data =
+    /// [big_local_array]` cost 16 bytes, i.e. only the outer array's one
+    /// slot) — with deep accounting the nested array's own contents are
+    /// charged too, so a small quota rejects it.
+    #[test]
+    fn deep_accounting_rejects_a_large_local_container_nested_in_a_global_write() {
+        let zeros = (0..200).map(|_| "0").collect::<Vec<_>>().join(",");
+        let wf = format!(
+            r#"
+var data: any = null
+
+pub fn set_it() {{
+    let big: [int] = [{zeros}]
+    data = [big]
+}}
+"#
+        );
+        let module = compile("/obj/thing", &[("/obj/thing", &wf)]);
+        let mut registry = Registry::default();
+        let prog = Rc::new(CompiledProgram::new(module, 1, None, Vec::new()));
+        registry.register_program(prog.clone());
+        let obj = make_object(&mut registry, prog);
+        let mut host = RegistryHost::new(&mut registry, obj);
+        // 200 ints nested one level in cost 200 * 16 = 3200 bytes deep, plus
+        // the outer array's own slot; a shallow accounting of "one element"
+        // would only ever charge 16 bytes here and never trip this quota.
+        host.limits.mem_quota_bytes = 1000;
+        let err = host
+            .call_on(obj, "set_it", vec![])
+            .expect_err("nested container must push the object over a 1000-byte quota");
+        assert!(
+            err.report().contains("memory quota exceeded"),
+            "{}",
+            err.report()
+        );
+
+        // Same program, quota big enough to hold it: must succeed.
+        let mut registry2 = Registry::default();
+        let prog2 = Rc::new(CompiledProgram::new(
+            compile("/obj/thing", &[("/obj/thing", &wf)]),
+            1,
+            None,
+            Vec::new(),
+        ));
+        registry2.register_program(prog2.clone());
+        let obj2 = make_object(&mut registry2, prog2);
+        let mut host2 = RegistryHost::new(&mut registry2, obj2);
+        host2.limits.mem_quota_bytes = 1_000_000;
+        host2
+            .call_on(obj2, "set_it", vec![])
+            .expect("comfortably under a 1_000_000 byte quota");
+    }
+
+    /// OBI-80 acceptance criterion: writing the same (shared) substructure
+    /// into two different objects' globals charges both in full (no
+    /// dedup/single-owner attribution), and releasing it from one holder
+    /// does not free the other's charged share.
+    #[test]
+    fn shared_substructure_written_into_two_objects_charges_both_independently() {
+        const WF: &str = r#"
+var data: any = null
+
+pub fn set(v: any) {
+    data = v
+}
+
+pub fn clear() {
+    data = 0
+}
+"#;
+        let module_a = compile("/obj/a", &[("/obj/a", WF)]);
+        let module_b = compile("/obj/b", &[("/obj/b", WF)]);
+        let mut registry = Registry::default();
+        let prog_a = Rc::new(CompiledProgram::new(module_a, 1, None, Vec::new()));
+        let prog_b = Rc::new(CompiledProgram::new(module_b, 1, None, Vec::new()));
+        registry.register_program(prog_a.clone());
+        registry.register_program(prog_b.clone());
+        let a = make_object(&mut registry, prog_a);
+        let b = make_object(&mut registry, prog_b);
+
+        let shared = Value::array(vec![Value::str(&"z".repeat(2000))]);
+
+        let mut host = RegistryHost::new(&mut registry, a);
+        host.call_on(a, "set", vec![shared.clone()]).unwrap();
+        host.call_on(b, "set", vec![shared]).unwrap();
+
+        let bytes_a = host.registry.get(a).unwrap().mem_bytes;
+        let bytes_b = host.registry.get(b).unwrap().mem_bytes;
+        assert!(
+            bytes_a > 2000,
+            "holder a must be charged the shared payload's full cost"
+        );
+        assert_eq!(
+            bytes_a, bytes_b,
+            "both holders charged the same, full amount"
+        );
+
+        // Release it from `a`: `b`'s charged share must be unaffected.
+        host.call_on(a, "clear", vec![]).unwrap();
+        let after_a = host.registry.get(a).unwrap().mem_bytes;
+        let after_b = host.registry.get(b).unwrap().mem_bytes;
+        assert!(after_a < bytes_a, "a released its share");
+        assert_eq!(after_b, bytes_b, "releasing from a must not free b's share");
+    }
+
+    /// OBI-80 acceptance criterion: filling an n-element global array by
+    /// index is O(n) total `cost()` calls, not O(n²) (CTO review: a
+    /// timing-ratio bound can't distinguish O(n) from a mild O(n²)
+    /// regression -- the review's own O(n²) re-walk only showed about 16x
+    /// on a 4x input, comfortably under the old, loose `< 20` ratio bound).
+    /// Each `data[i] = x` write does exactly four `cost()` calls: two in
+    /// `ArrayData::set` (the old element, the new one) and two in
+    /// `store_global`'s own quota bookkeeping (the whole array's old cost,
+    /// its new cost -- both O(1) reads of the array's own cached
+    /// `deep_bytes`, not a walk of its elements). O(1) per write, so n
+    /// writes make exactly `4n` calls, deterministically. An O(n) re-walk
+    /// per write (the regression this guards against) would make `O(n)`
+    /// calls *per write*, i.e. `O(n²)` total: caught exactly, no timing
+    /// noise, no threshold to tune.
+    #[test]
+    fn filling_a_global_array_by_index_makes_on_not_on_squared_cost_calls() {
+        fn cost_calls_to_fill(n: usize) -> u64 {
+            let zeros = vec!["0"; n].join(",");
+            let wf = format!(
+                r#"
+var data: [int] = [{zeros}]
+
+pub fn fill() {{
+    var i = 0
+    while i < {n} {{
+        data[i] = i
+        i += 1
+    }}
+}}
+"#
+            );
+            let prog = Rc::new(compile_program(
+                "/obj/thing",
+                &[("/obj/thing", &wf)],
+                1,
+                None,
+            ));
+            let mut registry = Registry::default();
+            registry.register_program(prog.clone());
+            let placeholder = ObjectId {
+                index: u32::MAX,
+                generation: 0,
+            };
+            let mut host = RegistryHost::new(&mut registry, placeholder);
+            let obj = host.instantiate(prog).expect("instantiate");
+            host.limits.mem_quota_bytes = u64::MAX;
+            heap::reset_cost_calls();
+            host.call_on(obj, "fill", vec![]).expect("fill");
+            heap::cost_calls()
+        }
+
+        let small = cost_calls_to_fill(2_000);
+        let large = cost_calls_to_fill(8_000); // 4x the elements
+        assert_eq!(
+            small,
+            4 * 2_000,
+            "O(1) per write: exactly 4 cost() calls per element"
+        );
+        assert_eq!(
+            large,
+            4 * 8_000,
+            "O(1) per write: exactly 4 cost() calls per element"
+        );
     }
 }

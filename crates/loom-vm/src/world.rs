@@ -224,8 +224,8 @@ pub const DEFAULT_HEARTBEAT_INTERVAL_TICKS: u64 = 20;
 pub struct Limits {
     pub max_ticks: u64,
     pub max_depth: u32,
-    /// Per-object (shallow) memory quota in bytes; see
-    /// `bcvm::vm::Limits::mem_quota_bytes`.
+    /// Per-object (deep, transitively-accounted) memory quota in bytes;
+    /// see `bcvm::vm::Limits::mem_quota_bytes`.
     pub mem_quota_bytes: u64,
     /// `upgrade_all(path)` (OBI-89, eager mode): how many queued objects
     /// [`World::tick`] migrates per world tick. Bounded, not all-at-once,
@@ -990,9 +990,9 @@ impl World {
         self.registry.cow_metrics.get(program)
     }
 
-    /// Current (shallow, see `bcvm::heap::shallow_bytes`) accounted memory
-    /// of `ob`'s program variables (spec r5 §5.2.1 "memory quotas with
-    /// per-object accounting").
+    /// Current (deep, transitively-accounted, see `bcvm::heap::cost`)
+    /// memory of `ob`'s program variables (spec r5 §5.2.1 "memory quotas
+    /// with per-object accounting").
     pub fn object_mem_bytes(&self, ob: ObjectId) -> Option<u64> {
         self.registry.get(ob).map(|o| o.mem_bytes)
     }
