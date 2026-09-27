@@ -12,9 +12,11 @@
 
 pub mod bcvm;
 pub mod efuns;
+pub mod fileio;
 pub mod host;
 pub mod object;
 pub mod privilege;
+pub mod rng;
 pub mod scheduler;
 pub mod world;
 
@@ -25,7 +27,7 @@ pub use bcvm::registry::UpgradeWarning;
 pub use bcvm::vm::RtError;
 pub use host::{Host, NullHost};
 pub use object::ObjectId;
-pub use world::{BootError, Limits, World};
+pub use world::{AccountAuth, BootError, Limits, NullAccountAuth, World};
 
 /// Parse and link every `.wf` file under `root` without running any code
 /// (`loom check`). Returns one rendered report per failing file, sorted.

@@ -983,11 +983,11 @@ impl<'a, H: Host> Interpreter<'a, H> {
     /// Efuns fundamental enough (no privilege gate, pure over values) to
     /// inline in the interpreter rather than round-trip through [`Host`]:
     /// `len` backs every `for` loop's bound check (see codegen's `IterElems`
-    /// lowering), so it is on the hot path; `split`/`join`/`keys`/`trim` are
-    /// the same handful of pure string/map efuns the Phase 0 evaluator
-    /// implements inline (`crate::efuns`), kept here so a self-contained
-    /// program (no `World`/`Host` needed) can still run real `.wf` string
-    /// processing end to end — see the `bcvm::compile` integration test.
+    /// lowering), so it is on the hot path; `split`/`join`/`keys`/`trim`/
+    /// `lower`/`to_int` are pure string/map efuns (spec §5.5; `lower`/
+    /// `to_int` added OBI-85) kept here so a self-contained program (no
+    /// `World`/`Host` needed) can still run real `.wf` string processing
+    /// end to end — see the `bcvm::compile` integration test.
     fn call_efun(&self, name: &str, args: &[Value]) -> Option<R<Value>> {
         fn len_of(v: &Value) -> Option<i64> {
             if let Some(s) = v.as_str() {
@@ -1052,6 +1052,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
             "trim" => Some(match args[0].as_str() {
                 Some(s) => Ok(Value::str(s.trim())),
                 None => Err(self.err_with_trace("trim(): expected string")),
+            }),
+            "lower" => Some(match args[0].as_str() {
+                Some(s) => Ok(Value::str(&s.to_lowercase())),
+                None => Err(self.err_with_trace("lower(): expected string")),
+            }),
+            "to_int" => Some(match args[0].as_str() {
+                Some(s) => Ok(parse_to_int(s).map_or(Value::Null, Value::Int)),
+                None => Err(self.err_with_trace("to_int(): expected string")),
             }),
             _ => None,
         }
@@ -1263,6 +1271,16 @@ fn cmp_bool(op: BinOp, ord: std::cmp::Ordering) -> Value {
         BinOp::Gt => ord.is_gt(),
         _ => ord.is_ge(),
     })
+}
+
+/// `to_int()` (spec §5.5, OBI-85): a trimmed decimal with an optional
+/// leading `-` (not `+`); `None` if it doesn't parse or overflows `i64`.
+fn parse_to_int(s: &str) -> Option<i64> {
+    let t = s.trim();
+    if t.is_empty() || t.starts_with('+') {
+        return None;
+    }
+    t.parse::<i64>().ok()
 }
 
 fn ty_name(ty: &Ty) -> String {
