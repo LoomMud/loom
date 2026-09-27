@@ -461,8 +461,31 @@ impl CompiledProgram {
 pub type Vars = HashMap<(Rc<str>, Rc<str>), Value>;
 
 pub struct BcObject {
+    /// `/std/sword` (blueprint) or `/std/sword#12` (clone).
+    pub name: String,
     pub program: Rc<CompiledProgram>,
     pub vars: Vars,
+    pub env: Option<ObjectId>,
+    pub inventory: Vec<ObjectId>,
+    /// Connection bound to this object (interactive), if any.
+    pub conn: Option<u64>,
+}
+
+impl BcObject {
+    /// A fresh, unnamed, unplaced object over `program` — the common case
+    /// for tests and [`RegistryHost::instantiate`], which sets `name`
+    /// afterwards (mirrors `crate::object::Object`'s tree-walker fields,
+    /// minus the ones only `World` fills in).
+    pub fn new(program: Rc<CompiledProgram>) -> BcObject {
+        BcObject {
+            name: String::new(),
+            program,
+            vars: Vars::new(),
+            env: None,
+            inventory: Vec::new(),
+            conn: None,
+        }
+    }
 }
 
 struct Slot {
@@ -480,6 +503,14 @@ pub struct Registry {
     slots: Vec<Slot>,
     free: Vec<u32>,
     pub programs: HashMap<String, Rc<CompiledProgram>>,
+    /// Object names (`/std/room`, `/std/room#3`) → id, kept here (not in
+    /// `World`) because efuns like `find_object`/`object_name` need it from
+    /// inside a running call, mirroring `crate::world::State::names`.
+    pub names: HashMap<String, ObjectId>,
+    pub next_clone: u64,
+    /// Connection id → the object it is bound to (mirrors
+    /// `crate::world::State::conns`).
+    pub conns: HashMap<u64, ObjectId>,
 }
 
 impl Registry {
@@ -553,6 +584,53 @@ impl Registry {
             })
             .collect()
     }
+
+    /// Move `id` out of its current environment (if any) and into `dest`'s
+    /// inventory (mirrors `crate::world::State::move_object`; the caller
+    /// is responsible for cycle checks, see `RegistryHost`'s `move_to`
+    /// efun).
+    pub fn move_object(&mut self, id: ObjectId, dest: ObjectId) {
+        let old = self.get(id).and_then(|o| o.env);
+        if let Some(old) = old
+            && let Some(o) = self.get_mut(old)
+        {
+            o.inventory.retain(|i| *i != id);
+        }
+        if let Some(d) = self.get_mut(dest) {
+            d.inventory.push(id);
+        }
+        if let Some(o) = self.get_mut(id) {
+            o.env = Some(dest);
+        }
+    }
+
+    /// Bind connection `conn` to object `id` (unbinding both sides'
+    /// previous partners), mirrors `crate::world::State::bind`.
+    pub fn bind(&mut self, conn: u64, id: ObjectId) {
+        if let Some(prev) = self.conns.insert(conn, id)
+            && prev != id
+            && let Some(o) = self.get_mut(prev)
+        {
+            o.conn = None;
+        }
+        let old_conn = self.get(id).and_then(|o| o.conn);
+        if let Some(old_conn) = old_conn
+            && old_conn != conn
+        {
+            self.conns.remove(&old_conn);
+        }
+        if let Some(o) = self.get_mut(id) {
+            o.conn = Some(conn);
+        }
+    }
+
+    /// The name `id` is registered under, or a placeholder if it was
+    /// destructed or never named (mirrors `crate::interp::Exec::obj_name`).
+    pub fn obj_name(&self, id: ObjectId) -> String {
+        self.get(id)
+            .map(|o| o.name.clone())
+            .unwrap_or_else(|| format!("<destructed:{id:?}>"))
+    }
 }
 
 /// A [`Host`] backed by a real [`Registry`] (multiple objects, multiple
@@ -567,7 +645,51 @@ pub struct RegistryHost<'a> {
     self_stack: Vec<ObjectId>,
     pub limits: Limits,
     pub ticks_left: u64,
+    /// Driver-level context (network host, compiler, `this_player`,
+    /// bound connection): only `World` provides this (`None` for the
+    /// unit tests in this module, which never call a driver efun).
+    driver: Option<Driver<'a>>,
+    /// Stack pointer at construction, for [`NESTED_CALL_STACK_BUDGET`].
+    stack_base: usize,
 }
+
+/// Everything a driver efun (`send`, `bind_connection`, `compile_object`,
+/// …) needs beyond the object/program registry, borrowed for the
+/// duration of one [`RegistryHost`] (mirrors `crate::interp::Exec`'s
+/// `host`/`this_player`/`conn`/`compiling` fields).
+struct Driver<'a> {
+    compiler: &'a mut Compiler,
+    net: &'a mut dyn crate::host::Host,
+    this_player: Option<ObjectId>,
+    conn: Option<u64>,
+    master: Option<ObjectId>,
+}
+
+/// Approximate current native stack position (mirrors the tree-walker's
+/// `crate::interp::stack_addr`, kept for the same reason: see
+/// [`NESTED_CALL_STACK_BUDGET`]).
+#[inline(never)]
+fn stack_addr() -> usize {
+    let marker = 0u8;
+    std::hint::black_box(&marker) as *const u8 as usize
+}
+
+/// Native-stack budget for [`RegistryHost::call_in`]'s nested-`Interpreter`
+/// recursion (spec r5 D26's known gap, see this module's doc comment):
+/// every `call_virtual`/`call_other`/`super::` call is a real Rust-level
+/// recursive call (codegen never emits `CalleeOp::Local`, so *every*
+/// unqualified Weft call — including simple same-module self-recursion
+/// like `fn dive() { dive() }` — goes through this path, not just
+/// cross-object calls). `self_stack.len()` alone is not a safe bound: a
+/// fixed call-*count* limit that is safe in an optimized release build can
+/// still overflow the native stack in an unoptimized debug build (each
+/// nested `Interpreter::call`/`run` costs far more stack per frame there),
+/// so — exactly like the tree-walker's own `max_stack_bytes` — this checks
+/// the *actual* stack pointer distance from where the call chain started,
+/// not just a counter. A stack overflow aborts the whole process; a Weft
+/// runtime error does not, so this is what keeps that true until D26's
+/// flat frame stack removes the native recursion entirely.
+const NESTED_CALL_STACK_BUDGET: usize = 1_000_000;
 
 impl<'a> RegistryHost<'a> {
     pub fn new(registry: &'a mut Registry, self_object: ObjectId) -> Self {
@@ -576,7 +698,122 @@ impl<'a> RegistryHost<'a> {
             self_stack: vec![self_object],
             limits: Limits::default(),
             ticks_left: 1_000_000,
+            driver: None,
+            stack_base: stack_addr(),
         }
+    }
+
+    /// A [`RegistryHost`] with driver efuns (`send`, `load_object`, …)
+    /// enabled, used by [`crate::world::World`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_driver(
+        registry: &'a mut Registry,
+        self_object: ObjectId,
+        limits: Limits,
+        ticks_left: u64,
+        compiler: &'a mut Compiler,
+        net: &'a mut dyn crate::host::Host,
+        this_player: Option<ObjectId>,
+        conn: Option<u64>,
+        master: Option<ObjectId>,
+    ) -> Self {
+        RegistryHost {
+            registry,
+            self_stack: vec![self_object],
+            limits,
+            ticks_left,
+            driver: Some(Driver {
+                compiler,
+                net,
+                this_player,
+                conn,
+                master,
+            }),
+            stack_base: stack_addr(),
+        }
+    }
+
+    /// Driver-side call of an apply (visibility is not enforced for the
+    /// driver). `Ok(None)` if the object does not define `name` (mirrors
+    /// `crate::interp::Exec::call_apply`).
+    pub fn call_apply(&mut self, on: ObjectId, name: &str, args: Vec<Value>) -> R<Option<Value>> {
+        let Some(prog) = self.registry.get(on).map(|o| o.program.clone()) else {
+            return Ok(None);
+        };
+        match prog.resolve(name) {
+            Some((target, idx)) => self.call_in(on, &target, idx, args).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// `load_object`: the blueprint for `path`, loading (compiling +
+    /// instantiating + `create()`) it if needed — the bytecode-VM analogue
+    /// of `crate::world::Exec::load_object`.
+    pub fn load_object(&mut self, path: &str) -> R<ObjectId> {
+        let path = mudlib::normalize_path(path).map_err(RtError::new)?;
+        if let Some(id) = self.registry.names.get(&path).copied()
+            && self.registry.get(id).is_some()
+        {
+            return Ok(id);
+        }
+        let prog = self.ensure_program(&path)?;
+        self.new_object(prog, path)
+    }
+
+    /// `clone_object`: a new clone `path#N`.
+    pub fn clone_object(&mut self, path: &str) -> R<ObjectId> {
+        let path = mudlib::normalize_path(path).map_err(RtError::new)?;
+        let prog = self.ensure_program(&path)?;
+        // Kept on the registry, not `Driver`, so it is never lost across
+        // per-call `RegistryHost` construction (mirrors `State::next_clone`).
+        self.registry.next_clone += 1;
+        let name = format!("{path}#{}", self.registry.next_clone);
+        self.new_object(prog, name)
+    }
+
+    fn ensure_program(&mut self, path: &str) -> R<Rc<CompiledProgram>> {
+        let driver = self
+            .driver
+            .as_mut()
+            .expect("ensure_program needs a driver context");
+        driver
+            .compiler
+            .ensure_program(self.registry, path)
+            .map_err(RtError::new)
+    }
+
+    /// Create an object, run variable initialisers (via [`Self::instantiate`])
+    /// then `create()`. On error the half-built object is removed (mirrors
+    /// `crate::world::Exec::new_object`).
+    fn new_object(&mut self, prog: Rc<CompiledProgram>, name: String) -> R<ObjectId> {
+        let id = self.instantiate(prog)?;
+        if let Some(o) = self.registry.get_mut(id) {
+            o.name = name.clone();
+        }
+        self.registry.names.insert(name.clone(), id);
+        match self.call_apply(id, "create", Vec::new()) {
+            Ok(_) => Ok(id),
+            Err(e) => {
+                self.registry.remove(id);
+                self.registry.names.remove(&name);
+                Err(e)
+            }
+        }
+    }
+
+    /// `compile_object`/`update` (§7.2): recompile `path` and install it,
+    /// all-or-nothing (mirrors `crate::world::Exec::recompile` +
+    /// [`RegistryHost::install`]).
+    pub fn recompile(&mut self, path: &str) -> Result<(), String> {
+        let path = mudlib::normalize_path(path)?;
+        let new_set = {
+            let driver = self
+                .driver
+                .as_mut()
+                .expect("recompile needs a driver context");
+            driver.compiler.recompile(self.registry, &path)?
+        };
+        self.install(new_set)
     }
 
     /// Call `name` on `on` (the object executing this call) as an
@@ -594,10 +831,192 @@ impl<'a> RegistryHost<'a> {
         self.call_in(on, &target, idx, args)
     }
 
+    fn want_obj(&self, efun: &str, v: &Value) -> R<ObjectId> {
+        match v {
+            Value::Object(id) if self.registry.get(*id).is_some() => Ok(*id),
+            Value::Object(_) => Err(RtError::new(format!("{efun}(): object was destructed"))),
+            v => Err(RtError::new(format!(
+                "{efun}(): expected object, got {}",
+                v.type_name()
+            ))),
+        }
+    }
+
+    /// Driver efuns not handled inline by the interpreter (spec §5.5),
+    /// ported from `crate::efuns::Exec::efun_inner`. `Err` ("needs full
+    /// World integration") when this `RegistryHost` has no [`Driver`]
+    /// context (the unit tests in this module).
+    fn driver_efun(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
+        if self.driver.is_none() {
+            return Err(RtError::new(format!(
+                "efun `{name}` is not available in this Host (needs full World integration)"
+            )));
+        }
+        let a0 = args.first().cloned().unwrap_or(Value::Null);
+        let a1 = args.get(1).cloned().unwrap_or(Value::Null);
+        match name {
+            "self" => Ok(Value::Object(self.self_object())),
+            "this_player" => Ok(self
+                .driver
+                .as_ref()
+                .and_then(|d| d.this_player)
+                .map_or(Value::Null, Value::Object)),
+            "load_object" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("load_object(): expected string"))?
+                    .to_string();
+                self.load_object(&p).map(Value::Object).map_err(|e| {
+                    RtError::new(format!("load_object(\"{p}\") failed:\n{}", e.report()))
+                })
+            }
+            "clone_object" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("clone_object(): expected string"))?
+                    .to_string();
+                self.clone_object(&p).map(Value::Object).map_err(|e| {
+                    RtError::new(format!("clone_object(\"{p}\") failed:\n{}", e.report()))
+                })
+            }
+            "find_object" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("find_object(): expected string"))?;
+                let key = p.strip_suffix(".wf").unwrap_or(p);
+                Ok(self
+                    .registry
+                    .names
+                    .get(key)
+                    .copied()
+                    .filter(|id| self.registry.get(*id).is_some())
+                    .map_or(Value::Null, Value::Object))
+            }
+            "object_name" => {
+                let id = self.want_obj(name, &a0)?;
+                Ok(Value::str(&self.registry.obj_name(id)))
+            }
+            "environment" => {
+                let id = if args.is_empty() {
+                    self.self_object()
+                } else {
+                    self.want_obj(name, &a0)?
+                };
+                Ok(self
+                    .registry
+                    .get(id)
+                    .and_then(|o| o.env)
+                    .map_or(Value::Null, Value::Object))
+            }
+            "inventory" => {
+                let id = self.want_obj(name, &a0)?;
+                let inv = self
+                    .registry
+                    .get(id)
+                    .map(|o| o.inventory.iter().map(|i| Value::Object(*i)).collect())
+                    .unwrap_or_default();
+                Ok(Value::array(inv))
+            }
+            "move_to" => {
+                let dest = self.want_obj(name, &a0)?;
+                let me = self.self_object();
+                let mut cur = Some(dest);
+                while let Some(c) = cur {
+                    if c == me {
+                        return Err(RtError::new(
+                            "move_to(): cannot move an object into itself or its contents",
+                        ));
+                    }
+                    cur = self.registry.get(c).and_then(|o| o.env);
+                }
+                self.registry.move_object(me, dest);
+                Ok(Value::Null)
+            }
+            "send" => {
+                let text = a1
+                    .as_str()
+                    .ok_or_else(|| RtError::new("send(): expected string"))?
+                    .to_string();
+                if let Value::Object(id) = a0 {
+                    let conn = self.registry.get(id).and_then(|o| o.conn);
+                    if let Some(conn) = conn
+                        && let Some(d) = self.driver.as_mut()
+                    {
+                        d.net.send(conn, &text);
+                    }
+                } else if !matches!(a0, Value::Null) {
+                    return Err(RtError::new(format!(
+                        "send(): expected object, got {}",
+                        a0.type_name()
+                    )));
+                }
+                Ok(Value::Null)
+            }
+            "disconnect" => {
+                if let Value::Object(id) = a0 {
+                    let conn = self.registry.get(id).and_then(|o| o.conn);
+                    if let Some(conn) = conn
+                        && let Some(d) = self.driver.as_mut()
+                    {
+                        d.net.close(conn);
+                    }
+                } else if !matches!(a0, Value::Null) {
+                    return Err(RtError::new(format!(
+                        "disconnect(): expected object, got {}",
+                        a0.type_name()
+                    )));
+                }
+                Ok(Value::Null)
+            }
+            "bind_connection" => {
+                let me = self.self_object();
+                let master = self.driver.as_ref().and_then(|d| d.master);
+                if master != Some(me) {
+                    return Err(RtError::new(
+                        "bind_connection() may only be called by the master object",
+                    ));
+                }
+                let id = self.want_obj(name, &a0)?;
+                let Some(conn) = self.driver.as_ref().and_then(|d| d.conn) else {
+                    return Err(RtError::new(
+                        "bind_connection(): no connection in this execution",
+                    ));
+                };
+                self.registry.bind(conn, id);
+                Ok(Value::Null)
+            }
+            "compile_object" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("compile_object(): expected string"))?
+                    .to_string();
+                Ok(match self.recompile(&p) {
+                    Ok(()) => Value::Null,
+                    Err(e) => Value::str(&e),
+                })
+            }
+            _ => Err(RtError::new(format!(
+                "internal: efun `{name}` not implemented"
+            ))),
+        }
+    }
+
     /// Call `name` declared in exactly `target` (no virtual dispatch) as
     /// `on`. Used for `$init` (each ancestor's own initialiser, never an
     /// override) and by [`Self::call_static`]/`call_on`/`call_other` once
     /// they have already resolved which program+slot to run.
+    /// Cross-object/virtual dispatch (`call_virtual`/`call_other`/`super::`)
+    /// nests a *new* [`Interpreter`] here — a real (if bounded) Rust-level
+    /// recursive call, not a push onto one flat frame stack (spec r5 D26
+    /// wants the latter so the whole call chain is suspendable at a
+    /// `TickCheck`; tracked as a known gap, see this module's doc comment).
+    /// Until that lands, `self_stack.len()` *is* this call chain's nesting
+    /// depth (it grows by exactly one per `call_in`, nested or not), so it
+    /// doubles as the guard that keeps unbounded Weft-level recursion
+    /// (e.g. `pub fn f() { f() }`, compiled to `CalleeOp::Virtual` even for
+    /// same-module calls) from overflowing the *native* stack: each nested
+    /// `Interpreter` only sees its own single frame, so `push_call`'s own
+    /// `max_depth` check never trips for this pattern without this.
     fn call_in(
         &mut self,
         on: ObjectId,
@@ -605,9 +1024,18 @@ impl<'a> RegistryHost<'a> {
         idx: u32,
         args: Vec<Value>,
     ) -> R<Value> {
-        self.self_stack.push(on);
         let func_name =
             target.module.strings[target.module.functions[idx as usize].name as usize].to_string();
+        let used = self.stack_base.abs_diff(stack_addr());
+        if self.self_stack.len() as u32 >= self.limits.max_depth || used > NESTED_CALL_STACK_BUDGET
+        {
+            let mut e = RtError::new(
+                "Too deep recursion (call depth limit or native stack budget exceeded)",
+            );
+            e.trace.push(format!("in {func_name}()"));
+            return Err(e);
+        }
+        self.self_stack.push(on);
         let limits = self.limits;
         let mut ticks = self.ticks_left;
         let result = {
@@ -628,10 +1056,7 @@ impl<'a> RegistryHost<'a> {
     /// Rolls back (removes the half-built object) on the first failing
     /// initialiser, matching `World::new_object`'s all-or-nothing create.
     pub fn instantiate(&mut self, prog: Rc<CompiledProgram>) -> R<ObjectId> {
-        let id = self.registry.insert(BcObject {
-            program: prog.clone(),
-            vars: Vars::new(),
-        });
+        let id = self.registry.insert(BcObject::new(prog.clone()));
         for ancestor in prog.chain() {
             let keep = vec![false; ancestor.init_specs().count()];
             if let Err(e) = self.run_init(id, &ancestor, &keep) {
@@ -856,10 +1281,8 @@ impl Host for RegistryHost<'_> {
         self.call_in(recv_id, &target, idx, args)
     }
 
-    fn call_efun(&mut self, name: &str, _args: Vec<Value>) -> R<Value> {
-        Err(RtError::new(format!(
-            "efun `{name}` is not available in this Host (needs full World integration)"
-        )))
+    fn call_efun(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
+        self.driver_efun(name, args)
     }
 
     fn load_global(&mut self, owner: &str, name: &str) -> Value {
@@ -883,6 +1306,31 @@ impl Host for RegistryHost<'_> {
 mod tests {
     use super::*;
     use loom_compiler::mudlib::{Outcome, Session};
+
+    #[test]
+    fn self_recursive_virtual_call_hits_the_depth_guard_not_the_native_stack() {
+        const WF: &str = r#"
+fn dive(n: int) -> int {
+    return dive(n + 1)
+}
+
+pub fn go() -> int {
+    return dive(0)
+}
+"#;
+        let module = compile("/obj/thing", &[("/obj/thing", WF)]);
+        let mut registry = Registry::default();
+        let prog = Rc::new(CompiledProgram::new(module, 1, None, Vec::new()));
+        registry.register_program(prog.clone());
+        let obj = make_object(&mut registry, prog);
+        let mut host = RegistryHost::new(&mut registry, obj);
+        let err = host.call_on(obj, "go", vec![]).unwrap_err();
+        assert!(
+            err.report().contains("Too deep recursion"),
+            "{}",
+            err.report()
+        );
+    }
 
     fn compile(path: &str, files: &[(&str, &str)]) -> Module {
         let map: HashMap<String, String> = files
@@ -920,10 +1368,7 @@ mod tests {
     }
 
     fn make_object(reg: &mut Registry, prog: Rc<CompiledProgram>) -> ObjectId {
-        reg.insert(BcObject {
-            program: prog,
-            vars: Vars::new(),
-        })
+        reg.insert(BcObject::new(prog))
     }
 
     /// D24 aliasing test, cross-object case (spec r5): a `pub fn` on one

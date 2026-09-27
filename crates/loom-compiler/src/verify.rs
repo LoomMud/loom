@@ -481,6 +481,20 @@ impl Cx<'_> {
                     self.expect(b, &Ty::String)?;
                     self.expect(dst, &Ty::String)
                 }
+                // `[T] + [T]` (spec r5 arrays have value semantics, `+=`
+                // is concatenation): `a`/`b`/`dst` must be the exact same
+                // array type — the checker (`check.rs`) only ever picks
+                // `OpKind::Array` for `BinOp::Add` when it already unified
+                // both operands to one element type.
+                OpKind::Array if matches!(op, BinOp::Add) => match self.reg(a)?.clone() {
+                    want @ Ty::Array(_) => {
+                        self.expect(b, &want)?;
+                        self.expect(dst, &want)
+                    }
+                    other => Err(VerifyError(format!(
+                        "%{a} has type {other}, expected an array"
+                    ))),
+                },
                 OpKind::Dyn => {
                     self.reg(a)?;
                     self.reg(b)?;
