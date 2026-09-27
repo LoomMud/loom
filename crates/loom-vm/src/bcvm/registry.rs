@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! A minimal, multi-object [`Host`] for the bytecode VM: a program
 //! registry with a per-program dispatch table (name → function slot,
