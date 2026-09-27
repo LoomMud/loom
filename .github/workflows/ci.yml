@@ -171,4 +171,41 @@ jobs:
         with:
           name: loadtest-smoke-report
           path: results/ci-smoke.*
+  docker-build:
+    # OBI-29: the Dockerfile and docker-compose.yml are only worth having if
+    # CI actually boots them, not just "should work". Not (yet) a required
+    # check on `main`.
+    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t loom:ci .
+      - name: Boot smoke test (Dockerfile, no compose)
+        run: |
+          set -euo pipefail
+          docker run -d --name loom-smoke -p 4000:4000 \
+            -v "$PWD/crates/loom-cli/tests/fixtures/tworoom:/mudlib:ro" \
+            loom:ci
+          for i in $(seq 1 50); do
+            python3 -c "import socket; socket.create_connection(('127.0.0.1',4000),timeout=1).close()" 2>/dev/null && break
+            sleep 0.2
+          done
+          python3 -c "import socket; s = socket.create_connection(('127.0.0.1', 4000), timeout=5); data = s.recv(64); assert data, 'no bytes from loom:ci container'"
+          docker logs loom-smoke
+          docker rm -f loom-smoke
+      - name: Boot smoke test (docker compose)
+        run: |
+          set -euo pipefail
+          rm -rf mudlib
+          cp -r crates/loom-cli/tests/fixtures/tworoom mudlib
+          docker compose config -q
+          docker compose up -d --build
+          for i in $(seq 1 50); do
+            python3 -c "import socket; socket.create_connection(('127.0.0.1',4000),timeout=1).close()" 2>/dev/null && break
+            sleep 0.2
+          done
+          python3 -c "import socket; s = socket.create_connection(('127.0.0.1', 4000), timeout=5); data = s.recv(64); assert data, 'no bytes from docker compose loom service'"
+          docker compose logs
+          docker compose down -v
 
