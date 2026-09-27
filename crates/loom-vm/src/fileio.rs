@@ -61,7 +61,11 @@ fn confine_canonical(root: &Path, candidate: &Path) -> Result<(), String> {
         std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
     let mut probe = candidate.to_path_buf();
     loop {
-        if probe.exists() {
+        // `symlink_metadata`, not `exists()`: a *dangling* symlink must
+        // count as existing, so `canonicalize` below fails on it instead
+        // of this loop skipping past it to its (confined) parent and a
+        // later write following it outside the root.
+        if std::fs::symlink_metadata(&probe).is_ok() {
             break;
         }
         if !probe.pop() {
@@ -119,6 +123,10 @@ pub fn write_file(root: &Path, path: &str, text: &str) -> Result<bool, String> {
         ));
     }
     let resolved = resolve(root, path)?;
+    // Confine *before* `create_dir_all` too, so a symlinked directory
+    // inside the root can't be used to create directories outside it
+    // (the deepest existing ancestor is what gets checked here).
+    confine_canonical(root, &resolved)?;
     if let Some(parent) = resolved.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
     }
@@ -128,6 +136,8 @@ pub fn write_file(root: &Path, path: &str, text: &str) -> Result<bool, String> {
     // existing ancestor, which also catches a pre-existing symlink
     // planted at `resolved` itself (its own canonical form is checked
     // too, not just its parent's).
+    // Residual risk (accepted for alpha): a symlink planted between this
+    // check and the write races it; nothing in-driver can create one.
     confine_canonical(root, &resolved)?;
     std::fs::write(&resolved, text).map_err(|e| format!("{path}: {e}"))?;
     Ok(true)
@@ -272,6 +282,47 @@ mod tests {
             "original",
             "the outside file must be untouched"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A *dangling* symlink at the leaf must not let `write_file` create
+    /// its target outside the root (CTO re-review, OBI-85).
+    #[test]
+    #[cfg(unix)]
+    fn write_through_a_dangling_symlinked_leaf_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("dangling-leaf");
+        let outside = tmp_root("dangling-leaf-outside");
+        std::fs::create_dir_all(root.join("domains/x")).unwrap();
+        symlink(outside.join("created.txt"), root.join("domains/x/link.txt")).unwrap();
+
+        let result = write_file(&root, "/domains/x/link.txt", "escaped");
+        assert!(result.is_err(), "expected an error, got {result:?}");
+        assert!(!outside.join("created.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// `write_file` must reject a path through a symlinked directory
+    /// *before* `create_dir_all`, so no directories appear outside the
+    /// root either (CTO re-review, OBI-85).
+    #[test]
+    #[cfg(unix)]
+    fn write_through_a_symlinked_dir_creates_nothing_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("symlink-mkdir");
+        let outside = tmp_root("symlink-mkdir-outside");
+        std::fs::create_dir_all(root.join("domains/x")).unwrap();
+        symlink(&outside, root.join("domains/x/evil")).unwrap();
+
+        let result = write_file(&root, "/domains/x/evil/a/b/c.txt", "x");
+        assert!(result.is_err(), "expected an error, got {result:?}");
+        assert!(!outside.join("a").exists(), "no directories outside root");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
