@@ -246,6 +246,9 @@ codes! {
     GATE_PHASE_0_GATE_STRUCT_LITERALS = "W0429", "Phase 0 gate: struct literals is not yet supported by the tree-walking evaluator";
     GATE_PHASE_0_GATE_ENUM_VARIANTS = "W0430", "Phase 0 gate: enum variants is not yet supported by the tree-walking evaluator";
 
+    // 09xx -- warnings and lints
+    LINT_LITERAL_SETTER_IN_CREATE = "W0900", "a `set_*` call in `create()` with only literal arguments is not re-applied on `upgrade()` (D-P1.4)";
+
 }
 
 /// Codes that used to be emitted but no longer are. A retired number is

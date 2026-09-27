@@ -1,0 +1,13 @@
+ok
+/item.wf:16:5: warning[W0900]: `set_short("a battered lantern")` in `create()` is not re-applied on upgrade (D-P1.4)
+   |
+16 |     set_short("a battered lantern");
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: move static content into an overridable function, e.g. `override fn short() -> string { return "a battered lantern"; }`; keep `create()` for per-instance mutable state
+
+/item.wf:18:5: warning[W0900]: `set_exits({"north": "/a/hall"})` in `create()` is not re-applied on upgrade (D-P1.4)
+   |
+18 |     set_exits({"north": "/a/hall"});
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = help: move static content into an overridable function, e.g. `override fn exits() -> map { return {"north": "/a/hall"}; }`; keep `create()` for per-instance mutable state
+

@@ -83,6 +83,10 @@ pub enum Outcome {
 pub struct Session<L: SourceLoader> {
     loader: L,
     done: BTreeMap<String, Outcome>,
+    /// Rendered `09xx` lint warnings (D-P1.4 etc.), by program path. Filled
+    /// in for every file that parses cleanly, independent of whether it
+    /// goes on to resolve/type-check (these lints are syntax-only).
+    warnings: BTreeMap<String, Vec<String>>,
     stack: Vec<String>,
 }
 
@@ -91,6 +95,7 @@ impl<L: SourceLoader> Session<L> {
         Session {
             loader,
             done: BTreeMap::new(),
+            warnings: BTreeMap::new(),
             stack: Vec::new(),
         }
     }
@@ -98,6 +103,11 @@ impl<L: SourceLoader> Session<L> {
     /// All outcomes so far, by program path.
     pub fn outcomes(&self) -> &BTreeMap<String, Outcome> {
         &self.done
+    }
+
+    /// All rendered lint warnings so far, by program path.
+    pub fn warnings(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.warnings
     }
 
     /// Force `path` to be recompiled on the next `.compile(path)` call
@@ -113,6 +123,13 @@ impl<L: SourceLoader> Session<L> {
 
     pub fn into_outcomes(self) -> BTreeMap<String, Outcome> {
         self.done
+    }
+
+    /// Consume the session, returning outcomes and rendered lint warnings.
+    pub fn into_outcomes_and_warnings(
+        self,
+    ) -> (BTreeMap<String, Outcome>, BTreeMap<String, Vec<String>>) {
+        (self.done, self.warnings)
     }
 
     /// Compile `path` (already normalised) and its ancestors.
@@ -139,6 +156,18 @@ impl<L: SourceLoader> Session<L> {
         let (ast, diags) = loom_syntax::parse(&src);
         if !diags.is_empty() {
             return Outcome::Failed(render(path, &src, &diags));
+        }
+        // Syntax-only lints (D-P1.4 etc., OBI-86) run on every clean parse,
+        // even if the program goes on to fail resolve/type-check below.
+        let lints = crate::lint::lint_program(&ast, &src);
+        if !lints.is_empty() {
+            self.warnings.insert(
+                path.to_string(),
+                lints
+                    .iter()
+                    .map(|d| d.render(&format!("{path}.wf"), &src))
+                    .collect(),
+            );
         }
         let mut diags = Vec::new();
         let mut parents = Vec::new();
@@ -252,6 +281,9 @@ pub struct MudlibReport {
     pub programs: BTreeMap<String, Checked>,
     /// One rendered report per failing file, sorted by path.
     pub errors: Vec<String>,
+    /// Rendered `09xx` lint warnings, sorted by path (D-P1.4 etc., OBI-86).
+    /// Warnings never fail `loom check` on their own; see `--deny-warnings`.
+    pub warnings: Vec<String>,
 }
 
 /// Check every `.wf` file under `root` (`loom check`).
@@ -265,9 +297,10 @@ pub fn check_mudlib(root: &Path) -> std::io::Result<MudlibReport> {
     for f in &files {
         s.compile(f);
     }
+    let (outcomes, warnings_by_path) = s.into_outcomes_and_warnings();
     let mut programs = BTreeMap::new();
     let mut errors = Vec::new();
-    for (path, o) in s.into_outcomes() {
+    for (path, o) in outcomes {
         match o {
             Outcome::Ok(c) => {
                 programs.insert(path, c);
@@ -281,7 +314,12 @@ pub fn check_mudlib(root: &Path) -> std::io::Result<MudlibReport> {
             }
         }
     }
-    Ok(MudlibReport { programs, errors })
+    let warnings = warnings_by_path.into_values().flatten().collect();
+    Ok(MudlibReport {
+        programs,
+        errors,
+        warnings,
+    })
 }
 
 fn collect_wf(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {

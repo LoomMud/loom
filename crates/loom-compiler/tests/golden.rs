@@ -20,6 +20,10 @@ fn render(dir: &Path, name: &str) -> String {
         out.push_str(e);
         out.push('\n');
     }
+    for w in &report.warnings {
+        out.push_str(w);
+        out.push('\n');
+    }
     if name.starts_with("hir_") {
         for c in report.programs.values() {
             out.push_str(&loom_compiler::dump::program(&c.hir));

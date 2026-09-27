@@ -40,17 +40,21 @@ async fn run() -> Result<(), String> {
         "check" => {
             let mut root = None;
             let mut dump_hir = false;
+            let mut deny_warnings = false;
             for a in args {
                 match a.as_str() {
                     "--dump-hir" => dump_hir = true,
+                    "--deny-warnings" => deny_warnings = true,
                     _ if root.is_none() => root = Some(PathBuf::from(a)),
                     _ => return Err(format!("unexpected argument: {a}")),
                 }
             }
             let Some(root) = root else {
-                return Err("usage: loom check <mudlib-root> [--dump-hir]".to_string());
+                return Err(
+                    "usage: loom check <mudlib-root> [--dump-hir] [--deny-warnings]".to_string(),
+                );
             };
-            check(root, dump_hir)
+            check(root, dump_hir, deny_warnings)
         }
         "disasm" => {
             let args: Vec<String> = args.collect();
@@ -91,8 +95,10 @@ fn disasm(root: PathBuf, program: &str) -> Result<(), String> {
 /// `loom check <mudlib-root>`: resolve and type-check every `.wf` file with
 /// the Phase 1 compiler front end (`loom-compiler`) without running anything;
 /// print diagnostics and fail if there are any. `--dump-hir` prints the
-/// typed HIR of every clean program.
-fn check(root: PathBuf, dump_hir: bool) -> Result<(), String> {
+/// typed HIR of every clean program. Lint warnings (`09xx` codes, e.g.
+/// D-P1.4 literal setters in `create()`) print but do not fail the check
+/// unless `--deny-warnings` is given.
+fn check(root: PathBuf, dump_hir: bool, deny_warnings: bool) -> Result<(), String> {
     let report = loom_compiler::check_mudlib(&root)
         .map_err(|err| format!("cannot scan {}: {err}", root.display()))?;
     if dump_hir {
@@ -100,16 +106,24 @@ fn check(root: PathBuf, dump_hir: bool) -> Result<(), String> {
             println!("{}", loom_compiler::dump::program(&c.hir));
         }
     }
+    for w in &report.warnings {
+        eprintln!("{w}");
+    }
     let errors = report.errors;
     for e in &errors {
         eprintln!("{e}\n");
     }
-    if errors.is_empty() {
-        println!("loom check: {} ok", root.display());
-        Ok(())
-    } else {
-        Err(format!("{} file(s) with errors", errors.len()))
+    if !errors.is_empty() {
+        return Err(format!("{} file(s) with errors", errors.len()));
     }
+    if deny_warnings && !report.warnings.is_empty() {
+        return Err(format!(
+            "{} warning(s) (--deny-warnings)",
+            report.warnings.len()
+        ));
+    }
+    println!("loom check: {} ok", root.display());
+    Ok(())
 }
 
 fn parse_mudlib_arg(mut args: impl Iterator<Item = String>) -> Result<PathBuf, String> {
