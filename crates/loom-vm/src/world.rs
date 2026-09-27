@@ -233,10 +233,19 @@ impl World {
     /// spec. The driver should call this on every event-loop iteration and
     /// on every tick, so login latency is bounded by how often the loop
     /// runs, not by how much other traffic there is.
+    ///
+    /// The apply runs in the issuer's *connection context* (OBI-38): if the
+    /// issuing object is bound to a connection, `this_player()` is that
+    /// object and the execution carries its connection, exactly as for
+    /// `process_input`. A login object can then hand its connection to the
+    /// player (`bind_connection` via the master) from inside
+    /// `account_result`, which is where a login flow finishes.
     pub fn drain_account_results(&mut self, host: &mut dyn Host) {
         while let Some((id, ob, ok, detail)) = self.account_results.pop_front() {
-            if self.registry.get(ob).is_some() {
-                let _ = self.exec(host, None, None, |h| {
+            if let Some(o) = self.registry.get(ob) {
+                let conn = o.conn;
+                let this_player = conn.map(|_| ob);
+                let _ = self.exec(host, this_player, conn, |h| {
                     h.call_apply(
                         ob,
                         "account_result",

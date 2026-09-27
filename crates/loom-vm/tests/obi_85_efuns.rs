@@ -403,6 +403,12 @@ fn account_request_id_is_returned_before_the_result_and_invalid_input_is_rejecte
             out.contains("account_result 1 false invalid"),
             "invalid input is rejected without touching the backend: {out:?}"
         );
+        // OBI-38: delivered with the issuer as this_player() (and its
+        // connection), so a login object can finish the login from here.
+        assert!(
+            out.contains("account_result context ok"),
+            "account_result must run in the issuer's connection context: {out:?}"
+        );
     });
 }
 
