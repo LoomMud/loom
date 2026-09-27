@@ -351,6 +351,7 @@ impl World {
     /// `delay` before it starts compiling — stands in for a large/slow
     /// compile in tests without needing an actually huge dependent tree
     /// (spec r5 amendment's own suggested alternative).
+    #[doc(hidden)]
     pub fn begin_recompile_after(
         &mut self,
         path: &str,
@@ -380,8 +381,12 @@ impl World {
             match job.poll() {
                 None => still_pending.push((token, job)),
                 Some(outcome) => {
+                    let root_path = job.path().to_string();
+                    let begin_snapshot = job.begin_snapshot().clone();
                     let result = self
-                        .exec(host, None, None, |h| Ok(h.finish_recompile(outcome)))
+                        .exec(host, None, None, |h| {
+                            Ok(h.finish_recompile(&root_path, &begin_snapshot, outcome))
+                        })
                         .unwrap_or_else(|e| Err(e.report()));
                     self.finished_recompiles.push((token, result));
                 }

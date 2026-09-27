@@ -113,3 +113,112 @@ fn a_failing_background_compile_reports_diagnostics_and_installs_nothing() {
         assert_eq!(world.program_version("/std/room"), Some(1));
     });
 }
+
+/// CTO review (OBI-93) item 1: a background compile's `ProgramSnapshot` is
+/// taken at `begin_recompile`, but only applied at `finish_recompile` —
+/// arbitrarily later. If a *synchronous* `compile_object` of the same path
+/// lands in between, the background result is stale (it would otherwise
+/// silently claim the same next version number the synchronous call
+/// already took, and migrate objects that are already on that program).
+/// `finish_recompile` must detect this, install nothing, and report it
+/// rather than corrupt the registry.
+#[test]
+fn a_stale_background_compile_is_rejected_not_installed() {
+    on_world_thread(|| {
+        let root = fixture("tworoom");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host);
+        assert_eq!(world.program_version("/std/room"), Some(1));
+
+        // Kick off a slow background recompile of `/std/room`...
+        let token = world.begin_recompile_after("/std/room", Duration::from_millis(200));
+        assert!(world.recompile_pending(token));
+
+        // ...then, while it's still asleep, recompile the very same path
+        // synchronously (a second admin `update`, or a driver retry).
+        let sync_err = world.compile_object("/std/room", &mut host);
+        assert_eq!(sync_err, None, "synchronous compile_object should succeed");
+        assert_eq!(world.program_version("/std/room"), Some(2));
+
+        // Now wait for the background job: it must notice the registry
+        // moved out from under it and refuse to install, leaving the
+        // synchronous call's version 2 alone.
+        let mut results = Vec::new();
+        for _ in 0..300 {
+            world.tick(&mut host);
+            if !world.recompile_pending(token) {
+                results = world.take_finished_recompiles();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, token);
+        let err = results[0].1.as_ref().expect_err("expected a stale error");
+        assert!(
+            err.contains("stale"),
+            "expected a staleness error, got: {err}"
+        );
+        assert_eq!(
+            world.program_version("/std/room"),
+            Some(2),
+            "the stale background result must not overwrite the synchronous compile's version"
+        );
+    });
+}
+
+/// CTO review (OBI-93) item 2: the background worker re-reads and
+/// re-typechecks every ancestor it needs from disk through its own private
+/// `Session`, including ones that aren't themselves being recompiled. If
+/// one of those (`/std/room`, the parent of `/domains/start/hall` here)
+/// changed on disk after it was last installed but before the background
+/// compile read it, the batch was type-checked against an interface that
+/// `registry.program(..)` won't actually link it to (the *old*, still-
+/// installed one). `finish_recompile` must detect that drift and refuse
+/// to install, rather than link a program against a different interface
+/// than the one it was verified against.
+#[test]
+fn an_ancestor_that_changed_on_disk_mid_compile_is_rejected() {
+    on_world_thread(|| {
+        let root = fixture("tworoom");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host); // loads /std/room and /domains/start/hall
+        assert_eq!(world.program_version("/domains/start/hall"), Some(1));
+
+        let token = world.begin_recompile_after("/domains/start/hall", Duration::from_millis(200));
+        assert!(world.recompile_pending(token));
+
+        // `/std/room` (hall's parent, not itself part of this batch)
+        // changes on disk while the background thread is still asleep, but
+        // is never `update`d/installed.
+        let room_src = std::fs::read_to_string(root.join("std/room.wf")).unwrap();
+        std::fs::write(
+            root.join("std/room.wf"),
+            format!("{room_src}\nfn extra_after_the_fact() {{}}\n"),
+        )
+        .unwrap();
+
+        let mut results = Vec::new();
+        for _ in 0..300 {
+            world.tick(&mut host);
+            if !world.recompile_pending(token) {
+                results = world.take_finished_recompiles();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, token);
+        let err = results[0]
+            .1
+            .as_ref()
+            .expect_err("expected an ancestor-drift error");
+        assert!(
+            err.contains("/std/room") && err.contains("changed on disk"),
+            "expected an ancestor-drift error naming /std/room, got: {err}"
+        );
+        assert_eq!(world.program_version("/domains/start/hall"), Some(1));
+    });
+}

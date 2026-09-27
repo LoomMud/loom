@@ -265,12 +265,18 @@ pub fn compile_hir_program(
 /// only virtually dispatches into its first parent's chain here.
 pub struct Compiler {
     session: Session<mudlib::FsLoader>,
+    /// Duplicated from `session`'s private `FsLoader` (OBI-90): both the
+    /// synchronous path and `begin_recompile`/`finish_recompile` need to
+    /// hash a program's `.wf` source (`compile_worker::source_hash`) to
+    /// detect drift, and `Session`'s loader isn't exposed for that.
+    root: PathBuf,
 }
 
 impl Compiler {
     pub fn new(root: PathBuf) -> Self {
         Compiler {
-            session: Session::new(mudlib::FsLoader { root }),
+            session: Session::new(mudlib::FsLoader { root: root.clone() }),
+            root,
         }
     }
 
@@ -311,8 +317,9 @@ impl Compiler {
                 .inherits
                 .first()
                 .and_then(|inh| registry.program(&inh.path));
-            let compiled =
+            let mut compiled =
                 compile_hir_program(&anc_hir, 1, parent).map_err(|e| format!("{anc}: {e}"))?;
+            compiled.source_hash = compile_worker::source_hash(&self.root, anc).unwrap_or(0);
             registry.register_program(Rc::new(compiled));
         }
         Ok(registry
@@ -393,8 +400,9 @@ impl Compiler {
                     .or_else(|| registry.program(&inh.path))
             });
             let version = registry.program(p).map_or(1, |old| old.version + 1);
-            let compiled =
+            let mut compiled =
                 compile_hir_program(&anc_hir, version, parent).map_err(|e| format!("{p}: {e}"))?;
+            compiled.source_hash = compile_worker::source_hash(&self.root, p).unwrap_or(0);
             new_set.insert(p.clone(), Rc::new(compiled));
         }
         Ok(new_set)
@@ -430,6 +438,7 @@ impl Compiler {
     /// [`Compiler::begin_recompile`], but the background thread sleeps for
     /// `delay` before compiling — test/tooling support for standing in for
     /// a large/slow compile, see `compile_worker::spawn_recompile_after`.
+    #[doc(hidden)]
     pub fn begin_recompile_after(
         &self,
         root: &Path,
@@ -455,20 +464,82 @@ impl Compiler {
     /// the new [`CompiledProgram`]s exactly like [`Compiler::recompile`],
     /// **not yet installed** — the caller still passes this to
     /// [`RegistryHost::install`].
+    /// Apply a finished [`compile_worker::RecompileJob`]'s outcome (OBI-90,
+    /// spec §7.2 step 4 up to `install`).
+    ///
+    /// **First (OBI-93 CTO review item 1, staleness):** re-snapshot
+    /// `registry` right now and compare it with `begin_snapshot` (the one
+    /// [`Compiler::begin_recompile`] captured before the background thread
+    /// started). If any program in this batch, or the dependent set of
+    /// `root_path`, has changed in the meantime — a second overlapping
+    /// `update`, a synchronous `compile_object`, or a brand-new dependent
+    /// loaded through `ensure_program` all count — refuse the whole batch
+    /// (`Err`, nothing installed) rather than risk two builds of the same
+    /// program both claiming the same version, or linking a dependent that
+    /// no longer exists/appeared mid-flight. Same check for every
+    /// out-of-batch ancestor the background compile actually consulted
+    /// (OBI-93 review item 2): if its on-disk source has changed since it
+    /// was installed, this batch was type-checked against an interface
+    /// that is no longer what `registry.program(..)` would link it to, so
+    /// refuse it too rather than silently mixing interfaces.
+    ///
+    /// **Then:** invalidate every recompiled path in `self.session` —
+    /// exactly like the synchronous [`Compiler::recompile`] does before it
+    /// starts, just deferred until here (and until *after* every check
+    /// above has passed) so a concurrent `ensure_program` for a brand-new
+    /// file during the background compile still sees the *old*,
+    /// still-installed interface — then decode and **re-verify** (spec
+    /// §5.8/§5.9: nothing runs unverified, including a `Module` that
+    /// round-tripped across this `Send` boundary the same way it would
+    /// across `encode`/`decode`) each program the background thread
+    /// produced, wiring `parent` to whichever `Rc<CompiledProgram>` is live
+    /// for that path (this batch first, then `registry`). Returns the new
+    /// [`CompiledProgram`]s exactly like [`Compiler::recompile`], **not yet
+    /// installed** — the caller still passes this to
+    /// [`RegistryHost::install`].
     pub fn finish_recompile(
         &mut self,
         registry: &Registry,
+        root_path: &str,
+        begin_snapshot: &compile_worker::ProgramSnapshot,
         outcome: compile_worker::CompileOutcome,
     ) -> Result<HashMap<String, Rc<CompiledProgram>>, String> {
-        let programs = match outcome {
-            compile_worker::CompileOutcome::Ready(p) => p,
+        let result = match outcome {
+            compile_worker::CompileOutcome::Ready(r) => r,
             compile_worker::CompileOutcome::Failed(e) => return Err(e),
         };
-        for p in &programs {
+
+        let now = compile_worker::ProgramSnapshot::capture(registry);
+        for wp in &result.programs {
+            if now.entry(&wp.path) != begin_snapshot.entry(&wp.path) {
+                return Err(format!(
+                    "stale: registry changed during background compile of {}; re-issue update",
+                    wp.path
+                ));
+            }
+        }
+        let mut begin_deps = begin_snapshot.dependents_of(root_path);
+        let mut now_deps = now.dependents_of(root_path);
+        begin_deps.sort_unstable();
+        now_deps.sort_unstable();
+        if begin_deps != now_deps {
+            return Err(format!(
+                "stale: dependent set of {root_path} changed during background compile; re-issue update"
+            ));
+        }
+        for (path, hash) in &result.ancestor_hashes {
+            if now.source_hash_of(path) != Some(*hash) {
+                return Err(format!(
+                    "ancestor {path} changed on disk since it was installed; update it first"
+                ));
+            }
+        }
+
+        for p in &result.programs {
             self.session.invalidate(&p.path);
         }
         let mut new_set: HashMap<String, Rc<CompiledProgram>> = HashMap::new();
-        for wp in programs {
+        for wp in result.programs {
             let module = loom_compiler::bytecode::decode(&wp.module_bytes)
                 .map_err(|e| format!("{}: corrupt background compile result: {e}", wp.path))?;
             loom_compiler::verify::verify(&module)
@@ -491,6 +562,7 @@ impl Compiler {
                 .and_then(|pp| new_set.get(pp).cloned().or_else(|| registry.program(pp)));
             let mut prog = CompiledProgram::new(module, wp.version, parent, var_specs);
             prog.non_public = wp.non_public.iter().map(|s| Rc::from(s.as_str())).collect();
+            prog.source_hash = wp.source_hash;
             new_set.insert(wp.path.clone(), Rc::new(prog));
         }
         Ok(new_set)
@@ -520,6 +592,14 @@ pub struct CompiledProgram {
     /// [`compile_hir_program`] from HIR visibility; empty for hand-assembled
     /// test modules built directly with [`CompiledProgram::new`].
     pub non_public: std::collections::HashSet<Rc<str>>,
+    /// [`compile_worker::source_hash`] of this program's own `.wf` file at
+    /// the moment it was compiled (OBI-93 CTO review item 2: lets a later
+    /// background compile that treats this program as an out-of-batch
+    /// ancestor detect that it has drifted on disk since). `0` for
+    /// hand-assembled test modules built directly with
+    /// [`CompiledProgram::new`] that never went through disk at all — not
+    /// a guaranteed-unused sentinel, just this type's default.
+    pub source_hash: u64,
 }
 
 impl ProgramCode for CompiledProgram {
@@ -550,6 +630,7 @@ impl CompiledProgram {
             parent,
             var_specs,
             non_public: Default::default(),
+            source_hash: 0,
         }
     }
 
@@ -1344,13 +1425,16 @@ impl<'a> RegistryHost<'a> {
 
     /// Apply a background [`compile_worker::RecompileJob`]'s outcome
     /// (OBI-90/D-P1.5, spec §7.2 step 4): decode + re-verify each program
-    /// the background thread produced, wire up `Rc<CompiledProgram>` parent
-    /// links against the *current* registry, then [`Self::install`] —
-    /// registry mutation + per-object migration — exactly like the
+    /// the background thread produced, refuse it if the registry drifted
+    /// while it was running (OBI-93 CTO review), wire up `Rc<CompiledProgram>`
+    /// parent links against the *current* registry, then [`Self::install`]
+    /// — registry mutation + per-object migration — exactly like the
     /// synchronous [`Self::recompile`], all still on the world thread, all
     /// still all-or-nothing.
     pub fn finish_recompile(
         &mut self,
+        root_path: &str,
+        begin_snapshot: &compile_worker::ProgramSnapshot,
         outcome: compile_worker::CompileOutcome,
     ) -> Result<(), String> {
         let new_set = {
@@ -1358,7 +1442,9 @@ impl<'a> RegistryHost<'a> {
                 .driver
                 .as_mut()
                 .expect("finish_recompile needs a driver context");
-            driver.compiler.finish_recompile(self.registry, outcome)?
+            driver
+                .compiler
+                .finish_recompile(self.registry, root_path, begin_snapshot, outcome)?
         };
         self.install(new_set)
     }
