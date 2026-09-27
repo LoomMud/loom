@@ -178,6 +178,21 @@ impl Value {
         }
     }
 
+    /// True if a write through [`Value::array_mut`]/[`Value::map_mut`]
+    /// would have to clone this value's heap buffer first (shared,
+    /// `Rc::strong_count() > 1`) rather than mutate it in place. Callers
+    /// check this *before* calling `array_mut`/`map_mut` to attribute an
+    /// actual clone-on-write to whichever code triggered it
+    /// (`loom_cow_copies_total{program}`, spec r5 §5.2.1, D24,
+    /// `bcvm::vm::Host::record_cow_copy`). The VM is single-threaded and
+    /// nothing else can observe/mutate the refcount between this check and
+    /// the `array_mut`/`map_mut` call it guards, so this is equivalent to
+    /// instrumenting `Rc::make_mut` itself, without coupling this
+    /// program-agnostic heap module to metrics or program identity.
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Value::Heap(h) if Rc::strong_count(h) > 1)
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Null => "null",
@@ -238,6 +253,35 @@ impl Value {
             (TypeKind::Map(..), Value::Heap(h)) => matches!(**h, HeapObj::Map(_)),
             _ => false,
         }
+    }
+}
+
+/// Approximate byte cost of one [`Value`], used for per-object memory
+/// quota accounting (spec r5 §5.2.1). **Shallow, not deep/transitive**: a
+/// container's own spine is counted (string bytes; array length ×
+/// `size_of::<Value>()`; map entry count × 2 × `size_of::<Value>()`), but
+/// an element/entry that is itself a container is counted only as its own
+/// 16-byte [`Value`] slot — its contents are not walked into and re-summed.
+/// This is a deliberate boundary, not an oversight: containers are
+/// copy-on-write value types that freely share their backing `Rc<HeapObj>`
+/// (see the module docs), so a deep byte count would either double-count a
+/// substructure shared between two objects' vars or attribute it
+/// arbitrarily to whichever object happened to write it last — neither is
+/// a meaningful "how much memory does this object own" answer. Shallow
+/// accounting charges exactly the allocation(s) an object's own write just
+/// touched, and is O(size of the value just written), not O(everything the
+/// object holds).
+pub fn shallow_bytes(v: &Value) -> u64 {
+    const SLOT: u64 = std::mem::size_of::<Value>() as u64;
+    match v {
+        Value::Heap(h) => match &**h {
+            HeapObj::Str(s) => s.len() as u64,
+            HeapObj::Array(a) => a.len() as u64 * SLOT,
+            HeapObj::Map(m) => m.entries.len() as u64 * 2 * SLOT,
+        },
+        // Primitives live in the var slot itself, not a separate heap
+        // allocation; nothing extra to charge.
+        _ => 0,
     }
 }
 
