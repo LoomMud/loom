@@ -47,6 +47,16 @@ pub enum NetEvent {
     Connected(ConnId),
     Line(ConnId, String),
     Disconnected(ConnId),
+    /// World-tick timer (spec r5 N2, OBI-82): `loom-cli::serve()` sends one
+    /// of these every `WORLD_TICK_INTERVAL` (100 ms) so the world thread can
+    /// call `World::tick(host)` between other events. Carries no data: the
+    /// world thread advances its own scheduler tick counter (`call_out`
+    /// delays are in world ticks, not wall-clock time), so a `Tick` is only
+    /// ever "advance by one", never "advance to time T". The timer that
+    /// produces this coalesces (see `loom-cli`'s tick task): if the world
+    /// thread falls behind, at most one `Tick` is ever pending in the event
+    /// channel, not one per missed 100 ms interval.
+    Tick,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -643,6 +653,7 @@ mod tests {
                         saw_slow_disconnect = true;
                     }
                 }
+                NetEvent::Tick => {}
             }
         }
 
