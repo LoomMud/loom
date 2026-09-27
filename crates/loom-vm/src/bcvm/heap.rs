@@ -99,9 +99,26 @@ pub struct EnumVal {
 /// for iteration/display (§5.1 determinism) but is **not** significant to
 /// `==` (r5): two maps are equal iff they have the same key set and the
 /// same value for every key.
+///
+/// `index`/`unindexed` (OBI-74) are a lookup accelerator, not part of the
+/// map's logical state: rebuilt implicitly as entries are inserted, and
+/// ignored by `PartialEq`. The type checker restricts map keys to
+/// `int`/`string`/`bool`/`object` (`check.rs` W0264), so
+/// [`Value::index_hash`] never sees an `Array`/`Map`/`Struct`/`Enum` key in
+/// practice; the `unindexed` fallback exists only so a `NaN`-ish or
+/// otherwise unhashable key (should one ever slip through, e.g. via `Any`)
+/// degrades to a linear scan among just those entries instead of
+/// corrupting lookups for everything else.
 #[derive(Clone, Debug, Default)]
 pub struct MapData {
     pub entries: Vec<(Value, Value)>,
+    /// `hash(key) -> entry indices` sharing that hash bucket (chained;
+    /// disambiguated by `Value::equals` on lookup, so a hash collision is
+    /// only ever a (rare) extra `equals` check, never a wrong answer).
+    index: std::collections::HashMap<u64, Vec<u32>>,
+    /// Entry indices whose key had no stable hash ([`Value::index_hash`]
+    /// returned `None`); scanned linearly.
+    unindexed: Vec<u32>,
 }
 
 impl PartialEq for MapData {
@@ -115,23 +132,42 @@ impl PartialEq for MapData {
 }
 
 impl MapData {
-    pub fn get(&self, k: &Value) -> Option<&Value> {
-        self.entries
+    fn find_index(&self, k: &Value) -> Option<usize> {
+        if let Some(h) = k.index_hash() {
+            return self.index.get(&h).and_then(|bucket| {
+                bucket
+                    .iter()
+                    .copied()
+                    .find(|&i| self.entries[i as usize].0.equals(k))
+                    .map(|i| i as usize)
+            });
+        }
+        self.unindexed
             .iter()
-            .find(|(e, _)| e.equals(k))
-            .map(|(_, v)| v)
+            .copied()
+            .find(|&i| self.entries[i as usize].0.equals(k))
+            .map(|i| i as usize)
+    }
+
+    pub fn get(&self, k: &Value) -> Option<&Value> {
+        self.find_index(k).map(|i| &self.entries[i].1)
     }
 
     pub fn insert(&mut self, k: Value, v: Value) {
-        if let Some(slot) = self.entries.iter_mut().find(|(e, _)| e.equals(&k)) {
-            slot.1 = v;
-        } else {
-            self.entries.push((k, v));
+        if let Some(i) = self.find_index(&k) {
+            self.entries[i].1 = v;
+            return;
         }
+        let idx = self.entries.len() as u32;
+        match k.index_hash() {
+            Some(h) => self.index.entry(h).or_default().push(idx),
+            None => self.unindexed.push(idx),
+        }
+        self.entries.push((k, v));
     }
 
     pub fn contains(&self, k: &Value) -> bool {
-        self.get(k).is_some()
+        self.find_index(k).is_some()
     }
 }
 
@@ -327,6 +363,51 @@ impl Value {
     pub fn is_valid_key(&self) -> bool {
         matches!(self, Value::Bool(_) | Value::Int(_) | Value::Object(_))
             || matches!(self, Value::Heap(h) if matches!(**h, HeapObj::Str(_)))
+    }
+
+    /// A hash consistent with [`Value::equals`] for [`MapData`]'s O(1)
+    /// lookup index (OBI-74): `a.equals(b)` implies
+    /// `a.index_hash() == b.index_hash()` for every `a`/`b` this returns
+    /// `Some` for. `None` means "not indexed": [`MapData`] falls back to a
+    /// linear scan for that entry rather than guess at a hash. The type
+    /// checker limits map keys to `int`/`string`/`bool`/`object`
+    /// (`check.rs` W0264, mirrored by [`Value::is_valid_key`]), so `Null`,
+    /// `Float`, and the compound heap kinds land here only via `Any`-typed
+    /// maps or direct VM construction, not surface-language map literals.
+    pub fn index_hash(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        match self {
+            Value::Null => 0u8.hash(&mut h),
+            Value::Bool(b) => {
+                1u8.hash(&mut h);
+                b.hash(&mut h);
+            }
+            Value::Int(i) => {
+                2u8.hash(&mut h);
+                i.hash(&mut h);
+            }
+            Value::Object(o) => {
+                3u8.hash(&mut h);
+                o.hash(&mut h);
+            }
+            Value::Heap(rc) => match &**rc {
+                HeapObj::Str(s) => {
+                    4u8.hash(&mut h);
+                    s.hash(&mut h);
+                }
+                // Not a valid map key (checker-enforced); no stable hash
+                // worth computing.
+                HeapObj::Array(_) | HeapObj::Map(_) | HeapObj::Struct(_) | HeapObj::Enum(_) => {
+                    return None;
+                }
+            },
+            // `f64` has no total `Hash` consistent with `PartialEq` (NaN,
+            // -0.0/0.0); floats are not a valid map key anyway, so just
+            // don't index them.
+            Value::Float(_) => return None,
+        }
+        Some(h.finish())
     }
 
     /// Shallow runtime type check against a declared type (element types of

@@ -69,6 +69,23 @@ fn containers() -> any {
     return total
 }
 
+// Same shape at 10x the entry count (OBI-74 acceptance: sub-quadratic at
+// 5k *and* 50k). If `MapData`'s lookup were still the O(n) linear scan
+// this replaced, going 5k -> 50k would cost ~100x, not ~10x.
+fn containers_50k() -> any {
+    var i = 0
+    var m: {int: int} = {:}
+    while i < 50000 {
+        m[i] = i * 2
+        i += 1
+    }
+    var total = 0
+    for k in keys(m) {
+        total += m[k] ?? 0
+    }
+    return total
+}
+
 fn cross_object() -> any {
     let b = load_object("/bench/b")
     var i = 0
@@ -252,6 +269,7 @@ fn run(iters: usize) {
         "recurse",
         "strings",
         "containers",
+        "containers_50k",
         "cross_object",
         "monocall",
         "monocall_other",
