@@ -156,7 +156,12 @@ pub trait Host {
     /// interpreter's one flat frame stack (D26). `site` identifies the
     /// calling `Op::Call`/`Op::CallOther` instruction, for a host that
     /// implements a per-call-site inline cache.
-    fn dispatch(&mut self, _site: CallSite, target: CallTarget<'_>, args: Vec<Value>) -> R<HostCall> {
+    fn dispatch(
+        &mut self,
+        _site: CallSite,
+        target: CallTarget<'_>,
+        args: Vec<Value>,
+    ) -> R<HostCall> {
         Ok(HostCall::Done(match target {
             CallTarget::Static { program, name } => self.call_static(program, name, args)?,
             CallTarget::Virtual { name } => self.call_virtual(name, args)?,
@@ -694,9 +699,11 @@ impl<'a, H: Host> Interpreter<'a, H> {
                             Ok(hc) => self.enter_or_store(hc, dst),
                             Err(argv) => {
                                 let name = self.str_of(name).to_string();
-                                let hc = self
-                                    .host
-                                    .dispatch(site, CallTarget::Virtual { name: &name }, argv)?;
+                                let hc = self.host.dispatch(
+                                    site,
+                                    CallTarget::Virtual { name: &name },
+                                    argv,
+                                )?;
                                 self.enter_or_store(hc, dst)
                             }
                         }
@@ -720,9 +727,11 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     Ok(hc) => self.enter_or_store(hc, Some(dst)),
                     Err(argv) => {
                         let name = self.str_of(name).to_string();
-                        let hc =
-                            self.host
-                                .dispatch(site, CallTarget::Other { recv, name: &name }, argv)?;
+                        let hc = self.host.dispatch(
+                            site,
+                            CallTarget::Other { recv, name: &name },
+                            argv,
+                        )?;
                         self.enter_or_store(hc, Some(dst))
                     }
                 }
@@ -1204,7 +1213,10 @@ mod tests {
 
     #[test]
     fn recursive_call_uses_heap_stack_not_native_recursion() {
-        let limits = Limits { max_depth: 20_000, ..Limits::default() };
+        let limits = Limits {
+            max_depth: 20_000,
+            ..Limits::default()
+        };
 
         // Run on a thread with a tiny (64 KiB) native stack: if the
         // interpreter ever recursed on the Rust stack for a Weft call, this
@@ -1235,7 +1247,10 @@ mod tests {
 
     #[test]
     fn recursion_past_the_weft_depth_limit_is_a_weft_error_not_a_crash() {
-        let limits = Limits { max_depth: 64, ..Limits::default() };
+        let limits = Limits {
+            max_depth: 64,
+            ..Limits::default()
+        };
 
         let result = std::thread::Builder::new()
             .stack_size(64 * 1024) // default-ish small stack (§ test spec: "default-stack thread")
@@ -1261,7 +1276,10 @@ mod tests {
     fn tick_metering_stops_a_runaway_call() {
         let module = countdown_module(false);
         let mut host = NoHost;
-        let limits = Limits { max_depth: 20_000, ..Limits::default() };
+        let limits = Limits {
+            max_depth: 20_000,
+            ..Limits::default()
+        };
         let mut ticks = 5u64; // far fewer ticks than the 10,000 needed
 
         let mut interp = Interpreter::new(&module, &mut host, &limits, &mut ticks);
@@ -1279,7 +1297,10 @@ mod tests {
     fn error_carries_a_stack_trace() {
         let module = countdown_module(false);
         let mut host = NoHost;
-        let limits = Limits { max_depth: 3, ..Limits::default() }; // recursion will exceed this quickly
+        let limits = Limits {
+            max_depth: 3,
+            ..Limits::default()
+        }; // recursion will exceed this quickly
         let mut ticks = 1_000_000u64;
 
         let mut interp = Interpreter::new(&module, &mut host, &limits, &mut ticks);

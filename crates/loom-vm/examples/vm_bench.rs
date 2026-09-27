@@ -7,6 +7,17 @@
 //! `main`) and the bytecode VM. No external deps; std `Instant` timing.
 //!
 //! `cargo run --release -p loom-vm --example vm_bench [iters]`
+//!
+//! **Per-call-site inline cache (OBI-78):** `monocall`/`monocall_other`
+//! below are dedicated, low-payload-per-call workloads (a virtual
+//! self-call and a `CallOther`, in a tight loop) whose time is almost
+//! entirely call *dispatch* overhead, not the callee's body — the
+//! workload the inline cache in `bcvm::registry::RegistryHost::dispatch`
+//! targets. Set `LOOM_VM_DISABLE_INLINE_CACHE=1` to get the pre-cache
+//! baseline numbers from this same binary (every call re-does the
+//! dispatch-table hash lookup) for an A/B comparison:
+//! `cargo run --release -p loom-vm --example vm_bench` vs.
+//! `LOOM_VM_DISABLE_INLINE_CACHE=1 cargo run --release -p loom-vm --example vm_bench`.
 
 use std::time::{Duration, Instant};
 
@@ -68,6 +79,36 @@ fn cross_object() -> any {
     }
     return acc
 }
+
+fn noop(n: int) -> int {
+    return n
+}
+
+// Virtual self-dispatch, monomorphic call site, trivial callee: isolates
+// `Op::Call` dispatch overhead from everything else (spec §5.8 inline
+// cache, OBI-78).
+fn monocall() -> any {
+    var i = 0
+    var acc = 0
+    while i < 500000 {
+        acc = noop(acc) + 1
+        i += 1
+    }
+    return acc
+}
+
+// Same, but `CallOther` (through the object table) instead of virtual
+// self-dispatch.
+fn monocall_other() -> any {
+    let b = load_object("/bench/b")
+    var i = 0
+    var acc = 0
+    while i < 500000 {
+        acc = b.inc(acc)
+        i += 1
+    }
+    return acc
+}
 "#;
 
 const B: &str = r#"
@@ -105,7 +146,15 @@ fn run(iters: usize) {
     let master = world.find_object("/secure/master").unwrap();
     println!("| workload | result | median | p95 | min |");
     println!("|---|---|---|---|---|");
-    for w in ["arith", "recurse", "strings", "containers", "cross_object"] {
+    for w in [
+        "arith",
+        "recurse",
+        "strings",
+        "containers",
+        "cross_object",
+        "monocall",
+        "monocall_other",
+    ] {
         let first = world
             .call(master, w, vec![], &mut NullHost)
             .unwrap_or_else(|e| panic!("{w}: {e}"));
