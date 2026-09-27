@@ -147,13 +147,7 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
             Ret::Ty(Ty::Bool),
             P0,
         ),
-        "set_heartbeat" => (
-            "set_heartbeat",
-            vec![P(Ty::Bool)],
-            1,
-            Ret::Ty(Ty::Void),
-            P0,
-        ),
+        "set_heartbeat" => ("set_heartbeat", vec![P(Ty::Bool)], 1, Ret::Ty(Ty::Void), P0),
         _ => return None,
     };
     Some(EfunSig {
