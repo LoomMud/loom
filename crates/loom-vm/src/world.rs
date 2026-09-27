@@ -19,6 +19,8 @@ use crate::bcvm::registry::{Compiler, Registry, RegistryHost};
 use crate::bcvm::vm::{Limits as VmLimits, RtError};
 use crate::host::{Host, NullHost};
 use crate::object::ObjectId;
+use crate::privilege::{AllowAllAudited, AuditEntry, PrivilegeCheck};
+use crate::scheduler::Scheduler;
 
 /// Path of the master object.
 pub const MASTER_PATH: &str = "/secure/master";
@@ -79,6 +81,11 @@ pub struct World {
     compiler: Compiler,
     master: Option<ObjectId>,
     limits: Limits,
+    /// `call_out`/heartbeat scheduler (OBI-33), advanced by `World::tick`.
+    scheduler: Scheduler,
+    /// P1+ enforcement hook (OBI-33): stubbed allow-all + audit log until
+    /// S1's policy replaces it (see `crate::privilege`).
+    privilege: Box<dyn PrivilegeCheck>,
 }
 
 impl World {
@@ -97,6 +104,8 @@ impl World {
             compiler: Compiler::new(mudlib_root.to_path_buf()),
             master: None,
             limits,
+            scheduler: Scheduler::new(),
+            privilege: Box::new(AllowAllAudited::new()),
         };
         let mut null = NullHost;
         let master = w
@@ -134,6 +143,8 @@ impl World {
             this_player,
             conn,
             self.master,
+            &mut self.scheduler,
+            self.privilege.as_mut(),
         );
         body(&mut rh)
     }
@@ -206,6 +217,84 @@ impl World {
         let _ = self.exec(host, Some(ob), None, |h| {
             h.call_apply(ob, "net_dead", Vec::new())
         });
+    }
+
+    /// Advance the world by one tick (OBI-33): `heart_beat()` on every
+    /// subscribed object, in subscription order, then every `call_out` now
+    /// due, in scheduling order (`Scheduler::advance`). Each call runs
+    /// against a fresh `RegistryHost` with its own metered tick budget
+    /// (`Limits::max_ticks`), exactly like `input`/`connect`, so one slow
+    /// callback cannot starve another. Errors have nowhere to report to
+    /// (neither path has a connection) and are swallowed, matching
+    /// `disconnect`'s `net_dead`.
+    pub fn tick(&mut self, host: &mut dyn Host) {
+        for ob in self.scheduler.heartbeat_targets() {
+            if self.registry.get(ob).is_none() {
+                continue; // destructed since it subscribed
+            }
+            let _ = self.exec(host, None, None, |h| {
+                h.call_apply(ob, "heart_beat", Vec::new())
+            });
+        }
+        for call in self.scheduler.advance() {
+            if self.registry.get(call.ob).is_none() {
+                continue; // destructed in the same tick it was scheduled for
+            }
+            let _ = self.exec(host, None, None, move |h| {
+                h.call_apply(call.ob, &call.func, call.args)
+            });
+        }
+    }
+
+    /// Destroy `ob`: move its inventory up into its own environment (or
+    /// drop it loose if it had none), unlink it from its environment's
+    /// inventory and its name/connection bindings, and cancel every
+    /// pending `call_out`/heartbeat subscription for it (OBI-33) before
+    /// freeing its slot. A no-op if `ob` is already gone. Not yet exposed
+    /// as a Weft efun (no ticket asks for `destruct_object()` yet); this
+    /// is the primitive such an efun and `World`'s tests both call.
+    pub fn destruct(&mut self, ob: ObjectId) {
+        let Some(existing_env) = self.registry.get(ob).map(|o| o.env) else {
+            return;
+        };
+        let inventory = self
+            .registry
+            .get(ob)
+            .map(|o| o.inventory.clone())
+            .unwrap_or_default();
+        for item in inventory {
+            match existing_env {
+                Some(dest) => self.registry.move_object(item, dest),
+                None => {
+                    if let Some(i) = self.registry.get_mut(item) {
+                        i.env = None;
+                    }
+                }
+            }
+        }
+        if let Some(env) = existing_env
+            && let Some(o) = self.registry.get_mut(env)
+        {
+            o.inventory.retain(|i| *i != ob);
+        }
+        if let Some(conn) = self.registry.get(ob).and_then(|o| o.conn) {
+            self.registry.conns.remove(&conn);
+        }
+        let name = self.registry.obj_name(ob);
+        self.registry.names.remove(&name);
+        self.scheduler.remove_for_object(ob);
+        self.registry.remove(ob);
+    }
+
+    /// Every P1+ efun call recorded so far by the enforcement hook
+    /// (OBI-33; empty until an efun with a gated `Privilege` runs).
+    pub fn audit_log(&self) -> &[AuditEntry] {
+        self.privilege.log()
+    }
+
+    /// Pending `call_out` count (tests/introspection).
+    pub fn pending_call_outs(&self) -> usize {
+        self.scheduler.pending_count()
     }
 
     // ---- introspection / tooling (tests, `loom` admin commands) -----------

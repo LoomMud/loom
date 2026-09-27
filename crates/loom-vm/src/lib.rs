@@ -14,6 +14,8 @@ pub mod bcvm;
 pub mod efuns;
 pub mod host;
 pub mod object;
+pub mod privilege;
+pub mod scheduler;
 pub mod world;
 
 use std::path::Path;

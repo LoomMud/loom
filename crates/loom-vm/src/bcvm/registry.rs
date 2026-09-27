@@ -759,6 +759,11 @@ struct Driver<'a> {
     this_player: Option<ObjectId>,
     conn: Option<u64>,
     master: Option<ObjectId>,
+    /// `call_out`/heartbeat scheduler (OBI-33), owned by `World`.
+    scheduler: &'a mut crate::scheduler::Scheduler,
+    /// P1+ enforcement hook (OBI-33): stubbed allow-all + audit log until
+    /// S1's security-model policy lands, see `crate::privilege`.
+    privilege: &'a mut dyn crate::privilege::PrivilegeCheck,
 }
 
 /// Approximate current native stack position (mirrors the tree-walker's
@@ -926,6 +931,8 @@ impl<'a> RegistryHost<'a> {
         this_player: Option<ObjectId>,
         conn: Option<u64>,
         master: Option<ObjectId>,
+        scheduler: &'a mut crate::scheduler::Scheduler,
+        privilege: &'a mut dyn crate::privilege::PrivilegeCheck,
     ) -> Self {
         RegistryHost {
             registry,
@@ -938,6 +945,8 @@ impl<'a> RegistryHost<'a> {
                 this_player,
                 conn,
                 master,
+                scheduler,
+                privilege,
             }),
             stack_base: stack_addr(),
             call_cache: HashMap::new(),
@@ -1062,6 +1071,16 @@ impl<'a> RegistryHost<'a> {
             return Err(RtError::new(format!(
                 "efun `{name}` is not available in this Host (needs full World integration)"
             )));
+        }
+        if let Some(p) = crate::efuns::privilege(name)
+            && p.gated()
+        {
+            let caller = self.self_object();
+            let driver = self.driver.as_mut().expect("checked above");
+            driver
+                .privilege
+                .check(caller, name, p)
+                .map_err(|e| RtError::new(format!("{name}(): {e}")))?;
         }
         let a0 = args.first().cloned().unwrap_or(Value::Null);
         let a1 = args.get(1).cloned().unwrap_or(Value::Null);
@@ -1205,6 +1224,51 @@ impl<'a> RegistryHost<'a> {
                     Ok(()) => Value::Null,
                     Err(e) => Value::str(&e),
                 })
+            }
+            "call_out" => {
+                let func = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("call_out(): expected string function name"))?
+                    .to_string();
+                let Value::Int(delay) = a1 else {
+                    return Err(RtError::new("call_out(): expected int delay"));
+                };
+                if delay < 0 {
+                    return Err(RtError::new("call_out(): delay must not be negative"));
+                }
+                let me = self.self_object();
+                let id = self
+                    .driver
+                    .as_mut()
+                    .expect("checked above")
+                    .scheduler
+                    .call_out(me, delay as u64, func, Vec::new());
+                Ok(Value::Int(id as i64))
+            }
+            "remove_call_out" => {
+                let Value::Int(id) = a0 else {
+                    return Err(RtError::new("remove_call_out(): expected int id"));
+                };
+                let removed = id >= 0
+                    && self
+                        .driver
+                        .as_mut()
+                        .expect("checked above")
+                        .scheduler
+                        .remove_call_out(id as u64);
+                Ok(Value::Bool(removed))
+            }
+            "set_heart_beat" => {
+                let Value::Bool(on) = a0 else {
+                    return Err(RtError::new("set_heart_beat(): expected bool"));
+                };
+                let me = self.self_object();
+                self.driver
+                    .as_mut()
+                    .expect("checked above")
+                    .scheduler
+                    .set_heart_beat(me, on);
+                Ok(Value::Null)
             }
             _ => Err(RtError::new(format!(
                 "internal: efun `{name}` not implemented"

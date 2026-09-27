@@ -1,0 +1,27 @@
+# Efun reference
+
+Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_compiler::efuns` (parameter/return types) by `cargo test -p loom-vm efuns_reference_doc_is_up_to_date -- --ignored` (regenerate with `UPDATE_EFUNS_DOC=1`). Do not hand-edit.
+
+| Efun | Signature | Privilege | Tick cost |
+|---|---|---|---|
+| `self` | `self() -> Object` | P0 | 1 |
+| `this_player` | `this_player() -> Optional(Object)` | P0 | 1 |
+| `load_object` | `load_object(String) -> Object` | P0 | 50 |
+| `clone_object` | `clone_object(String) -> Object` | P0 | 50 |
+| `find_object` | `find_object(String) -> Optional(Object)` | P0 | 5 |
+| `object_name` | `object_name(Object) -> String` | P0 | 1 |
+| `environment` | `environment(Optional(Object)?) -> Optional(Object)` | P0 | 1 |
+| `inventory` | `inventory(Object) -> Array(Object)` | P0 | 2 |
+| `move_to` | `move_to(Object) -> Void` | P0 | 2 |
+| `send` | `send(Optional(Object), String) -> Void` | P0 | 2 |
+| `disconnect` | `disconnect(Optional(Object)) -> Void` | P0 | 2 |
+| `bind_connection` | `bind_connection(Object) -> Void` | P3 | 2 |
+| `compile_object` | `compile_object(String) -> Optional(String)` | P1 | 500 |
+| `len` | `len(string \| [T] \| {K: V}) -> Int` | P0 | 1 |
+| `split` | `split(String, String) -> Array(String)` | P0 | 5 |
+| `join` | `join(Array(String), String) -> String` | P0 | 5 |
+| `keys` | `keys({K: V}) -> [K]` | P0 | 2 |
+| `trim` | `trim(String) -> String` | P0 | 1 |
+| `call_out` | `call_out(String, Int) -> Int` | P1 | 5 |
+| `remove_call_out` | `remove_call_out(Int) -> Bool` | P1 | 2 |
+| `set_heart_beat` | `set_heart_beat(Bool) -> Void` | P1 | 2 |

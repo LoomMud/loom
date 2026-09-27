@@ -4,10 +4,15 @@
 //! Efun type signatures for the checker (spec §5.5).
 //!
 //! This is the compile-time half of the efun registry: parameter and return
-//! types plus the privilege class. The runtime half (implementation, tick
-//! cost) lives in `loom-vm`. V6 (OBI-33) merges both into one registry; until
-//! then this table must list exactly the efuns `loom-vm` implements
-//! (`efun_table_matches_vm` in the tests keeps them in sync by name).
+//! types plus an *advisory* copy of the privilege class, for the checker's
+//! diagnostics only. `loom_vm::efuns` is the runtime half and the
+//! **authoritative** one (spec's HIR doc, invariant C2: "the VM gate looks
+//! the class up in its own efun registry ... the verifier" — here, a
+//! cross-crate test, `efun_table_matches_vm` — "checks the two agree").
+//! OBI-33 (V6) built that authoritative registry (name/arity/privilege/tick
+//! cost) in `loom-vm`; this table must keep listing exactly the same
+//! efuns with the same arity and privilege, which `efun_table_matches_vm`
+//! enforces.
 
 use crate::ty::Ty;
 
@@ -68,6 +73,9 @@ const NAMES: &[&str] = &[
     "join",
     "keys",
     "trim",
+    "call_out",
+    "remove_call_out",
+    "set_heart_beat",
 ];
 
 /// All efun names known to the checker.
@@ -125,6 +133,23 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
         ),
         "keys" => ("keys", vec![Param::AnyMap], 1, Ret::KeysOf, P0),
         "trim" => ("trim", vec![P(s.clone())], 1, Ret::Ty(s), P0),
+        // OBI-33: call_out / heartbeat scheduler efuns (see `loom_vm::efuns`
+        // for the authoritative arity/privilege/tick cost).
+        "call_out" => ("call_out", vec![P(s), P(Ty::Int)], 2, Ret::Ty(Ty::Int), P1),
+        "remove_call_out" => (
+            "remove_call_out",
+            vec![P(Ty::Int)],
+            1,
+            Ret::Ty(Ty::Bool),
+            P1,
+        ),
+        "set_heart_beat" => (
+            "set_heart_beat",
+            vec![P(Ty::Bool)],
+            1,
+            Ret::Ty(Ty::Void),
+            P1,
+        ),
         _ => return None,
     };
     Some(EfunSig {
