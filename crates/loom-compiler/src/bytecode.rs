@@ -230,6 +230,27 @@ pub fn encode(m: &Module) -> Vec<u8> {
     w.buf
 }
 
+/// Encode a bare [`Ty`], independent of any [`Module`] (OBI-90: the
+/// background compile worker hands a program's [`crate::registry::VarSpec`]
+/// list back to the world thread across a `Send` boundary the same way it
+/// hands back a [`Module`] — through this crate's existing encode/decode/
+/// verify trust boundary, not a shared `Rc`).
+pub fn encode_ty(ty: &Ty) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.put_ty(ty);
+    w.buf
+}
+
+/// Inverse of [`encode_ty`].
+pub fn decode_ty(bytes: &[u8]) -> Result<Ty, DecodeError> {
+    let mut r = Reader { buf: bytes, pos: 0 };
+    let ty = r.get_ty()?;
+    if r.pos != r.buf.len() {
+        return Err(DecodeError("trailing bytes".into()));
+    }
+    Ok(ty)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeError(pub String);
 
