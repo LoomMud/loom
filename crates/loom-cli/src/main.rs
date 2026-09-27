@@ -189,7 +189,14 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
 
     let mut server = tokio::spawn(loom_net::run_server(
         listener,
-        NetConfig::default(),
+        NetConfig {
+            mssp_fields: vec![
+                ("NAME".to_string(), "ObieMud".to_string()),
+                ("CODEBASE".to_string(), "Loom".to_string()),
+                ("CRAWL_DELAY".to_string(), "-1".to_string()),
+            ],
+            ..NetConfig::default()
+        },
         event_tx.clone(),
         command_rx,
         shutdown_rx.clone(),
@@ -394,6 +401,20 @@ fn spawn_world_thread(
                         // this is the coalescing boundary, not just a
                         // "received" acknowledgement.
                         tick_pending.store(false, Ordering::Release);
+                    }
+                    // NAWS/TTYPE/GMCP hooks into the world (efun-visible
+                    // state, `Char.*` driving game logic) are OBI-26
+                    // follow-up work; for the alpha the driver just logs
+                    // them so the wire protocol and tests are exercised
+                    // end to end without a `World`/`Host` seam change.
+                    NetEvent::WindowSize(conn, width, height) => {
+                        info!(conn, width, height, "NAWS window size");
+                    }
+                    NetEvent::TerminalType(conn, name) => {
+                        info!(conn, %name, "TTYPE terminal type");
+                    }
+                    NetEvent::Gmcp(conn, msg) => {
+                        info!(conn, ?msg, "GMCP message");
                     }
                 }
                 drain_account_events(&mut world, &mut host);
