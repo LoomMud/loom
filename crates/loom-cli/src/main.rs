@@ -81,7 +81,105 @@ async fn run() -> Result<(), String> {
             };
             disasm(PathBuf::from(root), program)
         }
+        "probe" => {
+            let url = args
+                .next()
+                .ok_or_else(|| "usage: loom probe <url>".to_string())?;
+            if args.next().is_some() {
+                return Err("usage: loom probe <url>".to_string());
+            }
+            probe(&url)
+        }
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+/// `loom probe <url>`: a minimal healthcheck client for use as a container
+/// `HEALTHCHECK`/Compose healthcheck command. The runtime image is
+/// `debian:bookworm-slim` with no `curl`/`wget`/`nc` installed (R6, OBI-42),
+/// so Docker Compose needs something already on `PATH` inside the image to
+/// probe `loom`'s own liveness/readiness.
+///
+/// Two URL schemes are supported:
+/// - `http://host:port/path` -- opens a TCP connection, sends a bare
+///   `GET /path HTTP/1.1` with a `Connection: close` header, and treats any
+///   `2xx` status line as success. Intended for the `loom-http` `:8080`
+///   `/healthz` and `/readyz` endpoints once that crate exists; today it
+///   works against any minimal HTTP responder.
+/// - `tcp://host:port` -- a bare TCP connect-and-close check, no HTTP
+///   involved. This is the interim healthcheck R6 uses today, since `loom`
+///   only listens on the telnet port (`:4000`); it proves the process is
+///   accepting connections, not that the world thread is healthy.
+///
+/// Exits (via the `Result` error path, caught by `main`) non-zero on any
+/// connection failure, timeout (5s) or non-2xx status, and prints nothing
+/// on success (Docker healthchecks judge by exit code only).
+fn probe(url: &str) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("probe: unsupported url (missing scheme): {url}"))?;
+
+    let connect = |host_port: &str| -> Result<TcpStream, String> {
+        let mut addrs = host_port
+            .to_socket_addrs()
+            .map_err(|err| format!("probe: cannot resolve {host_port}: {err}"))?;
+        let addr = addrs
+            .next()
+            .ok_or_else(|| format!("probe: no addresses for {host_port}"))?;
+        let stream = TcpStream::connect_timeout(&addr, TIMEOUT)
+            .map_err(|err| format!("probe: connect {host_port} failed: {err}"))?;
+        stream
+            .set_read_timeout(Some(TIMEOUT))
+            .map_err(|err| format!("probe: set_read_timeout: {err}"))?;
+        stream
+            .set_write_timeout(Some(TIMEOUT))
+            .map_err(|err| format!("probe: set_write_timeout: {err}"))?;
+        Ok(stream)
+    };
+
+    match scheme {
+        "tcp" => {
+            connect(rest)?;
+            Ok(())
+        }
+        "http" => {
+            let (host_port, path) = match rest.split_once('/') {
+                Some((hp, p)) => (hp, format!("/{p}")),
+                None => (rest, "/".to_string()),
+            };
+            let mut stream = connect(host_port)?;
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+            stream
+                .write_all(request.as_bytes())
+                .map_err(|err| format!("probe: write failed: {err}"))?;
+            let mut response = Vec::new();
+            stream
+                .read_to_end(&mut response)
+                .map_err(|err| format!("probe: read failed: {err}"))?;
+            let status_line = response
+                .split(|&b| b == b'\n')
+                .next()
+                .map(|line| String::from_utf8_lossy(line).trim().to_string())
+                .unwrap_or_default();
+            let status_code = status_line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|code| code.parse::<u16>().ok())
+                .ok_or_else(|| format!("probe: unparseable status line: {status_line:?}"))?;
+            if (200..300).contains(&status_code) {
+                Ok(())
+            } else {
+                Err(format!("probe: non-2xx status: {status_line}"))
+            }
+        }
+        other => Err(format!("probe: unsupported scheme: {other}")),
     }
 }
 
@@ -519,6 +617,65 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::probe;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// `loom probe tcp://host:port` (R6, OBI-42): a bare connect succeeds
+    /// against any listener, and fails once nothing is listening on that
+    /// port. This is the interim `loom` container healthcheck until
+    /// `loom-http` ships a real `/healthz`.
+    #[test]
+    fn tcp_probe_succeeds_against_a_listener_and_fails_once_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        // Accept (and drop) one connection per probe so the listener
+        // backlog doesn't matter.
+        let accept_thread = std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        assert!(probe(&format!("tcp://{addr}")).is_ok());
+        accept_thread.join().expect("accept thread");
+
+        // Nothing is listening on this port now: connect must fail.
+        assert!(probe(&format!("tcp://{addr}")).is_err());
+    }
+
+    /// `loom probe http://host:port/path` succeeds only on a genuine `2xx`
+    /// status line, and fails on a non-2xx response. Exercised against a
+    /// hand-rolled one-shot HTTP responder, since `loom-http` does not
+    /// exist yet.
+    #[test]
+    fn http_probe_checks_the_status_line() {
+        for (status_line, expect_ok) in [("HTTP/1.1 200 OK", true), ("HTTP/1.1 503 Busy", false)] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            let body = format!("{status_line}\r\nContent-Length: 0\r\n\r\n");
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                stream.write_all(body.as_bytes()).expect("write response");
+            });
+            let result = probe(&format!("http://{addr}/healthz"));
+            server.join().expect("server thread");
+            assert_eq!(result.is_ok(), expect_ok, "status line: {status_line}");
+        }
+    }
+
+    #[test]
+    fn unsupported_scheme_is_an_error() {
+        assert!(probe("ftp://127.0.0.1:9").is_err());
+    }
+
+    #[test]
+    fn missing_scheme_is_an_error() {
+        assert!(probe("127.0.0.1:9").is_err());
     }
 }
 
