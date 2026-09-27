@@ -30,10 +30,12 @@
 //! description rather than done quietly here.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use loom_compiler::bytecode::Module;
 use loom_compiler::hir;
+use loom_compiler::mudlib::{self, Outcome, Session};
 use loom_compiler::ty::Ty;
 
 use crate::bcvm::Value;
@@ -185,6 +187,91 @@ pub fn compile_hir_program(
         compile_and_verify(hir)?
     };
     Ok(CompiledProgram::new(module, version, parent, var_specs))
+}
+
+/// Disk-backed program registration (spec §7.2's `compile_object`/`update`,
+/// the bytecode-VM analogue of `crate::world::World::compile_file`\/
+/// `ensure_program`): parses, resolves imports/inherits, and type-checks
+/// through [`loom_compiler::mudlib::Session`] (which already knows how to
+/// load `<root>/<path>.wf` from disk and walk an inherit chain, parents
+/// first), then registers every not-yet-registered ancestor as a
+/// [`CompiledProgram`] in [`Registry`], root first.
+///
+/// **Scope of this slice:** first-load only (`ensure_program`), matching
+/// the acceptance-criteria's "real `.wf` programs run on this VM" step.
+/// Recompiling an *already-loaded* program in place (`compile_object`'s
+/// all-or-nothing relink-and-migrate-every-instance semantics, which
+/// `World::recompile`/`install` already implement for the tree-walker) is
+/// not ported yet — tracked as the next slice on this issue, not silently
+/// skipped: [`Compiler`] only ever *adds* new entries to a [`Registry`],
+/// it never replaces one, so calling it again for an already-registered
+/// path is a no-op that returns the existing [`CompiledProgram`] (stale if
+/// the source changed on disk since).
+///
+/// **Known simplification, carried over from the existing tree-walker**
+/// (`crate::program::link` also does this): only the *first* `inherit` is
+/// used as this program's single parent chain link. `hir::Program` and
+/// `mudlib::Session` already resolve full multi-parent linearisation
+/// (diamond-safe); [`CompiledProgram`] does not represent that yet
+/// (`parent: Option<Rc<CompiledProgram>>` is a single link), so a program
+/// with more than one `inherit` compiles and type-checks correctly but
+/// only virtually dispatches into its first parent's chain here.
+pub struct Compiler {
+    session: Session<mudlib::FsLoader>,
+}
+
+impl Compiler {
+    pub fn new(root: PathBuf) -> Self {
+        Compiler {
+            session: Session::new(mudlib::FsLoader { root }),
+        }
+    }
+
+    /// Ensure `path` (and every ancestor it needs) is compiled and
+    /// registered in `registry`, returning the leaf [`CompiledProgram`].
+    /// Rendered diagnostics / "file not found" on failure, exactly like
+    /// `World::ensure_program`'s `Result<_, String>`.
+    pub fn ensure_program(
+        &mut self,
+        registry: &mut Registry,
+        path: &str,
+    ) -> Result<Rc<CompiledProgram>, String> {
+        let path = mudlib::normalize_path(path)?;
+        if let Some(p) = registry.program(&path) {
+            return Ok(p);
+        }
+        let linearization: Vec<Rc<str>> = match self.session.compile(&path) {
+            Outcome::Ok(checked) => checked.info.linearization.clone(),
+            Outcome::Failed(msg) => return Err(msg.clone()),
+            Outcome::Missing(msg) => return Err(msg.clone()),
+        };
+        for anc in &linearization {
+            if registry.program(anc).is_some() {
+                continue;
+            }
+            let anc_hir = match self.session.outcomes().get(&**anc) {
+                Some(Outcome::Ok(c)) => c.hir.clone(),
+                _ => {
+                    return Err(format!(
+                        "internal: {anc} missing from the compile session after compiling {path}"
+                    ));
+                }
+            };
+            // Phase 0's/`crate::program::link`'s restriction, see the
+            // module doc comment: only the first `inherit` becomes this
+            // program's `CompiledProgram` parent link.
+            let parent = anc_hir
+                .inherits
+                .first()
+                .and_then(|inh| registry.program(&inh.path));
+            let compiled =
+                compile_hir_program(&anc_hir, 1, parent).map_err(|e| format!("{anc}: {e}"))?;
+            registry.register_program(Rc::new(compiled));
+        }
+        Ok(registry
+            .program(&path)
+            .expect("just registered by the loop above"))
+    }
 }
 
 /// A verified [`Module`] plus the metadata dispatch needs: its own
@@ -955,5 +1042,75 @@ pub fn get_data() -> string {
 
         let data = host.call_on(obj, "get_data", vec![]).unwrap();
         assert_eq!(data.as_str(), Some("fresh"));
+    }
+
+    /// End-to-end proof that the disk-backed [`Compiler`] (spec §7.2's
+    /// `compile_object`/`ensure_program`, the bytecode-VM analogue of
+    /// `crate::world::World::ensure_program`) actually loads real `.wf`
+    /// files from a mudlib root, parent first, and that the resulting
+    /// object dispatches correctly across the inherit chain — the same
+    /// proof `crate::world`'s own tests give the tree-walker, but for this
+    /// VM. Uses a real temp directory (not the in-memory `HashMap`
+    /// `SourceLoader` the other tests in this module use), because this is
+    /// specifically testing the disk-loading path `World` will need.
+    #[test]
+    fn compiler_loads_real_wf_files_from_disk_parent_first() {
+        let root = std::env::temp_dir().join(format!(
+            "loom-vm-bcvm-registry-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let write = |rel: &str, src: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, src).unwrap();
+        };
+        write(
+            "std/room.wf",
+            r#"
+var short_desc: string = "An empty room"
+
+pub fn short() -> string {
+    return short_desc
+}
+"#,
+        );
+        write(
+            "domains/start/hall.wf",
+            r#"
+inherit /std/room
+
+fn create() {
+    short_desc = "The Great Hall"
+}
+"#,
+        );
+
+        let mut compiler = Compiler::new(root.clone());
+        let mut registry = Registry::default();
+        let hall = compiler
+            .ensure_program(&mut registry, "/domains/start/hall")
+            .expect("ensure_program");
+        // Both the child and its parent must now be registered.
+        assert!(registry.program("/std/room").is_some());
+        assert_eq!(&*hall.path, "/domains/start/hall");
+
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(hall).expect("instantiate");
+        // `create()` isn't called automatically by `instantiate` (that is
+        // `World::new_object`'s job, not ported yet); call it explicitly
+        // the way this slice's other tests call functions directly.
+        host.call_on(obj, "create", vec![]).unwrap();
+        let short = host.call_on(obj, "short", vec![]).unwrap();
+        assert_eq!(short.as_str(), Some("The Great Hall"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
