@@ -1135,7 +1135,7 @@ impl Assembler {
             ret: f.ret.clone(),
             reg_types: f.reg_types.clone(),
             entry_points,
-            code,
+            code: code.into(),
             capture_targets: f.capture_targets.clone(),
         }
     }
@@ -1155,12 +1155,12 @@ impl Assembler {
                 dst: *dst,
                 owner: self.intern(&global.owner),
                 name: self.intern(&global.name),
-                ty: ty.clone(),
+                ty: Box::new(ty.clone()),
             },
             Inst::StoreGlobal { global, ty, src } => Op::StoreGlobal {
                 owner: self.intern(&global.owner),
                 name: self.intern(&global.name),
-                ty: ty.clone(),
+                ty: Box::new(ty.clone()),
                 src: *src,
             },
             Inst::UnOp { dst, op, kind, src } => Op::UnOp {
@@ -1188,7 +1188,7 @@ impl Assembler {
                 elems,
             } => Op::NewArray {
                 dst: *dst,
-                elem_ty: elem_ty.clone(),
+                elem_ty: Box::new(elem_ty.clone()),
                 elems: elems.clone(),
             },
             Inst::NewMap {
@@ -1198,8 +1198,8 @@ impl Assembler {
                 entries,
             } => Op::NewMap {
                 dst: *dst,
-                key_ty: key_ty.clone(),
-                val_ty: val_ty.clone(),
+                key_ty: Box::new(key_ty.clone()),
+                val_ty: Box::new(val_ty.clone()),
                 entries: entries.clone(),
             },
             Inst::Index {
@@ -1233,7 +1233,7 @@ impl Assembler {
                 dst: *dst,
                 src: *src,
                 kind: *kind,
-                elem_ty: elem_ty.clone(),
+                elem_ty: Box::new(elem_ty.clone()),
             },
             Inst::ToStr { dst, src } => Op::ToStr {
                 dst: *dst,
@@ -1271,7 +1271,7 @@ impl Assembler {
             Inst::Cast { dst, src, ty } => Op::Cast {
                 dst: *dst,
                 src: *src,
-                ty: ty.clone(),
+                ty: Box::new(ty.clone()),
             },
             Inst::TickCheck => Op::TickCheck,
             Inst::PushHandler {

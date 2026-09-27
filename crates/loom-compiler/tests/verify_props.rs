@@ -58,7 +58,7 @@ fn assert_actually_in_bounds(m: &Module) {
         let n_regs = f.reg_types.len();
         let check_reg = |r: u32| assert!((r as usize) < n_regs, "register %{r} out of bounds");
         let check_pc = |t: u32| assert!((t as usize) < f.code.len(), "pc {t} out of bounds");
-        for op in &f.code {
+        for op in f.code.iter() {
             match op {
                 Op::LoadConst { dst, idx } => {
                     check_reg(*dst);
@@ -295,7 +295,7 @@ proptest! {
                 ret: loom_compiler::Ty::Void,
                 reg_types,
                 entry_points: vec![0],
-                code,
+                code: code.into(),
                 capture_targets: Vec::new(),
             }],
         };
