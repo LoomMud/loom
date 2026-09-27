@@ -619,9 +619,24 @@ enum JournalEntry {
     /// `clone_object`: rollback deletes the clone. Does not attempt to
     /// undo anything the clone's own `create()` did to *other* objects
     /// beyond their variables (those are separately journaled `VarWrite`
-    /// entries) — `move_to`/inventory linkage is not yet journaled (scope
-    /// note below).
+    /// entries) — its own `move_to`/inventory linkage *is* covered, by a
+    /// separate `Move` entry (below) pushed by the same call that moved
+    /// it; replay runs most-recent-first, so that `Move` is always
+    /// undone before this `Clone` entry deletes the object.
     Clone { obj: ObjectId, name: String },
+    /// `move_to` (`Registry::move_object`): rollback relinks `obj` back
+    /// into `old_env`'s inventory at `old_index` (or unenvironed, if
+    /// `old_env` is `None`) instead of leaving it in whatever `atomic`
+    /// moved it to. Spec §5.2.1 names inventory moves as *the* `atomic`
+    /// use case (`transfer_to`); without this, a failed `atomic fn` left
+    /// `move_to` applied, and `clone_object` + `move_to(room)` + throw
+    /// left a dangling id in `room.inventory` after the clone itself was
+    /// deleted.
+    Move {
+        obj: ObjectId,
+        old_env: Option<ObjectId>,
+        old_index: Option<usize>,
+    },
 }
 
 impl Registry {
@@ -699,10 +714,17 @@ impl Registry {
     /// Move `id` out of its current environment (if any) and into `dest`'s
     /// inventory (mirrors `crate::world::State::move_object`; the caller
     /// is responsible for cycle checks, see `RegistryHost`'s `move_to`
-    /// efun).
+    /// efun). Journals a [`JournalEntry::Move`] if an `atomic` scope is
+    /// open (spec §5.2.1), recording exactly enough (`old_env`,
+    /// `old_index`) to relink `id` back into its original inventory slot
+    /// on rollback rather than merely appending it back to the end.
     pub fn move_object(&mut self, id: ObjectId, dest: ObjectId) {
-        let old = self.get(id).and_then(|o| o.env);
-        if let Some(old) = old
+        let old_env = self.get(id).and_then(|o| o.env);
+        let old_index = old_env.and_then(|old| {
+            self.get(old)
+                .and_then(|o| o.inventory.iter().position(|i| *i == id))
+        });
+        if let Some(old) = old_env
             && let Some(o) = self.get_mut(old)
         {
             o.inventory.retain(|i| *i != id);
@@ -713,6 +735,7 @@ impl Registry {
         if let Some(o) = self.get_mut(id) {
             o.env = Some(dest);
         }
+        self.journal_move(id, old_env, old_index);
     }
 
     /// Bind connection `conn` to object `id` (unbinding both sides'
@@ -784,6 +807,28 @@ impl Registry {
                     self.remove(obj);
                     self.names.remove(&name);
                 }
+                JournalEntry::Move {
+                    obj,
+                    old_env,
+                    old_index,
+                } => {
+                    let cur_env = self.get(obj).and_then(|o| o.env);
+                    if let Some(cur) = cur_env
+                        && let Some(o) = self.get_mut(cur)
+                    {
+                        o.inventory.retain(|i| *i != obj);
+                    }
+                    if let Some(old) = old_env
+                        && let Some(o) = self.get_mut(old)
+                    {
+                        let idx = old_index.unwrap_or(o.inventory.len());
+                        let idx = idx.min(o.inventory.len());
+                        o.inventory.insert(idx, obj);
+                    }
+                    if let Some(o) = self.get_mut(obj) {
+                        o.env = old_env;
+                    }
+                }
             }
         }
         self.atomic_active = self.atomic_active.saturating_sub(1);
@@ -802,6 +847,35 @@ impl Registry {
         if self.atomic_active > 0 {
             self.journal.push(JournalEntry::Clone { obj, name });
         }
+    }
+
+    /// Record a `move_to`, if an atomic scope is open.
+    fn journal_move(&mut self, obj: ObjectId, old_env: Option<ObjectId>, old_index: Option<usize>) {
+        if self.atomic_active > 0 {
+            self.journal.push(JournalEntry::Move {
+                obj,
+                old_env,
+                old_index,
+            });
+        }
+    }
+
+    /// No atomic scope should ever still be open, nor anything left in
+    /// its journal, at a `World::exec` boundary (CTO review of OBI-32,
+    /// should-do #3): every `atomic fn` call opens exactly one scope in
+    /// `Interpreter::push_call` and closes it in either `Op::Return`
+    /// (commit) or `Interpreter::run`'s error-unwind path (rollback), so
+    /// this only fires if some future suspend/unusual-exit path manages
+    /// to leave one open — which would otherwise silently journal every
+    /// write from then on, forever, since `journal_commit` only clears
+    /// the journal once `atomic_active` returns to zero.
+    pub(crate) fn debug_assert_atomic_scope_closed(&self) {
+        debug_assert!(
+            self.atomic_active == 0 && self.journal.is_empty(),
+            "atomic scope leaked across a World::exec boundary (atomic_active={}, journal has {} entries)",
+            self.atomic_active,
+            self.journal.len()
+        );
     }
 }
 
@@ -2820,6 +2894,52 @@ pub fn get_n() -> int {
         assert!(n.equals(&Value::Int(1)), "caught error must not roll back");
     }
 
+    /// Tick exhaustion inside `atomic` rolls back (spec §5.9's table:
+    /// "rollback if atomic"). `Interpreter::run`'s error-unwind path calls
+    /// `Host::rollback_atomic` for every atomic frame it pops on *any*
+    /// error, tick exhaustion included — the code path already existed,
+    /// this pins it specifically since tick/depth exhaustion are handled
+    /// separately from ordinary `RtError`s (uncatchable by `try`/`catch`,
+    /// spec r5) everywhere else in the VM.
+    #[test]
+    fn atomic_fn_rolls_back_on_tick_exhaustion() {
+        const WF: &str = r#"
+var n: int = 0
+
+atomic fn bump_then_spin() {
+    n = 1
+    while true {
+        n = n
+    }
+}
+
+pub fn get_n() -> int {
+    return n
+}
+"#;
+        let prog = Rc::new(compile_program("/t/obj", &[("/t/obj", WF)], 1, None));
+        let mut registry = Registry::default();
+        registry.register_program(prog.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(prog).expect("instantiate");
+
+        // Far fewer ticks than the infinite loop needs.
+        host.ticks_left = 50;
+        let err = host.call_on(obj, "bump_then_spin", vec![]).unwrap_err();
+        assert!(err.report().contains("Too long evaluation"), "{}", err.report());
+
+        host.ticks_left = 1_000_000;
+        let n = host.call_on(obj, "get_n", vec![]).unwrap();
+        assert!(
+            n.equals(&Value::Int(0)),
+            "n must be rolled back on tick exhaustion inside atomic, got {n:?}"
+        );
+    }
+
     /// Nested atomic calls telescope: an inner atomic call that commits is
     /// still undone if the *outer* atomic scope it ran inside later fails.
     #[test]
@@ -2914,5 +3034,59 @@ pub fn get_n() -> int {
             prop::collection::vec(any::<i64>(), 0..5)
                 .prop_map(|v| Value::array(v.into_iter().map(Value::Int).collect())),
         ]
+    }
+
+    /// Three bare objects (one "item", two "rooms") sharing the same
+    /// single-function program used by [`atomic_test_object`], for the
+    /// move-journaling property test below.
+    fn atomic_move_test_objects() -> (Registry, ObjectId, [ObjectId; 2]) {
+        let module = compile("/t/obj", &[("/t/obj", "fn create() {}\n")]);
+        let mut registry = Registry::default();
+        let prog = Rc::new(CompiledProgram::new(module, 1, None, Vec::new()));
+        registry.register_program(prog.clone());
+        let item = make_object(&mut registry, prog.clone());
+        let rooms = [
+            make_object(&mut registry, prog.clone()),
+            make_object(&mut registry, prog),
+        ];
+        (registry, item, rooms)
+    }
+
+    // Property test (CTO review of OBI-32, "add a move op to the proptest
+    // too if that's cheap"): an arbitrary sequence of `move_to`s made
+    // while an atomic scope is open is undone back to the exact prior
+    // environment and inventories on rollback, matching the var-write
+    // property test above but for `Registry::move_object`/`JournalEntry
+    // ::Move` instead of `store_global`/`JournalEntry::VarWrite`.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+        #[test]
+        fn atomic_move_rollback_restores_exact_prior_inventories(
+            start_room in 0usize..2,
+            moves in prop::collection::vec(0usize..2, 0..8),
+        ) {
+            let (mut registry, item, rooms) = atomic_move_test_objects();
+            registry.move_object(item, rooms[start_room]);
+
+            let snapshot_env = registry.get(item).and_then(|o| o.env);
+            let snapshot_inv: Vec<Vec<ObjectId>> = rooms
+                .iter()
+                .map(|r| registry.get(*r).unwrap().inventory.clone())
+                .collect();
+
+            let mut host = RegistryHost::new(&mut registry, item);
+            let mark = host.begin_atomic();
+            for m in &moves {
+                host.registry.move_object(item, rooms[*m]);
+            }
+            host.rollback_atomic(mark);
+
+            let got_env = host.registry.get(item).and_then(|o| o.env);
+            prop_assert_eq!(got_env, snapshot_env);
+            for (i, r) in rooms.iter().enumerate() {
+                let got_inv = &host.registry.get(*r).unwrap().inventory;
+                prop_assert_eq!(got_inv, &snapshot_inv[i]);
+            }
+        }
     }
 }
