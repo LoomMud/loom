@@ -1,0 +1,4 @@
+// Master object: hands every new connection a fresh player.
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}

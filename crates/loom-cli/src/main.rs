@@ -7,13 +7,19 @@ use std::path::PathBuf;
 use std::thread;
 
 use loom_net::{NetCommand, NetConfig, NetEvent};
-use loom_vm::{Host, World};
+use loom_persist::{DbEvent, DbRequest, Password};
+use loom_vm::{AccountAuth, Host, World};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const COMMAND_CHANNEL_CAPACITY: usize = 1024;
+/// Bound on in-flight `account_create`/`account_login` requests (spec's
+/// bounded-queue engineering lens): past this many outstanding DB/dev-
+/// backend requests, `blocking_send` in [`ChannelAccountAuth`] applies
+/// backpressure to the world thread rather than growing unbounded.
+const ACCOUNT_QUEUE_DEPTH: usize = 256;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -155,7 +161,15 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let world_handle = spawn_world_thread(mudlib_root.clone(), event_rx, command_tx.clone())?;
+    let (account_req_tx, account_event_rx) = spawn_account_backend().await?;
+
+    let world_handle = spawn_world_thread(
+        mudlib_root.clone(),
+        event_rx,
+        command_tx.clone(),
+        account_req_tx,
+        account_event_rx,
+    )?;
 
     info!(bind = %actual_addr, mudlib = %mudlib_root.display(), "loom server started");
 
@@ -198,10 +212,64 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
 /// Spawn the world thread. The `World` is not `Send` (single-threaded heap,
 /// spec §3.3), so it is booted *on* the world thread; boot errors are
 /// reported back before we start accepting connections.
+/// Wire up the `account_create`/`account_login` backend (spec, OBI-85):
+/// Postgres via `loom-persist`'s R2 DB worker if `DATABASE_URL` is set,
+/// else the in-memory dev backend (same Argon2 hashing, nothing survives
+/// a restart) -- what CI and the R4 load bot use.
+async fn spawn_account_backend()
+-> Result<(mpsc::Sender<DbRequest>, mpsc::Receiver<DbEvent>), String> {
+    match std::env::var("DATABASE_URL") {
+        Ok(url) => {
+            let persist = loom_persist::Persist::connect(&url, 5)
+                .await
+                .map_err(|err| format!("failed to connect DATABASE_URL: {err}"))?;
+            Ok(loom_persist::spawn_db_worker(persist, ACCOUNT_QUEUE_DEPTH))
+        }
+        Err(_) => {
+            warn!(
+                "DATABASE_URL is not set: accounts are NOT persisted (in-memory dev backend); \
+                 every account is lost on restart"
+            );
+            Ok(loom_persist::spawn_dev_account_worker(ACCOUNT_QUEUE_DEPTH))
+        }
+    }
+}
+
+/// [`AccountAuth`] wired to whichever `DbRequest` sender
+/// [`spawn_account_backend`] chose: `create_account`/`login` never block
+/// the world thread (they are one bounded-channel `blocking_send`), and
+/// the eventual [`DbEvent::AccountResult`] comes back through the
+/// `DbEvent` receiver the world thread drains every loop iteration (see
+/// `spawn_world_thread`; once `NetEvent::Tick`, OBI-82, lands, `World::tick`
+/// already drains it too -- see `World::tick`'s doc comment).
+struct ChannelAccountAuth {
+    request_tx: mpsc::Sender<DbRequest>,
+}
+
+impl AccountAuth for ChannelAccountAuth {
+    fn create_account(&mut self, request_id: u64, name: &str, password: &str) {
+        let _ = self.request_tx.blocking_send(DbRequest::CreateAccount {
+            correlation_id: request_id,
+            username: name.to_string(),
+            password: Password::new(password),
+        });
+    }
+
+    fn login(&mut self, request_id: u64, name: &str, password: &str) {
+        let _ = self.request_tx.blocking_send(DbRequest::VerifyLogin {
+            correlation_id: request_id,
+            username: name.to_string(),
+            password: Password::new(password),
+        });
+    }
+}
+
 fn spawn_world_thread(
     mudlib_root: PathBuf,
     mut event_rx: mpsc::Receiver<NetEvent>,
     command_tx: mpsc::Sender<NetCommand>,
+    account_req_tx: mpsc::Sender<DbRequest>,
+    mut account_event_rx: mpsc::Receiver<DbEvent>,
 ) -> Result<thread::JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let handle = thread::Builder::new()
@@ -217,7 +285,32 @@ fn spawn_world_thread(
                     return;
                 }
             };
+            world.set_account_auth(Box::new(ChannelAccountAuth {
+                request_tx: account_req_tx,
+            }));
             let mut host = NetHost { command_tx };
+
+            // OBI-85: drain any `account_create`/`account_login` result
+            // that has come back since the last time we looked, on every
+            // loop iteration -- once `NetEvent::Tick` (OBI-82) lands, an
+            // idle server will also flush this on every tick, since
+            // `World::tick` calls `World::drain_account_results` itself.
+            let mut drain_account_events = |world: &mut World, host: &mut NetHost| {
+                while let Ok(event) = account_event_rx.try_recv() {
+                    if let DbEvent::AccountResult {
+                        correlation_id,
+                        ok,
+                        detail,
+                    } = event
+                    {
+                        world.deliver_account_result(correlation_id, ok, &detail);
+                    }
+                    // `DbEvent::SleepDone`/`QueryFailed` are R2's own
+                    // diagnostics, not surfaced to the world; nothing else
+                    // uses this worker yet.
+                }
+                world.drain_account_results(host);
+            };
 
             while let Some(event) = event_rx.blocking_recv() {
                 match event {
@@ -225,6 +318,7 @@ fn spawn_world_thread(
                     NetEvent::Line(conn, line) => world.input(conn, &line, &mut host),
                     NetEvent::Disconnected(conn) => world.disconnect(conn, &mut host),
                 }
+                drain_account_events(&mut world, &mut host);
             }
         })
         .map_err(|err| format!("failed to spawn world thread: {err}"))?;
