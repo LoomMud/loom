@@ -23,6 +23,7 @@ fn tick_cost_is_charged_at_call_efun_not_just_declared() {
         let limits = loom_vm::Limits {
             max_ticks: 5_000,
             max_depth: 512,
+            ..Default::default()
         };
         let mut world = World::boot_with_limits(&root, limits).expect("boot");
         let mut host = FakeHost::default();
