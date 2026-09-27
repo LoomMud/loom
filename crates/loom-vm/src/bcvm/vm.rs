@@ -41,10 +41,19 @@ use crate::object::ObjectId;
 
 /// A Weft runtime error: message (with `path.wf:line:col` when available)
 /// plus a call trace, most recent frame first.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct RtError {
     pub message: String,
     pub trace: Vec<String>,
+    /// `false` for tick/call-depth exhaustion (spec: not catchable — a
+    /// `try`/`catch` in the unwind path must not stop it). `true` for
+    /// everything else, including `throw` and ordinary runtime errors
+    /// (division by zero, index out of range, ...).
+    pub catchable: bool,
+    /// The value passed to `throw`, if this error came from one. `None`
+    /// for a built-in runtime error, which a `catch` still sees — as a
+    /// string of [`RtError::message`] (see [`RtError::caught_value`]).
+    pub thrown: Option<Value>,
 }
 
 impl RtError {
@@ -52,7 +61,35 @@ impl RtError {
         RtError {
             message: message.into(),
             trace: Vec::new(),
+            catchable: true,
+            thrown: None,
         }
+    }
+
+    /// Tick/call-depth exhaustion (spec: not catchable).
+    pub fn uncatchable(message: impl Into<String>) -> RtError {
+        RtError {
+            catchable: false,
+            ..RtError::new(message)
+        }
+    }
+
+    /// `throw value`.
+    pub fn thrown(value: Value, message: String) -> RtError {
+        RtError {
+            message,
+            trace: Vec::new(),
+            catchable: true,
+            thrown: Some(value),
+        }
+    }
+
+    /// The value a `catch` handler binds: the thrown value itself, or a
+    /// string of the message for a built-in runtime error.
+    pub fn caught_value(&self) -> Value {
+        self.thrown
+            .clone()
+            .unwrap_or_else(|| Value::str(&self.message))
     }
 
     pub fn report(&self) -> String {
@@ -212,6 +249,12 @@ struct Frame {
     /// Register to write the callee's return value into, in the *caller*
     /// (the frame below this one). `None` for the outermost call.
     ret_into: Option<Reg>,
+    /// Active `try`/`catch` handlers on this frame, innermost last
+    /// (`Op::PushHandler`/`Op::PopHandler`, spec r5 OBI-32): `(catch_pc,
+    /// catch_reg)`. A catchable error unwinds to the innermost handler on
+    /// the *nearest* frame (this one, or an outer caller) that still has
+    /// one, popping every frame above it.
+    handlers: Vec<(u32, Option<Reg>)>,
 }
 
 /// Per-execution limits (spec §5.9): every tick-metered op consumes one
@@ -338,13 +381,20 @@ impl<'a, H: Host> Interpreter<'a, H> {
     /// unknown efun, which `call_efun`/`host.call_efun` will itself
     /// reject before this would matter, still must not divide-by-zero
     /// panic or otherwise special-case here).
+    ///
+    /// Tick exhaustion is **not catchable** (spec: tick accounting is a
+    /// security property; if `try`/`catch` could swallow a tick-limit
+    /// error, an efun with a large declared cost — e.g. `compile_object`
+    /// at 500 ticks — could be looped past the budget with impunity).
     fn charge_ticks(&mut self, n: u64) -> R<()> {
         if n == 0 {
             return Ok(());
         }
         if *self.ticks_left < n {
             *self.ticks_left = 0;
-            return Err(self.err_with_trace("Too long evaluation (tick limit exceeded)"));
+            return Err(
+                self.err_with_trace_uncatchable("Too long evaluation (tick limit exceeded)")
+            );
         }
         *self.ticks_left -= n;
         Ok(())
@@ -355,6 +405,12 @@ impl<'a, H: Host> Interpreter<'a, H> {
     /// the (single, flat) frame stack.
     fn err_with_trace(&self, msg: impl Into<String>) -> RtError {
         RtError::new(msg)
+    }
+
+    /// Like [`Interpreter::err_with_trace`], for tick/call-depth exhaustion
+    /// (spec: not catchable).
+    fn err_with_trace_uncatchable(&self, msg: impl Into<String>) -> RtError {
+        RtError::uncatchable(msg)
     }
 
     /// Call `name` in this module with `args`, from outside any running
@@ -403,7 +459,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
         entered: bool,
     ) -> R<()> {
         if self.stack.len() as u32 >= self.limits.max_depth {
-            return Err(self.err_with_trace(format!(
+            return Err(self.err_with_trace_uncatchable(format!(
                 "Too deep recursion (call depth limit {} exceeded)",
                 self.limits.max_depth
             )));
@@ -441,6 +497,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
             pc,
             regs,
             ret_into,
+            handlers: Vec::new(),
         });
         Ok(())
     }
@@ -462,6 +519,30 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 Ok(Step::Suspend) => return Ok(Exec::Suspended),
                 Ok(_) => continue,
                 Err(mut e) => {
+                    // spec r5 OBI-32: a catchable error (everything except
+                    // tick/call-depth exhaustion) unwinds to the innermost
+                    // active `try`/`catch` handler anywhere on this flat
+                    // frame stack (this frame, or an outer caller across
+                    // however many object/program boundaries D26 crossed
+                    // to get here) — not necessarily all the way out.
+                    if e.catchable
+                        && let Some(idx) = self.find_handler_frame()
+                    {
+                        while self.stack.len() > idx + 1 {
+                            self.pop_frame();
+                        }
+                        let (catch_pc, catch_reg) = self.stack[idx]
+                            .handlers
+                            .pop()
+                            .expect("find_handler_frame found a frame with a handler");
+                        let caught = e.caught_value();
+                        let frame = &mut self.stack[idx];
+                        frame.pc = catch_pc;
+                        if let Some(r) = catch_reg {
+                            frame.regs[r as usize] = caught;
+                        }
+                        continue;
+                    }
                     // Any trace already on `e` came from deeper, non-flat
                     // execution (a driver efun's nested run); append every
                     // live frame of this stack beneath it once, then unwind.
@@ -482,6 +563,17 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 }
             }
         }
+    }
+
+    /// The topmost frame index with an active `try`/`catch` handler, if
+    /// any (searched innermost-frame-first: the deepest call wins).
+    fn find_handler_frame(&self) -> Option<usize> {
+        self.stack
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, f)| !f.handlers.is_empty())
+            .map(|(i, _)| i)
     }
 
     /// Push a resolved cross-module call, or store its already-computed
@@ -807,6 +899,26 @@ impl<'a, H: Host> Interpreter<'a, H> {
                         return Ok(Step::Suspend);
                     }
                 }
+                Ok(Step::Continue)
+            }
+            Op::Throw { src } => {
+                let v = reg!(src);
+                let msg = self.show(&v);
+                Err(RtError::thrown(v, msg))
+            }
+            Op::PushHandler {
+                catch_pc,
+                catch_reg,
+            } => {
+                self.stack
+                    .last_mut()
+                    .unwrap()
+                    .handlers
+                    .push((catch_pc, catch_reg));
+                Ok(Step::Continue)
+            }
+            Op::PopHandler => {
+                self.stack.last_mut().unwrap().handlers.pop();
                 Ok(Step::Continue)
             }
         }

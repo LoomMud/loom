@@ -194,6 +194,26 @@ impl Dump {
                     self.expr(e, depth + 1);
                 }
             }
+            StmtKind::Try {
+                body,
+                catch_var,
+                handler,
+            } => {
+                self.line(depth, "try");
+                self.block(body, depth + 1);
+                match catch_var {
+                    Some(id) => {
+                        let l = self.local(*id);
+                        self.line(depth, &format!("catch {l}"));
+                    }
+                    None => self.line(depth, "catch"),
+                }
+                self.block(handler, depth + 1);
+            }
+            StmtKind::Throw(e) => {
+                self.line(depth, "throw");
+                self.expr(e, depth + 1);
+            }
             StmtKind::Expr(e) => {
                 self.line(depth, "expr");
                 self.expr(e, depth + 1);

@@ -23,21 +23,6 @@
 24 |     let n = match x {
    |             ^^^^^^^^^
    = help: use `if` / `else if` for now
-/main.wf:33:4: error[W0223]: `risky` may reach its end without returning a value
-   |
-33 | fn risky() -> bool {
-   |    ^^^^^
-   = help: it is declared `-> bool`; add a `return` on every path
-/main.wf:34:5: error[W0239]: `try`/`catch` is not implemented by the type checker yet
-   |
-34 |     try {
-   |     ^^^^^
-   = help: tracked under OBI-32 (atomic rollback + try/catch/throw)
-/main.wf:39:5: error[W0240]: `throw` is not implemented by the type checker yet
-   |
-39 |     throw 1
-   |     ^^^^^^^
-   = help: tracked under OBI-32 (atomic rollback + try/catch/throw)
 /main.wf:47:13: error[W0238]: `break` and `continue` are not implemented by the type checker yet
    |
 47 |             break

@@ -423,6 +423,25 @@ impl Cx<'_> {
                 }
             },
             Op::TickCheck => Ok(()),
+            Op::Throw { src } => {
+                self.reg(*src)?;
+                Ok(())
+            }
+            Op::PushHandler {
+                catch_pc,
+                catch_reg,
+            } => {
+                self.pc(*catch_pc)?;
+                if let Some(r) = catch_reg {
+                    // The caught value is always dynamically typed (a
+                    // `throw`n value keeps its own runtime type; a
+                    // built-in runtime error surfaces as a string), so
+                    // the handler's binding register must be `any`.
+                    self.expect(*r, &Ty::Any)?;
+                }
+                Ok(())
+            }
+            Op::PopHandler => Ok(()),
         }
     }
 
