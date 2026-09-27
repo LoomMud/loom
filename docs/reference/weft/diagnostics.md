@@ -193,6 +193,7 @@ or retiring a code in `crates/loom-syntax/src/codes.rs`.
 | `W0288` | variant `{}` is declared twice in enum `{}` |
 | `W0289` | `{}` refers to itself through {}, which is not allowed: structs and enums cannot be recursive without going through an array, map, or `object` |
 | `W0290` | a field's default must be a constant literal |
+| `W0291` | const `{}`'s value must be a compile-time constant expression |
 | `W0292` | `{}` is imported from both {} and {} |
 
 ### `03xx` — link (efun arity, applies, unknown names)

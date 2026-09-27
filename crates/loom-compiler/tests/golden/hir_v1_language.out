@@ -6,11 +6,11 @@ program /main
   fn pub total() -> int
     return
       Add Int : int
-        global /std/consts::MAX : int
+        10 : int
         1 : int
   fn pub greet() -> string
     return
-      global /std/consts::GREETING : string
+      "hi" : string
   fn pub tags() -> string
     return
       Add Str : string

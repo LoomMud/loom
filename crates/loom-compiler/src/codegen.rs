@@ -599,7 +599,31 @@ impl FnLower {
                 });
                 dst
             }
-            hir::ExprKind::Local(id) => *id,
+            hir::ExprKind::Local(id) => {
+                // Flow narrowing (spec §5.6, `hir::Expr::ty` doc: "a narrowed
+                // *use* has the narrower type on its Expr") changes only the
+                // *use*'s static type, never the local's own declared
+                // register type (registers are fixed-type, spec §5.8), so a
+                // narrowed read here can disagree with the register it comes
+                // from (e.g. `object?` narrowed to `object` after `!= null`).
+                // Emit the same runtime-checked `Cast` the checker already
+                // uses at the `any` boundary (§5.6, `ExprKind::Cast` doc):
+                // narrowing is always sound at runtime, so this cast can
+                // never actually fail, it just lets the verifier see the
+                // narrower type codegen already committed to everywhere
+                // else this expression's value is used.
+                if e.ty == self.reg_types[*id as usize] {
+                    *id
+                } else {
+                    let dst = self.new_reg(e.ty.clone());
+                    self.emit(Inst::Cast {
+                        dst,
+                        src: *id,
+                        ty: e.ty.clone(),
+                    });
+                    dst
+                }
+            }
             hir::ExprKind::Global(g) => {
                 let dst = self.new_reg(e.ty.clone());
                 self.emit(Inst::LoadGlobal {

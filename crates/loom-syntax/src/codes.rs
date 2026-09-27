@@ -200,6 +200,7 @@ codes! {
     CHECK_VARIANT_DECLARED_TWICE_IN_ENUM = "W0288", "variant `{}` is declared twice in enum `{}`";
     CHECK_STRUCT_OR_ENUM_CYCLE = "W0289", "`{}` refers to itself through {}, which is not allowed: structs and enums cannot be recursive without going through an array, map, or `object`";
     CHECK_STRUCT_DEFAULT_NOT_A_CONSTANT = "W0290", "a field's default must be a constant literal";
+    CHECK_CONST_VALUE_NOT_COMPILE_TIME_CONSTANT = "W0291", "const `{}`'s value must be a compile-time constant expression";
     CHECK_TYPE_IMPORTED_FROM_BOTH_AND = "W0292", "`{}` is imported from both {} and {}";
 
     // 03xx -- link (efun arity, applies, unknown names)

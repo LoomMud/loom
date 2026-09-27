@@ -104,6 +104,10 @@ pub struct ConstInfo {
     pub name: Rc<str>,
     pub owner: Rc<str>,
     pub ty: Ty,
+    /// The folded compile-time value (§5.3, `docs/hir.md`: "const folds to
+    /// literals in HIR"), substituted at every use site, including in
+    /// importers; see `check::eval_const_value` for what may appear here.
+    pub value: crate::ty::ConstVal,
 }
 
 /// What a program inherits, merged from all parents.

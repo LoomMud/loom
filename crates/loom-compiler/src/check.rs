@@ -27,7 +27,7 @@ use crate::interface::{
     ConstInfo, FnInfo, ImportInfo, Inherited, ParamInfo, ParentInfo, ProgramInfo, VarInfo,
     merge_parents,
 };
-use crate::ty::Ty;
+use crate::ty::{ConstVal, Ty};
 
 /// A successfully checked program: its HIR and the interface it exports.
 pub struct Checked {
@@ -51,6 +51,89 @@ pub fn check_program(
         declare_types(&path, ast, &inh, &imported_types, &mut diags);
     let decls = declare(&path, ast, &inh, &parents, &types, &mut diags);
 
+    // Consts first (§5.3, `docs/hir.md`: "const folds to literals in HIR"):
+    // every reference to a const anywhere in this program's own body
+    // substitutes the literal directly (`Cx::resolve`'s `Resolved::Const`
+    // arm), so the folded value has to be known before any var initialiser
+    // or function body is checked. A const's initialiser must be something
+    // the shared [`eval_const_value`] folds (D-P1.8: the same set struct
+    // field defaults accept), which excludes any `Ident`, so consts can
+    // never reference each other and declaration order does not matter: a
+    // fresh, `own_consts`-less `Cx` checks every const initialiser, then a
+    // second `Cx` (with `own_consts` filled in) checks vars and function
+    // bodies.
+    let empty_own_consts: HashMap<Rc<str>, (ConstVal, Ty)> = HashMap::new();
+    let mut own_consts: HashMap<Rc<str>, (ConstVal, Ty)> = HashMap::new();
+    let mut consts = Vec::new();
+    {
+        let mut cx = Cx {
+            path: path.clone(),
+            decls: &decls,
+            inh: &inh,
+            parents: &parents,
+            imported: &imported,
+            types: &types,
+            own_consts: &empty_own_consts,
+            diags: &mut diags,
+            var_tys: HashMap::new(),
+            locals: Vec::new(),
+            scopes: Vec::new(),
+            facts: Facts::default(),
+            ret: Ty::Void,
+            fn_name: Rc::from(""),
+        };
+        for c in &decls.consts {
+            let d = c.decl;
+            cx.reset_fn(Ty::Void, "");
+            let folded = match eval_const_value(&d.value) {
+                Ok(v) => v,
+                Err(span) => {
+                    cx.err_hint(
+                        "W0291",
+                        span,
+                        format!(
+                            "const `{}`'s value must be a compile-time constant expression",
+                            c.name
+                        ),
+                        CONST_EXPR_HINT,
+                    );
+                    // Harmless filler: the program fails to compile anyway.
+                    ConstVal::Null
+                }
+            };
+            let value = cx.expr(&d.value, c.ty.as_ref());
+            let (ty, value) = match &c.ty {
+                Some(t) => {
+                    let value = cx.coerce(value, t, &format!("the value of `{}`", c.name));
+                    (t.clone(), value)
+                }
+                None => {
+                    let t = cx.infer_binding(&value, &c.name, d.name.span);
+                    (t, value)
+                }
+            };
+            // D23 (OBI-24 CTO review): applies to consts too, since one value
+            // is shared by every instance across executions.
+            if ty == Ty::Object {
+                cx.err_hint(
+                    "W0285",
+                    d.name.span,
+                    format!(
+                        "const `{}` stores an object reference, so its type must be `object?`",
+                        c.name
+                    ),
+                    format!(
+                        "stored object references must be nullable (the object may be destructed); \
+                         declare `const {n}: object?` and narrow before use",
+                        n = c.name
+                    ),
+                );
+            }
+            own_consts.insert(c.name.clone(), (folded, ty.clone()));
+            consts.push((ty, value));
+        }
+    }
+
     let mut cx = Cx {
         path: path.clone(),
         decls: &decls,
@@ -58,6 +141,7 @@ pub fn check_program(
         parents: &parents,
         imported: &imported,
         types: &types,
+        own_consts: &own_consts,
         diags: &mut diags,
         var_tys: HashMap::new(),
         locals: Vec::new(),
@@ -129,42 +213,6 @@ pub fn check_program(
         cx.var_tys.insert(v.name.clone(), ty);
     }
 
-    let mut consts = Vec::new();
-    for c in &decls.consts {
-        let d = c.decl;
-        cx.reset_fn(Ty::Void, "");
-        let value = cx.expr(&d.value, c.ty.as_ref());
-        let ty = match &c.ty {
-            Some(t) => {
-                let value = cx.coerce(value, t, &format!("the value of `{}`", c.name));
-                consts.push((t.clone(), value));
-                t.clone()
-            }
-            None => {
-                let t = cx.infer_binding(&value, &c.name, d.name.span);
-                consts.push((t.clone(), value));
-                t
-            }
-        };
-        // D23 (OBI-24 CTO review): applies to consts too, since one value is
-        // shared by every instance across executions.
-        if ty == Ty::Object {
-            cx.err_hint(
-                "W0285",
-                d.name.span,
-                format!(
-                    "const `{}` stores an object reference, so its type must be `object?`",
-                    c.name
-                ),
-                format!(
-                    "stored object references must be nullable (the object may be destructed); \
-                     declare `const {n}: object?` and narrow before use",
-                    n = c.name
-                ),
-            );
-        }
-    }
-
     let mut fns = Vec::new();
     for f in &decls.fns {
         fns.push(cx.function(f));
@@ -232,6 +280,10 @@ pub fn check_program(
                     name: c.name.clone(),
                     owner: path.clone(),
                     ty: c.ty.clone(),
+                    value: own_consts
+                        .get(&c.name)
+                        .map(|(v, _)| v.clone())
+                        .unwrap_or(ConstVal::Null),
                 }),
             );
         }
@@ -583,32 +635,74 @@ fn const_matches_ty(c: &crate::ty::ConstVal, ty: &Ty) -> bool {
     }
 }
 
+/// What a compile-time constant expression may be, for the diagnostics'
+/// hints (struct field defaults W0290 and const initialisers W0291).
+const CONST_EXPR_HINT: &str = "compile-time constants are evaluated once, without an object: \
+     use a literal (a leading `-` on a number is fine), a `$\"...\"` interpolation of \
+     literal text only, or an array of those; no efun calls, no arithmetic, no reading \
+     variables, fields, other consts, or `self`";
+
 /// A struct field's `= expr` default (spec r5 §7.3: "every added field has a
 /// default"), so migration can fill a missing field without running any
-/// code. Only literals — no efun calls, no reading other fields — are
-/// constant enough for that.
-fn eval_const(e: &ast::Expr, diags: &mut Vec<Diagnostic>) -> Option<crate::ty::ConstVal> {
-    use crate::ty::ConstVal as CV;
-    match &e.kind {
-        E::Int(n) => Some(CV::Int(*n)),
-        E::Float(f) => Some(CV::Float(*f)),
-        E::Bool(b) => Some(CV::Bool(*b)),
-        E::Str(s) => Some(CV::Str(Rc::from(s.as_str()))),
-        E::Null => Some(CV::Null),
-        E::Array(es) => {
-            let mut out = Vec::with_capacity(es.len());
-            for x in es {
-                out.push(eval_const(x, diags)?);
-            }
-            Some(CV::Array(out.into()))
-        }
-        _ => {
+/// code. Accepts exactly what [`eval_const_value`] folds.
+fn eval_const(e: &ast::Expr, diags: &mut Vec<Diagnostic>) -> Option<ConstVal> {
+    match eval_const_value(e) {
+        Ok(v) => Some(v),
+        Err(span) => {
             diags.push(
-                Diagnostic::error("W0290", e.span, "a field's default must be a constant literal")
-                    .with_hint("defaults are evaluated once, without an object, so they can only be literals (no efun calls, no reading other fields)"),
+                Diagnostic::error(
+                    "W0290",
+                    span,
+                    "a field's default must be a constant literal",
+                )
+                .with_hint(CONST_EXPR_HINT),
             );
             None
         }
+    }
+}
+
+/// The one compile-time constant evaluator (D-P1.8), shared by struct field
+/// defaults and `const` initialisers so both accept exactly the same set:
+/// literals, unary minus on a numeric constant (overflow-checked), a
+/// `$"..."` interpolation of literal text only, and arrays of constants.
+/// Deliberately no arithmetic and no names (so no const-to-const
+/// references, hence no evaluation order). `Err` carries the span of the
+/// first sub-expression that isn't constant.
+fn eval_const_value(e: &ast::Expr) -> Result<ConstVal, Span> {
+    use ConstVal as CV;
+    match &e.kind {
+        E::Int(n) => Ok(CV::Int(*n)),
+        E::Float(f) => Ok(CV::Float(*f)),
+        E::Bool(b) => Ok(CV::Bool(*b)),
+        E::Str(s) => Ok(CV::Str(Rc::from(s.as_str()))),
+        E::Null => Ok(CV::Null),
+        E::Unary {
+            op: ast::UnOp::Neg,
+            expr,
+        } => match eval_const_value(expr)? {
+            CV::Int(n) => n.checked_neg().map(CV::Int).ok_or(e.span),
+            CV::Float(f) => Ok(CV::Float(-f)),
+            _ => Err(e.span),
+        },
+        E::Interp(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                match p {
+                    ast::InterpPart::Lit(l) => out.push_str(l),
+                    ast::InterpPart::Expr(x) => return Err(x.span),
+                }
+            }
+            Ok(CV::Str(Rc::from(out.as_str())))
+        }
+        E::Array(es) => {
+            let mut out = Vec::with_capacity(es.len());
+            for x in es {
+                out.push(eval_const_value(x)?);
+            }
+            Ok(CV::Array(out.into()))
+        }
+        _ => Err(e.span),
     }
 }
 
@@ -1108,6 +1202,10 @@ struct Cx<'a> {
     /// Every struct/enum name visible here: local, inherited, imported
     /// (spec r5 §7.3, OBI-88).
     types: &'a HashMap<Rc<str>, Ty>,
+    /// This program's own consts, folded to a literal value and their
+    /// final type (§5.3). Populated before any var initialiser or function
+    /// body is checked; see the comment in `check_program`.
+    own_consts: &'a HashMap<Rc<str>, (ConstVal, Ty)>,
     diags: &'a mut Vec<Diagnostic>,
     /// Final types of own program variables (filled in declaration order).
     var_tys: HashMap<Rc<str>, Ty>,
@@ -1121,9 +1219,39 @@ struct Cx<'a> {
 enum Resolved {
     Local(LocalId),
     Global(hir::GlobalRef, Ty),
-    Const(hir::GlobalRef, Ty),
+    /// A `const` reference, already folded to its literal value (§5.3): no
+    /// `GlobalRef` here on purpose, a `const` is never stored as an object
+    /// variable, so there is nothing for a runtime `LoadGlobal` to read.
+    Const(ConstVal, Ty),
     SelfObj,
     Fn(Callee, Rc<FnInfo>),
+}
+
+/// Turn a folded const value back into an HIR expression at a use site
+/// (`Cx::expr`'s `Resolved::Const` arm): this *is* the fix for consts
+/// reading back `null` at runtime (they used to lower to `ExprKind::Global`,
+/// but a `const` is never stored as an object variable for a `LoadGlobal` to
+/// find). Array elements take the element type of `ty`.
+fn const_hir(v: &ConstVal, ty: &Ty, span: Span) -> hir::Expr {
+    let kind = match v {
+        ConstVal::Int(n) => hir::ExprKind::Int(*n),
+        ConstVal::Float(x) => hir::ExprKind::Float(*x),
+        ConstVal::Str(s) => hir::ExprKind::Str(s.clone()),
+        ConstVal::Bool(b) => hir::ExprKind::Bool(*b),
+        ConstVal::Null => hir::ExprKind::Null,
+        ConstVal::Array(es) => {
+            let elem = match ty.non_null() {
+                Ty::Array(t) => (*t).clone(),
+                _ => Ty::Any,
+            };
+            hir::ExprKind::Array(es.iter().map(|e| const_hir(e, &elem, span)).collect())
+        }
+    };
+    hir::Expr {
+        kind,
+        ty: ty.clone(),
+        span,
+    }
 }
 
 fn given(n: usize) -> String {
@@ -1270,14 +1398,12 @@ impl Cx<'_> {
         }
         if let Some(&i) = self.decls.const_index.get(name) {
             let c = &self.decls.consts[i];
-            let ty = c.ty.clone().unwrap_or(Ty::Error);
-            return Some(Resolved::Const(
-                hir::GlobalRef {
-                    owner: self.path.clone(),
-                    name: c.name.clone(),
-                },
-                ty,
-            ));
+            let (value, ty) = self
+                .own_consts
+                .get(&c.name)
+                .cloned()
+                .unwrap_or((ConstVal::Null, Ty::Error));
+            return Some(Resolved::Const(value, ty));
         }
         if let Some(&i) = self.decls.var_index.get(name) {
             let v = &self.decls.vars[i];
@@ -1296,13 +1422,7 @@ impl Cx<'_> {
             ));
         }
         if let Some(c) = self.inh.consts.get(name) {
-            return Some(Resolved::Const(
-                hir::GlobalRef {
-                    owner: c.owner.clone(),
-                    name: c.name.clone(),
-                },
-                c.ty.clone(),
-            ));
+            return Some(Resolved::Const(c.value.clone(), c.ty.clone()));
         }
         if let Some(v) = self.inh.vars.get(name) {
             return Some(Resolved::Global(
@@ -1314,13 +1434,7 @@ impl Cx<'_> {
             ));
         }
         if let Some(c) = self.imported.get(name) {
-            return Some(Resolved::Const(
-                hir::GlobalRef {
-                    owner: c.owner.clone(),
-                    name: c.name.clone(),
-                },
-                c.ty.clone(),
-            ));
+            return Some(Resolved::Const(c.value.clone(), c.ty.clone()));
         }
         if name == "self" {
             return Some(Resolved::SelfObj);
@@ -2041,7 +2155,7 @@ impl Cx<'_> {
             E::Ident(n) => match self.resolve(n) {
                 Some(Resolved::Local(id)) => Self::mk(H::Local(id), self.local_ty(id), span),
                 Some(Resolved::Global(g, ty)) => Self::mk(H::Global(g), ty, span),
-                Some(Resolved::Const(g, ty)) => Self::mk(H::Global(g), ty, span),
+                Some(Resolved::Const(v, ty)) => const_hir(&v, &ty, span),
                 Some(Resolved::SelfObj) => Self::mk(H::SelfObj, Ty::Object, span),
                 Some(Resolved::Fn(c, f)) => Self::mk(H::FnRef(c), f.fn_ty(), span),
                 None => {

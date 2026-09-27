@@ -18,5 +18,5 @@
    |
 20 |     m: int = get_default()
    |              ^^^^^^^^^^^^^
-   = help: defaults are evaluated once, without an object, so they can only be literals (no efun calls, no reading other fields)
+   = help: compile-time constants are evaluated once, without an object: use a literal (a leading `-` on a number is fine), a `$"..."` interpolation of literal text only, or an array of those; no efun calls, no arithmetic, no reading variables, fields, other consts, or `self`
 
