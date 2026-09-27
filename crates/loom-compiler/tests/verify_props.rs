@@ -175,6 +175,22 @@ fn assert_actually_in_bounds(m: &Module) {
                     }
                 }
                 Op::PopHandler => {}
+                Op::MakeFn { dst, .. } => check_reg(*dst),
+                Op::MakeClosure { dst, captures, .. } => {
+                    check_reg(*dst);
+                    for &c in captures {
+                        check_reg(c);
+                    }
+                }
+                Op::CallValue { dst, func, args } => {
+                    if let Some(d) = dst {
+                        check_reg(*d);
+                    }
+                    check_reg(*func);
+                    for &a in args {
+                        check_reg(a);
+                    }
+                }
             }
         }
     }
@@ -280,6 +296,7 @@ proptest! {
                 reg_types,
                 entry_points: vec![0],
                 code,
+                capture_targets: Vec::new(),
             }],
         };
         if verify(&m).is_ok() {

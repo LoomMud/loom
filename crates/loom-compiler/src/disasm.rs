@@ -220,5 +220,31 @@ fn op_text(m: &Module, f: &FunctionCode, op: &Op) -> String {
             None => format!("PushHandler {catch_pc:04}"),
         },
         Op::PopHandler => "PopHandler".to_string(),
+        Op::MakeFn { dst, callee } => {
+            let c = match callee {
+                CalleeOp::Virtual { name } => format!("virtual {}", str_at(m, *name)),
+                CalleeOp::Static { program, name } => {
+                    format!("static {}::{}", str_at(m, *program), str_at(m, *name))
+                }
+            };
+            format!("MakeFn %{dst}, {c} : {}", reg_ty(f, *dst))
+        }
+        Op::MakeClosure {
+            dst,
+            func,
+            captures,
+        } => format!(
+            "MakeClosure %{dst}, #{func}({}) : {}",
+            args_text(captures),
+            reg_ty(f, *dst)
+        ),
+        Op::CallValue { dst, func, args } => match dst {
+            Some(d) => format!(
+                "CallValue %{d}, %{func}({}) : {}",
+                args_text(args),
+                reg_ty(f, *d)
+            ),
+            None => format!("CallValue %{func}({})", args_text(args)),
+        },
     }
 }

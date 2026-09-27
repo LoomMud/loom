@@ -81,6 +81,8 @@ pub fn check_program(
             facts: Facts::default(),
             ret: Ty::Void,
             fn_name: Rc::from(""),
+            outer: None,
+            captures: Vec::new(),
         };
         for c in &decls.consts {
             let d = c.decl;
@@ -149,6 +151,8 @@ pub fn check_program(
         facts: Facts::default(),
         ret: Ty::Void,
         fn_name: Rc::from(""),
+        outer: None,
+        captures: Vec::new(),
     };
 
     let mut vars = Vec::new();
@@ -1214,6 +1218,24 @@ struct Cx<'a> {
     facts: Facts,
     ret: Ty,
     fn_name: Rc<str>,
+    /// Set while compiling a closure body (spec r5 §5.2.2, OBI-79): a
+    /// snapshot of the enclosing function's locals/scopes at the point the
+    /// closure literal was entered, consulted by `lookup_local` only after
+    /// its own scopes come up empty. `None` at the top of an ordinary
+    /// function (or the outermost enclosing function of a closure chain).
+    outer: Option<Box<OuterScope>>,
+    /// `(outer local id, this closure's own local id)` pairs, in first-use
+    /// order, for every enclosing-function local this closure captures.
+    /// Reset per closure; `ClosureFn::captures`/`ExprKind::Closure`'s outer
+    /// id list are both derived from this when the closure literal is
+    /// finished.
+    captures: Vec<(LocalId, LocalId)>,
+}
+
+/// See `Cx::outer`.
+struct OuterScope {
+    locals: Vec<hir::Local>,
+    scopes: Vec<Vec<(Rc<str>, LocalId)>>,
 }
 
 enum Resolved {
@@ -1358,8 +1380,36 @@ impl Cx<'_> {
         id
     }
 
-    fn lookup_local(&self, name: &str) -> Option<LocalId> {
-        self.scopes
+    fn lookup_local(&mut self, name: &str) -> Option<LocalId> {
+        if let Some(id) = Self::lookup_in(&self.scopes, name) {
+            return Some(id);
+        }
+        // Not found in this closure's own scopes: fall back to the
+        // enclosing function's scopes (spec r5 §5.2.2, OBI-79). Found
+        // there, it becomes a capture: snapshot its value into a fresh
+        // local of this closure (by-value, per spec), memoized in
+        // `self.captures` so a name captured twice reuses one local.
+        let outer_id = Self::lookup_in(&self.outer.as_ref()?.scopes, name)?;
+        if let Some((_, closure_local)) = self.captures.iter().find(|(o, _)| *o == outer_id) {
+            return Some(*closure_local);
+        }
+        let outer_local = self.outer.as_ref().unwrap().locals[outer_id as usize].clone();
+        let new_id = self.locals.len() as LocalId;
+        self.locals.push(hir::Local {
+            name: outer_local.name.clone(),
+            ty: outer_local.ty,
+            mutable: outer_local.mutable,
+            span: outer_local.span,
+        });
+        if let Some(s) = self.scopes.last_mut() {
+            s.push((outer_local.name, new_id));
+        }
+        self.captures.push((outer_id, new_id));
+        Some(new_id)
+    }
+
+    fn lookup_in(scopes: &[Vec<(Rc<str>, LocalId)>], name: &str) -> Option<LocalId> {
+        scopes
             .iter()
             .rev()
             .flat_map(|s| s.iter().rev())
@@ -1392,7 +1442,7 @@ impl Cx<'_> {
         })
     }
 
-    fn resolve(&self, name: &str) -> Option<Resolved> {
+    fn resolve(&mut self, name: &str) -> Option<Resolved> {
         if let Some(id) = self.lookup_local(name) {
             return Some(Resolved::Local(id));
         }
@@ -2415,10 +2465,10 @@ impl Cx<'_> {
         Self::poison(span)
     }
 
-    /// A closure literal `fn(params) => expr` / `fn(params) { … }` (§5.3).
-    /// V1 does not capture the enclosing function's locals: the body sees
-    /// only its own parameters, program globals, `self` and named functions.
-    /// (Capture is a V5 runtime feature, OBI-32.)
+    /// A closure literal `fn(params) => expr` / `fn(params) { … }` (spec r5
+    /// §5.2.2, OBI-79): the body sees its own parameters, program globals,
+    /// `self`, named functions, and (by value, snapshotted here) any local
+    /// still in scope from the enclosing function(s) — see `lookup_local`.
     fn closure(&mut self, c: &ast::Closure, span: Span) -> hir::Expr {
         let mut param_tys = Vec::new();
         for p in &c.params {
@@ -2459,6 +2509,11 @@ impl Cx<'_> {
         let saved_facts = std::mem::take(&mut self.facts);
         let saved_ret = std::mem::replace(&mut self.ret, declared_ret.clone().unwrap_or(Ty::Void));
         let saved_name = std::mem::replace(&mut self.fn_name, Rc::from("<closure>"));
+        let saved_outer = self.outer.replace(Box::new(OuterScope {
+            locals: saved_locals.clone(),
+            scopes: saved_scopes.clone(),
+        }));
+        let saved_captures = std::mem::take(&mut self.captures);
 
         self.scopes.push(Vec::new());
         let mut params = Vec::new();
@@ -2503,18 +2558,26 @@ impl Cx<'_> {
         self.facts = saved_facts;
         self.ret = saved_ret;
         self.fn_name = saved_name;
+        self.outer = saved_outer;
+        let captures = std::mem::replace(&mut self.captures, saved_captures);
+        let (outer_ids, closure_locals): (Vec<LocalId>, Vec<LocalId>) =
+            captures.into_iter().unzip();
 
         let fn_ty = Ty::Fn(Rc::new(crate::ty::FnTy {
             params: param_tys,
             ret: ret.clone(),
         }));
         Self::mk(
-            hir::ExprKind::Closure(Rc::new(hir::ClosureFn {
-                params,
-                ret,
-                locals,
-                body,
-            })),
+            hir::ExprKind::Closure(
+                Rc::new(hir::ClosureFn {
+                    params,
+                    ret,
+                    locals,
+                    body,
+                    captures: closure_locals,
+                }),
+                outer_ids,
+            ),
             fn_ty,
             span,
         )

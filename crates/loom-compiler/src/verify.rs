@@ -442,6 +442,101 @@ impl Cx<'_> {
                 Ok(())
             }
             Op::PopHandler => Ok(()),
+            Op::MakeFn { dst, callee } => {
+                match callee {
+                    CalleeOp::Virtual { name } => {
+                        self.str(*name)?;
+                    }
+                    CalleeOp::Static { program, name } => {
+                        self.str(*program)?;
+                        self.str(*name)?;
+                    }
+                }
+                match self.reg(*dst)? {
+                    Ty::Fn(_) => Ok(()),
+                    other => Err(VerifyError(format!(
+                        "%{dst} has type {other}, expected a function type"
+                    ))),
+                }
+            }
+            Op::MakeClosure {
+                dst,
+                func,
+                captures,
+            } => {
+                let target = self
+                    .m
+                    .functions
+                    .get(*func as usize)
+                    .ok_or_else(|| VerifyError(format!("closure #{func} out of bounds")))?;
+                if captures.len() != target.capture_targets.len() {
+                    return Err(VerifyError(format!(
+                        "closure #{func} expects {} capture(s), got {}",
+                        target.capture_targets.len(),
+                        captures.len()
+                    )));
+                }
+                for (&src, &t_reg) in captures.iter().zip(&target.capture_targets) {
+                    let want = target.reg_types.get(t_reg as usize).ok_or_else(|| {
+                        VerifyError(format!(
+                            "closure #{func}'s capture target register %{t_reg} out of bounds"
+                        ))
+                    })?;
+                    self.expect_assignable(src, want)?;
+                }
+                match self.reg(*dst)? {
+                    Ty::Fn(_) => Ok(()),
+                    other => Err(VerifyError(format!(
+                        "%{dst} has type {other}, expected a function type"
+                    ))),
+                }
+            }
+            Op::CallValue { dst, func, args } => {
+                self.args(args)?;
+                let func_ty = self.reg(*func)?.clone();
+                match &func_ty {
+                    Ty::Fn(sig) => {
+                        if args.len() != sig.params.len() {
+                            return Err(VerifyError(format!(
+                                "function value takes {} argument(s), got {}",
+                                sig.params.len(),
+                                args.len()
+                            )));
+                        }
+                        for (i, &a) in args.iter().enumerate() {
+                            self.expect_assignable(a, &sig.params[i])?;
+                        }
+                        match dst {
+                            Some(d) => {
+                                if sig.ret == Ty::Void {
+                                    return Err(VerifyError(
+                                        "function value returns no value but the call has a destination register".into(),
+                                    ));
+                                }
+                                self.expect_assignable(*d, &sig.ret)?;
+                            }
+                            None => {
+                                if sig.ret != Ty::Void {
+                                    return Err(VerifyError(format!(
+                                        "function value's result is discarded but it returns {}",
+                                        sig.ret
+                                    )));
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+                    Ty::Any => {
+                        if let Some(d) = dst {
+                            self.reg(*d)?;
+                        }
+                        Ok(())
+                    }
+                    other => Err(VerifyError(format!(
+                        "%{func} has type {other}, expected a function type"
+                    ))),
+                }
+            }
         }
     }
 
@@ -586,6 +681,7 @@ mod tests {
             reg_types: vec![],
             entry_points: vec![0],
             code: vec![Op::Return { src: None }],
+            capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_ok());
     }
@@ -601,6 +697,7 @@ mod tests {
             reg_types: vec![Ty::Int],
             entry_points: vec![0],
             code: vec![Op::Return { src: Some(7) }],
+            capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
     }
@@ -616,6 +713,7 @@ mod tests {
             reg_types: vec![Ty::Int],
             entry_points: vec![0],
             code: vec![Op::Return { src: Some(0) }],
+            capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
     }
@@ -631,6 +729,7 @@ mod tests {
             reg_types: vec![],
             entry_points: vec![0],
             code: vec![Op::Jump { target: 5 }],
+            capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
     }
@@ -655,6 +754,7 @@ mod tests {
                 },
                 Op::Return { src: None },
             ],
+            capture_targets: vec![],
         };
         // dst is typed `string` but Add.Int must produce `int`.
         assert!(verify(&m1(f)).is_err());
@@ -680,6 +780,7 @@ mod tests {
                 },
                 Op::Return { src: Some(2) },
             ],
+            capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_ok());
     }
