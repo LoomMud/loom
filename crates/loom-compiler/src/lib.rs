@@ -19,6 +19,7 @@ pub mod efuns;
 pub mod hir;
 pub mod interface;
 pub mod ir;
+pub mod lint;
 pub mod mudlib;
 pub mod ty;
 pub mod verify;

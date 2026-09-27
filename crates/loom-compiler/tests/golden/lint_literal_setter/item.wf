@@ -1,0 +1,36 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+fn max_hp() -> int {
+    return 100;
+}
+
+fn other_helper() {
+    // Not `create()`: literal `set_*` calls here never warn (D-P1.4 is only
+    // about the function that never re-runs on upgrade).
+    set_short("not create, no warning");
+}
+
+fn create() {
+    // Warns: every argument is a literal string.
+    set_short("a battered lantern");
+    // Warns: every argument is a literal map of literals.
+    set_exits({"north": "/a/hall"});
+    // Does not warn: the argument is a call, not a literal.
+    set_hp(max_hp());
+    // Does not warn: the argument is a variable, not a literal.
+    let n = "town lantern";
+    set_name(n);
+    // Does not warn: not a `set_*` function.
+    describe("a lantern");
+    // Does not warn: suppressed.
+    // loom:allow(literal-setter-in-create)
+    set_id("lantern-001");
+}
+
+fn set_short(s: string) {}
+fn set_exits(e: {string: string}) {}
+fn set_hp(h: int) {}
+fn set_name(n: string) {}
+fn set_id(i: string) {}
+fn describe(s: string) {}

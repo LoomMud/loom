@@ -245,6 +245,12 @@ or retiring a code in `crates/loom-syntax/src/codes.rs`.
 | `W0429` | Phase 0 gate: struct literals is not yet supported by the tree-walking evaluator |
 | `W0430` | Phase 0 gate: enum variants is not yet supported by the tree-walking evaluator |
 
+### `09xx` — warnings and lints
+
+| Code | Description |
+| --- | --- |
+| `W0900` | a `set_*` call in `create()` with only literal arguments is not re-applied on `upgrade()` (D-P1.4) |
+
 ### Retired
 
 | Code | Description |
