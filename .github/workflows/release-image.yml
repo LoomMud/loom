@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ${{ (vars.CI_RUNS_ON && !github.event.pull_request.head.repo.fork) && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'ubuntu-latest' }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     env:
       IMAGE: ghcr.io/loommud/loom
       TAG: ${{ github.ref_name }}
@@ -23,6 +23,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Ensure tools (ARC minimal runner image)
+        run: scripts/ci-ensure-tools.sh jq:jq gh:gh curl:curl
 
       # Same action as ci.yml's `deny` job, so release and PR gating agree
       # (cargo-deny 0.18.5 cannot parse CVSS 4.0 advisories).
