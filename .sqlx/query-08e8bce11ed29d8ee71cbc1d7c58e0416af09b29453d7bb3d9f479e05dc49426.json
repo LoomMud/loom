@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO object_state (\n                object_path,\n                key,\n                program_path,\n                program_version,\n                schema_hash,\n                state_json\n            )\n            VALUES ($1, $2, $3, $4, $5, $6)\n            ON CONFLICT (object_path, key)\n            DO UPDATE SET\n                program_path = EXCLUDED.program_path,\n                program_version = EXCLUDED.program_version,\n                schema_hash = EXCLUDED.schema_hash,\n                state_json = EXCLUDED.state_json,\n                updated_at = NOW()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "08e8bce11ed29d8ee71cbc1d7c58e0416af09b29453d7bb3d9f479e05dc49426"
+}

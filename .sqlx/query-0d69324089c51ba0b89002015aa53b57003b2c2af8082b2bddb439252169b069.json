@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO grants (uid, kind, target, granted_by, expires_at)\n         VALUES ($1, 'efun', 'snoop', $2, NOW() - INTERVAL '1 hour')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0d69324089c51ba0b89002015aa53b57003b2c2af8082b2bddb439252169b069"
+}
