@@ -89,9 +89,35 @@ pub fn process_input(line: string) {
         send(self, "heartbeat off\n")
     } else if verb == "beats" {
         send(self, $"{beats}\n")
+    } else if verb == "rand" and len(words) == 2 {
+        let n = to_int(words[1]) ?? 0
+        send(self, $"{random(n)}\n")
+    } else if verb == "toint" and len(words) == 2 {
+        send(self, $"{to_int(words[1])}\n")
+    } else if verb == "lower" and len(words) == 2 {
+        send(self, $"{lower(words[1])}\n")
+    } else if verb == "now" {
+        send(self, $"{time() > 0}\n")
+    } else if verb == "usercount" {
+        send(self, $"{len(users())}\n")
+    } else if verb == "readfile" and len(words) == 2 {
+        send(self, $"{read_file(words[1])}\n")
+    } else if verb == "writefile" and len(words) == 3 {
+        send(self, $"{write_file(words[1], words[2])}\n")
+    } else if verb == "selfdestruct" {
+        destruct(self)
+        send(self, "destructing self did not crash the frame\n")
+    } else if verb == "makeaccount" and len(words) == 3 {
+        send(self, $"req {account_create(words[1], words[2])}\n")
+    } else if verb == "loginaccount" and len(words) == 3 {
+        send(self, $"req {account_login(words[1], words[2])}\n")
     } else {
         send(self, "What?\n")
     }
+}
+
+pub fn account_result(id: int, ok: bool, detail: string) {
+    send(self, $"account_result {id} {ok} {detail}\n")
 }
 
 fn dive(n: int) -> int {
