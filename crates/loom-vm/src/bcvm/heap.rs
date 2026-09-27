@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Bytecode-VM runtime values: a 16-byte tagged [`Value`] (spec §5.8: "16
 //! byte values"), with **copy-on-write value semantics** for containers

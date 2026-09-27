@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! The bytecode VM core (OBI-31): values, heap, and the register-bytecode
 //! interpreter that will replace [`crate::interp`]'s tree-walker behind the

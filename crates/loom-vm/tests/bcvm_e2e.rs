@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! End-to-end proof that real `.wf` source runs on the bytecode VM: parse →
 //! resolve/check (`loom-compiler`) → codegen → verify → execute

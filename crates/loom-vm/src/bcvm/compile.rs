@@ -1,5 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
-// SPDX-License-Identifier: LicenseRef-Oberfield-Proprietary
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Bridge from a checked `loom-compiler` program to a `Module` this VM can
 //! run: codegen, then the bytecode verifier (the trust boundary that must
