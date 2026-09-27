@@ -1178,16 +1178,32 @@ impl Registry {
     /// [`Host::rollback_atomic`]: undo every entry recorded since `mark`,
     /// most recent first (so a var written twice restores its
     /// *original* value, not an intermediate one), then close this scope.
+    ///
+    /// **OBI-80:** each `VarWrite` restore bypasses
+    /// [`RegistryHost::store_global`] (there is nothing to re-check a quota
+    /// against on a rollback), but it must still keep [`BcObject::mem_bytes`]
+    /// correct — the same O(1) cost-delta `store_global` does, not a
+    /// [`BcObject::recompute_mem_bytes`] walk per restored var. Without this,
+    /// a rolled-back var write left `mem_bytes` charging bytes for whatever
+    /// the *failed* attempt had written, not what `vars` actually holds
+    /// after the rollback.
     fn journal_rollback(&mut self, mark: u64) {
         while self.journal.len() as u64 > mark {
             match self.journal.pop().unwrap() {
                 JournalEntry::VarWrite { obj, key, old } => {
                     if let Some(o) = self.get_mut(obj) {
+                        let prev_cost = o.vars.get(&key).map(heap::cost).unwrap_or(0);
                         match old {
                             Some(v) => {
+                                let new_cost = heap::cost(&v);
+                                o.mem_bytes = o
+                                    .mem_bytes
+                                    .saturating_sub(prev_cost)
+                                    .saturating_add(new_cost);
                                 o.vars.insert(key, v);
                             }
                             None => {
+                                o.mem_bytes = o.mem_bytes.saturating_sub(prev_cost);
                                 o.vars.remove(&key);
                             }
                         }
@@ -4854,6 +4870,49 @@ pub fn get_xs() -> [int] {
         assert!(
             xs.equals(&want),
             "xs must be rolled back exactly, got {xs:?}"
+        );
+    }
+
+    /// OBI-80: `journal_rollback` restores each rolled-back var directly
+    /// (bypassing `store_global`'s O(1) delta), so it must apply the same
+    /// delta itself — otherwise a rolled-back write leaves `mem_bytes`
+    /// charging for the *failed* attempt's value instead of what `vars`
+    /// actually holds after the rollback.
+    #[test]
+    fn atomic_rollback_keeps_mem_bytes_consistent_with_the_restored_vars() {
+        const WF: &str = r#"
+var xs: [int] = [1, 2, 3]
+
+atomic fn grow_then_fail() {
+    xs = xs + [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+    throw "boom"
+}
+"#;
+        let prog = Rc::new(compile_program("/t/obj", &[("/t/obj", WF)], 1, None));
+        let mut registry = Registry::default();
+        registry.register_program(prog.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(prog).expect("instantiate");
+        let before = host.registry.get(obj).unwrap().mem_bytes;
+
+        host.call_on(obj, "grow_then_fail", vec![]).unwrap_err();
+
+        let after = host.registry.get(obj).unwrap().mem_bytes;
+        assert_eq!(
+            after, before,
+            "mem_bytes must be back to its pre-atomic value, not still charging the \
+             rolled-back (larger) array"
+        );
+        let o = host.registry.get_mut(obj).unwrap();
+        let vars = o.vars.clone();
+        o.recompute_mem_bytes();
+        assert_eq!(
+            o.mem_bytes, after,
+            "incremental accounting after rollback must match a full recompute over {vars:?}"
         );
     }
 
