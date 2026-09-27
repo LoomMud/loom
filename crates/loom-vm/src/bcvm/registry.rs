@@ -1714,6 +1714,22 @@ impl<'a> RegistryHost<'a> {
         }
     }
 
+    /// Like [`Self::want_obj`], but a destructed handle is accepted (not an
+    /// error): callers that are themselves safe on a dead reference
+    /// (`environment`, `destruct`, spec/CTO review OBI-85) use this
+    /// instead so a stale `object` var doesn't turn every read of it into
+    /// a runtime error -- only [`Self::want_obj`]'s callers (`move_to`,
+    /// `object_name`, `inventory`, ...) still refuse a dead handle.
+    fn want_obj_or_dead(&self, efun: &str, v: &Value) -> R<ObjectId> {
+        match v {
+            Value::Object(id) => Ok(*id),
+            v => Err(RtError::new(format!(
+                "{efun}(): expected object, got {}",
+                v.type_name()
+            ))),
+        }
+    }
+
     /// Driver efuns not handled inline by the interpreter (spec §5.5),
     /// ported from `crate::efuns::Exec::efun_inner`. `Err` ("needs full
     /// World integration") when this `RegistryHost` has no [`Driver`]
@@ -1782,7 +1798,7 @@ impl<'a> RegistryHost<'a> {
                 let id = if args.is_empty() {
                     self.self_object()
                 } else {
-                    self.want_obj(name, &a0)?
+                    self.want_obj_or_dead(name, &a0)?
                 };
                 Ok(self
                     .registry
@@ -1998,8 +2014,18 @@ impl<'a> RegistryHost<'a> {
                     .map(Value::Object)
                     .collect(),
             )),
+            "destructed" => Ok(Value::Bool(match a0 {
+                Value::Null => true,
+                Value::Object(id) => self.registry.get(id).is_none(),
+                v => {
+                    return Err(RtError::new(format!(
+                        "destructed(): expected object?, got {}",
+                        v.type_name()
+                    )));
+                }
+            })),
             "destruct" => {
-                let id = self.want_obj(name, &a0)?;
+                let id = self.want_obj_or_dead(name, &a0)?;
                 let driver = self.driver.as_mut().expect("checked above");
                 let conn = self.registry.destruct(id, driver.scheduler);
                 if let Some(c) = conn {
@@ -2067,10 +2093,19 @@ impl<'a> RegistryHost<'a> {
                 .push_back((id, caller, false, "invalid".to_string()));
         } else {
             driver.accounts.pending.insert(id, caller);
-            if create {
-                driver.accounts.auth.create_account(id, name, password);
+            let issued = if create {
+                driver.accounts.auth.create_account(id, name, password)
             } else {
-                driver.accounts.auth.login(id, name, password);
+                driver.accounts.auth.login(id, name, password)
+            };
+            if !issued {
+                // The backend's request queue is full or closed: never
+                // leave this pending forever (spec/CTO review OBI-85).
+                driver.accounts.pending.remove(&id);
+                driver
+                    .accounts
+                    .results
+                    .push_back((id, caller, false, "unavailable".to_string()));
             }
         }
         Ok(Value::Int(id as i64))
@@ -2484,13 +2519,19 @@ impl Host for RegistryHost<'_> {
         self.driver_efun(name, args)
     }
 
-    fn load_global(&mut self, owner: &str, name: &str) -> Value {
+    fn load_global(&mut self, owner: &str, name: &str) -> R<Value> {
         let self_id = self.self_object();
-        self.registry
-            .get(self_id)
-            .and_then(|o| o.vars.get(&(Rc::from(owner), Rc::from(name))))
+        let Some(o) = self.registry.get(self_id) else {
+            // OBI-85 CTO review: a plain `Ok(Null)` here would make a
+            // stale `self` (destructed mid-call, e.g. by its own
+            // `destruct(self)`) silently read every field back as `null`
+            // instead of surfacing the runtime error it actually is.
+            return Err(RtError::new("self was destructed"));
+        };
+        Ok(o.vars
+            .get(&(Rc::from(owner), Rc::from(name)))
             .cloned()
-            .unwrap_or(Value::Null)
+            .unwrap_or(Value::Null))
     }
 
     fn store_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
@@ -2499,10 +2540,10 @@ impl Host for RegistryHost<'_> {
         let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
         let new_bytes = heap::shallow_bytes(&v);
         let Some(o) = self.registry.get_mut(self_id) else {
-            // A destructed object writing a global is silently dropped,
-            // matching the pre-quota behaviour above (nothing left to
-            // charge memory to either).
-            return Ok(());
+            // OBI-85 CTO review: writing a field on a destructed `self`
+            // is a runtime error, same as reading one (`load_global`
+            // above), not a silent no-op.
+            return Err(RtError::new("self was destructed"));
         };
         let old_bytes = o.vars.get(&key).map(heap::shallow_bytes).unwrap_or(0);
         let new_total = o.mem_bytes.saturating_sub(old_bytes) + new_bytes;
@@ -3977,7 +4018,10 @@ pub fn get_n() -> int {
             for (i, v) in &setup {
                 host.store_global("/t/obj", keys[*i], v.clone()).unwrap();
             }
-            let snapshot: Vec<Value> = keys.iter().map(|k| host.load_global("/t/obj", k)).collect();
+            let snapshot: Vec<Value> = keys
+                .iter()
+                .map(|k| host.load_global("/t/obj", k).unwrap())
+                .collect();
 
             let mark = host.begin_atomic();
             for (i, v) in &during {
@@ -3987,7 +4031,7 @@ pub fn get_n() -> int {
                 // The nested-element-write case the AC calls out by name:
                 // read the container, mutate a copy (COW), write the whole
                 // (new) value back over the global slot.
-                let mut xs = host.load_global("/t/obj", "xs");
+                let mut xs = host.load_global("/t/obj", "xs").unwrap();
                 if let Some(arr) = xs.array_mut()
                     && !arr.is_empty()
                 {
@@ -3998,7 +4042,7 @@ pub fn get_n() -> int {
             host.rollback_atomic(mark);
 
             for (k, want) in keys.iter().zip(&snapshot) {
-                let got = host.load_global("/t/obj", k);
+                let got = host.load_global("/t/obj", k).unwrap();
                 prop_assert!(
                     want.equals(&got),
                     "rollback did not restore the exact prior state of `{k}`: want {want:?}, got {got:?}"

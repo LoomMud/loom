@@ -4,9 +4,17 @@
 //! Mudlib-confined file I/O for the `read_file`/`write_file` efuns (spec
 //! §5.5, OBI-85): the `ed`-lite builder command's storage. Paths are
 //! mudlib-absolute (`/domains/x/y.wf`), normalised and confined to the
-//! mudlib root -- `..` and NUL are rejected outright, and both directions
-//! are capped at [`MAX_FILE_BYTES`].
+//! mudlib root -- `..` and NUL are rejected outright -- and both
+//! directions are capped at [`MAX_FILE_BYTES`].
+//!
+//! Confinement is two layers (CTO review, OBI-85): [`resolve`] rejects
+//! `..`/NUL/non-absolute paths lexically, and [`confine_canonical`]
+//! additionally canonicalizes (resolves symlinks) before trusting the
+//! result, so a symlink planted *inside* the root that points outside it
+//! (`/domains/x/evil -> /etc`) cannot be used to read or write outside the
+//! mudlib root even though `resolve` alone would accept it.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Read/write size cap (spec: "cap it at 1 MiB").
@@ -15,7 +23,9 @@ pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 /// Resolve a mudlib-absolute path to a filesystem path confined under
 /// `root`, purely lexically (no `..`, no NUL, no empty/`.` segments kept).
 /// Does not touch the filesystem, so it also confines a path that does
-/// not exist yet (`write_file` creating a new file).
+/// not exist yet (`write_file` creating a new file). Suffix checks
+/// (`write_file`'s `.wf`/`.txt` allow-list) run against `path` *before*
+/// trimming happens here, keeping both checks looking at the same text.
 fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     if path.as_bytes().contains(&0) {
         return Err("path must not contain a NUL byte".to_string());
@@ -37,32 +47,69 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(out)
 }
 
+/// Canonicalize `candidate` (or, if it does not exist, its deepest
+/// existing ancestor) and require the result to still be under `root`'s
+/// own canonical form. This is the layer that catches a symlink *inside*
+/// the root pointing outside it -- `resolve`'s purely lexical check
+/// cannot see through one.
+///
+/// // S2: this is still just "no symlink escape"; `valid_write`'s
+/// per-tier/per-domain write confinement is a separate, later policy
+/// layer on top of this one.
+fn confine_canonical(root: &Path, candidate: &Path) -> Result<(), String> {
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let mut probe = candidate.to_path_buf();
+    loop {
+        if probe.exists() {
+            break;
+        }
+        if !probe.pop() {
+            // Ran out of ancestors without finding one that exists; `root`
+            // itself always exists (checked above), so this can't happen
+            // for a `candidate` actually built from `resolve(root, ..)`.
+            return Err("path has no existing ancestor under the mudlib root".to_string());
+        }
+    }
+    let canonical_probe =
+        std::fs::canonicalize(&probe).map_err(|e| format!("{}: {e}", probe.display()))?;
+    if !canonical_probe.starts_with(&canonical_root) {
+        return Err("path escapes the mudlib root".to_string());
+    }
+    Ok(())
+}
+
 /// `read_file()`: `Ok(None)` if the file does not exist, `Err` for a bad
 /// path, an oversized file, or any other I/O failure.
 pub fn read_file(root: &Path, path: &str) -> Result<Option<String>, String> {
     let resolved = resolve(root, path)?;
-    match std::fs::metadata(&resolved) {
-        Ok(meta) if meta.len() > MAX_FILE_BYTES => {
-            return Err(format!(
-                "{path}: {} bytes exceeds the {MAX_FILE_BYTES}-byte cap",
-                meta.len()
-            ));
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{path}: {e}")),
+    if !resolved.exists() {
+        return Ok(None);
     }
-    match std::fs::read_to_string(&resolved) {
-        Ok(s) => Ok(Some(s)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{path}: {e}")),
+    confine_canonical(root, &resolved)?;
+
+    // Read at most `MAX_FILE_BYTES + 1` bytes through `Read::take`, so a
+    // file that grows between an earlier `metadata()` check and the read
+    // itself (TOCTOU) can never smuggle more than one byte over the cap
+    // through, rather than trusting a stale size (CTO review, OBI-85).
+    let file = std::fs::File::open(&resolved).map_err(|e| format!("{path}: {e}"))?;
+    let mut buf = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{path}: {e}"))?;
+    if buf.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!("{path}: exceeds the {MAX_FILE_BYTES}-byte cap"));
     }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|e| format!("{path}: not valid UTF-8: {e}"))
 }
 
 /// `write_file()`: only `.wf`/`.txt` suffixes are allowed; parent
 /// directories are created under the root as needed.
 pub fn write_file(root: &Path, path: &str, text: &str) -> Result<bool, String> {
-    if !(path.ends_with(".wf") || path.ends_with(".txt")) {
+    let trimmed = path.trim();
+    if !(trimmed.ends_with(".wf") || trimmed.ends_with(".txt")) {
         return Err(format!("{path}: write_file only allows .wf or .txt files"));
     }
     if text.len() as u64 > MAX_FILE_BYTES {
@@ -75,9 +122,13 @@ pub fn write_file(root: &Path, path: &str, text: &str) -> Result<bool, String> {
     if let Some(parent) = resolved.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
     }
-    // S2: `valid_write` policy hook goes here (per-tier/per-domain write
-    // confinement beyond the mudlib-root confinement `resolve` already
-    // enforces).
+    // Canonicalize *after* `create_dir_all`, so newly created parent
+    // directories are confirmed to exist and be confined before any
+    // write happens; `confine_canonical` walks up to `resolved`'s deepest
+    // existing ancestor, which also catches a pre-existing symlink
+    // planted at `resolved` itself (its own canonical form is checked
+    // too, not just its parent's).
+    confine_canonical(root, &resolved)?;
     std::fs::write(&resolved, text).map_err(|e| format!("{path}: {e}"))?;
     Ok(true)
 }
@@ -91,7 +142,10 @@ mod tests {
             std::env::temp_dir().join(format!("loom-fileio-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        root
+        // Canonicalize once here too, so tests that compare against
+        // `root` don't trip over e.g. macOS's `/tmp` -> `/private/tmp`
+        // symlink looking like an "escape".
+        std::fs::canonicalize(&root).unwrap()
     }
 
     #[test]
@@ -166,5 +220,60 @@ mod tests {
         std::fs::write(&path, vec![b'a'; MAX_FILE_BYTES as usize + 1]).unwrap();
         assert!(read_file(&root, "/big.txt").is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A symlink *inside* the mudlib root pointing outside it must not let
+    /// either `read_file` or `write_file` escape (CTO review, OBI-85).
+    #[test]
+    #[cfg(unix)]
+    fn symlink_escape_is_rejected_for_read_and_write() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("symlink-escape");
+        let outside = tmp_root("symlink-escape-outside");
+        std::fs::write(outside.join("secret.txt"), "top secret").unwrap();
+
+        std::fs::create_dir_all(root.join("domains/x")).unwrap();
+        symlink(&outside, root.join("domains/x/evil")).unwrap();
+
+        // Reading through the symlink must fail, not return the outside
+        // file's contents.
+        let result = read_file(&root, "/domains/x/evil/secret.txt");
+        assert!(result.is_err(), "expected an error, got {result:?}");
+
+        // Writing through the symlink must fail, not land outside root.
+        let result = write_file(&root, "/domains/x/evil/pwned.txt", "pwned");
+        assert!(result.is_err(), "expected an error, got {result:?}");
+        assert!(!outside.join("pwned.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A symlink planted at the *exact* write target (parent dir is fine,
+    /// but the leaf itself is a symlink pointing outside root) must also
+    /// be rejected, not silently followed by `std::fs::write`.
+    #[test]
+    #[cfg(unix)]
+    fn write_through_a_symlinked_leaf_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("symlink-leaf");
+        let outside = tmp_root("symlink-leaf-outside");
+        std::fs::write(outside.join("real.txt"), "original").unwrap();
+
+        std::fs::create_dir_all(root.join("domains/x")).unwrap();
+        symlink(outside.join("real.txt"), root.join("domains/x/link.txt")).unwrap();
+
+        let result = write_file(&root, "/domains/x/link.txt", "clobbered");
+        assert!(result.is_err(), "expected an error, got {result:?}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("real.txt")).unwrap(),
+            "original",
+            "the outside file must be untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

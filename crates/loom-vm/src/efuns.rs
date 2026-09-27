@@ -97,6 +97,10 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     ("users", 0, 0, Privilege::P0, 2),
     ("lower", 1, 1, Privilege::P0, 1),
     ("to_int", 1, 1, Privilege::P0, 1),
+    // OBI-85 CTO review: destructed-reference safety Warp needs --
+    // `destructed(ob)` is P0 (a pure liveness check, same class as
+    // `find_object`).
+    ("destructed", 1, 1, Privilege::P0, 1),
     // OBI-85: `destruct` on an object the caller doesn't own is P2, same
     // rationale as `disconnect` above (spec r5 §5.5).
     ("destruct", 1, 1, Privilege::P2, 5),
