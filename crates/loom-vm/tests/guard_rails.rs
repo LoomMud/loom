@@ -10,6 +10,47 @@ use common::{FakeHost, fixture, on_world_thread};
 use loom_vm::World;
 
 #[test]
+fn tick_cost_is_charged_at_call_efun_not_just_declared() {
+    // CTO review (OBI-33): the `EFUNS` doc comment claims tick cost is
+    // charged, but it wasn't. Pin it: a loop of `compile_object` calls
+    // (declared cost 500) must exhaust a much smaller `max_ticks` budget
+    // in far fewer iterations than the same loop of `len` calls
+    // (declared cost 1), which a shared `TickCheck`-only meter (one tick
+    // per loop backedge, ignoring what the call inside it costs) could
+    // not distinguish.
+    on_world_thread(|| {
+        let root = fixture("tworoom");
+        let limits = loom_vm::Limits {
+            max_ticks: 5_000,
+            max_depth: 512,
+        };
+        let mut world = World::boot_with_limits(&root, limits).expect("boot");
+        let mut host = FakeHost::default();
+
+        world.connect(1, &mut host);
+        host.out.clear();
+        world.input(1, "burnlen", &mut host);
+        assert!(host.take(1).contains("Too long evaluation"));
+        world.input(1, "burncount", &mut host);
+        let len_iters: i64 = host.take(1).trim().parse().unwrap();
+
+        world.connect(2, &mut host);
+        host.take(2);
+        world.input(2, "burncompile", &mut host);
+        assert!(host.take(2).contains("Too long evaluation"));
+        world.input(2, "burncount", &mut host);
+        let compile_iters: i64 = host.take(2).trim().parse().unwrap();
+
+        assert!(
+            len_iters > 10 * compile_iters,
+            "len loop should run far more iterations than the same budget \
+             affords a compile_object loop: len={len_iters} compile={compile_iters}"
+        );
+        assert!(compile_iters >= 1, "budget must allow at least one call");
+    });
+}
+
+#[test]
 fn infinite_loop_and_runaway_recursion_abort_and_world_keeps_serving() {
     on_world_thread(|| {
         let root = fixture("tworoom");

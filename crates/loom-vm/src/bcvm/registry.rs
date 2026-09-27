@@ -1249,18 +1249,19 @@ impl<'a> RegistryHost<'a> {
                 let Value::Int(id) = a0 else {
                     return Err(RtError::new("remove_call_out(): expected int id"));
                 };
+                let me = self.self_object();
                 let removed = id >= 0
                     && self
                         .driver
                         .as_mut()
                         .expect("checked above")
                         .scheduler
-                        .remove_call_out(id as u64);
+                        .remove_call_out(me, id as u64);
                 Ok(Value::Bool(removed))
             }
-            "set_heart_beat" => {
+            "set_heartbeat" => {
                 let Value::Bool(on) = a0 else {
-                    return Err(RtError::new("set_heart_beat(): expected bool"));
+                    return Err(RtError::new("set_heartbeat(): expected bool"));
                 };
                 let me = self.self_object();
                 self.driver

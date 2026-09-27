@@ -329,10 +329,24 @@ impl<'a, H: Host> Interpreter<'a, H> {
     }
 
     fn tick(&mut self) -> R<()> {
-        if *self.ticks_left == 0 {
+        self.charge_ticks(1)
+    }
+
+    /// Charge `n` ticks against the running budget (spec §5.9: "efuns
+    /// declare costs", `crate::efuns::tick_cost`), the same counter
+    /// `Op::TickCheck` decrements one at a time. `n == 0` is a no-op (an
+    /// unknown efun, which `call_efun`/`host.call_efun` will itself
+    /// reject before this would matter, still must not divide-by-zero
+    /// panic or otherwise special-case here).
+    fn charge_ticks(&mut self, n: u64) -> R<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if *self.ticks_left < n {
+            *self.ticks_left = 0;
             return Err(self.err_with_trace("Too long evaluation (tick limit exceeded)"));
         }
-        *self.ticks_left -= 1;
+        *self.ticks_left -= n;
         Ok(())
     }
 
@@ -739,6 +753,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
             Op::CallEfun { dst, name, args } => {
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
                 let name_s = self.str_of(name).to_string();
+                // Spec §5.9: efuns declare a tick cost (`crate::efuns::
+                // tick_cost`); charge it against the same budget
+                // `Op::TickCheck` meters, before running the efun, so a
+                // loop of expensive efun calls (e.g. `compile_object`)
+                // exhausts a frame's ticks sooner than the same loop of
+                // cheap ones (e.g. `len`) even with no `TickCheck` between
+                // iterations.
+                self.charge_ticks(crate::efuns::tick_cost(&name_s).unwrap_or(1) as u64)?;
                 let v = match self.call_efun(&name_s, &argv) {
                     Some(v) => v?,
                     None => self.host.call_efun(&name_s, argv)?,

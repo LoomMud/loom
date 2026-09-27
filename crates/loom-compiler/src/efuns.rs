@@ -75,7 +75,7 @@ const NAMES: &[&str] = &[
     "trim",
     "call_out",
     "remove_call_out",
-    "set_heart_beat",
+    "set_heartbeat",
 ];
 
 /// All efun names known to the checker.
@@ -107,7 +107,10 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
         ),
         "move_to" => ("move_to", vec![P(obj)], 1, Ret::Ty(Ty::Void), P0),
         "send" => ("send", vec![P(oobj), P(s)], 2, Ret::Ty(Ty::Void), P0),
-        "disconnect" => ("disconnect", vec![P(oobj)], 1, Ret::Ty(Ty::Void), P0),
+        // Reclassified P2 (CTO review of OBI-33, spec r5 §5.5 "destruct
+        // on objects the caller doesn't own is P2"): disconnect(ob) acts
+        // on another user's connection.
+        "disconnect" => ("disconnect", vec![P(oobj)], 1, Ret::Ty(Ty::Void), P2),
         "bind_connection" => ("bind_connection", vec![P(obj)], 1, Ret::Ty(Ty::Void), P3),
         "compile_object" => (
             "compile_object",
@@ -133,22 +136,23 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
         ),
         "keys" => ("keys", vec![Param::AnyMap], 1, Ret::KeysOf, P0),
         "trim" => ("trim", vec![P(s.clone())], 1, Ret::Ty(s), P0),
-        // OBI-33: call_out / heartbeat scheduler efuns (see `loom_vm::efuns`
-        // for the authoritative arity/privilege/tick cost).
-        "call_out" => ("call_out", vec![P(s), P(Ty::Int)], 2, Ret::Ty(Ty::Int), P1),
+        // OBI-33 / CTO review: call_out / remove_call_out / set_heartbeat
+        // are §5.5's Timing row, P0 (see `loom_vm::efuns` for the
+        // authoritative arity/privilege/tick cost and the rationale).
+        "call_out" => ("call_out", vec![P(s), P(Ty::Int)], 2, Ret::Ty(Ty::Int), P0),
         "remove_call_out" => (
             "remove_call_out",
             vec![P(Ty::Int)],
             1,
             Ret::Ty(Ty::Bool),
-            P1,
+            P0,
         ),
-        "set_heart_beat" => (
-            "set_heart_beat",
+        "set_heartbeat" => (
+            "set_heartbeat",
             vec![P(Ty::Bool)],
             1,
             Ret::Ty(Ty::Void),
-            P1,
+            P0,
         ),
         _ => return None,
     };

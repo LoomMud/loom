@@ -61,7 +61,12 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     ("inventory", 1, 1, Privilege::P0, 2),
     ("move_to", 1, 1, Privilege::P0, 2),
     ("send", 2, 2, Privilege::P0, 2),
-    ("disconnect", 1, 1, Privilege::P0, 2),
+    // Spec r5 §5.5: "destruct on objects the caller doesn't own is P2";
+    // disconnect(ob) acts on another user's connection by the same
+    // analogy, so it is P2, not P0 (reclassified in CTO review of
+    // OBI-33). S1 may relax this to P0 when `ob` is the caller's own
+    // connection.
+    ("disconnect", 1, 1, Privilege::P2, 2),
     ("bind_connection", 1, 1, Privilege::P3, 2),
     ("compile_object", 1, 1, Privilege::P1, 500),
     ("len", 1, 1, Privilege::P0, 1),
@@ -69,14 +74,16 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     ("join", 2, 2, Privilege::P0, 5),
     ("keys", 1, 1, Privilege::P0, 2),
     ("trim", 1, 1, Privilege::P0, 1),
-    // OBI-33: call_out / heartbeat scheduler efuns. Scheduling future
-    // execution (and opting into the heartbeat, which runs every world
-    // tick whether or not anything else would have called this object)
-    // is a shared, metered resource across every object in the world, so
-    // these are gated (`P1`) rather than `P0` like `send`/`move_to`.
-    ("call_out", 2, 2, Privilege::P1, 5),
-    ("remove_call_out", 1, 1, Privilege::P1, 2),
-    ("set_heart_beat", 1, 1, Privilege::P1, 2),
+    // OBI-33 / CTO review: call_out / remove_call_out / set_heartbeat
+    // are §5.5's "Timing" row, which is **P0**: every mudlib object
+    // needs to be able to schedule itself, so gating this at P1 would
+    // leave any tier without P1 unable to schedule anything at all.
+    // Abuse is bounded by per-tier *quotas* (§5.11.2: pending call_outs
+    // per object/uid, heartbeat objects, sustained tick share), tracked
+    // as OBI-36 (S2), not by the privilege class here.
+    ("call_out", 2, 2, Privilege::P0, 5),
+    ("remove_call_out", 1, 1, Privilege::P0, 2),
+    ("set_heartbeat", 1, 1, Privilege::P0, 2),
 ];
 
 /// `(min args, max args)` of efun `name`, if it exists.
