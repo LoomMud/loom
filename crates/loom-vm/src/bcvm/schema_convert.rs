@@ -62,11 +62,38 @@ fn value_matches_ty(v: &Value, ty: &Ty) -> bool {
         Ty::Array(elem) => v
             .as_array()
             .is_some_and(|a| a.iter().all(|e| value_matches_ty(e, elem))),
-        Ty::Map(_, val_ty) => v
-            .as_map()
-            .is_some_and(|m| m.entries.iter().all(|(_, mv)| value_matches_ty(mv, val_ty))),
-        Ty::Struct(s) => v.as_struct().is_some_and(|sv| sv.name == s.name),
-        Ty::Enum(e) => v.as_enum().is_some_and(|ev| ev.name == e.name),
+        Ty::Map(key_ty, val_ty) => v.as_map().is_some_and(|m| {
+            m.entries
+                .iter()
+                .all(|(k, mv)| value_matches_ty(k, key_ty) && value_matches_ty(mv, val_ty))
+        }),
+        // A nested struct/enum must match *structurally*, not just by name:
+        // a field holding `Stats` whose own schema changed (e.g. `hp: int`
+        // -> `hp: string`) would otherwise be carried over "losslessly"
+        // with a stale shape. Same nominal identity (module + name), the
+        // exact same field-name set, and every field value matching.
+        Ty::Struct(s) => v.as_struct().is_some_and(|sv| {
+            sv.module == s.module
+                && sv.name == s.name
+                && sv.fields.len() == s.fields.len()
+                && s.fields.iter().all(|f| {
+                    sv.field(&f.name)
+                        .is_some_and(|fv| value_matches_ty(fv, &f.ty))
+                })
+        }),
+        Ty::Enum(e) => v.as_enum().is_some_and(|ev| {
+            ev.module == e.module
+                && ev.name == e.name
+                && e.variants.iter().any(|var| {
+                    var.name == ev.variant
+                        && var.payload.len() == ev.payload.len()
+                        && ev
+                            .payload
+                            .iter()
+                            .zip(&var.payload)
+                            .all(|(pv, pt)| value_matches_ty(pv, pt))
+                })
+        }),
         Ty::Void | Ty::Never | Ty::Fn(_) | Ty::Error => false,
     }
 }
@@ -332,5 +359,33 @@ mod tests {
         };
         let new = enum_ty(vec![variant("Fire", vec![Ty::String])]);
         assert!(matches!(convert_enum(&old, &new), Migrated::Lossy { .. }));
+    }
+
+    #[test]
+    fn struct_is_lossy_when_a_nested_struct_schema_changed() {
+        // `Loadout { stats: Stats }` where `Stats.hp` changed int -> string:
+        // the outer field still *names* `Stats`, but the held value has the
+        // old shape, so carrying it over would be silent data corruption.
+        let inner_old = Value::struct_val(old_struct(&[("hp", Value::Int(10))]));
+        let old = StructVal {
+            module: Rc::from("/std/item"),
+            name: Rc::from("Loadout"),
+            fields: vec![(Rc::from("stats"), inner_old)],
+        };
+        let new_inner = struct_ty(vec![field("hp", Ty::String, None)]);
+        let new = Rc::new(StructTy {
+            module: Rc::from("/std/item"),
+            name: Rc::from("Loadout"),
+            fields: vec![field("stats", Ty::Struct(new_inner), None)],
+        });
+        assert!(matches!(convert_struct(&old, &new), Migrated::Lossy { .. }));
+    }
+
+    #[test]
+    fn nested_struct_from_another_module_does_not_match() {
+        let mut other = old_struct(&[("hp", Value::Int(1))]);
+        other.module = Rc::from("/std/other");
+        let ty = Ty::Struct(struct_ty(vec![field("hp", Ty::Int, None)]));
+        assert!(!value_matches_ty(&Value::struct_val(other), &ty));
     }
 }

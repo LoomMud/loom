@@ -311,75 +311,114 @@ impl Ty {
     ///
     /// [OBI-52]: /OBI/issues/OBI-52
     pub fn schema_hash(&self) -> u64 {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = SchemaHasher::new();
         self.hash_schema(&mut h);
-        h.finish()
+        h.0
     }
 
-    fn hash_schema(&self, h: &mut std::collections::hash_map::DefaultHasher) {
+    fn hash_schema(&self, h: &mut SchemaHasher) {
         // A leading discriminant tag keeps e.g. `Ty::Array(Ty::Int)` from
         // colliding with a differently-shaped type that happens to hash the
         // same parts in the same order.
         match self {
-            Ty::Int => 0u8.hash(h),
-            Ty::Float => 1u8.hash(h),
-            Ty::Bool => 2u8.hash(h),
-            Ty::String => 3u8.hash(h),
-            Ty::Object => 4u8.hash(h),
-            Ty::Null => 5u8.hash(h),
-            Ty::Any => 6u8.hash(h),
-            Ty::Void => 7u8.hash(h),
-            Ty::Never => 8u8.hash(h),
-            Ty::Error => 9u8.hash(h),
+            Ty::Int => h.tag(0),
+            Ty::Float => h.tag(1),
+            Ty::Bool => h.tag(2),
+            Ty::String => h.tag(3),
+            Ty::Object => h.tag(4),
+            Ty::Null => h.tag(5),
+            Ty::Any => h.tag(6),
+            Ty::Void => h.tag(7),
+            Ty::Never => h.tag(8),
+            Ty::Error => h.tag(9),
             Ty::Array(e) => {
-                10u8.hash(h);
+                h.tag(10);
                 e.hash_schema(h);
             }
             Ty::Map(k, v) => {
-                11u8.hash(h);
+                h.tag(11);
                 k.hash_schema(h);
                 v.hash_schema(h);
             }
             Ty::Optional(t) => {
-                12u8.hash(h);
+                h.tag(12);
                 t.hash_schema(h);
             }
             Ty::Fn(ft) => {
-                13u8.hash(h);
-                ft.params.len().hash(h);
+                h.tag(13);
+                h.len(ft.params.len());
                 for p in &ft.params {
                     p.hash_schema(h);
                 }
                 ft.ret.hash_schema(h);
             }
             Ty::Struct(s) => {
-                20u8.hash(h);
-                s.module.hash(h);
-                s.name.hash(h);
+                h.tag(20);
+                h.str(&s.module);
+                h.str(&s.name);
                 let mut fields: Vec<&FieldTy> = s.fields.iter().collect();
                 fields.sort_by(|a, b| a.name.cmp(&b.name));
-                fields.len().hash(h);
+                h.len(fields.len());
                 for f in fields {
-                    f.name.hash(h);
+                    h.str(&f.name);
                     f.ty.hash_schema(h);
                 }
             }
             Ty::Enum(e) => {
-                21u8.hash(h);
-                e.module.hash(h);
-                e.name.hash(h);
+                h.tag(21);
+                h.str(&e.module);
+                h.str(&e.name);
                 let mut variants: Vec<&VariantTy> = e.variants.iter().collect();
                 variants.sort_by(|a, b| a.name.cmp(&b.name));
-                variants.len().hash(h);
+                h.len(variants.len());
                 for v in variants {
-                    v.name.hash(h);
-                    v.payload.len().hash(h);
+                    h.str(&v.name);
+                    h.len(v.payload.len());
                     for p in &v.payload {
                         p.hash_schema(h);
                     }
                 }
             }
         }
+    }
+}
+
+/// FNV-1a (64-bit) over an explicit, platform-independent byte encoding.
+/// Schema hashes are compared across compiles, processes, and (via
+/// `loom-persist`'s `schema_hash` column, once OBI-34 folds these in)
+/// across restarts and toolchain upgrades, so they must not depend on
+/// `std`'s `DefaultHasher` (algorithm unspecified across Rust releases) or
+/// on `usize` width / `Hash` impl details. Every length is encoded as a
+/// little-endian `u64`; every string as its length followed by its UTF-8
+/// bytes. Changing this encoding changes every persisted schema hash.
+struct SchemaHasher(u64);
+
+impl SchemaHasher {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        SchemaHasher(Self::OFFSET)
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= u64::from(*b);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn tag(&mut self, t: u8) {
+        self.bytes(&[t]);
+    }
+
+    fn len(&mut self, n: usize) {
+        self.bytes(&(n as u64).to_le_bytes());
+    }
+
+    fn str(&mut self, s: &str) {
+        self.len(s.len());
+        self.bytes(s.as_bytes());
     }
 }
 
