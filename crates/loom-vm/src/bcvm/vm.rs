@@ -83,6 +83,27 @@ pub enum CallTarget<'s> {
     Other { recv: Value, name: &'s str },
 }
 
+/// Identifies one `Op::Call`/`Op::CallOther` instruction, for the
+/// per-call-site inline cache (spec §5.8 "dispatch tables ... with inline
+/// cache"): a [`Host`] implementation may remember what a given call site
+/// resolved to last time and skip its dispatch-table hash lookup (and, via
+/// [`Host::dispatch_cached`], the interpreter's own name-string lookup/
+/// allocation) on the next visit, as long as it re-checks a cheap guard
+/// first (see `bcvm::registry::RegistryHost`'s use of this).
+///
+/// `code` is the identity of the *calling* function's code (a
+/// `Rc<dyn ProgramCode>`'s data pointer, or the base module's address for
+/// the outermost call) — together with `func`/`pc` this is unique for as
+/// long as that compiled program is reachable; a recompile produces a
+/// brand new `Rc`/`Module`, so old cache entries simply stop matching any
+/// call site that can still execute (no explicit invalidation needed).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CallSite {
+    code: usize,
+    func: u32,
+    pc: u32,
+}
+
 /// How a [`Host`] answers [`Host::dispatch`].
 pub enum HostCall {
     /// The host ran the call itself (or it needed no Weft frames).
@@ -123,24 +144,52 @@ pub trait Host {
     /// [`Interpreter::call_efun`] for the ones that are).
     fn call_efun(&mut self, name: &str, args: Vec<Value>) -> R<Value>;
     fn load_global(&mut self, owner: &str, name: &str) -> Value;
-    fn store_global(&mut self, owner: &str, name: &str, v: Value);
+    /// Store a program variable. `Err` (with a Weft stack trace, like any
+    /// other [`RtError`]) if the host enforces a per-object memory quota
+    /// (spec r5 §5.2.1) and this write would exceed it — see
+    /// `bcvm::registry::RegistryHost::store_global`.
+    fn store_global(&mut self, owner: &str, name: &str, v: Value) -> R<()>;
 
     /// Resolve a cross-module call. The default runs it to completion via
     /// the `call_*` methods above; a host that can hand out code overrides
     /// this to return [`HostCall::Enter`] so the call stays on the
-    /// interpreter's one flat frame stack (D26).
-    fn dispatch(&mut self, target: CallTarget<'_>, args: Vec<Value>) -> R<HostCall> {
+    /// interpreter's one flat frame stack (D26). `site` identifies the
+    /// calling `Op::Call`/`Op::CallOther` instruction, for a host that
+    /// implements a per-call-site inline cache.
+    fn dispatch(&mut self, _site: CallSite, target: CallTarget<'_>, args: Vec<Value>) -> R<HostCall> {
         Ok(HostCall::Done(match target {
             CallTarget::Static { program, name } => self.call_static(program, name, args)?,
             CallTarget::Virtual { name } => self.call_virtual(name, args)?,
             CallTarget::Other { recv, name } => self.call_other(recv, name, args)?,
         }))
     }
+    /// Fast-path probe for [`CallSite`] `site`, tried by the interpreter
+    /// *before* it materializes the callee name (which `dispatch` needs but
+    /// a cache hit does not) — the actual saving a per-call-site inline
+    /// cache buys over always doing [`Host::dispatch`]. `recv` is `None`
+    /// for `Virtual`/`Static` (guard is self's own program) or the receiver
+    /// value for `Other` (guard is its program). `Err(args)` (cache miss,
+    /// or no cache) hands `args` straight back so the slow path
+    /// (`dispatch`) can use them without recomputing anything; default
+    /// implementation always misses.
+    fn dispatch_cached(
+        &mut self,
+        _site: CallSite,
+        _recv: Option<&Value>,
+        args: Vec<Value>,
+    ) -> Result<HostCall, Vec<Value>> {
+        Err(args)
+    }
     /// A [`HostCall::Enter`] frame for `obj` was pushed: `self_object()`
     /// must now answer `obj` until the matching [`Host::leave_self`].
     fn enter_self(&mut self, _obj: ObjectId) {}
     /// The frame pushed by the matching [`Host::enter_self`] was popped.
     fn leave_self(&mut self) {}
+    /// `Value::array_mut`/`map_mut` actually cloned a shared buffer
+    /// (`loom_cow_copies_total{program}`, spec r5 §5.2.1, D24); `program` is
+    /// the path of whichever module's bytecode did the write. No-op unless
+    /// a host collects this (see `bcvm::registry::RegistryHost`).
+    fn record_cow_copy(&mut self, _program: &str) {}
 }
 
 /// One activation: which function, at which instruction, with its own
@@ -161,15 +210,28 @@ struct Frame {
 }
 
 /// Per-execution limits (spec §5.9): every tick-metered op consumes one
-/// tick; the call stack cannot exceed `max_depth` frames.
+/// tick; the call stack cannot exceed `max_depth` frames; a single
+/// program-variable write cannot push its owning object's (shallow,
+/// see `bcvm::heap::shallow_bytes`) accounted memory past `mem_quota_bytes`
+/// (spec r5 §5.2.1 "memory quotas with per-object accounting").
+/// **Flat default, not yet per-tier:** builder/privilege tiers are the
+/// CTO's security-model policy and are not modeled in `loom-vm` yet; this
+/// is the single hook point a future per-tier quota would plug into.
 #[derive(Clone, Copy)]
 pub struct Limits {
     pub max_depth: u32,
+    pub mem_quota_bytes: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_depth: 512 }
+        Limits {
+            max_depth: 512,
+            // 8 MiB of (shallow) var storage per object: generous enough
+            // that no existing test/benchmark workload trips it by
+            // accident, small enough to be a real backstop.
+            mem_quota_bytes: 8 * 1024 * 1024,
+        }
     }
 }
 
@@ -231,6 +293,16 @@ impl<'a, H: Host> Interpreter<'a, H> {
         match &f.code {
             Some(c) => c.module(),
             None => self.module,
+        }
+    }
+
+    /// Identity of `frame`'s code, for [`CallSite`]: the data pointer of
+    /// its `Rc<dyn ProgramCode>`, or the base module's address if this
+    /// frame runs the interpreter's own (outermost) module.
+    fn code_identity(&self, frame: &Frame) -> usize {
+        match &frame.code {
+            Some(c) => Rc::as_ptr(c) as *const () as usize,
+            None => self.module as *const Module as usize,
         }
     }
 
@@ -475,7 +547,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     self.str_of(owner).to_string(),
                     self.str_of(name).to_string(),
                 );
-                self.host.store_global(&owner, &name, reg!(src));
+                self.host.store_global(&owner, &name, reg!(src))?;
                 Ok(Step::Continue)
             }
             Op::UnOp { dst, op, kind, src } => {
@@ -534,8 +606,17 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 // (OBI-53); this instruction only ever owns one register.
                 let key = reg!(index);
                 let val = reg!(src);
+                // `loom_cow_copies_total{program}` (spec r5 §5.2.1, D24):
+                // checked before the write that would trigger the clone, and
+                // attributed to whichever module's bytecode is doing it.
+                let path = self.cur().path.clone();
                 let frame = self.stack.last_mut().unwrap();
-                Self::index_set(kind, &mut frame.regs[base as usize], key, val)?;
+                let place = &mut frame.regs[base as usize];
+                let shared = place.is_shared();
+                Self::index_set(kind, place, key, val)?;
+                if shared {
+                    self.host.record_cow_copy(&path);
+                }
                 Ok(Step::Continue)
             }
             Op::IterElems { dst, src, kind, .. } => {
@@ -579,25 +660,46 @@ impl<'a, H: Host> Interpreter<'a, H> {
                         Ok(Step::Continue)
                     }
                     CalleeOp::Static { program, name } => {
-                        let (program, name) = (
-                            self.str_of(program).to_string(),
-                            self.str_of(name).to_string(),
-                        );
-                        let hc = self.host.dispatch(
-                            CallTarget::Static {
-                                program: &program,
-                                name: &name,
-                            },
-                            argv,
-                        )?;
-                        self.enter_or_store(hc, dst)
+                        let site = CallSite {
+                            code: self.code_identity(self.stack.last().unwrap()),
+                            func: func_idx,
+                            pc: pc as u32,
+                        };
+                        match self.host.dispatch_cached(site, None, argv) {
+                            Ok(hc) => self.enter_or_store(hc, dst),
+                            Err(argv) => {
+                                let (program, name) = (
+                                    self.str_of(program).to_string(),
+                                    self.str_of(name).to_string(),
+                                );
+                                let hc = self.host.dispatch(
+                                    site,
+                                    CallTarget::Static {
+                                        program: &program,
+                                        name: &name,
+                                    },
+                                    argv,
+                                )?;
+                                self.enter_or_store(hc, dst)
+                            }
+                        }
                     }
                     CalleeOp::Virtual { name } => {
-                        let name = self.str_of(name).to_string();
-                        let hc = self
-                            .host
-                            .dispatch(CallTarget::Virtual { name: &name }, argv)?;
-                        self.enter_or_store(hc, dst)
+                        let site = CallSite {
+                            code: self.code_identity(self.stack.last().unwrap()),
+                            func: func_idx,
+                            pc: pc as u32,
+                        };
+                        match self.host.dispatch_cached(site, None, argv) {
+                            Ok(hc) => self.enter_or_store(hc, dst),
+                            Err(argv) => {
+                                let name = self.str_of(name).to_string();
+                                let hc = self
+                                    .host
+                                    .dispatch(site, CallTarget::Virtual { name: &name }, argv)?;
+                                self.enter_or_store(hc, dst)
+                            }
+                        }
                     }
                 }
             }
@@ -609,11 +711,21 @@ impl<'a, H: Host> Interpreter<'a, H> {
             } => {
                 let recv = reg!(recv);
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
-                let name = self.str_of(name).to_string();
-                let hc = self
-                    .host
-                    .dispatch(CallTarget::Other { recv, name: &name }, argv)?;
-                self.enter_or_store(hc, Some(dst))
+                let site = CallSite {
+                    code: self.code_identity(self.stack.last().unwrap()),
+                    func: func_idx,
+                    pc: pc as u32,
+                };
+                match self.host.dispatch_cached(site, Some(&recv), argv) {
+                    Ok(hc) => self.enter_or_store(hc, Some(dst)),
+                    Err(argv) => {
+                        let name = self.str_of(name).to_string();
+                        let hc =
+                            self.host
+                                .dispatch(site, CallTarget::Other { recv, name: &name }, argv)?;
+                        self.enter_or_store(hc, Some(dst))
+                    }
+                }
             }
             Op::CallEfun { dst, name, args } => {
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
@@ -1024,7 +1136,9 @@ mod tests {
         fn load_global(&mut self, _owner: &str, _name: &str) -> Value {
             Value::Null
         }
-        fn store_global(&mut self, _owner: &str, _name: &str, _v: Value) {}
+        fn store_global(&mut self, _owner: &str, _name: &str, _v: Value) -> R<()> {
+            Ok(())
+        }
     }
 
     /// `fn countdown(n: int) -> int { if n <= 0 { return n; } return
@@ -1090,7 +1204,7 @@ mod tests {
 
     #[test]
     fn recursive_call_uses_heap_stack_not_native_recursion() {
-        let limits = Limits { max_depth: 20_000 };
+        let limits = Limits { max_depth: 20_000, ..Limits::default() };
 
         // Run on a thread with a tiny (64 KiB) native stack: if the
         // interpreter ever recursed on the Rust stack for a Weft call, this
@@ -1121,7 +1235,7 @@ mod tests {
 
     #[test]
     fn recursion_past_the_weft_depth_limit_is_a_weft_error_not_a_crash() {
-        let limits = Limits { max_depth: 64 };
+        let limits = Limits { max_depth: 64, ..Limits::default() };
 
         let result = std::thread::Builder::new()
             .stack_size(64 * 1024) // default-ish small stack (§ test spec: "default-stack thread")
@@ -1147,7 +1261,7 @@ mod tests {
     fn tick_metering_stops_a_runaway_call() {
         let module = countdown_module(false);
         let mut host = NoHost;
-        let limits = Limits { max_depth: 20_000 };
+        let limits = Limits { max_depth: 20_000, ..Limits::default() };
         let mut ticks = 5u64; // far fewer ticks than the 10,000 needed
 
         let mut interp = Interpreter::new(&module, &mut host, &limits, &mut ticks);
@@ -1165,7 +1279,7 @@ mod tests {
     fn error_carries_a_stack_trace() {
         let module = countdown_module(false);
         let mut host = NoHost;
-        let limits = Limits { max_depth: 3 }; // recursion will exceed this quickly
+        let limits = Limits { max_depth: 3, ..Limits::default() }; // recursion will exceed this quickly
         let mut ticks = 1_000_000u64;
 
         let mut interp = Interpreter::new(&module, &mut host, &limits, &mut ticks);

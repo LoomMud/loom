@@ -42,7 +42,8 @@ use loom_compiler::ty::Ty;
 
 use crate::bcvm::Value;
 use crate::bcvm::compile::{CompileError, compile_and_verify};
-use crate::bcvm::vm::{CallTarget, Host, HostCall, Interpreter, Limits, ProgramCode, R, RtError};
+use crate::bcvm::heap;
+use crate::bcvm::vm::{CallSite, CallTarget, Host, HostCall, Interpreter, Limits, ProgramCode, R, RtError};
 use crate::object::ObjectId;
 
 /// The name of the synthetic per-program initialiser function
@@ -494,6 +495,11 @@ pub struct BcObject {
     pub inventory: Vec<ObjectId>,
     /// Connection bound to this object (interactive), if any.
     pub conn: Option<u64>,
+    /// Sum of [`heap::shallow_bytes`] over every value currently in `vars`
+    /// (spec r5 §5.2.1 "memory quotas with per-object accounting"),
+    /// maintained incrementally by [`RegistryHost::store_global`] so a
+    /// quota check never has to re-walk `vars`.
+    pub mem_bytes: u64,
 }
 
 impl BcObject {
@@ -509,6 +515,7 @@ impl BcObject {
             env: None,
             inventory: Vec::new(),
             conn: None,
+            mem_bytes: 0,
         }
     }
 }
@@ -516,6 +523,33 @@ impl BcObject {
 struct Slot {
     generation: u32,
     obj: Option<BcObject>,
+}
+
+/// In-process `loom_cow_copies_total{program}` counter (spec r5 §5.2.1,
+/// D24): how many times a write through `Value::array_mut`/`map_mut`
+/// actually had to clone a shared buffer, per executing program path.
+///
+/// **Where this is collected/exposed, and why (flagged, not silently
+/// decided):** the repo has no metrics-export story outside
+/// `loom-net`/`loom-persist` yet, so this is *only* an in-process counter
+/// table, owned by [`Registry`] (long-lived, one per [`crate::world::World`])
+/// and read back via `World::cow_copies_total`. Wiring it to an actual
+/// `/metrics` (or similar) endpoint is a cross-seam decision — whoever owns
+/// `loom-net`'s HTTP/ops surface, or the CTO if that is not yet decided —
+/// not made here.
+#[derive(Default)]
+pub struct CowMetrics {
+    counts: HashMap<String, u64>,
+}
+
+impl CowMetrics {
+    pub fn record(&mut self, program: &str) {
+        *self.counts.entry(program.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn get(&self, program: &str) -> u64 {
+        self.counts.get(program).copied().unwrap_or(0)
+    }
 }
 
 /// A slab of [`BcObject`]s addressed by generational id, and the program
@@ -536,6 +570,9 @@ pub struct Registry {
     /// Connection id → the object it is bound to (mirrors
     /// `crate::world::State::conns`).
     pub conns: HashMap<u64, ObjectId>,
+    /// `loom_cow_copies_total{program}` (spec r5 §5.2.1, D24); see
+    /// [`CowMetrics`].
+    pub cow_metrics: CowMetrics,
 }
 
 impl Registry {
@@ -676,6 +713,29 @@ pub struct RegistryHost<'a> {
     driver: Option<Driver<'a>>,
     /// Stack pointer at construction, for [`NESTED_CALL_STACK_BUDGET`].
     stack_base: usize,
+    /// Per-call-site inline cache (spec §5.8): `Op::Call`/`Op::CallOther`
+    /// site → last resolution, valid as long as [`CacheEntry::guard`] is
+    /// still `Rc::ptr_eq` to the current receiver's leaf program. Scoped to
+    /// this `RegistryHost`'s lifetime, i.e. one top-level `World::call`/
+    /// driver entry (a fresh `RegistryHost` is built per call, see
+    /// `World::exec`) — which already covers the hot case a cache exists
+    /// for: a tight loop of monomorphic calls inside one running function.
+    call_cache: HashMap<CallSite, CacheEntry>,
+}
+
+/// One [`RegistryHost::call_cache`] entry: what `dispatch` resolved to last
+/// time this call site ran, and the guard to re-check before trusting it.
+struct CacheEntry {
+    /// The receiver's leaf program at resolution time (self's own program
+    /// for `Virtual`/`Static`, `recv`'s for `Other`). A hot-reload `upgrade`
+    /// always installs a brand-new `Rc<CompiledProgram>` on the object (see
+    /// `RegistryHost::upgrade`), so this pointer naturally stops matching
+    /// after any upgrade — no separate version check or explicit
+    /// invalidation needed.
+    guard: Rc<CompiledProgram>,
+    target: Rc<CompiledProgram>,
+    func: u32,
+    self_obj: ObjectId,
 }
 
 /// Everything a driver efun (`send`, `bind_connection`, `compile_object`,
@@ -708,16 +768,36 @@ fn stack_addr() -> usize {
 /// costs far more native stack per nested run than a release build.
 const NESTED_CALL_STACK_BUDGET: usize = 1_000_000;
 
+/// Bench/test-only escape hatch: `LOOM_VM_DISABLE_INLINE_CACHE=1` makes
+/// [`RegistryHost::dispatch`]/[`RegistryHost::dispatch_cached`] behave as
+/// they did before the per-call-site inline cache existed (every call
+/// re-does the dispatch-table hash lookup), so `examples/vm_bench.rs` can
+/// report cache-on vs. cache-off numbers for the *same* binary without a
+/// second build. Not a runtime feature flag — nothing in `World`'s own API
+/// reads this.
+fn inline_cache_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("LOOM_VM_DISABLE_INLINE_CACHE").is_some())
+}
+
 impl<'a> RegistryHost<'a> {
     /// Resolve `name` on `recv`'s program chain (most-derived first). With
     /// `require_pub`, a non-`pub` target is refused with the same wording
     /// the Phase 0 tree-walker used.
+    /// Resolve `name` on `recv`'s program chain (most-derived first). With
+    /// `require_pub`, a non-`pub` target is refused with the same wording
+    /// the Phase 0 tree-walker used. Also returns `recv`'s own (leaf)
+    /// program, unwalked — the inline-cache guard: two calls through this
+    /// same call site resolve identically as long as the receiving
+    /// object's *leaf* program is `Rc::ptr_eq` to what was cached, whether
+    /// or not `name` is inherited from an ancestor of it (see
+    /// [`RegistryHost::dispatch`]).
     fn resolve_on(
         &self,
         recv: Value,
         name: &str,
         require_pub: bool,
-    ) -> R<(ObjectId, Rc<CompiledProgram>, u32)> {
+    ) -> R<(ObjectId, Rc<CompiledProgram>, Rc<CompiledProgram>, u32)> {
         let Value::Object(recv_id) = recv else {
             return Err(RtError::new(format!(
                 "cannot call `{name}` on a {}",
@@ -739,12 +819,18 @@ impl<'a> RegistryHost<'a> {
                 target.path
             )));
         }
-        Ok((recv_id, target, idx))
+        Ok((recv_id, prog, target, idx))
     }
 
     /// `super::name()` / `program::name()`: `name` declared in exactly
-    /// `program` (an ancestor of self's program), never an override.
-    fn resolve_static(&self, program: &str, name: &str) -> R<(ObjectId, Rc<CompiledProgram>, u32)> {
+    /// `program` (an ancestor of self's program), never an override. Also
+    /// returns self's own (leaf) program as the inline-cache guard; see
+    /// [`RegistryHost::resolve_on`].
+    fn resolve_static(
+        &self,
+        program: &str,
+        name: &str,
+    ) -> R<(ObjectId, Rc<CompiledProgram>, Rc<CompiledProgram>, u32)> {
         let self_id = self.self_object();
         let prog = self
             .registry
@@ -762,10 +848,13 @@ impl<'a> RegistryHost<'a> {
         let idx = target
             .resolve_own(name)
             .ok_or_else(|| RtError::new(format!("no function `{name}` in {program}")))?;
-        Ok((self_id, target, idx))
+        Ok((self_id, prog, target, idx))
     }
 
-    fn resolve_target(&self, t: CallTarget<'_>) -> R<(ObjectId, Rc<CompiledProgram>, u32)> {
+    fn resolve_target(
+        &self,
+        t: CallTarget<'_>,
+    ) -> R<(ObjectId, Rc<CompiledProgram>, Rc<CompiledProgram>, u32)> {
         match t {
             CallTarget::Static { program, name } => self.resolve_static(program, name),
             // Unqualified `f()` on self: internal/private visibility was
@@ -782,8 +871,23 @@ impl<'a> RegistryHost<'a> {
     /// Run-to-completion form of a resolved call (nested [`Interpreter`]);
     /// only reached via the non-flat `Host::call_*` entry points.
     fn run_target(&mut self, t: CallTarget<'_>, args: Vec<Value>) -> R<Value> {
-        let (on, target, idx) = self.resolve_target(t)?;
+        let (on, _guard, target, idx) = self.resolve_target(t)?;
         self.call_in(on, &target, idx, args)
+    }
+
+    /// The inline-cache guard `dispatch`/`dispatch_cached` would resolve
+    /// `recv`/self against *right now*, without doing the actual name
+    /// lookup: self's leaf program for `Virtual`/`Static` (`recv ==
+    /// None`), or `recv`'s for `Other`. `None` if the relevant object is
+    /// already destructed or `recv` is not an object (the slow path's own
+    /// error reporting handles those cases).
+    fn current_guard(&self, recv: Option<&Value>) -> Option<Rc<CompiledProgram>> {
+        let id = match recv {
+            None => self.self_object(),
+            Some(Value::Object(id)) => *id,
+            Some(_) => return None,
+        };
+        self.registry.get(id).map(|o| o.program.clone())
     }
 
     pub fn new(registry: &'a mut Registry, self_object: ObjectId) -> Self {
@@ -794,6 +898,7 @@ impl<'a> RegistryHost<'a> {
             ticks_left: 1_000_000,
             driver: None,
             stack_base: stack_addr(),
+            call_cache: HashMap::new(),
         }
     }
 
@@ -824,6 +929,7 @@ impl<'a> RegistryHost<'a> {
                 master,
             }),
             stack_base: stack_addr(),
+            call_cache: HashMap::new(),
         }
     }
 
@@ -1331,14 +1437,65 @@ impl Host for RegistryHost<'_> {
     /// D26: hand the resolved function back to the interpreter so it runs
     /// as a frame on the caller's own flat stack (no nested `Interpreter`,
     /// no native recursion, suspendable at any `TickCheck`).
-    fn dispatch(&mut self, target: CallTarget<'_>, args: Vec<Value>) -> R<HostCall> {
-        let (self_obj, code, func) = self.resolve_target(target)?;
+    ///
+    /// **Per-call-site inline cache (spec §5.8):** the actual dispatch
+    /// resolution (`resolve_target`, itself already a single hash lookup
+    /// per program via `CompiledProgram::resolve`/`resolve_own`, not a
+    /// linear scan) always runs here; [`RegistryHost::dispatch_cached`] is
+    /// what lets a monomorphic call site skip both that lookup *and* the
+    /// interpreter materializing the callee name at all. This method
+    /// always (re-)populates the cache slot for `site`, so a call that
+    /// missed once still gets cached for next time.
+    fn dispatch(&mut self, site: CallSite, target: CallTarget<'_>, args: Vec<Value>) -> R<HostCall> {
+        let (self_obj, guard, code, func) = self.resolve_target(target)?;
+        if !inline_cache_disabled() {
+            self.call_cache.insert(
+                site,
+                CacheEntry {
+                    guard,
+                    target: code.clone(),
+                    func,
+                    self_obj,
+                },
+            );
+        }
         Ok(HostCall::Enter {
             code,
             func,
             self_obj,
             args,
         })
+    }
+
+    /// Fast path: served entirely from [`RegistryHost::call_cache`], no
+    /// name lookup, if `site` is cached and its guard still matches the
+    /// current receiver (self for `recv == None`, `recv` itself
+    /// otherwise). See [`Host::dispatch_cached`]'s doc for why this exists
+    /// as its own method instead of just an internal fast path inside
+    /// `dispatch`: skipping the *interpreter's own* `str_of(..).to_string()`
+    /// on a cache hit needs the interpreter to ask before it has a name to
+    /// hand `dispatch` at all.
+    fn dispatch_cached(
+        &mut self,
+        site: CallSite,
+        recv: Option<&Value>,
+        args: Vec<Value>,
+    ) -> Result<HostCall, Vec<Value>> {
+        if inline_cache_disabled() {
+            return Err(args);
+        }
+        let Some(entry) = self.call_cache.get(&site) else {
+            return Err(args);
+        };
+        match self.current_guard(recv) {
+            Some(g) if Rc::ptr_eq(&g, &entry.guard) => Ok(HostCall::Enter {
+                code: entry.target.clone(),
+                func: entry.func,
+                self_obj: entry.self_obj,
+                args,
+            }),
+            _ => Err(args),
+        }
     }
 
     fn enter_self(&mut self, obj: ObjectId) {
@@ -1362,11 +1519,33 @@ impl Host for RegistryHost<'_> {
             .unwrap_or(Value::Null)
     }
 
-    fn store_global(&mut self, owner: &str, name: &str, v: Value) {
+    fn store_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
         let self_id = self.self_object();
-        if let Some(o) = self.registry.get_mut(self_id) {
-            o.vars.insert((Rc::from(owner), Rc::from(name)), v);
+        let quota = self.limits.mem_quota_bytes;
+        let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
+        let new_bytes = heap::shallow_bytes(&v);
+        let Some(o) = self.registry.get_mut(self_id) else {
+            // A destructed object writing a global is silently dropped,
+            // matching the pre-quota behaviour above (nothing left to
+            // charge memory to either).
+            return Ok(());
+        };
+        let old_bytes = o.vars.get(&key).map(heap::shallow_bytes).unwrap_or(0);
+        let new_total = o.mem_bytes - old_bytes + new_bytes;
+        if new_total > quota {
+            return Err(RtError::new(format!(
+                "{}: memory quota exceeded writing `{name}` ({new_total} bytes of vars would be \
+                 in use, quota is {quota} bytes)",
+                o.name
+            )));
         }
+        o.mem_bytes = new_total;
+        o.vars.insert(key, v);
+        Ok(())
+    }
+
+    fn record_cow_copy(&mut self, program: &str) {
+        self.registry.cow_metrics.record(program);
     }
 }
 
@@ -1903,7 +2082,7 @@ fn create() {
             .spawn(|| {
                 let (root, mut registry, [_, _, c]) = three_object_chain("d26-deep");
                 let prog = registry.get(c).unwrap().program.clone();
-                let limits = Limits { max_depth: 10_000 };
+                let limits = Limits { max_depth: 10_000, ..Limits::default() };
                 let mut host = RegistryHost::new(&mut registry, c);
                 let mut ticks = 10_000_000u64;
                 let mut interp = Interpreter::new(&prog.module, &mut host, &limits, &mut ticks);
