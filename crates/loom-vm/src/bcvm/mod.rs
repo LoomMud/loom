@@ -16,8 +16,10 @@
 
 pub mod compile;
 pub mod heap;
+pub mod registry;
 pub mod vm;
 
 pub use compile::{CompileError, compile_and_verify};
 pub use heap::{HeapObj, MapData, Value};
+pub use registry::{BcObject, CompiledProgram, Registry, RegistryHost};
 pub use vm::{Host, Interpreter, Limits, RtError};
