@@ -93,6 +93,7 @@ struct Frame {
 
 /// Per-execution limits (spec §5.9): every tick-metered op consumes one
 /// tick; the call stack cannot exceed `max_depth` frames.
+#[derive(Clone, Copy)]
 pub struct Limits {
     pub max_depth: u32,
 }
