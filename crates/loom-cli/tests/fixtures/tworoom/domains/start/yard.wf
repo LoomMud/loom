@@ -1,0 +1,10 @@
+inherit /std/room
+
+override fn create() {
+    set_short("The Yard")
+    add_exit("south", "/domains/start/hall")
+}
+
+pub override fn long() -> string {
+    return "A muddy yard under an open sky."
+}

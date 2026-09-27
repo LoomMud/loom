@@ -1,0 +1,31 @@
+// Base room.
+var short_desc: string = "A room"
+var exits: {string: string} = {:}
+
+fn create() {
+}
+
+fn set_short(s: string) {
+    short_desc = s
+}
+
+fn add_exit(dir: string, dest: string) {
+    exits[dir] = dest
+}
+
+pub fn short() -> string {
+    return short_desc
+}
+
+pub fn long() -> string {
+    return "An empty room."
+}
+
+pub fn exit_dest(dir: string) -> string? {
+    return exits[dir]
+}
+
+pub fn look() -> string {
+    let names = keys(exits)
+    return $"{short()}\n{long()}\nExits: {join(names, ", ")}\n"
+}
