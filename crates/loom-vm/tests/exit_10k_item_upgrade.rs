@@ -40,6 +40,10 @@ fn ten_thousand_item_clones_survive_a_recompile_and_upgrade_all_with_zero_discon
             &root,
             Limits {
                 eager_upgrade_batch: 200,
+                // Every world tick fires heartbeats (OBI-82 made the
+                // default 20): the per-tick "not starved" check below
+                // needs a heartbeat on every tick.
+                heartbeat_interval_ticks: 1,
                 ..Limits::default()
             },
         )
