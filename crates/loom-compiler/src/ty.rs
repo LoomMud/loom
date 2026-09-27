@@ -183,17 +183,20 @@ impl Ty {
     }
 
     /// Is this type a function type, or does it contain one (in an array,
-    /// a map's key or value, or `T?`)? Spec r5 §5.2.2 rule 4: a `persistent`
-    /// variable's type can never be or contain `fn(...)` — function values
-    /// pin a code version and a principal that may not survive a reboot.
-    /// Struct fields are not checked yet: V1 structs are not implemented by
-    /// the type checker (`W0208`), so `Ty` has no struct variant to recurse
-    /// into; add that arm here when structs land.
+    /// a map's key or value, a struct field, an enum variant payload, or
+    /// `T?`)? Spec r5 §5.2.2 rule 4: a `persistent` variable's type can
+    /// never be or contain `fn(...)` — function values pin a code version
+    /// and a principal that may not survive a reboot.
     pub fn contains_fn(&self) -> bool {
         match self {
             Ty::Fn(_) => true,
             Ty::Array(t) | Ty::Optional(t) => t.contains_fn(),
             Ty::Map(k, v) => k.contains_fn() || v.contains_fn(),
+            Ty::Struct(s) => s.fields.iter().any(|f| f.ty.contains_fn()),
+            Ty::Enum(e) => e
+                .variants
+                .iter()
+                .any(|v| v.payload.iter().any(|t| t.contains_fn())),
             Ty::Int
             | Ty::Float
             | Ty::Bool

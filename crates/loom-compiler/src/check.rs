@@ -1968,16 +1968,23 @@ impl Cx<'_> {
     /// Resolve an lvalue ast expression into a [`hir::Place`] recursively:
     /// a name, or an element path rooted in one (spec r5 §5.2.1 rule 1).
     /// `op` is only used for the leaf-mutability diagnostic on `let` locals
-    /// (`Set` and compound ops are both writes).
+    /// (`Set` and compound ops are both writes). `leaf` is true only for
+    /// the direct assignment target, not when recursing into an `Index`
+    /// base: rebinding `a = ...` needs `var a`, but mutating `a`'s
+    /// contents in place (`a[0] = ...`) does not rebind `a` and is allowed
+    /// on a `let`-bound local or a parameter alike (value semantics, spec
+    /// r5 D24 — the container is this function's own logical copy either
+    /// way).
     fn resolve_place(
         &mut self,
         target: &ast::Expr,
         op: ast::AssignOp,
+        leaf: bool,
     ) -> (hir::Place, Ty, Option<LocalId>) {
         match &target.kind {
             E::Ident(n) => match self.resolve(n) {
                 Some(Resolved::Local(id)) => {
-                    if !self.locals[id as usize].mutable {
+                    if leaf && !self.locals[id as usize].mutable {
                         self.err_hint(
                             "W0241",
                             target.span,
@@ -2038,7 +2045,7 @@ impl Cx<'_> {
                     let _ = self.expr(index, None);
                     return (hir::Place::Local(0), Ty::Error, None);
                 }
-                let (base_place, base_ty, local) = self.resolve_place(base, op);
+                let (base_place, base_ty, local) = self.resolve_place(base, op, false);
                 let (i, kind, ety) = match base_ty.clone() {
                     Ty::Array(t) => {
                         let i = self.expr(index, Some(&Ty::Int));
@@ -2104,7 +2111,7 @@ impl Cx<'_> {
         op: ast::AssignOp,
         value: &ast::Expr,
     ) -> hir::StmtKind {
-        let (place, pty, local) = self.resolve_place(target, op);
+        let (place, pty, local) = self.resolve_place(target, op, true);
         let (v, kind) = if op == ast::AssignOp::Set {
             let v = self.expr(value, Some(&pty));
             (self.coerce(v, &pty, "the assignment"), OpKind::Dyn)

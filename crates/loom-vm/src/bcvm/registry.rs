@@ -144,10 +144,13 @@ fn synth_init_function(p: &hir::Program) -> Option<hir::Function> {
                 .expect("filtered to vars with an initialiser");
             let assign = hir::Stmt {
                 kind: hir::StmtKind::Assign {
-                    place: hir::Place::Global(hir::GlobalRef {
-                        owner: p.path.clone(),
-                        name: v.name.clone(),
-                    }),
+                    place: hir::Place::Global(
+                        hir::GlobalRef {
+                            owner: p.path.clone(),
+                            name: v.name.clone(),
+                        },
+                        v.ty.clone(),
+                    ),
                     op: hir::AssignOp::Set,
                     kind: hir::OpKind::Dyn,
                     value: init,

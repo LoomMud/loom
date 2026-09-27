@@ -811,9 +811,12 @@ mod tests {
         // producing an array.
         let f = FunctionCode {
             name: 0,
+            atomic: false,
             params: 0,
+            min_arity: 0,
             ret: Ty::Void,
             reg_types: vec![Ty::array(Ty::Int), Ty::array(Ty::Int), Ty::array(Ty::Int)],
+            entry_points: vec![0],
             code: vec![
                 Op::BinOp {
                     dst: 2,
@@ -832,9 +835,12 @@ mod tests {
     fn rejects_array_add_with_a_non_array_operand() {
         let f = FunctionCode {
             name: 0,
+            atomic: false,
             params: 0,
+            min_arity: 0,
             ret: Ty::Void,
             reg_types: vec![Ty::array(Ty::Int), Ty::Int, Ty::array(Ty::Int)],
+            entry_points: vec![0],
             code: vec![
                 Op::BinOp {
                     dst: 2,
