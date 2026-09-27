@@ -28,6 +28,9 @@ pub const MASTER_PATH: &str = "/secure/master";
 pub struct Limits {
     pub max_ticks: u64,
     pub max_depth: u32,
+    /// Per-object (shallow) memory quota in bytes; see
+    /// `bcvm::vm::Limits::mem_quota_bytes`.
+    pub mem_quota_bytes: u64,
 }
 
 impl Default for Limits {
@@ -35,6 +38,7 @@ impl Default for Limits {
         Limits {
             max_ticks: 1_000_000,
             max_depth: 512,
+            mem_quota_bytes: VmLimits::default().mem_quota_bytes,
         }
     }
 }
@@ -43,6 +47,7 @@ impl Limits {
     fn vm_limits(&self) -> VmLimits {
         VmLimits {
             max_depth: self.max_depth,
+            mem_quota_bytes: self.mem_quota_bytes,
         }
     }
 }
@@ -270,6 +275,22 @@ impl World {
                 .get(&(p.path.clone(), std::rc::Rc::from(name)))
                 .cloned()
         })
+    }
+
+    /// `loom_cow_copies_total{program}` (spec r5 §5.2.1, D24): how many
+    /// times a write through `Value::array_mut`/`map_mut` has had to clone
+    /// a shared buffer while executing `program`'s bytecode. See
+    /// `bcvm::registry::CowMetrics` for where/how this is collected and why
+    /// there is no exporter wired up yet.
+    pub fn cow_copies_total(&self, program: &str) -> u64 {
+        self.registry.cow_metrics.get(program)
+    }
+
+    /// Current (shallow, see `bcvm::heap::shallow_bytes`) accounted memory
+    /// of `ob`'s program variables (spec r5 §5.2.1 "memory quotas with
+    /// per-object accounting").
+    pub fn object_mem_bytes(&self, ob: ObjectId) -> Option<u64> {
+        self.registry.get(ob).map(|o| o.mem_bytes)
     }
 
     /// Render a value as Weft interpolation would.

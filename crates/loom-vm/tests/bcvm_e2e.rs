@@ -76,8 +76,9 @@ impl Host for SingleProgramHost<'_> {
         self.vars.get(name).cloned().unwrap_or(Value::Null)
     }
 
-    fn store_global(&mut self, _owner: &str, name: &str, v: Value) {
+    fn store_global(&mut self, _owner: &str, name: &str, v: Value) -> Result<(), RtError> {
         self.vars.insert(name.to_string(), v);
+        Ok(())
     }
 }
 
