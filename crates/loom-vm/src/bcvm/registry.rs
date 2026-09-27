@@ -43,7 +43,9 @@ use loom_compiler::ty::Ty;
 use crate::bcvm::Value;
 use crate::bcvm::compile::{CompileError, compile_and_verify};
 use crate::bcvm::heap;
-use crate::bcvm::vm::{CallSite, CallTarget, Host, HostCall, Interpreter, Limits, ProgramCode, R, RtError};
+use crate::bcvm::vm::{
+    CallSite, CallTarget, Host, HostCall, Interpreter, Limits, ProgramCode, R, RtError,
+};
 use crate::object::ObjectId;
 
 /// The name of the synthetic per-program initialiser function
@@ -1446,7 +1448,12 @@ impl Host for RegistryHost<'_> {
     /// interpreter materializing the callee name at all. This method
     /// always (re-)populates the cache slot for `site`, so a call that
     /// missed once still gets cached for next time.
-    fn dispatch(&mut self, site: CallSite, target: CallTarget<'_>, args: Vec<Value>) -> R<HostCall> {
+    fn dispatch(
+        &mut self,
+        site: CallSite,
+        target: CallTarget<'_>,
+        args: Vec<Value>,
+    ) -> R<HostCall> {
         let (self_obj, guard, code, func) = self.resolve_target(target)?;
         if !inline_cache_disabled() {
             self.call_cache.insert(
@@ -2082,7 +2089,10 @@ fn create() {
             .spawn(|| {
                 let (root, mut registry, [_, _, c]) = three_object_chain("d26-deep");
                 let prog = registry.get(c).unwrap().program.clone();
-                let limits = Limits { max_depth: 10_000, ..Limits::default() };
+                let limits = Limits {
+                    max_depth: 10_000,
+                    ..Limits::default()
+                };
                 let mut host = RegistryHost::new(&mut registry, c);
                 let mut ticks = 10_000_000u64;
                 let mut interp = Interpreter::new(&prog.module, &mut host, &limits, &mut ticks);
@@ -2205,5 +2215,217 @@ pub fn long() -> string {
         assert_eq!(long.as_str(), Some("The Great Hall (nothing else to see)"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// spec r5 §5.2.1 "memory quotas with per-object accounting": a
+    /// program-variable write that would push the object's accounted
+    /// (shallow) `vars` bytes past the configured quota is rejected as an
+    /// `RtError`, not silently allowed — and the error carries a Weft
+    /// stack trace (the frame it happened in), like any other `RtError`.
+    #[test]
+    fn store_global_rejects_a_write_that_exceeds_the_memory_quota() {
+        const WF: &str = r#"
+var data: [int] = []
+
+pub fn grow(n: int) {
+    var a: [int] = []
+    var i = 0
+    while i < n {
+        a = a + [i]
+        i += 1
+    }
+    data = a
+}
+"#;
+        let module = compile("/obj/thing", &[("/obj/thing", WF)]);
+        let mut registry = Registry::default();
+        let prog = Rc::new(CompiledProgram::new(module, 1, None, Vec::new()));
+        registry.register_program(prog.clone());
+        let obj = make_object(&mut registry, prog);
+        let mut host = RegistryHost::new(&mut registry, obj);
+        // A handful of ints, not the 1000 `grow` is about to build.
+        host.limits.mem_quota_bytes = 64;
+        let err = host
+            .call_on(obj, "grow", vec![Value::Int(1000)])
+            .unwrap_err();
+        assert!(
+            err.report().contains("memory quota exceeded"),
+            "{}",
+            err.report()
+        );
+        assert!(
+            err.report().contains("in grow()"),
+            "a quota error must carry a Weft stack trace like any other RtError:\n{}",
+            err.report()
+        );
+    }
+
+    /// A write that stays within quota succeeds and `mem_bytes` tracks it
+    /// (no false rejection, and the accounting is actually maintained, not
+    /// just checked-and-discarded).
+    #[test]
+    fn store_global_accepts_a_write_within_quota_and_tracks_mem_bytes() {
+        const WF: &str = r#"
+var data: [int] = []
+
+pub fn set(n: int) {
+    var a: [int] = []
+    var i = 0
+    while i < n {
+        a = a + [i]
+        i += 1
+    }
+    data = a
+}
+"#;
+        let module = compile("/obj/thing", &[("/obj/thing", WF)]);
+        let mut registry = Registry::default();
+        let prog = Rc::new(CompiledProgram::new(module, 1, None, Vec::new()));
+        registry.register_program(prog.clone());
+        let obj = make_object(&mut registry, prog);
+        let mut host = RegistryHost::new(&mut registry, obj);
+        host.call_on(obj, "set", vec![Value::Int(4)]).unwrap();
+        let mem = host.registry.get(obj).unwrap().mem_bytes;
+        assert!(mem > 0, "a non-empty array var must be charged some bytes");
+    }
+
+    /// `loom_cow_copies_total{program}` (spec r5 §5.2.1, D24): only an
+    /// *actual* clone-on-write counts. A uniquely-owned array (taken by
+    /// value as a parameter — no other register/var holds a reference to
+    /// its buffer) mutated in place must never increment the counter for
+    /// its program; a program that keeps a second reference alive before
+    /// mutating (forcing `Rc::make_mut` to clone) must increment it by
+    /// exactly one per such write.
+    ///
+    /// (Deliberately takes `a` as a parameter, not a `var a: [int] = [...]`
+    /// local with a literal initialiser: codegen currently lowers every
+    /// `let`/`var` initialiser through a temp register plus a `Copy` into
+    /// the local — a codegen inefficiency, not Weft-level aliasing — which
+    /// would leave a second live `Rc` in the dead temp register and make
+    /// even a "no other Weft code ever aliases this" body clone on its
+    /// first write. A parameter *is* its register directly, so this
+    /// isolates the metric from that unrelated codegen artifact.)
+    #[test]
+    fn cow_metric_counts_only_actual_clones_not_every_write() {
+        const UNIQUE_WF: &str = r#"
+pub fn touch(a: [int]) -> int {
+    a[0] = 99
+    a[1] = 100
+    return a[0]
+}
+"#;
+        const ALIASED_WF: &str = r#"
+pub fn touch(a: [int]) -> int {
+    var b = a
+    a[0] = 99
+    return b[0]
+}
+"#;
+        let unique_module = compile("/obj/unique", &[("/obj/unique", UNIQUE_WF)]);
+        let aliased_module = compile("/obj/aliased", &[("/obj/aliased", ALIASED_WF)]);
+        let mut registry = Registry::default();
+        let unique_prog = Rc::new(CompiledProgram::new(unique_module, 1, None, Vec::new()));
+        let aliased_prog = Rc::new(CompiledProgram::new(aliased_module, 1, None, Vec::new()));
+        registry.register_program(unique_prog.clone());
+        registry.register_program(aliased_prog.clone());
+        let unique_obj = make_object(&mut registry, unique_prog);
+        let aliased_obj = make_object(&mut registry, aliased_prog);
+
+        let mut host = RegistryHost::new(&mut registry, unique_obj);
+        // Two writes on the unique object: still zero clones.
+        let arg = Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert!(matches!(
+            host.call_on(unique_obj, "touch", vec![arg]).unwrap(),
+            Value::Int(99)
+        ));
+        assert_eq!(host.registry.cow_metrics.get("/obj/unique"), 0);
+
+        // One write on the aliased object: exactly one clone.
+        let arg = Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert!(
+            matches!(
+                host.call_on(aliased_obj, "touch", vec![arg]).unwrap(),
+                Value::Int(1)
+            ),
+            "b must still see the pre-mutation value (COW, not shared mutation)"
+        );
+        assert_eq!(host.registry.cow_metrics.get("/obj/aliased"), 1);
+    }
+
+    /// Per-call-site inline cache (spec §5.8): a megamorphic call site
+    /// (virtual dispatch on `self` from a function two different
+    /// subclasses both inherit unmodified) must still resolve *correctly*
+    /// for whichever object is currently running it, even though both
+    /// calls go through the very same `Op::Call` instruction/cache slot —
+    /// the guard check must catch the receiver-program mismatch and
+    /// re-resolve, not serve object A's cached target to object B.
+    #[test]
+    fn inline_cache_guard_reresolves_for_a_different_receiver_program() {
+        const PARENT_WF: &str = r#"
+pub fn describe() -> string {
+    return kind()
+}
+fn kind() -> string {
+    return "parent"
+}
+"#;
+        let mut registry = Registry::default();
+        let parent_prog = Rc::new(compile_program(
+            "/obj/parent",
+            &[("/obj/parent", PARENT_WF)],
+            1,
+            None,
+        ));
+        registry.register_program(parent_prog.clone());
+
+        const CHILD_A_WF: &str = r#"
+inherit /obj/parent
+override fn kind() -> string {
+    return "A"
+}
+"#;
+        const CHILD_B_WF: &str = r#"
+inherit /obj/parent
+override fn kind() -> string {
+    return "B"
+}
+"#;
+        let child_a = Rc::new(compile_program(
+            "/obj/child_a",
+            &[("/obj/parent", PARENT_WF), ("/obj/child_a", CHILD_A_WF)],
+            1,
+            Some(parent_prog.clone()),
+        ));
+        let child_b = Rc::new(compile_program(
+            "/obj/child_b",
+            &[("/obj/parent", PARENT_WF), ("/obj/child_b", CHILD_B_WF)],
+            1,
+            Some(parent_prog.clone()),
+        ));
+        registry.register_program(child_a.clone());
+        registry.register_program(child_b.clone());
+        let obj_a = make_object(&mut registry, child_a);
+        let obj_b = make_object(&mut registry, child_b);
+
+        // Same `RegistryHost`, so the inline cache persists across both
+        // calls below (see `RegistryHost::call_cache`'s doc comment).
+        let mut host = RegistryHost::new(&mut registry, obj_a);
+        assert_eq!(
+            host.call_on(obj_a, "describe", vec![]).unwrap().as_str(),
+            Some("A")
+        );
+        // If the cache served A's cached resolution here without checking
+        // the guard, this would wrongly come back "A" too.
+        assert_eq!(
+            host.call_on(obj_b, "describe", vec![]).unwrap().as_str(),
+            Some("B")
+        );
+        // And a third call back on A must still be correct (the cache
+        // slot bounced between two guards, proving it re-checks every
+        // time rather than latching onto whichever guard it saw last).
+        assert_eq!(
+            host.call_on(obj_a, "describe", vec![]).unwrap().as_str(),
+            Some("A")
+        );
     }
 }
