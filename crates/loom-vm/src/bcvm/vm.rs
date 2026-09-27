@@ -37,8 +37,8 @@ use loom_compiler::bytecode::{
 use std::rc::Rc;
 
 use crate::bcvm::heap::{FnBody, FunctionValue, MapData, Value};
-use crate::security::GuardSet;
 use crate::object::ObjectId;
+use crate::security::GuardSet;
 
 /// A Weft runtime error: message (with `path.wf:line:col` when available)
 /// plus a call trace, most recent frame first.

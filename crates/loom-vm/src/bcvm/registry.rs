@@ -1578,7 +1578,12 @@ impl<'a> RegistryHost<'a> {
     }
 
     /// A [`RegistryHost`] with driver efuns (`send`, `load_object`, …)
-    /// enabled, used by [`crate::world::World`].
+    /// enabled, used by [`crate::world::World`]. `cut_guard` overrides the
+    /// cut's starting guard set (OBI-35 D-S1.7): `Some(g)` for a scheduled
+    /// call_out, whose guard must be exactly its captured `g`, not
+    /// `self_object`'s own principal; `None` for every other entry point
+    /// (a player command, a heartbeat, a master apply), which starts at
+    /// `self_object`'s own euid as before (D-S1.2 rule 5).
     #[allow(clippy::too_many_arguments)]
     pub fn with_driver(
         registry: &'a mut Registry,
@@ -1593,8 +1598,10 @@ impl<'a> RegistryHost<'a> {
         scheduler: &'a mut crate::scheduler::Scheduler,
         accounts: crate::world::AccountsCtx<'a>,
         security: &'a mut SecurityState,
+        cut_guard: Option<GuardSet>,
     ) -> Self {
-        let base = GuardSet::empty().with(principal_of(registry, self_object));
+        let base = cut_guard
+            .unwrap_or_else(|| GuardSet::empty().with(principal_of(registry, self_object)));
         let root = compiler.root().to_path_buf();
         RegistryHost {
             registry,
@@ -2224,12 +2231,14 @@ impl<'a> RegistryHost<'a> {
                     return Err(RtError::new("call_out(): delay must not be negative"));
                 }
                 let me = self.self_object();
+                let guard = Host::current_guard(self);
+                let quota_uid = Host::current_uid(self);
                 let id = self
                     .driver
                     .as_mut()
                     .expect("checked above")
                     .scheduler
-                    .call_out(me, delay as u64, func, Vec::new());
+                    .call_out(me, delay as u64, func, Vec::new(), guard, quota_uid);
                 Ok(Value::Int(id as i64))
             }
             "remove_call_out" => {

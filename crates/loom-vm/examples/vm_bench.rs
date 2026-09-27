@@ -203,6 +203,22 @@ pub fn priv_read_hit() -> any {
 pub fn priv_miss() -> any {
     return priv_read_hit()
 }
+
+// OBI-87 (creator frame, D-S1.7): `b` creates a trivial closure once and
+// hands it to `d` to invoke 10000 times. Every `CallValue` crosses two
+// principals (`d`'s own frame, then the closure's synthetic creator frame
+// unioning in `b`'s captured guard), so this isolates the creator-frame
+// push/pop cost from ordinary dispatch (`monocall_other` is the nearest
+// baseline: same call count, same trivial callee, but no function value
+// and only one principal).
+pub fn priv_creator_frame() -> any {
+    let f = make_closure()
+    return load_object("/builders/d/p").invoke_many(f)
+}
+
+fn make_closure() -> fn() -> int {
+    return fn() -> int => 1
+}
 "#;
 
 const PRIV_C: &str = r#"
@@ -219,6 +235,17 @@ pub fn hot() -> any {
         i += 1
     }
     return i
+}
+
+// See `PRIV_B::priv_creator_frame`.
+pub fn invoke_many(f: fn() -> int) -> any {
+    var i = 0
+    var acc = 0
+    while i < 10000 {
+        acc += f()
+        i += 1
+    }
+    return acc
 }
 "#;
 
@@ -279,6 +306,7 @@ fn run(iters: usize) {
         "priv_check_deep",
         "priv_read_hit",
         "priv_miss",
+        "priv_creator_frame",
     ] {
         let on = if w.starts_with("priv_") {
             world
