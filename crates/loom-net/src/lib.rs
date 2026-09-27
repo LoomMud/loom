@@ -20,6 +20,12 @@ use telnet::{DO, DONT, IAC, SB, SE, TelnetEvent, TelnetOptionTable, WILL, WONT, 
 
 pub type ConnId = u64;
 
+/// Cap on any telnet subnegotiation body (CTO decision, OBI-26): GMCP in
+/// particular carries a client-controlled JSON parser on the network
+/// edge, so an oversized frame gets dropped (and counted), not buffered
+/// without bound.
+const MAX_SUBNEGOTIATION_BYTES: usize = 8192;
+
 pub const DEFAULT_TELNET_ADDR: &str = "0.0.0.0:4000";
 
 pub fn telnet_addr_from_env() -> String {
@@ -353,6 +359,8 @@ struct TelnetCodec {
     bucket: TokenBucket,
     options: TelnetOptionTable,
     sub_buf: Vec<u8>,
+    sub_oversized: bool,
+    oversize_subnegotiations: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -379,6 +387,8 @@ impl TelnetCodec {
             bucket: TokenBucket::new(burst, refill_per_second),
             options: TelnetOptionTable::new(mssp_fields),
             sub_buf: Vec::new(),
+            sub_oversized: false,
+            oversize_subnegotiations: 0,
         }
     }
 
@@ -417,6 +427,7 @@ impl TelnetCodec {
                     }
                     SB => {
                         self.sub_buf.clear();
+                        self.sub_oversized = false;
                         self.state = ParseState::Subnegotiation;
                     }
                     _ => {
@@ -437,29 +448,63 @@ impl TelnetCodec {
                 ParseState::Subnegotiation => {
                     if *byte == IAC {
                         self.state = ParseState::SubnegotiationIac;
+                    } else if self.sub_buf.len() >= MAX_SUBNEGOTIATION_BYTES {
+                        // Cap any subnegotiation body at 8 KiB (CTO
+                        // decision, OBI-26): a client-controlled parser
+                        // (GMCP JSON in particular) sits on the network
+                        // edge, so an oversized frame must be dropped and
+                        // counted, not buffered forever or used to
+                        // disconnect the connection outright.
+                        self.sub_oversized = true;
                     } else {
                         self.sub_buf.push(*byte);
                     }
                 }
                 ParseState::SubnegotiationIac => {
                     if *byte == SE {
-                        let (response, event) = self.options.handle_subnegotiation(&self.sub_buf);
-                        if !response.is_empty() {
-                            responses.push(response);
-                        }
-                        if let Some(event) = event {
-                            events.push(event);
+                        if self.sub_oversized {
+                            self.oversize_subnegotiations += 1;
+                            warn!(
+                                total = self.oversize_subnegotiations,
+                                "dropped oversized telnet subnegotiation (> {MAX_SUBNEGOTIATION_BYTES} bytes)"
+                            );
+                        } else {
+                            let is_gmcp = self.sub_buf.first() == Some(&telnet::OPT_GMCP);
+                            let (response, event) =
+                                self.options.handle_subnegotiation(&self.sub_buf);
+                            if !response.is_empty() {
+                                responses.push(response);
+                            }
+                            if let Some(event) = event {
+                                events.push(event);
+                            }
+                            // GMCP frames count against the same
+                            // per-connection input rate limit as text
+                            // lines (CTO decision, OBI-26): it's a
+                            // client-controlled parser on the network
+                            // edge, same as line input.
+                            if is_gmcp && !self.bucket.try_take() {
+                                return CodecOutcome::Disconnect;
+                            }
                         }
                         self.sub_buf.clear();
+                        self.sub_oversized = false;
                         self.state = ParseState::Data;
                     } else if *byte == IAC {
                         // Escaped 0xFF byte inside the subnegotiation body.
-                        self.sub_buf.push(IAC);
+                        if !self.sub_oversized {
+                            if self.sub_buf.len() >= MAX_SUBNEGOTIATION_BYTES {
+                                self.sub_oversized = true;
+                            } else {
+                                self.sub_buf.push(IAC);
+                            }
+                        }
                         self.state = ParseState::Subnegotiation;
                     } else {
                         // Protocol violation: bail out of the subnegotiation
                         // rather than buffer forever.
                         self.sub_buf.clear();
+                        self.sub_oversized = false;
                         self.state = ParseState::Data;
                     }
                 }
@@ -832,8 +877,8 @@ mod tests {
         let msg = feed_gmcp(&mut codec, "Char.Login", r#"{"name":"frodo"}"#);
         assert_eq!(
             msg,
-            GmcpMessage::Char {
-                message: "Char.Login".into(),
+            GmcpMessage::Package {
+                module: "Char.Login".into(),
                 payload: serde_json::json!({"name": "frodo"}),
             }
         );
@@ -841,10 +886,88 @@ mod tests {
         let msg = feed_gmcp(&mut codec, "Room.Info", r#"{"num":1}"#);
         assert_eq!(
             msg,
-            GmcpMessage::Other {
-                package_message: "Room.Info".into(),
+            GmcpMessage::Package {
+                module: "Room.Info".into(),
                 payload: serde_json::json!({"num": 1}),
             }
+        );
+    }
+
+    #[test]
+    fn gmcp_malformed_json_drops_the_frame() {
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        let _ = codec.start();
+        let _ = codec.feed(&[IAC, DO, telnet::OPT_GMCP]);
+
+        let mut body = vec![IAC, SB, telnet::OPT_GMCP];
+        body.extend_from_slice(b"Char.Login {not json");
+        body.push(IAC);
+        body.push(SE);
+        let CodecOutcome::Ok { events, .. } = codec.feed(&body) else {
+            panic!("unexpected disconnect");
+        };
+        assert!(
+            events.is_empty(),
+            "malformed JSON must drop the whole frame, not deliver payload: None"
+        );
+    }
+
+    #[test]
+    fn gmcp_oversize_subnegotiation_is_dropped_not_disconnected() {
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        let _ = codec.start();
+        let _ = codec.feed(&[IAC, DO, telnet::OPT_GMCP]);
+
+        let mut body = vec![IAC, SB, telnet::OPT_GMCP];
+        body.extend_from_slice(b"Char.Login ");
+        body.extend(std::iter::repeat_n(b'a', MAX_SUBNEGOTIATION_BYTES + 1));
+        body.push(IAC);
+        body.push(SE);
+        let CodecOutcome::Ok { events, .. } = codec.feed(&body) else {
+            panic!("oversized frame must be dropped, not disconnect the connection");
+        };
+        assert!(
+            events.is_empty(),
+            "oversized frame must not produce an event"
+        );
+
+        // The connection must still be usable afterwards.
+        let msg = feed_gmcp(&mut codec, "Core.Hello", r#"{"client":"x","version":"1"}"#);
+        assert_eq!(
+            msg,
+            GmcpMessage::CoreHello {
+                client: "x".into(),
+                version: "1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn gmcp_core_supports_is_tracked_per_connection() {
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        let _ = codec.start();
+        let _ = codec.feed(&[IAC, DO, telnet::OPT_GMCP]);
+
+        feed_gmcp(&mut codec, "Core.Supports.Set", r#"["Char 1", "Room 1"]"#);
+        assert_eq!(
+            codec.options.supports(),
+            &["Char 1".to_string(), "Room 1".to_string()]
+                .into_iter()
+                .collect()
+        );
+
+        feed_gmcp(&mut codec, "Core.Supports.Add", r#"["Char 1"]"#);
+        assert_eq!(
+            codec.options.supports(),
+            &["Char 1".to_string(), "Room 1".to_string()]
+                .into_iter()
+                .collect()
+        );
+
+        feed_gmcp(&mut codec, "Core.Supports.Remove", r#"["Room 1"]"#);
+        assert_eq!(
+            codec.options.supports(),
+            &["Char 1".to_string()].into_iter().collect()
         );
     }
 
