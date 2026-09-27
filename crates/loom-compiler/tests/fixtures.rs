@@ -39,5 +39,15 @@ fn efun_table_matches_vm() {
         let sig = loom_compiler::efuns::lookup(n).expect(n);
         let (min, max) = loom_vm::efuns::arity(n).expect(n);
         assert_eq!((sig.min_args, sig.params.len()), (min, max), "{n}");
+        // OBI-33: the checker's `Privilege` is advisory (diagnostics only);
+        // `loom_vm::efuns::Privilege` is authoritative (the VM gate reads
+        // it). They must still agree, or a diagnostic could tell a builder
+        // an efun needs a lower tier than the VM actually enforces.
+        let vm_priv = loom_vm::efuns::privilege(n).expect(n);
+        assert_eq!(
+            format!("{:?}", sig.privilege),
+            format!("{vm_priv:?}"),
+            "{n}: checker privilege disagrees with the VM's"
+        );
     }
 }
