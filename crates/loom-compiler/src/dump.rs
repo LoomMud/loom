@@ -357,8 +357,15 @@ impl Dump {
                 self.line(depth, &format!("cast : {ty}"));
                 self.expr(inner, depth + 1);
             }
-            ExprKind::Closure(c) => {
-                self.line(depth, &format!("closure({} params) : {ty}", c.params.len()));
+            ExprKind::Closure(c, outer_ids) => {
+                self.line(
+                    depth,
+                    &format!(
+                        "closure({} params, {} captures) : {ty}",
+                        c.params.len(),
+                        outer_ids.len()
+                    ),
+                );
                 let saved = std::mem::replace(
                     &mut self.locals,
                     c.locals.iter().map(|l| l.name.to_string()).collect(),

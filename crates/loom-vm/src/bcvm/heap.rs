@@ -36,9 +36,82 @@
 
 use std::rc::Rc;
 
+use loom_compiler::bytecode::Callee;
 use loom_syntax::ast::{Type, TypeKind};
 
+use crate::bcvm::vm::ProgramCode;
 use crate::object::ObjectId;
+use crate::security::{GuardSet, Sym};
+
+/// How a [`FunctionValue`] is invoked (spec r5 §5.2.2, OBI-79).
+#[derive(Clone)]
+pub enum FnBody {
+    /// A named reference (`add_verb("x", do_x)`, `&do_x`): no captures, no
+    /// pinned version. Late-bound: resolved by (creator, name) on the
+    /// creator's *current* program at call time (a missing name is a
+    /// runtime error).
+    Named(Callee),
+    /// An anonymous closure literal: captures by value, snapshotted at
+    /// creation (`captures[i]` preloads into `code`'s
+    /// `capture_targets[i]` register — see
+    /// `loom_compiler::bytecode::FunctionCode::capture_targets`). Pins the
+    /// creator's program version at creation time: `code` is the exact
+    /// `Rc<CompiledProgram>` alive then, kept alive by this value's own
+    /// refcount even across a later hot-reload `upgrade()` of the creator
+    /// (the AC's "old version stays alive via the closures' refcount,
+    /// freed after the last one dies").
+    Closure {
+        code: Rc<dyn ProgramCode>,
+        func: u32,
+        captures: Vec<Value>,
+        /// The creator's program version at creation, for the stale-call
+        /// warning/metric (`loom_stale_closure_calls_total{program}`):
+        /// compared against the creator's *current* program version at
+        /// call time by whoever drives the call (`RegistryHost`).
+        program_version: u32,
+    },
+}
+
+impl std::fmt::Debug for FnBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FnBody::Named(c) => write!(f, "Named({c:?})"),
+            FnBody::Closure {
+                func,
+                captures,
+                program_version,
+                ..
+            } => write!(
+                f,
+                "Closure {{ func: {func}, captures: {captures:?}, program_version: {program_version} }}"
+            ),
+        }
+    }
+}
+
+/// A function value (spec r5 §5.2.2, OBI-79; OBI-35 D-S1.6): the runtime
+/// representation of a closure literal or a named function reference used
+/// as a value.
+#[derive(Clone, Debug)]
+pub struct FunctionValue {
+    /// The object whose code created this value — for a `Named` value,
+    /// also who `(creator, name)` late-binding resolves against; for a
+    /// `Closure`, who its body runs "as" (its own `self`/globals).
+    pub creator: ObjectId,
+    pub body: FnBody,
+    /// The guard set at the moment of creation (`Host::current_guard()`),
+    /// captured once and never re-read: a later `seteuid` by the creator
+    /// does not change it, whether it raises or lowers the euid (OBI-35
+    /// D-S1.6, AC 5). Invoking this value pushes a synthetic creator frame
+    /// of exactly this guard (D-S1.7) via `Host::enter_creator_frame`.
+    pub guard: GuardSet,
+    /// The uid of the lowest-tier principal in `guard` at creation, ties
+    /// going to the most recently pushed (D-S1.6); with no roles/tier
+    /// snapshot available yet (S2, OBI-36), the creator's own uid. This is
+    /// the quota root uid a scheduled invocation (call_out, a future
+    /// `db_query` callback) charges ticks/memory against.
+    pub quota_uid: Sym,
+}
 
 /// A heap-allocated Weft value: string, array, map, struct, or enum. Always
 /// reached through [`Value::Heap`]. No field here is interior-mutable; see
@@ -62,6 +135,8 @@ pub enum HeapObj {
     /// in the declaration, precisely so a recompile that reorders variants
     /// cannot silently relabel a live value.
     Enum(EnumVal),
+    /// A function value (spec r5 §5.2.2, OBI-79). See [`FunctionValue`].
+    Fn(FunctionValue),
 }
 
 /// A struct value: the declaring program's path + the struct's name (its
@@ -233,6 +308,11 @@ impl Value {
         }
     }
 
+    /// See [`FunctionValue`].
+    pub fn function(f: FunctionValue) -> Value {
+        Value::Heap(Rc::new(HeapObj::Fn(f)))
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::Heap(h) => match &**h {
@@ -257,6 +337,16 @@ impl Value {
         match self {
             Value::Heap(h) => match &**h {
                 HeapObj::Map(m) => Some(m),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn as_fn(&self) -> Option<&FunctionValue> {
+        match self {
+            Value::Heap(h) => match &**h {
+                HeapObj::Fn(f) => Some(f),
                 _ => None,
             },
             _ => None,
@@ -315,6 +405,7 @@ impl Value {
                 HeapObj::Map(_) => "map",
                 HeapObj::Struct(_) => "struct",
                 HeapObj::Enum(_) => "enum",
+                HeapObj::Fn(_) => "function",
             },
         }
     }
@@ -326,6 +417,11 @@ impl Value {
     /// every field); enums by (module, name, **variant name** — never an
     /// ordinal — and payload), so two enum values from differently
     /// ordered variant lists that name the same variant are still equal.
+    /// Function values are not given any value equality by the spec; this
+    /// compares them by heap identity (the same closure/reference, not
+    /// merely an equivalent one), which is at least never wrong to call
+    /// "equal" even though it may under-report (two independently-created
+    /// references to the same named function are `!=` here).
     pub fn equals(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Null, Value::Null) => true,
@@ -354,6 +450,7 @@ impl Value {
                         && x.payload.len() == y.payload.len()
                         && x.payload.iter().zip(&y.payload).all(|(a, b)| a.equals(b))
                 }
+                (HeapObj::Fn(_), HeapObj::Fn(_)) => Rc::ptr_eq(a, b),
                 _ => false,
             },
             _ => false,
@@ -430,6 +527,7 @@ impl Value {
                 HeapObj::Enum(e) => &*e.name == n,
                 _ => false,
             },
+            (TypeKind::Fn { .. }, Value::Heap(h)) => matches!(**h, HeapObj::Fn(_)),
             _ => false,
         }
     }
@@ -459,6 +557,12 @@ pub fn shallow_bytes(v: &Value) -> u64 {
             HeapObj::Map(m) => m.entries.len() as u64 * 2 * SLOT,
             HeapObj::Struct(s) => s.fields.len() as u64 * SLOT,
             HeapObj::Enum(e) => e.payload.len() as u64 * SLOT,
+            // A function value's captures already sat in the creator's
+            // own vars/regs before capture (or are `Copy` primitives), so
+            // memory-quota accounting on this heap slot only charges the
+            // fixed cost of the value itself — already covered by `SLOT`
+            // at the call site, nothing extra here.
+            HeapObj::Fn(_) => 0,
         },
         // Primitives live in the var slot itself, not a separate heap
         // allocation; nothing extra to charge.
@@ -553,6 +657,9 @@ fn write_value(
                     }
                     out.push(')');
                 }
+            }
+            HeapObj::Fn(f) => {
+                let _ = write!(out, "<function of {}>", name(f.creator));
             }
         },
     }
