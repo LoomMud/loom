@@ -330,8 +330,10 @@ impl Persist {
     /// Grant `uid` a time-boxed, per-uid exception via `roles_grant`.
     ///
     /// `actor` MUST be the driver's effective principal (see module docs).
-    /// Requires actor tier >= 3 (domain lead and above); `expires_at` must
-    /// be in the future. Exceptions never require a tier change.
+    /// Requires actor tier >= 4 (arch and above); the actor may not grant to
+    /// itself, may only grant to a uid whose recorded tier is strictly below
+    /// the actor's own, and `expires_at` must be in the future and no more
+    /// than 90 days out. Exceptions never require a tier change.
     pub async fn roles_grant(
         &self,
         actor: &str,

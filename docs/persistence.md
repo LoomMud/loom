@@ -68,6 +68,16 @@ the `actor` the driver passes in. See the doc comment on `Persist` in
   path, once OBI-35's effective-principal plumbing lands.
 - Domain lifecycle (create/archive) and `staff` row removal (full demotion to
   player) are not yet covered by any `security definer` function.
+- **`roles_set_tier` assumes uid == username for new staff.** It binds a new
+  `staff` row via `accounts.username = p_target_uid`, so it only works when
+  the target's account username matches its intended uid. That assumption
+  breaks for a root created by `roles_bootstrap_root` with a uid different
+  from its account's username. A follow-up should, for *existing* staff, look
+  the account up through `staff.account_id` instead of `accounts.username`;
+  for now, new staff must be created with uid == username by convention.
+- `roles_set_member` does not reject changes to membership in an `archived`
+  domain; a follow-up should add that check alongside the existing `unknown
+  domain` check.
 
 ## SQLx offline metadata
 
