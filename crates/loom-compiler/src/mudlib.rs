@@ -119,6 +119,9 @@ impl<L: SourceLoader> Session<L> {
     /// even though `path` itself now reflects the new one.
     pub fn invalidate(&mut self, path: &str) {
         self.done.remove(path);
+        // Lint warnings are recomputed on the next compile; drop stale ones
+        // so a fixed file doesn't keep reporting old W09xx warnings.
+        self.warnings.remove(path);
     }
 
     pub fn into_outcomes(self) -> BTreeMap<String, Outcome> {
