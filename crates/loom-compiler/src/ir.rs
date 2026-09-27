@@ -46,6 +46,8 @@ pub struct Program {
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: Rc<str>,
+    /// `atomic fn` (spec r5 §5.2.1): see `hir::Function::atomic`.
+    pub atomic: bool,
     /// Registers `0..param_count` are the parameters, in order.
     pub param_count: u32,
     /// Number of leading parameters that are required (no default); see

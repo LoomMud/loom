@@ -178,6 +178,24 @@ pub trait Host {
     fn enter_self(&mut self, _obj: ObjectId) {}
     /// The frame pushed by the matching [`Host::enter_self`] was popped.
     fn leave_self(&mut self) {}
+
+    /// `atomic fn` (spec r5 §5.2.1, OBI-32): entering an atomic-marked
+    /// function opens a journal scope and returns its mark. Every
+    /// object-variable write (including a container mutation — r5: that
+    /// is still an object-variable write, journaled as one `Rc` clone of
+    /// the old value) and clone/destruct while any scope is open must be
+    /// undoable back to that mark. The default (no journal) is correct for
+    /// a `Host` that never runs an atomic function.
+    fn begin_atomic(&mut self) -> u64 {
+        0
+    }
+    /// The atomic call returned normally: the scope's writes are kept.
+    fn commit_atomic(&mut self, _mark: u64) {}
+    /// The atomic call ended by propagating an error out of it (not one
+    /// caught inside its own body): undo every object-variable write and
+    /// clone/destruct recorded since `mark`, in reverse order, exactly
+    /// restoring the prior state.
+    fn rollback_atomic(&mut self, _mark: u64) {}
 }
 
 /// One activation: which function, at which instruction, with its own
@@ -201,6 +219,11 @@ struct Frame {
     /// the *nearest* frame (this one, or an outer caller) that still has
     /// one, popping every frame above it.
     handlers: Vec<(u32, Option<Reg>)>,
+    /// `Some(mark)` if this frame is running an `atomic fn` (spec r5
+    /// §5.2.1): the [`Host::begin_atomic`] mark to [`Host::commit_atomic`]
+    /// on a normal return or [`Host::rollback_atomic`] if this frame is
+    /// popped while an error unwinds past it.
+    atomic_mark: Option<u64>,
 }
 
 /// Per-execution limits (spec §5.9): every tick-metered op consumes one
@@ -392,8 +415,10 @@ impl<'a, H: Host> Interpreter<'a, H> {
         }
         let k = args.len() as u32 - f.min_arity;
         let pc = f.entry_points[k as usize];
+        let atomic = f.atomic;
         let mut regs: Vec<Value> = args;
         regs.resize(f.reg_types.len(), Value::Null);
+        let atomic_mark = atomic.then(|| self.host.begin_atomic());
         self.stack.push(Frame {
             code,
             entered,
@@ -402,6 +427,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
             regs,
             ret_into,
             handlers: Vec::new(),
+            atomic_mark,
         });
         Ok(())
     }
@@ -411,6 +437,19 @@ impl<'a, H: Host> Interpreter<'a, H> {
         let f = self.stack.pop().unwrap();
         if f.entered {
             self.host.leave_self();
+        }
+        f
+    }
+
+    /// Like [`Interpreter::pop_frame`], for a frame being discarded while
+    /// an error unwinds past it (not a normal return): an `atomic fn`
+    /// frame rolls its journal scope back here (spec r5 §5.2.1) — exactly
+    /// once, since this is the only place a frame is dropped without
+    /// having returned.
+    fn pop_frame_on_error(&mut self) -> Frame {
+        let f = self.pop_frame();
+        if let Some(mark) = f.atomic_mark {
+            self.host.rollback_atomic(mark);
         }
         f
     }
@@ -433,7 +472,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                         && let Some(idx) = self.find_handler_frame()
                     {
                         while self.stack.len() > idx + 1 {
-                            self.pop_frame();
+                            self.pop_frame_on_error();
                         }
                         let (catch_pc, catch_reg) = self.stack[idx]
                             .handlers
@@ -461,7 +500,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                         e.trace.extend(names);
                     }
                     while !self.stack.is_empty() {
-                        self.pop_frame();
+                        self.pop_frame_on_error();
                     }
                     return Err(e);
                 }
@@ -735,6 +774,9 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     None => Value::Null,
                 };
                 let frame = self.pop_frame();
+                if let Some(mark) = frame.atomic_mark {
+                    self.host.commit_atomic(mark);
+                }
                 if let Some(caller) = self.stack.last_mut()
                     && let Some(dst) = frame.ret_into
                 {
@@ -1185,6 +1227,7 @@ mod tests {
             consts: vec![ConstValue::Int(0), ConstValue::Int(1)],
             functions: vec![FunctionCode {
                 name: 1,
+                atomic: false,
                 params: 1,
                 min_arity: 1,
                 ret: Ty::Int,
@@ -1314,6 +1357,7 @@ mod tests {
             consts: vec![ConstValue::Int(0), ConstValue::Int(99)],
             functions: vec![FunctionCode {
                 name: 1,
+                atomic: false,
                 params: 0,
                 min_arity: 0,
                 ret: Ty::array(Ty::Int),

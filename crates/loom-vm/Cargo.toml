@@ -15,3 +15,6 @@ workspace = true
 [dependencies]
 loom-syntax = { version = "0.0.1", path = "../loom-syntax" }
 loom-compiler = { version = "0.0.1", path = "../loom-compiler" }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
