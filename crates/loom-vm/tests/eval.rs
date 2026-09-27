@@ -163,10 +163,8 @@ fn short_circuit_and_null_handling() {
 /// OBI-77: the bytecode VM's callee-side prologue for trailing default
 /// parameters, exercised at every possible call arity (not just "all
 /// defaults" or "no defaults"). Kept separate from the acceptance test
-/// below, which additionally exercises runtime argument/return type checks
-/// that are a pre-existing, unrelated gap (see the OBI-77 task notes: the
-/// V2 checker now catches those mismatches at compile time with a
-/// different message, not at runtime).
+/// below, which exercises the two-parameter case plus the type-error
+/// diagnostics.
 #[test]
 fn default_parameters_at_every_call_arity() {
     let src = r#"
@@ -182,7 +180,14 @@ fn main() -> any {
 }
 
 #[test]
-#[ignore = "OBI-77: default parameter values are now implemented (see default_parameters_at_every_call_arity); the remaining failure here is a separate, pre-existing gap: fn f(n: int)... f(\"x\") is now a compile-time W0226 diagnostic ('mismatched types in argument 1 of `f`') under the V2 checker, not the Phase-0 tree-walker's runtime 'argument `n` must be int, got string'. Rewriting this test or changing checker policy to defer these to runtime is a spec-level call outside this task's scope (see OBI-77 notes) -- flagged to the CTO."]
+// OBI-77 (CTO decision): the programs below are the Phase 0 conformance
+// programs, unchanged, and every one is still rejected. What changed is *when*
+// and *how it is worded*: the V2 static checker rejects the type errors at
+// compile time (W0226 / W0275, with a span) instead of the Phase 0
+// tree-walker's runtime type-mismatch message. Rejecting them statically is
+// strictly stronger, so we keep the checker and update only the expected
+// messages. OBI-31's "tests pass unchanged" criterion is amended to "same
+// programs, same accept/reject outcome" for these diagnostics.
 fn functions_defaults_and_runtime_type_checks() {
     let src = r#"
 fn greet(name: string, greeting: string = "hello") -> string {
@@ -195,22 +200,34 @@ fn main() -> any {
 "#;
     assert_eq!(ok(src), "[\"hello bob\", \"hi amy\"]");
     let e = err("fn f(n: int) -> int {\n  return n\n}\nfn main() -> any {\n  return f(\"x\")\n}\n");
-    assert!(e.contains("argument `n` must be int, got string"), "{e}");
+    assert!(
+        e.contains(
+            "error[W0226]: mismatched types in argument 1 of `f`: expected `int`, found `string`"
+        ),
+        "{e}"
+    );
     let e = err("fn f() -> int {\n  return \"s\"\n}\nfn main() -> any {\n  return f()\n}\n");
     assert!(
-        e.contains("f() must return int, but returned string"),
+        e.contains(
+            "error[W0226]: mismatched types in the return value: expected `int`, found `string`"
+        ),
         "{e}"
     );
     let e = err("fn f(a: int) {\n}\nfn main() -> any {\n  return f()\n}\n");
-    assert!(e.contains("missing argument `a`"), "{e}");
+    assert!(
+        e.contains("error[W0275]: `f` takes 1 argument, but 0 were given"),
+        "{e}"
+    );
     let e = err("var n: int = 0\nfn main() -> any {\n  n = \"x\"\n  return n\n}\n");
     assert!(
-        e.contains("`n` is declared int but the value is string"),
+        e.contains(
+            "error[W0226]: mismatched types in the assignment: expected `int`, found `string`"
+        ),
         "{e}"
     );
     let e = err(&main_returning("let s: string = 5\nreturn s"));
     assert!(
-        e.contains("`s` is declared string but the value is int"),
+        e.contains("error[W0226]: mismatched types in the initialiser of `s`: expected `string`, found `int`"),
         "{e}"
     );
 }
