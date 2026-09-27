@@ -76,6 +76,10 @@ fn upgrade_all_spreads_migration_across_ticks_within_its_budget_without_starving
             &root,
             Limits {
                 eager_upgrade_batch: 10,
+                // Pin the pre-OBI-82 one-tick-is-one-heartbeat cadence:
+                // this test asserts player B's `beats` advances by
+                // exactly one per `World::tick()` call.
+                heartbeat_interval_ticks: 1,
                 ..Limits::default()
             },
         )
