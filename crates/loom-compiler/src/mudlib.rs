@@ -100,6 +100,17 @@ impl<L: SourceLoader> Session<L> {
         &self.done
     }
 
+    /// Force `path` to be recompiled on the next `.compile(path)` call
+    /// (spec §7.2 `compile_object`/`update`): drops its cached [`Outcome`]
+    /// so a stale interface can never be reused for it. Callers doing an
+    /// incremental recompile must also invalidate every program that
+    /// (transitively) inherits/imports `path`, or that program's cached
+    /// `Outcome` still refers to `path`'s *old* [`crate::interface::ProgramInfo`]
+    /// even though `path` itself now reflects the new one.
+    pub fn invalidate(&mut self, path: &str) {
+        self.done.remove(path);
+    }
+
     pub fn into_outcomes(self) -> BTreeMap<String, Outcome> {
         self.done
     }

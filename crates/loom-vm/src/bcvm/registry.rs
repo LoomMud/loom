@@ -272,6 +272,86 @@ impl Compiler {
             .program(&path)
             .expect("just registered by the loop above"))
     }
+
+    /// spec §7.2 `compile_object`/`update`: recompile `path` and every
+    /// currently-registered program that (directly or transitively)
+    /// inherits it, against fresh disk contents, all against *mutually
+    /// consistent* interfaces — the bytecode-VM analogue of
+    /// `World::recompile`. Returns the new [`CompiledProgram`]s, keyed by
+    /// path, **not yet installed**: nothing in `registry` or any live
+    /// object changes until the caller passes this to
+    /// [`RegistryHost::install`], which is what makes the whole operation
+    /// all-or-nothing (a compile error here changes nothing at all, and an
+    /// `install` failure rolls back every object it had already touched).
+    ///
+    /// Every *other* ancestor of `path` (i.e. anything not itself `path` or
+    /// one of its dependents) is assumed unchanged and reused as-is from
+    /// `registry`, exactly like `World::recompile`'s `overrides`/registry
+    /// lookup — this does not silently recompile the whole mudlib on every
+    /// `update`.
+    ///
+    /// **Known simplification (flagged, not hidden):** unlike
+    /// `World::recompile` (which relinks a dependent from its own already-
+    /// parsed, cached AST), this re-reads and re-parses every dependent's
+    /// `.wf` source from disk on every call — `CompiledProgram` does not
+    /// retain the checked `hir::Program`/source needed to relink without
+    /// going back through `Session`. Correct, but more I/O than the
+    /// tree-walker's incremental relink; acceptable for how rarely
+    /// `update`/`compile_object` runs relative to normal object traffic,
+    /// not something a hot path depends on.
+    pub fn recompile(
+        &mut self,
+        registry: &Registry,
+        path: &str,
+    ) -> Result<HashMap<String, Rc<CompiledProgram>>, String> {
+        let path = mudlib::normalize_path(path)?;
+        let mut dependents: Vec<Rc<CompiledProgram>> = registry
+            .programs
+            .values()
+            .filter(|p| p.inherits(&path))
+            .cloned()
+            .collect();
+        // Parents before children, so a child's rebuild can find its
+        // freshly-rebuilt parent already in `new_set` below.
+        dependents.sort_by_key(|p| p.chain().len());
+
+        self.session.invalidate(&path);
+        for d in &dependents {
+            self.session.invalidate(&d.path);
+        }
+
+        let mut to_compile: Vec<String> = vec![path.clone()];
+        to_compile.extend(dependents.iter().map(|d| d.path.to_string()));
+
+        let mut new_set: HashMap<String, Rc<CompiledProgram>> = HashMap::new();
+        for p in &to_compile {
+            if new_set.contains_key(p) {
+                continue;
+            }
+            match self.session.compile(p) {
+                Outcome::Ok(_) => {}
+                Outcome::Failed(msg) => return Err(msg.clone()),
+                Outcome::Missing(msg) => return Err(msg.clone()),
+            }
+            let anc_hir = match self.session.outcomes().get(p) {
+                Some(Outcome::Ok(c)) => c.hir.clone(),
+                _ => return Err(format!("internal: {p} missing from the compile session")),
+            };
+            // Same Phase 0 restriction as `ensure_program`: only the first
+            // `inherit` becomes this program's parent link.
+            let parent = anc_hir.inherits.first().and_then(|inh| {
+                new_set
+                    .get(&*inh.path)
+                    .cloned()
+                    .or_else(|| registry.program(&inh.path))
+            });
+            let version = registry.program(p).map_or(1, |old| old.version + 1);
+            let compiled =
+                compile_hir_program(&anc_hir, version, parent).map_err(|e| format!("{p}: {e}"))?;
+            new_set.insert(p.clone(), Rc::new(compiled));
+        }
+        Ok(new_set)
+    }
 }
 
 /// A verified [`Module`] plus the metadata dispatch needs: its own
@@ -358,6 +438,21 @@ impl CompiledProgram {
         v.reverse();
         v
     }
+
+    /// True if `path` is a strict ancestor of this program (mirrors
+    /// `crate::program::Program::inherits`, used the same way: finding
+    /// every currently-registered dependent of a program being
+    /// recompiled).
+    pub fn inherits(&self, path: &str) -> bool {
+        let mut cur = self.parent.as_deref();
+        while let Some(p) = cur {
+            if &*p.path == path {
+                return true;
+            }
+            cur = p.parent.as_deref();
+        }
+        false
+    }
 }
 
 /// An object's variables, keyed by (declaring program path, name) exactly
@@ -442,6 +537,21 @@ impl Registry {
         let obj = slot.obj.take()?;
         self.free.push(id.index);
         Some(obj)
+    }
+
+    /// Every live object id (mirrors `crate::object::ObjectTable::ids`),
+    /// used by [`RegistryHost::install`] to find every object an upgrade
+    /// set affects.
+    pub fn ids(&self) -> Vec<ObjectId> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.obj.is_some())
+            .map(|(i, s)| ObjectId {
+                index: i as u32,
+                generation: s.generation,
+            })
+            .collect()
     }
 }
 
@@ -597,6 +707,68 @@ impl<'a> RegistryHost<'a> {
             self.run_init(id, &ancestor, &keep)?;
         }
         Ok(())
+    }
+
+    /// Install the output of [`Compiler::recompile`]: register every new
+    /// [`CompiledProgram`] and upgrade every existing object whose
+    /// *current* program is one of them, all-or-nothing (spec §7.2) — the
+    /// bytecode-VM analogue of `World::install`. On the first failing
+    /// object upgrade, every program registration and every object already
+    /// upgraded in this call are rolled back to their pre-`install` state,
+    /// and the (rendered) error is returned; nothing is left half-migrated.
+    pub fn install(&mut self, new_set: HashMap<String, Rc<CompiledProgram>>) -> Result<(), String> {
+        let old_programs: Vec<(String, Option<Rc<CompiledProgram>>)> = new_set
+            .keys()
+            .map(|k| (k.clone(), self.registry.program(k)))
+            .collect();
+        for v in new_set.values() {
+            self.registry.register_program(v.clone());
+        }
+        let affected: Vec<(ObjectId, Rc<CompiledProgram>)> = self
+            .registry
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                let o = self.registry.get(id)?;
+                new_set.get(&*o.program.path).map(|p| (id, p.clone()))
+            })
+            .collect();
+        let mut saved: Vec<(ObjectId, Rc<CompiledProgram>, Vars)> = Vec::new();
+        let mut failure: Option<(ObjectId, RtError)> = None;
+        for (id, new_prog) in affected {
+            let Some(o) = self.registry.get(id) else {
+                continue;
+            };
+            saved.push((id, o.program.clone(), o.vars.clone()));
+            if let Err(e) = self.upgrade(id, new_prog) {
+                failure = Some((id, e));
+                break;
+            }
+        }
+        let Some((id, e)) = failure else {
+            return Ok(());
+        };
+        // Roll back everything: programs, then every touched object.
+        for (k, old) in old_programs {
+            match old {
+                Some(p) => {
+                    self.registry.register_program(p);
+                }
+                None => {
+                    self.registry.programs.remove(&k);
+                }
+            }
+        }
+        for (sid, prog, vars) in saved {
+            if let Some(o) = self.registry.get_mut(sid) {
+                o.program = prog;
+                o.vars = vars;
+            }
+        }
+        Err(format!(
+            "upgrade of object {id:?} failed, nothing was changed:\n{}",
+            e.report()
+        ))
     }
 }
 
@@ -1110,6 +1282,110 @@ fn create() {
         host.call_on(obj, "create", vec![]).unwrap();
         let short = host.call_on(obj, "short", vec![]).unwrap();
         assert_eq!(short.as_str(), Some("The Great Hall"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn tmp_mudlib_root(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "loom-vm-bcvm-registry-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// End-to-end proof that [`Compiler::recompile`] +
+    /// [`RegistryHost::install`] (spec §7.2 `compile_object`/`update`) work
+    /// together the way `World::recompile`/`install` do for the
+    /// tree-walker: recompiling `/std/room` on disk, then installing that
+    /// recompile, (a) upgrades a *dependent* program (`/domains/start/hall`,
+    /// which inherits `/std/room`) too, not just `/std/room` itself, (b)
+    /// makes newly added inherited behaviour (`long()`) reachable from an
+    /// object that already existed before the recompile, without
+    /// disconnecting or re-instantiating it, and (c) preserves that
+    /// existing object's already-set, type-compatible variable
+    /// (`short_desc`, set by `hall`'s `create()` before the recompile)
+    /// instead of resetting it to the freshly declared default.
+    #[test]
+    fn recompile_and_install_upgrade_a_live_dependent_in_place() {
+        let root = tmp_mudlib_root("recompile");
+        let write = |rel: &str, src: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, src).unwrap();
+        };
+        write(
+            "std/room.wf",
+            r#"
+var short_desc: string = "An empty room"
+
+pub fn short() -> string {
+    return short_desc
+}
+"#,
+        );
+        write(
+            "domains/start/hall.wf",
+            r#"
+inherit /std/room
+
+fn create() {
+    short_desc = "The Great Hall"
+}
+"#,
+        );
+
+        let mut compiler = Compiler::new(root.clone());
+        let mut registry = Registry::default();
+        let hall = compiler
+            .ensure_program(&mut registry, "/domains/start/hall")
+            .expect("ensure_program");
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let obj = {
+            let mut host = RegistryHost::new(&mut registry, placeholder);
+            let obj = host.instantiate(hall).expect("instantiate");
+            host.call_on(obj, "create", vec![]).unwrap();
+            obj
+        };
+
+        // Change `/std/room` on disk: add `long()`. `short_desc`'s default
+        // is unchanged (still type-compatible), so the *existing* object's
+        // mutated value must survive the upgrade.
+        write(
+            "std/room.wf",
+            r#"
+var short_desc: string = "An empty room"
+
+pub fn short() -> string {
+    return short_desc
+}
+
+pub fn long() -> string {
+    return short() + " (nothing else to see)"
+}
+"#,
+        );
+        let new_set = compiler
+            .recompile(&registry, "/std/room")
+            .expect("recompile");
+        // Both /std/room and its dependent /domains/start/hall must be in
+        // the recompiled set.
+        assert!(new_set.contains_key("/std/room"));
+        assert!(new_set.contains_key("/domains/start/hall"));
+
+        let mut host = RegistryHost::new(&mut registry, obj);
+        host.install(new_set).expect("install");
+
+        // The pre-existing object now has `long()` (added by the
+        // recompile) and its old `short_desc` value survived the upgrade.
+        let long = host.call_on(obj, "long", vec![]).unwrap();
+        assert_eq!(long.as_str(), Some("The Great Hall (nothing else to see)"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
