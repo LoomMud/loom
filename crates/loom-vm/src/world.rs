@@ -12,6 +12,7 @@
 //! introspection helpers below) is unchanged from the tree-walker it
 //! replaces.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use crate::bcvm::Value;
@@ -25,6 +26,43 @@ use crate::scheduler::Scheduler;
 
 /// Path of the master object.
 pub const MASTER_PATH: &str = "/secure/master";
+
+/// The `account_create`/`account_login` async backend (spec, OBI-85):
+/// `World` calls this to *issue* a request (never blocking); the answer
+/// comes back out-of-band, through whatever channel the implementation
+/// uses, and the driver (`loom-cli`) hands it to
+/// [`World::deliver_account_result`] using the same `request_id`.
+///
+/// [`NullAccountAuth`] (the default until `loom-cli` wires a real one) never
+/// answers at all -- fine for every test/tool that does not exercise
+/// accounts, since a request that never completes is silently inert, not a
+/// hang (nothing awaits it synchronously).
+pub trait AccountAuth {
+    fn create_account(&mut self, request_id: u64, name: &str, password: &str);
+    fn login(&mut self, request_id: u64, name: &str, password: &str);
+}
+
+/// Default [`AccountAuth`]: never answers (see the trait's doc).
+pub struct NullAccountAuth;
+
+impl AccountAuth for NullAccountAuth {
+    fn create_account(&mut self, _request_id: u64, _name: &str, _password: &str) {}
+    fn login(&mut self, _request_id: u64, _name: &str, _password: &str) {}
+}
+
+/// `account_create`/`account_login` bookkeeping (OBI-85), borrowed by
+/// `RegistryHost`'s `Driver` for the lifetime of one call: a shared request
+/// id counter, the map of requests still awaiting an out-of-band answer
+/// (`request_id` → the object that issued it, so a since-destructed issuer
+/// is silently skipped, per spec), the queue of results ready to deliver on
+/// the *next* top-level entry (`World::drain_account_results`), and the
+/// backend itself.
+pub struct AccountsCtx<'a> {
+    pub next_id: &'a mut u64,
+    pub pending: &'a mut HashMap<u64, ObjectId>,
+    pub results: &'a mut VecDeque<(u64, ObjectId, bool, String)>,
+    pub auth: &'a mut dyn AccountAuth,
+}
 
 /// Per-execution guard rails (§5.8).
 #[derive(Clone, Copy, Debug)]
@@ -103,6 +141,11 @@ pub struct World {
     /// installed (or failed to) since the last `take_finished_recompiles`.
     finished_recompiles: Vec<(RecompileToken, Result<(), String>)>,
     next_recompile_token: u64,
+    /// `account_create`/`account_login` (OBI-85): see `AccountsCtx`.
+    account_auth: Box<dyn AccountAuth>,
+    account_next_id: u64,
+    account_pending: HashMap<u64, ObjectId>,
+    account_results: VecDeque<(u64, ObjectId, bool, String)>,
 }
 
 /// Identifies one [`World::begin_recompile`] call, so its eventual result
@@ -132,6 +175,10 @@ impl World {
             pending_recompiles: Vec::new(),
             finished_recompiles: Vec::new(),
             next_recompile_token: 0,
+            account_auth: Box::new(NullAccountAuth),
+            account_next_id: 0,
+            account_pending: HashMap::new(),
+            account_results: VecDeque::new(),
         };
         let mut null = NullHost;
         let master = w
@@ -139,6 +186,47 @@ impl World {
             .map_err(|e| BootError::Master(e.report()))?;
         w.master = Some(master);
         Ok(w)
+    }
+
+    /// Install the real `account_create`/`account_login` backend (OBI-85);
+    /// until this is called, every account request is issued but never
+    /// answered ([`NullAccountAuth`]).
+    pub fn set_account_auth(&mut self, auth: Box<dyn AccountAuth>) {
+        self.account_auth = auth;
+    }
+
+    /// Deliver an out-of-band `account_create`/`account_login` result
+    /// (OBI-85): the driver calls this after receiving the matching event
+    /// from whatever channel its [`AccountAuth`] impl uses. A no-op if
+    /// `request_id` is unknown (already delivered, or never issued).
+    /// Queues the result rather than calling the apply immediately, so
+    /// delivery always happens on a later top-level entry, same as a
+    /// validation failure (see `RegistryHost::issue_account_request`).
+    pub fn deliver_account_result(&mut self, request_id: u64, ok: bool, detail: &str) {
+        if let Some(ob) = self.account_pending.remove(&request_id) {
+            self.account_results
+                .push_back((request_id, ob, ok, detail.to_string()));
+        }
+    }
+
+    /// Run every `account_result` apply queued by
+    /// [`Self::deliver_account_result`] or by a validation failure. Skips
+    /// (drops) a result whose issuing object has since been destructed, per
+    /// spec. The driver should call this on every event-loop iteration and
+    /// on every tick, so login latency is bounded by how often the loop
+    /// runs, not by how much other traffic there is.
+    pub fn drain_account_results(&mut self, host: &mut dyn Host) {
+        while let Some((id, ob, ok, detail)) = self.account_results.pop_front() {
+            if self.registry.get(ob).is_some() {
+                let _ = self.exec(host, None, None, |h| {
+                    h.call_apply(
+                        ob,
+                        "account_result",
+                        vec![Value::Int(id as i64), Value::Bool(ok), Value::str(&detail)],
+                    )
+                });
+            }
+        }
     }
 
     /// The mudlib root this world was booted from.
@@ -172,6 +260,12 @@ impl World {
             self.master,
             &mut self.scheduler,
             self.privilege.as_mut(),
+            crate::world::AccountsCtx {
+                next_id: &mut self.account_next_id,
+                pending: &mut self.account_pending,
+                results: &mut self.account_results,
+                auth: self.account_auth.as_mut(),
+            },
         );
         let result = body(&mut rh);
         self.registry.debug_assert_atomic_scope_closed();
@@ -289,7 +383,7 @@ impl World {
             let _ = self.exec(host, None, None, move |h| {
                 // Someone may have already lazily upgraded `ob` (an
                 // ordinary access) between `upgrade_all` queuing it and
-                // this tick draining it — `RegistryHost::upgrade` itself
+                // this tick draining it -- `RegistryHost::upgrade` itself
                 // does not check that, so guard it here.
                 // Runs at tick top level, so `ob` can't have a live frame
                 // (OBI-89 CTO review: never migrate under a running frame).
@@ -306,46 +400,22 @@ impl World {
                 Ok(())
             });
         }
+        // OBI-85: flush any account_create/account_login result queued
+        // since the last tick, so login latency is bounded even on an
+        // otherwise idle world.
+        self.drain_account_results(host);
     }
 
     /// Destroy `ob`: move its inventory up into its own environment (or
     /// drop it loose if it had none), unlink it from its environment's
-    /// inventory and its name/connection bindings, and cancel every
-    /// pending `call_out`/heartbeat subscription for it (OBI-33) before
-    /// freeing its slot. A no-op if `ob` is already gone. Not yet exposed
-    /// as a Weft efun (no ticket asks for `destruct_object()` yet); this
-    /// is the primitive such an efun and `World`'s tests both call.
-    pub fn destruct(&mut self, ob: ObjectId) {
-        let Some(existing_env) = self.registry.get(ob).map(|o| o.env) else {
-            return;
-        };
-        let inventory = self
-            .registry
-            .get(ob)
-            .map(|o| o.inventory.clone())
-            .unwrap_or_default();
-        for item in inventory {
-            match existing_env {
-                Some(dest) => self.registry.move_object(item, dest),
-                None => {
-                    if let Some(i) = self.registry.get_mut(item) {
-                        i.env = None;
-                    }
-                }
-            }
+    /// inventory and its name/connection bindings, close its connection if
+    /// it had one (OBI-85), and cancel every pending `call_out`/heartbeat
+    /// subscription for it (OBI-33) before freeing its slot. A no-op if
+    /// `ob` is already gone.
+    pub fn destruct(&mut self, ob: ObjectId, host: &mut dyn Host) {
+        if let Some(conn) = self.registry.destruct(ob, &mut self.scheduler) {
+            host.close(conn);
         }
-        if let Some(env) = existing_env
-            && let Some(o) = self.registry.get_mut(env)
-        {
-            o.inventory.retain(|i| *i != ob);
-        }
-        if let Some(conn) = self.registry.get(ob).and_then(|o| o.conn) {
-            self.registry.conns.remove(&conn);
-        }
-        let name = self.registry.obj_name(ob);
-        self.registry.names.remove(&name);
-        self.scheduler.remove_for_object(ob);
-        self.registry.remove(ob);
     }
 
     /// Every P1+ efun call recorded so far by the enforcement hook

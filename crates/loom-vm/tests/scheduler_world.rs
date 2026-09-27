@@ -124,7 +124,7 @@ fn destructing_an_object_drops_its_pending_call_outs_and_heartbeat() {
         assert_eq!(world.pending_call_outs(), 1);
 
         let player = world.connection_object(1).expect("bound");
-        world.destruct(player);
+        world.destruct(player, &mut host);
         assert_eq!(world.pending_call_outs(), 0);
 
         // Ticking after destruction must not panic or resurrect the call.
