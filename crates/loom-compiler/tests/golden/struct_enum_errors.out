@@ -1,0 +1,22 @@
+/main.wf:6:5: error[W0287]: field `hp` is declared twice in struct `Stats`
+  |
+6 |     hp: int
+  |     ^^
+/main.wf:11:5: error[W0288]: variant `Red` is declared twice in enum `Color`
+   |
+11 |     Red(int),
+   |     ^^^
+/main.wf:14:8: error[W0286]: `Stats` is declared twice in this program
+   |
+14 | struct Stats {
+   |        ^^^^^
+/main.wf:19:14: error[W0290]: a field's default must be a constant literal of type `int`
+   |
+19 |     n: int = "not an int literal type, but still just a literal check"
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/main.wf:20:14: error[W0290]: a field's default must be a constant literal
+   |
+20 |     m: int = get_default()
+   |              ^^^^^^^^^^^^^
+   = help: defaults are evaluated once, without an object, so they can only be literals (no efun calls, no reading other fields)
+

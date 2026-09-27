@@ -97,6 +97,7 @@ or retiring a code in `crates/loom-syntax/src/codes.rs`.
 | `W0101` | `{}` is inherited twice |
 | `W0102` | variable `{name}` is inherited from both {} and {} |
 | `W0103` | const `{name}` is inherited from both {} and {} |
+| `W0104` | type `{name}` is inherited from more than one parent with different shapes |
 | `W0110` | invalid program path (not absolute, or a bad segment) |
 | `W0111` | {what} chain is too deep |
 | `W0112` | {what} cycle through {ppath} |
@@ -115,8 +116,6 @@ or retiring a code in `crates/loom-syntax/src/codes.rs`.
 | `W0205` | variable `{}` is already declared in {} |
 | `W0206` | `{}` is declared twice in this program |
 | `W0207` | const `{}` is already declared in {} |
-| `W0208` | `struct` is not implemented by the type checker yet |
-| `W0209` | `enum` is not implemented by the type checker yet |
 | `W0210` | `{}` is declared twice in this program |
 | `W0211` | function `{name}` is inherited from both {} |
 | `W0212` | parameter `{}` is declared twice |
@@ -189,6 +188,12 @@ or retiring a code in `crates/loom-syntax/src/codes.rs`.
 | `W0283` | `{}{}` is ambiguous: it is inherited from {} |
 | `W0284` | program variable `{}` stores an object reference, so its type must be `object?` |
 | `W0285` | const `{}` stores an object reference, so its type must be `object?` |
+| `W0286` | `{}` is declared twice in this program |
+| `W0287` | field `{}` is declared twice in struct `{}` |
+| `W0288` | variant `{}` is declared twice in enum `{}` |
+| `W0289` | `{}` refers to itself through {}, which is not allowed: structs and enums cannot be recursive without going through an array, map, or `object` |
+| `W0290` | a field's default must be a constant literal |
+| `W0292` | `{}` is imported from both {} and {} |
 
 ### `03xx` — link (efun arity, applies, unknown names)
 
@@ -257,5 +262,7 @@ or retiring a code in `crates/loom-syntax/src/codes.rs`.
 | --- | --- |
 | `W0239` | `try`/`catch` is not implemented by the type checker yet |
 | `W0240` | `throw` is not implemented by the type checker yet |
+| `W0208` | `struct` is not implemented by the type checker yet |
+| `W0209` | `enum` is not implemented by the type checker yet |
 
 <!-- END GENERATED CODE TABLE -->

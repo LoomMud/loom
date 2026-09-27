@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+// Clean: `struct`/`enum` declarations type-check (no more W0208/W0209),
+// `import` resolves struct/enum types across modules, and a struct field
+// can itself be a struct/enum type (OBI-88).
+import /std/combat.{Stats, DamageKind}
+
+struct Loadout {
+    primary: Stats
+    kind: DamageKind
+}
+
+var current: Stats? = null
+var last_hit: DamageKind? = null
+
+pub fn describe() -> string {
+    return "loadout"
+}

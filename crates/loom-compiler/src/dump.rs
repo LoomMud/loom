@@ -7,6 +7,7 @@
 use std::fmt::Write as _;
 
 use crate::hir::*;
+use crate::ty::Ty;
 
 pub fn program(p: &Program) -> String {
     let mut d = Dump {
@@ -25,6 +26,31 @@ pub fn program(p: &Program) -> String {
         }
     }
     let _ = writeln!(d.out, "  linearization {}", p.linearization.join(" "));
+    for s in &p.structs {
+        let _ = writeln!(
+            d.out,
+            "  struct {} {} (schema {:016x})",
+            vis(s.vis),
+            s.name,
+            Ty::Struct(s.ty.clone()).schema_hash()
+        );
+        for f in &s.ty.fields {
+            let _ = writeln!(d.out, "    field {}: {}", f.name, f.ty);
+        }
+    }
+    for e in &p.enums {
+        let _ = writeln!(
+            d.out,
+            "  enum {} {} (schema {:016x})",
+            vis(e.vis),
+            e.name,
+            Ty::Enum(e.ty.clone()).schema_hash()
+        );
+        for v in &e.ty.variants {
+            let payload: Vec<String> = v.payload.iter().map(|t| t.to_string()).collect();
+            let _ = writeln!(d.out, "    variant {}({})", v.name, payload.join(", "));
+        }
+    }
     for v in &p.vars {
         let _ = writeln!(
             d.out,

@@ -1,0 +1,23 @@
+ok
+program /main
+  linearization /main
+  struct internal Loadout (schema 01e5319e0d0c2685)
+    field primary: Stats
+    field kind: DamageKind
+  var internal current: Stats?
+    null : null
+  var internal last_hit: DamageKind?
+    null : null
+  fn pub describe() -> string
+    return
+      "loadout" : string
+
+program /std/combat
+  linearization /std/combat
+  struct pub Stats (schema b4f9477199c03767)
+    field hp: int
+    field name: string
+  enum pub DamageKind (schema 8ec5fb7edfc83287)
+    variant Slash()
+    variant Fire(int)
+

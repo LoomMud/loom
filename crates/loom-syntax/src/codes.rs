@@ -107,6 +107,7 @@ codes! {
     IFACE_INHERITED_TWICE = "W0101", "`{}` is inherited twice";
     IFACE_VARIABLE_NAME_INHERITED_FROM_BOTH = "W0102", "variable `{name}` is inherited from both {} and {}";
     IFACE_CONST_NAME_INHERITED_FROM_BOTH = "W0103", "const `{name}` is inherited from both {} and {}";
+    IFACE_TYPE_INHERITED_WITH_DIFFERENT_SHAPES = "W0104", "type `{name}` is inherited from more than one parent with different shapes";
     MUDLIB_INVALID_PROGRAM_PATH_NOT_ABSOLUTE = "W0110", "invalid program path (not absolute, or a bad segment)";
     MUDLIB_WHAT_CHAIN_TOO_DEEP = "W0111", "{what} chain is too deep";
     MUDLIB_WHAT_CYCLE_THROUGH_PPATH = "W0112", "{what} cycle through {ppath}";
@@ -122,8 +123,6 @@ codes! {
     CHECK_VARIABLE_ALREADY_DECLARED = "W0205", "variable `{}` is already declared in {}";
     CHECK_DECLARED_TWICE_PROGRAM_2 = "W0206", "`{}` is declared twice in this program";
     CHECK_CONST_ALREADY_DECLARED = "W0207", "const `{}` is already declared in {}";
-    CHECK_STRUCT_NOT_IMPLEMENTED_TYPE_CHECKER = "W0208", "`struct` is not implemented by the type checker yet";
-    CHECK_ENUM_NOT_IMPLEMENTED_TYPE_CHECKER = "W0209", "`enum` is not implemented by the type checker yet";
     CHECK_DECLARED_TWICE_PROGRAM_3 = "W0210", "`{}` is declared twice in this program";
     CHECK_FUNCTION_NAME_INHERITED_FROM_BOTH = "W0211", "function `{name}` is inherited from both {}";
     CHECK_PARAMETER_DECLARED_TWICE = "W0212", "parameter `{}` is declared twice";
@@ -196,6 +195,12 @@ codes! {
     CHECK_AMBIGUOUS_INHERITED_FROM = "W0283", "`{}{}` is ambiguous: it is inherited from {}";
     CHECK_VAR_STORES_OBJECT_MUST_BE_NULLABLE = "W0284", "program variable `{}` stores an object reference, so its type must be `object?`";
     CHECK_CONST_STORES_OBJECT_MUST_BE_NULLABLE = "W0285", "const `{}` stores an object reference, so its type must be `object?`";
+    CHECK_STRUCT_OR_ENUM_DECLARED_TWICE = "W0286", "`{}` is declared twice in this program";
+    CHECK_FIELD_DECLARED_TWICE_IN_STRUCT = "W0287", "field `{}` is declared twice in struct `{}`";
+    CHECK_VARIANT_DECLARED_TWICE_IN_ENUM = "W0288", "variant `{}` is declared twice in enum `{}`";
+    CHECK_STRUCT_OR_ENUM_CYCLE = "W0289", "`{}` refers to itself through {}, which is not allowed: structs and enums cannot be recursive without going through an array, map, or `object`";
+    CHECK_STRUCT_DEFAULT_NOT_A_CONSTANT = "W0290", "a field's default must be a constant literal";
+    CHECK_TYPE_IMPORTED_FROM_BOTH_AND = "W0292", "`{}` is imported from both {} and {}";
 
     // 03xx -- link (efun arity, applies, unknown names)
     LINK_DECLARED_TWICE_PROGRAM = "W0300", "`{}` is declared twice in this program";
@@ -262,6 +267,11 @@ pub const RETIRED: &[(&str, &str)] = &[
         "W0240",
         "`throw` is not implemented by the type checker yet",
     ),
+    (
+        "W0208",
+        "`struct` is not implemented by the type checker yet",
+    ),
+    ("W0209", "`enum` is not implemented by the type checker yet"),
 ];
 
 #[cfg(test)]
