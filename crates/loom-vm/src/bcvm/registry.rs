@@ -186,7 +186,18 @@ pub fn compile_hir_program(
     } else {
         compile_and_verify(hir)?
     };
-    Ok(CompiledProgram::new(module, version, parent, var_specs))
+    let mut prog = CompiledProgram::new(module, version, parent, var_specs);
+    // `ob.f()` may only reach `pub` functions (spec §5.3; the deleted
+    // tree-walker enforced this in `call_other` too). The synthetic
+    // `$init` is never `pub`.
+    prog.non_public = hir
+        .fns
+        .iter()
+        .filter(|f| f.vis != hir::Visibility::Public)
+        .map(|f| f.name.clone())
+        .chain(std::iter::once(Rc::from(INIT_FN)))
+        .collect();
+    Ok(prog)
 }
 
 /// Disk-backed program registration (spec §7.2's `compile_object`/`update`,
@@ -372,6 +383,11 @@ pub struct CompiledProgram {
     /// `has_init`, the order [`synth_init_function`]'s `$init` parameters
     /// expect (see [`CompiledProgram::init_specs`]).
     pub var_specs: Vec<VarSpec>,
+    /// Functions declared here that are *not* `pub`, so
+    /// [`RegistryHost::call_other`] (`ob.f()`) must refuse them. Filled by
+    /// [`compile_hir_program`] from HIR visibility; empty for hand-assembled
+    /// test modules built directly with [`CompiledProgram::new`].
+    pub non_public: std::collections::HashSet<Rc<str>>,
 }
 
 impl CompiledProgram {
@@ -395,6 +411,7 @@ impl CompiledProgram {
             dispatch,
             parent,
             var_specs,
+            non_public: Default::default(),
         }
     }
 
@@ -692,6 +709,40 @@ fn stack_addr() -> usize {
 const NESTED_CALL_STACK_BUDGET: usize = 1_000_000;
 
 impl<'a> RegistryHost<'a> {
+    /// Resolve `name` on `recv`'s program chain (most-derived first) and
+    /// run it as `recv`. With `require_pub`, a non-`pub` target is refused
+    /// with the same wording the Phase 0 tree-walker used.
+    fn dispatch_on(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: Vec<Value>,
+        require_pub: bool,
+    ) -> R<Value> {
+        let Value::Object(recv_id) = recv else {
+            return Err(RtError::new(format!(
+                "cannot call `{name}` on a {}",
+                recv.type_name()
+            )));
+        };
+        let prog = self
+            .registry
+            .get(recv_id)
+            .ok_or_else(|| RtError::new(format!("call `{name}` on a destructed object")))?
+            .program
+            .clone();
+        let (target, idx) = prog
+            .resolve(name)
+            .ok_or_else(|| RtError::new(format!("no function `{name}` on {}", prog.path)))?;
+        if require_pub && target.non_public.contains(name) {
+            return Err(RtError::new(format!(
+                "`{name}` in {} is not `pub`, so other objects cannot call it",
+                target.path
+            )));
+        }
+        self.call_in(recv_id, &target, idx, args)
+    }
+
     pub fn new(registry: &'a mut Registry, self_object: ObjectId) -> Self {
         RegistryHost {
             registry,
@@ -1258,27 +1309,16 @@ impl Host for RegistryHost<'_> {
     }
 
     fn call_virtual(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
+        // Unqualified `f()` on self: internal/private visibility was already
+        // enforced by the checker, so no `pub` check here.
         let self_id = self.self_object();
-        self.call_other(Value::Object(self_id), name, args)
+        self.dispatch_on(Value::Object(self_id), name, args, false)
     }
 
     fn call_other(&mut self, recv: Value, name: &str, args: Vec<Value>) -> R<Value> {
-        let Value::Object(recv_id) = recv else {
-            return Err(RtError::new(format!(
-                "cannot call `{name}` on a {}",
-                recv.type_name()
-            )));
-        };
-        let prog = self
-            .registry
-            .get(recv_id)
-            .ok_or_else(|| RtError::new(format!("call `{name}` on a destructed object")))?
-            .program
-            .clone();
-        let (target, idx) = prog
-            .resolve(name)
-            .ok_or_else(|| RtError::new(format!("no function `{name}` on {}", prog.path)))?;
-        self.call_in(recv_id, &target, idx, args)
+        // `ob.f()`: `ob` may be generically typed (`object`/`any`), so the
+        // checker cannot always see the callee; enforce `pub` at runtime.
+        self.dispatch_on(recv, name, args, true)
     }
 
     fn call_efun(&mut self, name: &str, args: Vec<Value>) -> R<Value> {

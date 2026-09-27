@@ -309,7 +309,6 @@ fn main() -> any {
 }
 
 #[test]
-#[ignore = "known gap (OBI-72 follow-up, security-relevant, flag to CTO): RegistryHost::call_other calls any function on the receiver's program chain regardless of pub/private; FunctionCode has no visibility flag and nothing in bcvm checks one at runtime"]
 fn cross_object_calls_to_a_private_function_are_rejected() {
     let files = |main: &'static str| {
         [
