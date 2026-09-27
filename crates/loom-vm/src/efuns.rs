@@ -90,6 +90,23 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     ("call_out", 2, 2, Privilege::P0, 5),
     ("remove_call_out", 1, 1, Privilege::P0, 2),
     ("set_heartbeat", 1, 1, Privilege::P0, 2),
+    // OBI-85 (Warp alpha S4): P0 utility efuns the mudlib needs and had
+    // no driver support for yet.
+    ("random", 1, 1, Privilege::P0, 1),
+    ("time", 0, 0, Privilege::P0, 1),
+    ("users", 0, 0, Privilege::P0, 2),
+    ("lower", 1, 1, Privilege::P0, 1),
+    ("to_int", 1, 1, Privilege::P0, 1),
+    // OBI-85: `destruct` on an object the caller doesn't own is P2, same
+    // rationale as `disconnect` above (spec r5 §5.5).
+    ("destruct", 1, 1, Privilege::P2, 5),
+    // OBI-85: mudlib-confined file I/O for the `ed`-lite builder command.
+    ("read_file", 1, 1, Privilege::P1, 20),
+    ("write_file", 2, 2, Privilege::P1, 20),
+    // OBI-85: async R2-account logins (spec's `account_result` apply).
+    // Master-only in intent; S1 enforces, stub allow-all for now.
+    ("account_create", 2, 2, Privilege::P3, 50),
+    ("account_login", 2, 2, Privilege::P3, 50),
 ];
 
 /// `(min args, max args)` of efun `name`, if it exists.
