@@ -55,9 +55,22 @@ pub struct FunctionCode {
     pub name: StrId,
     /// Registers `0..params` are the parameters, in order.
     pub params: u32,
+    /// Number of leading parameters that are *required* (no default);
+    /// `min_arity..params` may be omitted at the call site (hir §
+    /// `Param::default`, spec: defaults are trailing-only, enforced by the
+    /// checker). `min_arity == params` when the function has no defaults.
+    pub min_arity: u32,
     pub ret: Ty,
     /// The static type of every register (spec §5.8: typed ops).
     pub reg_types: Vec<Ty>,
+    /// Entry program counters into [`Self::code`], indexed by `args_passed
+    /// - min_arity` for `args_passed` in `min_arity..=params`. The callee's
+    /// prologue evaluates [`crate::hir::Param::default`] for parameters the
+    /// caller omitted, so a call with fewer arguments starts further back
+    /// in this table; `entry_points[params - min_arity]` is the "every
+    /// argument supplied" entry point that skips default evaluation
+    /// entirely. Length is always `params - min_arity + 1`.
+    pub entry_points: Vec<PC>,
     pub code: Vec<Op>,
 }
 
@@ -419,10 +432,15 @@ impl Writer {
     fn put_function(&mut self, f: &FunctionCode) {
         self.put_varu32(f.name);
         self.put_varu32(f.params);
+        self.put_varu32(f.min_arity);
         self.put_ty(&f.ret);
         self.put_varu32(f.reg_types.len() as u32);
         for t in &f.reg_types {
             self.put_ty(t);
+        }
+        self.put_varu32(f.entry_points.len() as u32);
+        for pc in &f.entry_points {
+            self.put_varu32(*pc);
         }
         self.put_varu32(f.code.len() as u32);
         for op in &f.code {
@@ -802,6 +820,10 @@ impl<'a> Reader<'a> {
     fn get_function(&mut self) -> Result<FunctionCode, DecodeError> {
         let name = self.get_varu32()?;
         let params = self.get_varu32()?;
+        let min_arity = self.get_varu32()?;
+        if min_arity > params {
+            return Err(DecodeError("min_arity exceeds params".into()));
+        }
         let ret = self.get_ty()?;
         let n_regs = self.get_varu32()? as usize;
         if n_regs > self.buf.len() {
@@ -810,6 +832,14 @@ impl<'a> Reader<'a> {
         let mut reg_types = Vec::with_capacity(n_regs);
         for _ in 0..n_regs {
             reg_types.push(self.get_ty()?);
+        }
+        let n_entries = self.get_varu32()? as usize;
+        if n_entries > self.buf.len() {
+            return Err(DecodeError("implausible entry point count".into()));
+        }
+        let mut entry_points = Vec::with_capacity(n_entries);
+        for _ in 0..n_entries {
+            entry_points.push(self.get_varu32()?);
         }
         let n_code = self.get_varu32()? as usize;
         if n_code > self.buf.len() {
@@ -822,8 +852,10 @@ impl<'a> Reader<'a> {
         Ok(FunctionCode {
             name,
             params,
+            min_arity,
             ret,
             reg_types,
+            entry_points,
             code,
         })
     }
@@ -972,8 +1004,10 @@ mod tests {
             functions: vec![FunctionCode {
                 name: 0,
                 params: 0,
+                min_arity: 0,
                 ret: Ty::String,
                 reg_types: vec![Ty::Int],
+                entry_points: vec![0],
                 code: vec![
                     Op::LoadConst { dst: 0, idx: 0 },
                     Op::Return { src: Some(0) },
@@ -996,8 +1030,10 @@ mod tests {
             functions: vec![FunctionCode {
                 name: 0,
                 params: 0,
+                min_arity: 0,
                 ret: Ty::Void,
                 reg_types: vec![],
+                entry_points: vec![0],
                 code: vec![Op::Return { src: None }],
             }],
         };

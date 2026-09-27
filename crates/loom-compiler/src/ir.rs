@@ -48,11 +48,18 @@ pub struct Function {
     pub name: Rc<str>,
     /// Registers `0..param_count` are the parameters, in order.
     pub param_count: u32,
+    /// Number of leading parameters that are required (no default); see
+    /// [`crate::bytecode::FunctionCode::min_arity`].
+    pub min_arity: u32,
     pub ret: Ty,
     /// The static type of every register, indexed by [`Reg`].
     pub reg_types: Vec<Ty>,
     pub blocks: Vec<Block>,
     pub entry: BlockId,
+    /// Entry block ids, indexed by `args_passed - min_arity`; see
+    /// [`crate::bytecode::FunctionCode::entry_points`]. Length is always
+    /// `param_count - min_arity + 1`; the last entry is always `entry`.
+    pub default_entries: Vec<BlockId>,
 }
 
 #[derive(Clone, Debug, Default)]

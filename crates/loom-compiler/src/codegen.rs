@@ -70,13 +70,50 @@ fn lower_function(f: &hir::Function) -> Result<ir::Function, Unsupported> {
         assert_eq!(f.ret, Ty::Void, "{}: missing return", f.name);
         b.seal_cur(Terminator::Return(None));
     }
+
+    // Trailing parameters may have a default (hir::Param doc: "filled
+    // callee-side"); the checker enforces defaults are a contiguous suffix,
+    // so `min_arity` is just the count of leading params without one.
+    let min_arity = f.params.iter().take_while(|p| p.default.is_none()).count() as u32;
+    let param_count = f.params.len() as u32;
+    let mut default_entries = vec![0u32; (param_count - min_arity + 1) as usize];
+    // entry_points[params - min_arity] is "every argument supplied": the
+    // unmodified body entry, no default evaluation needed.
+    default_entries[(param_count - min_arity) as usize] = 0;
+    // Build one block per omittable trailing parameter, in reverse
+    // declaration order, each evaluating that parameter's default into its
+    // register then falling through to the next parameter's block (or, for
+    // the last one, into the body's real entry, block 0).
+
+    let mut next_blk: ir::BlockId = 0;
+    for p_idx in (min_arity as usize..param_count as usize).rev() {
+        let param = &f.params[p_idx];
+        let default = param
+            .default
+            .as_ref()
+            .expect("trailing parameter must have a default (checker invariant)");
+        let blk = b.new_block();
+        b.switch(blk);
+        b.unreachable = false;
+        let r = b.expr(default)?;
+        b.emit(Inst::Copy {
+            dst: param.local,
+            src: r,
+        });
+        b.seal_cur(Terminator::Jump(next_blk));
+        default_entries[p_idx - min_arity as usize] = blk;
+        next_blk = blk;
+    }
+
     Ok(ir::Function {
         name: f.name.clone(),
-        param_count: f.params.len() as u32,
+        param_count,
+        min_arity,
         ret: f.ret.clone(),
         reg_types: b.reg_types,
         blocks: b.blocks,
         entry: 0,
+        default_entries,
     })
 }
 
@@ -911,12 +948,19 @@ impl Assembler {
                 Terminator::Unset => unreachable!(),
             });
         }
+        let entry_points: Vec<u32> = f
+            .default_entries
+            .iter()
+            .map(|&blk| starts[blk as usize])
+            .collect();
         let name = self.intern(&f.name);
         FunctionCode {
             name,
             params: f.param_count,
+            min_arity: f.min_arity,
             ret: f.ret.clone(),
             reg_types: f.reg_types.clone(),
+            entry_points,
             code,
         }
     }
