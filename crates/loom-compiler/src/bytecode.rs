@@ -386,6 +386,68 @@ impl Writer {
                 }
                 self.put_ty(&ft.ret);
             }
+            Ty::Struct(s) => {
+                self.put_u8(14);
+                self.put_str(&s.module);
+                self.put_str(&s.name);
+                self.put_varu32(s.fields.len() as u32);
+                for f in &s.fields {
+                    self.put_str(&f.name);
+                    self.put_ty(&f.ty);
+                    self.put_opt_constval(f.default.as_ref());
+                }
+            }
+            Ty::Enum(e) => {
+                self.put_u8(15);
+                self.put_str(&e.module);
+                self.put_str(&e.name);
+                self.put_varu32(e.variants.len() as u32);
+                for v in &e.variants {
+                    self.put_str(&v.name);
+                    self.put_varu32(v.payload.len() as u32);
+                    for p in &v.payload {
+                        self.put_ty(p);
+                    }
+                }
+            }
+        }
+    }
+    fn put_opt_constval(&mut self, c: Option<&crate::ty::ConstVal>) {
+        match c {
+            None => self.put_u8(0),
+            Some(c) => {
+                self.put_u8(1);
+                self.put_constval(c);
+            }
+        }
+    }
+    fn put_constval(&mut self, c: &crate::ty::ConstVal) {
+        use crate::ty::ConstVal as CV;
+        match c {
+            CV::Null => self.put_u8(0),
+            CV::Bool(b) => {
+                self.put_u8(1);
+                self.put_u8(*b as u8);
+            }
+            CV::Int(n) => {
+                self.put_u8(2);
+                self.put_i64(*n);
+            }
+            CV::Float(x) => {
+                self.put_u8(3);
+                self.put_f64(*x);
+            }
+            CV::Str(s) => {
+                self.put_u8(4);
+                self.put_str(s);
+            }
+            CV::Array(a) => {
+                self.put_u8(5);
+                self.put_varu32(a.len() as u32);
+                for e in a.iter() {
+                    self.put_constval(e);
+                }
+            }
         }
     }
     fn put_const(&mut self, c: &ConstValue) {
@@ -793,7 +855,92 @@ impl<'a> Reader<'a> {
                 let ret = self.get_ty_depth(depth + 1)?;
                 Ty::Fn(Rc::new(crate::ty::FnTy { params, ret }))
             }
+            14 => {
+                let module = Rc::from(self.get_str()?);
+                let name = Rc::from(self.get_str()?);
+                let n = self.get_varu32()? as usize;
+                if n > 4096 {
+                    return Err(DecodeError("implausible struct field count".into()));
+                }
+                let mut fields = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let fname = Rc::from(self.get_str()?);
+                    let ty = self.get_ty_depth(depth + 1)?;
+                    let default = self.get_opt_constval(depth)?;
+                    fields.push(crate::ty::FieldTy {
+                        name: fname,
+                        ty,
+                        default,
+                    });
+                }
+                Ty::Struct(Rc::new(crate::ty::StructTy {
+                    module,
+                    name,
+                    fields,
+                }))
+            }
+            15 => {
+                let module = Rc::from(self.get_str()?);
+                let name = Rc::from(self.get_str()?);
+                let n = self.get_varu32()? as usize;
+                if n > 4096 {
+                    return Err(DecodeError("implausible enum variant count".into()));
+                }
+                let mut variants = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let vname = Rc::from(self.get_str()?);
+                    let pn = self.get_varu32()? as usize;
+                    if pn > 64 {
+                        return Err(DecodeError("implausible variant payload arity".into()));
+                    }
+                    let mut payload = Vec::with_capacity(pn);
+                    for _ in 0..pn {
+                        payload.push(self.get_ty_depth(depth + 1)?);
+                    }
+                    variants.push(crate::ty::VariantTy {
+                        name: vname,
+                        payload,
+                    });
+                }
+                Ty::Enum(Rc::new(crate::ty::EnumTy {
+                    module,
+                    name,
+                    variants,
+                }))
+            }
             t => return Err(DecodeError(format!("bad type tag {t}"))),
+        })
+    }
+    fn get_opt_constval(&mut self, depth: u32) -> Result<Option<crate::ty::ConstVal>, DecodeError> {
+        match self.get_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.get_constval(depth)?)),
+            t => Err(DecodeError(format!("bad option tag {t}"))),
+        }
+    }
+    fn get_constval(&mut self, depth: u32) -> Result<crate::ty::ConstVal, DecodeError> {
+        use crate::ty::ConstVal as CV;
+        if depth > MAX_TY_DEPTH {
+            return Err(DecodeError("const value nesting too deep".into()));
+        }
+        Ok(match self.get_u8()? {
+            0 => CV::Null,
+            1 => CV::Bool(self.get_u8()? != 0),
+            2 => CV::Int(self.get_i64()?),
+            3 => CV::Float(self.get_f64()?),
+            4 => CV::Str(Rc::from(self.get_str()?)),
+            5 => {
+                let n = self.get_varu32()? as usize;
+                if n > self.buf.len() {
+                    return Err(DecodeError("implausible const array length".into()));
+                }
+                let mut elems = Vec::with_capacity(n);
+                for _ in 0..n {
+                    elems.push(self.get_constval(depth + 1)?);
+                }
+                CV::Array(elems.into())
+            }
+            t => return Err(DecodeError(format!("bad const value tag {t}"))),
         })
     }
     fn get_const(&mut self) -> Result<ConstValue, DecodeError> {

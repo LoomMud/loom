@@ -12,6 +12,7 @@
 //! so codegen emits the runtime check: that is the gradual boundary.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -36,6 +37,15 @@ pub enum Ty {
     /// `T?`. Never nested, never wraps `any`/`null`/`void` (see [`Ty::optional`]).
     Optional(Rc<Ty>),
     Fn(Rc<FnTy>),
+    /// A nominal `struct` (spec r5 §7.3, D27, [OBI-52]): fields carry their
+    /// declared source order (positional layout for codegen/HIR), but see
+    /// [`Ty::schema_hash`] for the order-independent identity hot reload
+    /// compares across versions.
+    ///
+    /// [OBI-52]: /OBI/issues/OBI-52
+    Struct(Rc<StructTy>),
+    /// A nominal `enum`: see [`Ty::Struct`] for the schema-hash rationale.
+    Enum(Rc<EnumTy>),
     /// Poison: an expression that already produced a diagnostic. Consistent
     /// with everything so one mistake reports once.
     Error,
@@ -46,6 +56,95 @@ pub enum Ty {
 pub struct FnTy {
     pub params: Vec<Ty>,
     pub ret: Ty,
+}
+
+/// `[vis] struct Name { field: T [= default], … }` (spec r5 §7.3).
+/// Identity for assignability/equality is *nominal*: two `StructTy`s are
+/// the same type iff `module` + `name` + every field match (derived
+/// `PartialEq`), which is exactly what changes between compiles of the
+/// same declaration — see [`Ty::schema_hash`] for the hot-reload-facing
+/// notion of "the same shape, maybe reordered".
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StructTy {
+    /// Declaring program's path, e.g. `/std/item`.
+    pub module: Rc<str>,
+    pub name: Rc<str>,
+    /// Declaration order (positional layout); [`Ty::schema_hash`] sorts by
+    /// name internally so this order does not affect the hash.
+    pub fields: Vec<FieldTy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FieldTy {
+    pub name: Rc<str>,
+    pub ty: Ty,
+    /// A compile-time-constant default (`= expr` where `expr` is a
+    /// literal), used to fill this field when an older value being
+    /// migrated does not have it (spec r5 §7.3 by-name struct conversion:
+    /// "every added field has a default"). `None` means the field is
+    /// mandatory at construction and has no fallback for migration.
+    pub default: Option<ConstVal>,
+}
+
+/// `[vis] enum Name { A, B(int), … }`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct EnumTy {
+    pub module: Rc<str>,
+    pub name: Rc<str>,
+    /// Declaration order; [`Ty::schema_hash`] sorts by name internally.
+    pub variants: Vec<VariantTy>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct VariantTy {
+    pub name: Rc<str>,
+    /// Positional payload types; empty for a plain tag.
+    pub payload: Vec<Ty>,
+}
+
+/// A compile-time-constant value: what a struct field's `= default` may be
+/// (literals only, so migration can fill a missing field without running
+/// any code — see [`FieldTy::default`]). Manual `Eq`/`Hash` because `f64`
+/// has neither; two `ConstVal::Float`s compare/hash by bit pattern, which
+/// is fine here (these are frozen source-literal defaults, never the
+/// result of arithmetic that could produce distinct NaNs worth conflating).
+#[derive(Clone, Debug)]
+pub enum ConstVal {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(Rc<str>),
+    Array(Rc<[ConstVal]>),
+}
+
+impl PartialEq for ConstVal {
+    fn eq(&self, other: &Self) -> bool {
+        use ConstVal::*;
+        match (self, other) {
+            (Null, Null) => true,
+            (Bool(a), Bool(b)) => a == b,
+            (Int(a), Int(b)) => a == b,
+            (Float(a), Float(b)) => a.to_bits() == b.to_bits(),
+            (Str(a), Str(b)) => a == b,
+            (Array(a), Array(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for ConstVal {}
+impl Hash for ConstVal {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            ConstVal::Null => {}
+            ConstVal::Bool(b) => b.hash(state),
+            ConstVal::Int(n) => n.hash(state),
+            ConstVal::Float(f) => f.to_bits().hash(state),
+            ConstVal::Str(s) => s.hash(state),
+            ConstVal::Array(a) => a.iter().for_each(|c| c.hash(state)),
+        }
+    }
 }
 
 impl Ty {
@@ -195,6 +294,91 @@ impl fmt::Display for Ty {
                 Ok(())
             }
             Ty::Error => f.write_str("{error}"),
+            Ty::Struct(s) => f.write_str(&s.name),
+            Ty::Enum(e) => f.write_str(&e.name),
+        }
+    }
+}
+
+impl Ty {
+    /// Recursive type schema hash (spec r5 §7.3, D27, [OBI-52]): stable
+    /// under struct-field/enum-variant *reordering*, sensitive to any type
+    /// change anywhere in the type's structure (including a nested
+    /// struct/enum reached through an array/map/optional/fn type). Two
+    /// `struct`/`enum` declarations that only reordered their
+    /// fields/variants hash equal; changing a field's/variant's type, name,
+    /// arity, or the type's own module+name changes the hash.
+    ///
+    /// [OBI-52]: /OBI/issues/OBI-52
+    pub fn schema_hash(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.hash_schema(&mut h);
+        h.finish()
+    }
+
+    fn hash_schema(&self, h: &mut std::collections::hash_map::DefaultHasher) {
+        // A leading discriminant tag keeps e.g. `Ty::Array(Ty::Int)` from
+        // colliding with a differently-shaped type that happens to hash the
+        // same parts in the same order.
+        match self {
+            Ty::Int => 0u8.hash(h),
+            Ty::Float => 1u8.hash(h),
+            Ty::Bool => 2u8.hash(h),
+            Ty::String => 3u8.hash(h),
+            Ty::Object => 4u8.hash(h),
+            Ty::Null => 5u8.hash(h),
+            Ty::Any => 6u8.hash(h),
+            Ty::Void => 7u8.hash(h),
+            Ty::Never => 8u8.hash(h),
+            Ty::Error => 9u8.hash(h),
+            Ty::Array(e) => {
+                10u8.hash(h);
+                e.hash_schema(h);
+            }
+            Ty::Map(k, v) => {
+                11u8.hash(h);
+                k.hash_schema(h);
+                v.hash_schema(h);
+            }
+            Ty::Optional(t) => {
+                12u8.hash(h);
+                t.hash_schema(h);
+            }
+            Ty::Fn(ft) => {
+                13u8.hash(h);
+                ft.params.len().hash(h);
+                for p in &ft.params {
+                    p.hash_schema(h);
+                }
+                ft.ret.hash_schema(h);
+            }
+            Ty::Struct(s) => {
+                20u8.hash(h);
+                s.module.hash(h);
+                s.name.hash(h);
+                let mut fields: Vec<&FieldTy> = s.fields.iter().collect();
+                fields.sort_by(|a, b| a.name.cmp(&b.name));
+                fields.len().hash(h);
+                for f in fields {
+                    f.name.hash(h);
+                    f.ty.hash_schema(h);
+                }
+            }
+            Ty::Enum(e) => {
+                21u8.hash(h);
+                e.module.hash(h);
+                e.name.hash(h);
+                let mut variants: Vec<&VariantTy> = e.variants.iter().collect();
+                variants.sort_by(|a, b| a.name.cmp(&b.name));
+                variants.len().hash(h);
+                for v in variants {
+                    v.name.hash(h);
+                    v.payload.len().hash(h);
+                    for p in &v.payload {
+                        p.hash_schema(h);
+                    }
+                }
+            }
         }
     }
 }
@@ -257,5 +441,94 @@ mod tests {
             Ty::optional(Ty::Int).join(&Ty::Int),
             Some(Ty::optional(Ty::Int))
         );
+    }
+
+    fn field(name: &str, ty: Ty) -> FieldTy {
+        FieldTy {
+            name: Rc::from(name),
+            ty,
+            default: None,
+        }
+    }
+
+    fn variant(name: &str, payload: Vec<Ty>) -> VariantTy {
+        VariantTy {
+            name: Rc::from(name),
+            payload,
+        }
+    }
+
+    fn struct_ty(fields: Vec<FieldTy>) -> Ty {
+        Ty::Struct(Rc::new(StructTy {
+            module: Rc::from("/std/item"),
+            name: Rc::from("Stats"),
+            fields,
+        }))
+    }
+
+    fn enum_ty(variants: Vec<VariantTy>) -> Ty {
+        Ty::Enum(Rc::new(EnumTy {
+            module: Rc::from("/std/combat"),
+            name: Rc::from("DamageKind"),
+            variants,
+        }))
+    }
+
+    #[test]
+    fn struct_schema_hash_is_stable_under_field_reorder() {
+        let a = struct_ty(vec![field("hp", Ty::Int), field("name", Ty::String)]);
+        let b = struct_ty(vec![field("name", Ty::String), field("hp", Ty::Int)]);
+        assert_eq!(a.schema_hash(), b.schema_hash());
+        // But the two `Ty`s are still distinct values (field order is the
+        // codegen layout, not just cosmetic).
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn struct_schema_hash_changes_with_a_field_type() {
+        let a = struct_ty(vec![field("hp", Ty::Int)]);
+        let b = struct_ty(vec![field("hp", Ty::Float)]);
+        assert_ne!(a.schema_hash(), b.schema_hash());
+    }
+
+    #[test]
+    fn struct_schema_hash_recurses_through_containers() {
+        let inner_a = struct_ty(vec![field("hp", Ty::Int)]);
+        let inner_b = struct_ty(vec![field("hp", Ty::Float)]);
+        let outer_a = Ty::Struct(Rc::new(StructTy {
+            module: Rc::from("/std/item"),
+            name: Rc::from("Loadout"),
+            fields: vec![field("stats", Ty::array(inner_a))],
+        }));
+        let outer_b = Ty::Struct(Rc::new(StructTy {
+            module: Rc::from("/std/item"),
+            name: Rc::from("Loadout"),
+            fields: vec![field("stats", Ty::array(inner_b))],
+        }));
+        assert_ne!(
+            outer_a.schema_hash(),
+            outer_b.schema_hash(),
+            "a change to a nested struct reached through `[T]` must change the outer hash"
+        );
+    }
+
+    #[test]
+    fn enum_schema_hash_is_stable_under_variant_reorder() {
+        let a = enum_ty(vec![
+            variant("Slash", vec![]),
+            variant("Fire", vec![Ty::Int]),
+        ]);
+        let b = enum_ty(vec![
+            variant("Fire", vec![Ty::Int]),
+            variant("Slash", vec![]),
+        ]);
+        assert_eq!(a.schema_hash(), b.schema_hash());
+    }
+
+    #[test]
+    fn enum_schema_hash_changes_with_a_variant_payload_type() {
+        let a = enum_ty(vec![variant("Fire", vec![Ty::Int])]);
+        let b = enum_ty(vec![variant("Fire", vec![Ty::Float])]);
+        assert_ne!(a.schema_hash(), b.schema_hash());
     }
 }

@@ -40,14 +40,59 @@ use loom_syntax::ast::{Type, TypeKind};
 
 use crate::object::ObjectId;
 
-/// A heap-allocated Weft value: string, array, or map. Always reached
-/// through [`Value::Heap`]. No field here is interior-mutable; see the
-/// module docs for why that is exactly what makes containers value types.
+/// A heap-allocated Weft value: string, array, map, struct, or enum. Always
+/// reached through [`Value::Heap`]. No field here is interior-mutable; see
+/// the module docs for why that is exactly what makes containers value
+/// types.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
     Str(Box<str>),
     Array(Vec<Value>),
     Map(MapData),
+    /// A `struct` value (spec r5 §7.3, D27, [OBI-52]). Fields are stored
+    /// positionally (declaration order, matching [`loom_compiler::ty::StructTy::fields`])
+    /// for O(1) access by codegen-assigned index; [`StructVal::field`] is
+    /// the by-name lookup migration/`upgrade()` code should use instead of
+    /// ever assuming index stability across versions.
+    ///
+    /// [OBI-52]: /OBI/issues/OBI-52
+    Struct(StructVal),
+    /// An `enum` value. **Never** compared/stored by ordinal (spec r5
+    /// §7.3): [`EnumVal::variant`] is the variant's *name*, not its index
+    /// in the declaration, precisely so a recompile that reorders variants
+    /// cannot silently relabel a live value.
+    Enum(EnumVal),
+}
+
+/// A struct value: the declaring program's path + the struct's name (its
+/// nominal identity, matching `loom_compiler::ty::StructTy`), and its
+/// fields by name.
+#[derive(Clone, Debug)]
+pub struct StructVal {
+    pub module: Rc<str>,
+    pub name: Rc<str>,
+    /// `(field name, value)`, declaration order.
+    pub fields: Vec<(Rc<str>, Value)>,
+}
+
+impl StructVal {
+    pub fn field(&self, name: &str) -> Option<&Value> {
+        self.fields
+            .iter()
+            .find(|(n, _)| &**n == name)
+            .map(|(_, v)| v)
+    }
+}
+
+/// An enum value: the declaring program's path + the enum's name, the
+/// **variant name** (never an ordinal — see the [`HeapObj::Enum`] docs),
+/// and its positional payload.
+#[derive(Clone, Debug)]
+pub struct EnumVal {
+    pub module: Rc<str>,
+    pub name: Rc<str>,
+    pub variant: Rc<str>,
+    pub payload: Vec<Value>,
 }
 
 /// Insertion-ordered entries backing a Weft map value. Order is preserved
@@ -122,6 +167,34 @@ impl Value {
 
     pub fn map(m: MapData) -> Value {
         Value::Heap(Rc::new(HeapObj::Map(m)))
+    }
+
+    pub fn struct_val(v: StructVal) -> Value {
+        Value::Heap(Rc::new(HeapObj::Struct(v)))
+    }
+
+    pub fn enum_val(v: EnumVal) -> Value {
+        Value::Heap(Rc::new(HeapObj::Enum(v)))
+    }
+
+    pub fn as_struct(&self) -> Option<&StructVal> {
+        match self {
+            Value::Heap(h) => match &**h {
+                HeapObj::Struct(s) => Some(s),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn as_enum(&self) -> Option<&EnumVal> {
+        match self {
+            Value::Heap(h) => match &**h {
+                HeapObj::Enum(e) => Some(e),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub fn as_str(&self) -> Option<&str> {
@@ -204,6 +277,8 @@ impl Value {
                 HeapObj::Str(_) => "string",
                 HeapObj::Array(_) => "array",
                 HeapObj::Map(_) => "map",
+                HeapObj::Struct(_) => "struct",
+                HeapObj::Enum(_) => "enum",
             },
         }
     }
@@ -211,7 +286,10 @@ impl Value {
     /// `==` semantics (spec r5 §5.2.1): primitives and strings by value,
     /// objects by identity, arrays and maps **structurally** (not by
     /// reference/identity — value semantics means two unrelated arrays
-    /// with equal elements are equal).
+    /// with equal elements are equal). Structs compare by (module, name,
+    /// every field); enums by (module, name, **variant name** — never an
+    /// ordinal — and payload), so two enum values from differently
+    /// ordered variant lists that name the same variant are still equal.
     pub fn equals(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Null, Value::Null) => true,
@@ -225,6 +303,21 @@ impl Value {
                     x.len() == y.len() && x.iter().zip(y).all(|(a, b)| a.equals(b))
                 }
                 (HeapObj::Map(x), HeapObj::Map(y)) => x == y,
+                (HeapObj::Struct(x), HeapObj::Struct(y)) => {
+                    x.module == y.module
+                        && x.name == y.name
+                        && x.fields.len() == y.fields.len()
+                        && x.fields
+                            .iter()
+                            .all(|(n, v)| y.field(n).is_some_and(|ov| ov.equals(v)))
+                }
+                (HeapObj::Enum(x), HeapObj::Enum(y)) => {
+                    x.module == y.module
+                        && x.name == y.name
+                        && x.variant == y.variant
+                        && x.payload.len() == y.payload.len()
+                        && x.payload.iter().zip(&y.payload).all(|(a, b)| a.equals(b))
+                }
                 _ => false,
             },
             _ => false,
@@ -251,6 +344,11 @@ impl Value {
             (TypeKind::Object, Value::Object(_)) => true,
             (TypeKind::Array(_), Value::Heap(h)) => matches!(**h, HeapObj::Array(_)),
             (TypeKind::Map(..), Value::Heap(h)) => matches!(**h, HeapObj::Map(_)),
+            (TypeKind::Named(n), Value::Heap(h)) => match &**h {
+                HeapObj::Struct(s) => &*s.name == n,
+                HeapObj::Enum(e) => &*e.name == n,
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -278,6 +376,8 @@ pub fn shallow_bytes(v: &Value) -> u64 {
             HeapObj::Str(s) => s.len() as u64,
             HeapObj::Array(a) => a.len() as u64 * SLOT,
             HeapObj::Map(m) => m.entries.len() as u64 * 2 * SLOT,
+            HeapObj::Struct(s) => s.fields.len() as u64 * SLOT,
+            HeapObj::Enum(e) => e.payload.len() as u64 * SLOT,
         },
         // Primitives live in the var slot itself, not a separate heap
         // allocation; nothing extra to charge.
@@ -347,6 +447,31 @@ fn write_value(
                     write_value(out, e, name, depth + 1, true);
                 }
                 out.push('}');
+            }
+            HeapObj::Struct(s) => {
+                let _ = write!(out, "{}", s.name);
+                out.push_str(" { ");
+                for (i, (n, v)) in s.fields.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "{n}: ");
+                    write_value(out, v, name, depth + 1, true);
+                }
+                out.push_str(" }");
+            }
+            HeapObj::Enum(e) => {
+                let _ = write!(out, "{}.{}", e.name, e.variant);
+                if !e.payload.is_empty() {
+                    out.push('(');
+                    for (i, v) in e.payload.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        write_value(out, v, name, depth + 1, true);
+                    }
+                    out.push(')');
+                }
             }
         },
     }

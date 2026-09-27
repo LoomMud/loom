@@ -1911,6 +1911,14 @@ fn value_conforms(v: &Value, ty: &Ty) -> bool {
         // the others through as a var's declared type) — conservative
         // false rather than a panic if one ever does.
         Ty::Void | Ty::Never | Ty::Fn(_) | Ty::Error => false,
+        // Shallow nominal check only (module + name): does not verify the
+        // stored value's fields/variant still match the *current* schema
+        // field-by-field. `crate::bcvm::schema_convert` does that deep,
+        // by-name, lossless-or-portable comparison (spec r5 §7.3); wiring
+        // it into this by-name var carry-over is OBI-34's own follow-up,
+        // not this check (see OBI-88).
+        Ty::Struct(s) => v.as_struct().is_some_and(|sv| sv.name == s.name),
+        Ty::Enum(e) => v.as_enum().is_some_and(|ev| ev.name == e.name),
     }
 }
 
