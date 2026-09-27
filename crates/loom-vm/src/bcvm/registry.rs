@@ -2930,7 +2930,11 @@ pub fn get_n() -> int {
         // Far fewer ticks than the infinite loop needs.
         host.ticks_left = 50;
         let err = host.call_on(obj, "bump_then_spin", vec![]).unwrap_err();
-        assert!(err.report().contains("Too long evaluation"), "{}", err.report());
+        assert!(
+            err.report().contains("Too long evaluation"),
+            "{}",
+            err.report()
+        );
 
         host.ticks_left = 1_000_000;
         let n = host.call_on(obj, "get_n", vec![]).unwrap();
