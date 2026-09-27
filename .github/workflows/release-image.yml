@@ -27,7 +27,7 @@ jobs:
       # Same action as ci.yml's `deny` job, so release and PR gating agree
       # (cargo-deny 0.18.5 cannot parse CVSS 4.0 advisories).
       - name: cargo deny (licenses, bans, sources, advisories)
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check licenses bans sources advisories
 
