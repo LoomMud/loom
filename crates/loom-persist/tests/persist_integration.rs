@@ -346,3 +346,217 @@ async fn expired_grant_is_ignored_by_active_grants_view() {
         "the expired grant must not appear in active_grants: {active:?}"
     );
 }
+
+/// A T3 domain lead may not grant a per-uid exception to itself, even to a
+/// tier strictly below its own recorded tier.
+#[tokio::test]
+async fn t3_self_grant_is_denied() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let lead_uid = unique_uid("lead-self-grant");
+    let lead_account = seed_account(&fx.owner, &lead_uid).await;
+    seed_staff(&fx.owner, &lead_uid, lead_account, 3).await;
+
+    let future = OffsetDateTime::now_utc() + Duration::from_secs(3600);
+    let result = fx
+        .app
+        .roles_grant(
+            &lead_uid,
+            &lead_uid,
+            GrantKind::Efun,
+            "shutdown",
+            future,
+            "self-grant attempt",
+        )
+        .await;
+    assert!(result.is_err(), "T3 self-grant must be denied");
+}
+
+/// A T3 domain lead has no grant right at all (§5.11.2: T3 *receives*
+/// per-query DB access, it does not issue grants).
+#[tokio::test]
+async fn t3_granting_to_another_uid_is_denied() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let lead_uid = unique_uid("lead-grantor");
+    let lead_account = seed_account(&fx.owner, &lead_uid).await;
+    seed_staff(&fx.owner, &lead_uid, lead_account, 3).await;
+
+    let target_uid = unique_uid("builder-grant-target");
+    let target_account = seed_account(&fx.owner, &target_uid).await;
+    seed_staff(&fx.owner, &target_uid, target_account, 1).await;
+
+    let future = OffsetDateTime::now_utc() + Duration::from_secs(3600);
+    let result = fx
+        .app
+        .roles_grant(
+            &lead_uid,
+            &target_uid,
+            GrantKind::Path,
+            "/domains/start/wip",
+            future,
+            "T3 attempting to grant",
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "T3 must not be able to issue per-uid grants"
+    );
+}
+
+/// A T4 arch may not grant an exception with an expiry more than 90 days
+/// out (§5.11.3: grants must remain time-boxed exceptions).
+#[tokio::test]
+async fn t4_grant_beyond_90_days_is_denied() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let arch_uid = unique_uid("arch-grantor");
+    let arch_account = seed_account(&fx.owner, &arch_uid).await;
+    seed_staff(&fx.owner, &arch_uid, arch_account, 4).await;
+
+    let target_uid = unique_uid("builder-far-grant");
+    let target_account = seed_account(&fx.owner, &target_uid).await;
+    seed_staff(&fx.owner, &target_uid, target_account, 1).await;
+
+    let too_far = OffsetDateTime::now_utc() + Duration::from_secs(91 * 24 * 3600);
+    let result = fx
+        .app
+        .roles_grant(
+            &arch_uid,
+            &target_uid,
+            GrantKind::Path,
+            "/domains/start/wip",
+            too_far,
+            "expiry too far out",
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a grant expiring more than 90 days out must be denied"
+    );
+
+    // Sanity check: the same grant with a within-window expiry succeeds.
+    let ok_expiry = OffsetDateTime::now_utc() + Duration::from_secs(89 * 24 * 3600);
+    fx.app
+        .roles_grant(
+            &arch_uid,
+            &target_uid,
+            GrantKind::Path,
+            "/domains/start/wip",
+            ok_expiry,
+            "expiry within window",
+        )
+        .await
+        .expect("a grant within the 90-day window should succeed");
+}
+
+/// A T3 domain lead cannot demote or remove a co-lead in its own domain --
+/// appointing/removing leads is T4 (§5.11.2).
+#[tokio::test]
+async fn t3_cannot_demote_or_remove_a_co_lead() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let domain = unique_uid("domain-coleads");
+    seed_domain(&fx.owner, &domain, "wip").await;
+
+    let lead_uid = unique_uid("lead-a");
+    let lead_account = seed_account(&fx.owner, &lead_uid).await;
+    seed_staff(&fx.owner, &lead_uid, lead_account, 3).await;
+    seed_domain_member(&fx.owner, &domain, &lead_uid, "lead").await;
+
+    let co_lead_uid = unique_uid("lead-b");
+    let co_lead_account = seed_account(&fx.owner, &co_lead_uid).await;
+    seed_staff(&fx.owner, &co_lead_uid, co_lead_account, 3).await;
+    seed_domain_member(&fx.owner, &domain, &co_lead_uid, "lead").await;
+
+    let demote_result = fx
+        .app
+        .roles_set_member(
+            &lead_uid,
+            &domain,
+            &co_lead_uid,
+            Some("member"),
+            "attempted co-lead demotion",
+        )
+        .await;
+    assert!(
+        demote_result.is_err(),
+        "T3 must not be able to demote a co-lead to member"
+    );
+
+    let remove_result = fx
+        .app
+        .roles_set_member(
+            &lead_uid,
+            &domain,
+            &co_lead_uid,
+            None,
+            "attempted co-lead removal",
+        )
+        .await;
+    assert!(
+        remove_result.is_err(),
+        "T3 must not be able to remove a co-lead's membership"
+    );
+
+    let current_role: String =
+        sqlx::query_scalar("SELECT role FROM domain_members WHERE domain = $1 AND uid = $2")
+            .bind(&domain)
+            .bind(&co_lead_uid)
+            .fetch_one(&fx.owner)
+            .await
+            .expect("co-lead membership should still exist");
+    assert_eq!(current_role, "lead", "co-lead's role must be unchanged");
+}
+
+/// D-27.7 / OBI-36 matrix: a T3 domain lead demotes a T2 member of its own
+/// domain to T1, and the change is recorded in `role_changes`.
+#[tokio::test]
+async fn t3_demotes_t2_member_to_t1_in_own_domain() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let domain = unique_uid("domain-demote");
+    seed_domain(&fx.owner, &domain, "wip").await;
+
+    let lead_uid = unique_uid("lead-demoter");
+    let lead_account = seed_account(&fx.owner, &lead_uid).await;
+    seed_staff(&fx.owner, &lead_uid, lead_account, 3).await;
+    seed_domain_member(&fx.owner, &domain, &lead_uid, "lead").await;
+
+    let builder_uid = unique_uid("builder-demoted");
+    let builder_account = seed_account(&fx.owner, &builder_uid).await;
+    seed_staff(&fx.owner, &builder_uid, builder_account, 2).await;
+    seed_domain_member(&fx.owner, &domain, &builder_uid, "member").await;
+
+    fx.app
+        .roles_set_tier(&lead_uid, &builder_uid, 1, "demoted for inactivity")
+        .await
+        .expect("T3 lead demotes a T2 member of its own domain to T1");
+
+    let tier = staff_tier(&fx.owner, &builder_uid)
+        .await
+        .expect("builder should still have a staff row");
+    assert_eq!(tier, 1);
+
+    let audit_row = sqlx::query!(
+        "SELECT old_tier, new_tier, actor FROM role_changes
+         WHERE uid = $1 ORDER BY at DESC LIMIT 1",
+        builder_uid,
+    )
+    .fetch_one(&fx.owner)
+    .await
+    .expect("role_changes row should exist");
+    assert_eq!(audit_row.old_tier, Some(2));
+    assert_eq!(audit_row.new_tier, Some(1));
+    assert_eq!(audit_row.actor, lead_uid);
+}

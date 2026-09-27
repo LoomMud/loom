@@ -144,8 +144,9 @@ GRANT SELECT ON role_changes TO loom_app;
 --     session cannot redirect it to an attacker-controlled shadow table.
 -- ---------------------------------------------------------------------------
 
--- roles_set_tier: T3 (domain lead) may only promote T1 -> T2 within a domain
--- it leads. T4 (arch) may set any tier 1-3 for anyone currently below T4.
+-- roles_set_tier: T3 (domain lead) may only promote T1 -> T2, or demote its
+-- own T2 members back to T1, within a domain it leads. T4 (arch) may set any
+-- tier 1-3 for anyone currently below T4.
 -- Neither may self-promote. T4/T5 are never granted here in Phase 1; see
 -- roles_bootstrap_root for root bootstrap, and "what's next" below for the
 -- deferred two-root approval flow for T4/T5 grants.
@@ -188,8 +189,8 @@ BEGIN
             RAISE EXCEPTION 'actor tier % may not change the tier of an arch/root account', actor_tier;
         END IF;
     ELSIF actor_tier = 3 THEN
-        IF old_tier <> 1 OR p_new_tier <> 2 THEN
-            RAISE EXCEPTION 'domain leads (T3) may only promote T1 to T2';
+        IF NOT ((old_tier = 1 AND p_new_tier = 2) OR (old_tier = 2 AND p_new_tier = 1)) THEN
+            RAISE EXCEPTION 'domain leads (T3) may only promote T1 to T2 or demote T2 to T1';
         END IF;
 
         SELECT EXISTS (
@@ -243,6 +244,7 @@ AS $$
 DECLARE
     actor_tier SMALLINT;
     actor_leads_domain BOOLEAN;
+    target_current_role TEXT;
 BEGIN
     IF p_actor IS NULL OR p_domain IS NULL OR p_target_uid IS NULL OR p_reason IS NULL THEN
         RAISE EXCEPTION 'actor, domain, target uid and reason are required';
@@ -274,6 +276,14 @@ BEGIN
         IF p_role = 'lead' THEN
             RAISE EXCEPTION 'domain leads (T3) may not appoint other leads';
         END IF;
+
+        SELECT role INTO target_current_role
+        FROM public.domain_members
+        WHERE domain = p_domain AND uid = p_target_uid;
+
+        IF target_current_role = 'lead' THEN
+            RAISE EXCEPTION 'domain leads (T3) may not demote or remove a co-lead';
+        END IF;
     ELSE
         RAISE EXCEPTION 'actor tier % may not change domain membership', actor_tier;
     END IF;
@@ -296,6 +306,14 @@ GRANT EXECUTE ON FUNCTION public.roles_set_member(TEXT, TEXT, TEXT, TEXT, TEXT) 
 
 -- roles_grant: per-uid exceptions (efun/db_query/path), always with an
 -- expiry and a granting actor, so exceptions never require a tier change.
+--
+-- Per design §5.11.2, T3 receives per-query DB access as a grant but is
+-- never given the right to *issue* grants; only T4 (arch) and T5 (root) may
+-- call this. The actor may never grant to itself, and may only grant to a
+-- uid whose recorded tier is strictly below the actor's own tier (so a T4
+-- reaches T1-T3, and a T5 reaches T1-T4, but nobody can hand out rights at
+-- or above their own tier). Expiry is capped at 90 days so a grant can
+-- never become an unbounded, tier-change-free promotion (§5.11.3).
 CREATE OR REPLACE FUNCTION public.roles_grant(
     p_actor      TEXT,
     p_uid        TEXT,
@@ -309,7 +327,8 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    actor_tier SMALLINT;
+    actor_tier  SMALLINT;
+    target_tier SMALLINT;
 BEGIN
     IF p_actor IS NULL OR p_uid IS NULL OR p_kind IS NULL OR p_target IS NULL OR p_reason IS NULL THEN
         RAISE EXCEPTION 'actor, uid, kind, target and reason are required';
@@ -323,15 +342,28 @@ BEGIN
         RAISE EXCEPTION 'grants must have a future expiry';
     END IF;
 
+    IF p_expires_at > NOW() + INTERVAL '90 days' THEN
+        RAISE EXCEPTION 'grants may not expire more than 90 days out';
+    END IF;
+
+    IF p_actor = p_uid THEN
+        RAISE EXCEPTION 'self-granting is not permitted';
+    END IF;
+
     SELECT tier INTO actor_tier FROM public.staff WHERE uid = p_actor;
     actor_tier := COALESCE(actor_tier, 0);
 
-    IF actor_tier < 3 THEN
+    IF actor_tier < 4 THEN
         RAISE EXCEPTION 'actor tier % may not grant per-uid exceptions', actor_tier;
     END IF;
 
-    IF NOT EXISTS (SELECT 1 FROM public.staff WHERE uid = p_uid) THEN
+    SELECT tier INTO target_tier FROM public.staff WHERE uid = p_uid;
+    IF target_tier IS NULL THEN
         RAISE EXCEPTION 'grant target % is not staff', p_uid;
+    END IF;
+
+    IF target_tier >= actor_tier THEN
+        RAISE EXCEPTION 'actor tier % may not grant to a uid at or above its own tier', actor_tier;
     END IF;
 
     INSERT INTO public.grants (uid, kind, target, granted_by, expires_at)
@@ -350,6 +382,8 @@ REVOKE ALL ON FUNCTION public.roles_grant(TEXT, TEXT, TEXT, TEXT, TIMESTAMPTZ, T
 GRANT EXECUTE ON FUNCTION public.roles_grant(TEXT, TEXT, TEXT, TEXT, TIMESTAMPTZ, TEXT) TO loom_app;
 
 -- roles_revoke_grant: removes a per-uid exception before its natural expiry.
+-- Same actor/target-tier rule as roles_grant, so a T3 can't strip a grant
+-- an arch issued.
 CREATE OR REPLACE FUNCTION public.roles_revoke_grant(
     p_actor  TEXT,
     p_uid    TEXT,
@@ -362,7 +396,8 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    actor_tier SMALLINT;
+    actor_tier    SMALLINT;
+    target_tier   SMALLINT;
     deleted_count INTEGER;
 BEGIN
     IF p_actor IS NULL OR p_uid IS NULL OR p_kind IS NULL OR p_target IS NULL OR p_reason IS NULL THEN
@@ -372,8 +407,13 @@ BEGIN
     SELECT tier INTO actor_tier FROM public.staff WHERE uid = p_actor;
     actor_tier := COALESCE(actor_tier, 0);
 
-    IF actor_tier < 3 THEN
+    IF actor_tier < 4 THEN
         RAISE EXCEPTION 'actor tier % may not revoke grants', actor_tier;
+    END IF;
+
+    SELECT tier INTO target_tier FROM public.staff WHERE uid = p_uid;
+    IF target_tier IS NULL OR target_tier >= actor_tier THEN
+        RAISE EXCEPTION 'actor tier % may not revoke a grant belonging to %', actor_tier, p_uid;
     END IF;
 
     DELETE FROM public.grants
