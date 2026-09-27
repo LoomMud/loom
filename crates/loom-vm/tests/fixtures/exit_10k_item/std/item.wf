@@ -1,0 +1,7 @@
+// /std/item v1: cloned 10k times by the OBI-91 exit test.
+var name: string = "widget"
+var count: int = 0
+
+pub fn set_count(n: int) {
+    count = n
+}
