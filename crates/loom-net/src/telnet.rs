@@ -163,11 +163,13 @@ pub enum TelnetEvent {
     Gmcp(GmcpMessage),
 }
 
-/// GMCP payloads the world cares about get a structured variant; everything
-/// else is `Other` so unknown/future packages don't get silently dropped.
-/// This is the cross-seam surface named in OBI-26's acceptance criteria and
-/// needs a CTO decision before merge because it's a new `NetEvent`/
-/// `NetCommand` shape.
+/// GMCP payloads the world cares about get a structured variant
+/// (`Core.Hello`, `Core.Supports.*`); everything else (including `Char.*`,
+/// which the driver gives no semantics of its own) is the generic
+/// `Package` variant so unknown/future packages don't get silently
+/// dropped, without needing a seam change every time a new package shows
+/// up. This is the cross-seam surface named in OBI-26's acceptance
+/// criteria (CTO decision recorded on the owning issue before merge).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GmcpMessage {
     CoreHello {
@@ -177,16 +179,20 @@ pub enum GmcpMessage {
     CoreSupportsSet(Vec<String>),
     CoreSupportsAdd(Vec<String>),
     CoreSupportsRemove(Vec<String>),
-    Char {
-        message: String,
-        payload: serde_json::Value,
-    },
-    Other {
-        package_message: String,
+    /// Any package/message other than `Core.Hello`/`Core.Supports.*`
+    /// (`Char.*` included). `payload` is `Value::Null` for a GMCP message
+    /// with no body (that's valid GMCP, not an error); malformed JSON is
+    /// never delivered here at all -- `parse_gmcp` drops the whole frame.
+    Package {
+        module: String,
         payload: serde_json::Value,
     },
 }
 
+/// Parses one GMCP frame. Returns `None` if the frame isn't valid UTF-8 or
+/// its JSON payload doesn't parse -- the caller drops the frame entirely
+/// rather than deliver a `Package { payload: Value::Null, .. }`, since
+/// `Null` is reserved for "module with no payload" (valid GMCP).
 fn parse_gmcp(body: &[u8]) -> Option<GmcpMessage> {
     let text = std::str::from_utf8(body).ok()?;
     let (package_message, payload_str) = match text.find(char::is_whitespace) {
@@ -199,8 +205,8 @@ fn parse_gmcp(body: &[u8]) -> Option<GmcpMessage> {
         match serde_json::from_str(payload_str) {
             Ok(v) => v,
             Err(err) => {
-                warn!(package_message, %err, "malformed GMCP payload, treating as Other");
-                serde_json::Value::Null
+                warn!(package_message, %err, "malformed GMCP payload, dropping frame");
+                return None;
             }
         }
     };
@@ -222,12 +228,8 @@ fn parse_gmcp(body: &[u8]) -> Option<GmcpMessage> {
         "Core.Supports.Set" => GmcpMessage::CoreSupportsSet(string_array(&payload)),
         "Core.Supports.Add" => GmcpMessage::CoreSupportsAdd(string_array(&payload)),
         "Core.Supports.Remove" => GmcpMessage::CoreSupportsRemove(string_array(&payload)),
-        other if other.starts_with("Char.") => GmcpMessage::Char {
-            message: other.to_string(),
-            payload,
-        },
-        other => GmcpMessage::Other {
-            package_message: other.to_string(),
+        other => GmcpMessage::Package {
+            module: other.to_string(),
             payload,
         },
     })
@@ -307,6 +309,10 @@ pub struct TelnetOptionTable {
     options: HashMap<u8, OptionNego>,
     ttype: TtypeCycle,
     mssp_fields: Vec<(String, String)>,
+    /// The client's advertised `Core.Supports` package set (spec §7). Kept
+    /// here rather than in the VM per the CTO decision on OBI-26: it's
+    /// connection/protocol bookkeeping, not world state.
+    supports: std::collections::HashSet<String>,
 }
 
 /// Whether we (the server) are willing to enable our side of an option
@@ -327,7 +333,19 @@ impl TelnetOptionTable {
             options: HashMap::new(),
             ttype: TtypeCycle::default(),
             mssp_fields,
+            supports: std::collections::HashSet::new(),
         }
+    }
+
+    /// The client's current `Core.Supports` package set, as tracked from
+    /// `Core.Supports.Set/Add/Remove` frames. Connection-local bookkeeping
+    /// (spec §7); the world never sees this directly. Not consumed by any
+    /// caller yet in the alpha (no GMCP-aware world hook exists until the
+    /// `NetEvent::Gmcp` apply lands) -- kept `pub` and tested directly so
+    /// the tracking itself is proven now.
+    #[allow(dead_code)]
+    pub fn supports(&self) -> &std::collections::HashSet<String> {
+        &self.supports
     }
 
     fn entry(&mut self, option: u8) -> &mut OptionNego {
@@ -440,7 +458,23 @@ impl TelnetOptionTable {
                 (out, Some(TelnetEvent::TerminalType(name)))
             }
             OPT_GMCP => match parse_gmcp(body) {
-                Some(msg) => (Vec::new(), Some(TelnetEvent::Gmcp(msg))),
+                Some(msg) => {
+                    match &msg {
+                        GmcpMessage::CoreSupportsSet(pkgs) => {
+                            self.supports = pkgs.iter().cloned().collect();
+                        }
+                        GmcpMessage::CoreSupportsAdd(pkgs) => {
+                            self.supports.extend(pkgs.iter().cloned());
+                        }
+                        GmcpMessage::CoreSupportsRemove(pkgs) => {
+                            for pkg in pkgs {
+                                self.supports.remove(pkg);
+                            }
+                        }
+                        _ => {}
+                    }
+                    (Vec::new(), Some(TelnetEvent::Gmcp(msg)))
+                }
                 None => (Vec::new(), None),
             },
             _ => (Vec::new(), None),
