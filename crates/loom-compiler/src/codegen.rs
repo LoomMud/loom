@@ -43,23 +43,39 @@ pub fn compile(p: &hir::Program) -> Result<Module, Unsupported> {
 }
 
 fn lower_program(p: &hir::Program) -> Result<ir::Program, Unsupported> {
+    // Closures found anywhere in the program (including inside other
+    // closures) are lowered as ordinary `ir::Function`s and appended after
+    // every named function (spec r5 §5.2.2, OBI-79): `base` is the index
+    // the first one gets, so an `Inst::MakeClosure` built while lowering
+    // function `i` can already name a not-yet-appended closure by its
+    // final index in the flattened list.
+    let base = p.fns.len() as u32;
+    let mut extra = Vec::new();
     let functions = p
         .fns
         .iter()
-        .map(lower_function)
+        .map(|f| lower_function(f, base, &mut extra))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut functions = functions;
+    functions.extend(extra);
     Ok(ir::Program {
         path: p.path.clone(),
         functions,
     })
 }
 
-fn lower_function(f: &hir::Function) -> Result<ir::Function, Unsupported> {
+fn lower_function(
+    f: &hir::Function,
+    base: u32,
+    extra: &mut Vec<ir::Function>,
+) -> Result<ir::Function, Unsupported> {
     let mut b = FnLower {
         reg_types: f.locals.iter().map(|l| l.ty.clone()).collect(),
         blocks: vec![ir::Block::default()],
         cur: 0,
         unreachable: false,
+        base,
+        extra,
     };
     b.block(&f.body)?;
     // Falling off the end of the body is only well-typed for a `void`
@@ -115,10 +131,11 @@ fn lower_function(f: &hir::Function) -> Result<ir::Function, Unsupported> {
         blocks: b.blocks,
         entry: 0,
         default_entries,
+        capture_targets: Vec::new(),
     })
 }
 
-struct FnLower {
+struct FnLower<'e> {
     reg_types: Vec<Ty>,
     blocks: Vec<ir::Block>,
     cur: BlockId,
@@ -127,9 +144,16 @@ struct FnLower {
     /// later statements in the same lexical block are dead code, and must
     /// not append to (or re-terminate) an already-terminated block.
     unreachable: bool,
+    /// See `lower_program`'s doc: the index the first closure body in
+    /// `extra` gets in the final flattened function list.
+    base: u32,
+    /// Closure bodies discovered while lowering this function (or, when
+    /// this `FnLower` is itself lowering a closure body, discovered inside
+    /// it), shared with every closure nested inside it too (OBI-79).
+    extra: &'e mut Vec<ir::Function>,
 }
 
-impl FnLower {
+impl FnLower<'_> {
     fn new_reg(&mut self, ty: Ty) -> Reg {
         self.reg_types.push(ty);
         (self.reg_types.len() - 1) as Reg
@@ -543,6 +567,16 @@ impl FnLower {
                     args: args_r,
                 });
             }
+            hir::ExprKind::CallValue { callee, args } => {
+                let func_r = self.expr(callee)?;
+                let args_r = self.args(args)?;
+                self.emit(Inst::TickCheck);
+                self.emit(Inst::CallValue {
+                    dst: None,
+                    func: func_r,
+                    args: args_r,
+                });
+            }
             _ => {
                 self.expr(e)?;
             }
@@ -552,6 +586,66 @@ impl FnLower {
 
     fn args(&mut self, args: &[hir::Expr]) -> Result<Vec<Reg>, Unsupported> {
         args.iter().map(|a| self.expr(a)).collect()
+    }
+
+    /// Lower a closure literal (spec r5 §5.2.2, OBI-79): its body becomes
+    /// an ordinary [`ir::Function`] appended to this program's flattened
+    /// function list (see `lower_program`); the captured-by-value
+    /// snapshot is taken *here*, at the `Closure` expression, by reading
+    /// `outer_ids` — registers of *this* function — right now.
+    fn closure(
+        &mut self,
+        cf: &hir::ClosureFn,
+        outer_ids: &[hir::LocalId],
+        span: loom_syntax::Span,
+    ) -> Result<Reg, Unsupported> {
+        let synth = hir::Function {
+            name: Rc::from("<closure>"),
+            vis: hir::Visibility::Private,
+            is_override: false,
+            atomic: false,
+            params: cf
+                .params
+                .iter()
+                .map(|&local| hir::Param {
+                    local,
+                    default: None,
+                })
+                .collect(),
+            ret: cf.ret.clone(),
+            locals: cf.locals.clone(),
+            body: cf.body.clone(),
+            span,
+        };
+        let mut body_ir = lower_function(&synth, self.base, self.extra)?;
+        body_ir.capture_targets = cf.captures.clone();
+        let idx = self.base + self.extra.len() as u32;
+        self.extra.push(body_ir);
+
+        let captures = outer_ids.iter().map(|&id| self.expr_local(id)).collect();
+        let ty = Ty::Fn(Rc::new(crate::ty::FnTy {
+            params: cf
+                .params
+                .iter()
+                .map(|&id| self.reg_types[id as usize].clone())
+                .collect(),
+            ret: cf.ret.clone(),
+        }));
+        let dst = self.new_reg(ty);
+        self.emit(Inst::MakeClosure {
+            dst,
+            func: idx,
+            captures,
+        });
+        Ok(dst)
+    }
+
+    /// A local read as a plain register (locals and registers share one
+    /// numbering, see the module docs): used for reading an *outer*
+    /// function's local at the point a closure captures it, where there is
+    /// no `hir::Expr` to lower through `Self::expr`.
+    fn expr_local(&self, id: hir::LocalId) -> Reg {
+        id
     }
 
     fn expr(&mut self, e: &hir::Expr) -> Result<Reg, Unsupported> {
@@ -614,8 +708,15 @@ impl FnLower {
                 self.emit(Inst::LoadSelf { dst });
                 dst
             }
-            hir::ExprKind::FnRef(_) => return Err(Unsupported("function references".into())),
-            hir::ExprKind::Closure(_) => return Err(Unsupported("closures".into())),
+            hir::ExprKind::FnRef(callee) => {
+                let dst = self.new_reg(e.ty.clone());
+                self.emit(Inst::MakeFn {
+                    dst,
+                    callee: lower_callee(callee),
+                });
+                dst
+            }
+            hir::ExprKind::Closure(cf, outer_ids) => self.closure(cf, outer_ids, e.span)?,
             hir::ExprKind::Index { base, index, kind } => {
                 let base_r = self.expr(base)?;
                 let index_r = self.expr(index)?;
@@ -666,8 +767,17 @@ impl FnLower {
                 });
                 dst
             }
-            hir::ExprKind::CallValue { .. } => {
-                return Err(Unsupported("indirect calls (function values)".into()));
+            hir::ExprKind::CallValue { callee, args } => {
+                let func_r = self.expr(callee)?;
+                let args_r = self.args(args)?;
+                self.emit(Inst::TickCheck);
+                let dst = self.new_reg(e.ty.clone());
+                self.emit(Inst::CallValue {
+                    dst: Some(dst),
+                    func: func_r,
+                    args: args_r,
+                });
+                dst
             }
             hir::ExprKind::CallEfun { name, args, .. } => {
                 let args_r = self.args(args)?;
@@ -1002,6 +1112,7 @@ impl Assembler {
             reg_types: f.reg_types.clone(),
             entry_points,
             code,
+            capture_targets: f.capture_targets.clone(),
         }
     }
 
@@ -1147,6 +1258,32 @@ impl Assembler {
                 catch_reg: *catch_reg,
             },
             Inst::PopHandler => Op::PopHandler,
+            Inst::MakeFn { dst, callee } => Op::MakeFn {
+                dst: *dst,
+                callee: match callee {
+                    Callee::Virtual { name } => CalleeOp::Virtual {
+                        name: self.intern(name),
+                    },
+                    Callee::Static { program, name } => CalleeOp::Static {
+                        program: self.intern(program),
+                        name: self.intern(name),
+                    },
+                },
+            },
+            Inst::MakeClosure {
+                dst,
+                func,
+                captures,
+            } => Op::MakeClosure {
+                dst: *dst,
+                func: *func,
+                captures: captures.clone(),
+            },
+            Inst::CallValue { dst, func, args } => Op::CallValue {
+                dst: *dst,
+                func: *func,
+                args: args.clone(),
+            },
         }
     }
 }

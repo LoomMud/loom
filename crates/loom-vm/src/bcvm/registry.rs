@@ -35,13 +35,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use loom_compiler::bytecode::Module;
+use loom_compiler::bytecode::{Callee, Module};
 use loom_compiler::hir;
 use loom_compiler::mudlib::{self, Outcome, Session};
 use loom_compiler::ty::Ty;
 
 use crate::bcvm::Value;
 use crate::bcvm::compile::{CompileError, compile_and_verify};
+use crate::bcvm::heap::FnBody;
 use crate::bcvm::vm::{CallTarget, Host, HostCall, Interpreter, Limits, ProgramCode, R, RtError};
 use crate::object::ObjectId;
 
@@ -396,6 +397,10 @@ pub struct CompiledProgram {
 impl ProgramCode for CompiledProgram {
     fn module(&self) -> &Module {
         &self.module
+    }
+
+    fn version(&self) -> u32 {
+        self.version
     }
 }
 
@@ -1441,7 +1446,88 @@ impl Host for RegistryHost<'_> {
             func,
             self_obj,
             args,
+            captures: Vec::new(),
         })
+    }
+
+    /// See [`Host::dispatch_value`] (spec r5 §5.2.2, OBI-79). `creator`
+    /// must still be a live object for either shape (the destructed-object
+    /// AC); a `Named` reference then late-binds `callee` on `creator`'s
+    /// *current* program — unlike `call_other`, this may reach a private
+    /// or `super::`-declared function, because the value itself could
+    /// only ever have been formed by code of `creator`'s own program
+    /// naming it in the first place.
+    fn dispatch_value(
+        &mut self,
+        creator: ObjectId,
+        body: &FnBody,
+        args: Vec<Value>,
+    ) -> R<HostCall> {
+        let prog = self
+            .registry
+            .get(creator)
+            .ok_or_else(|| RtError::new("call on a destructed object"))?
+            .program
+            .clone();
+        match body {
+            FnBody::Named(callee) => {
+                let (target, idx) = match callee {
+                    Callee::Virtual { name } => prog.resolve(name).ok_or_else(|| {
+                        RtError::new(format!(
+                            "stale closure: no function `{name}` on {}",
+                            prog.path
+                        ))
+                    })?,
+                    Callee::Static { program, name } => {
+                        let target = prog
+                            .chain()
+                            .into_iter()
+                            .find(|p| p.path.as_ref() == program.as_ref())
+                            .ok_or_else(|| {
+                                RtError::new(format!(
+                                    "`{program}` is not an ancestor of {}",
+                                    prog.path
+                                ))
+                            })?;
+                        let idx = target.resolve_own(name).ok_or_else(|| {
+                            RtError::new(format!("no function `{name}` in {program}"))
+                        })?;
+                        (target, idx)
+                    }
+                };
+                Ok(HostCall::Enter {
+                    code: target,
+                    func: idx,
+                    self_obj: creator,
+                    args,
+                    captures: Vec::new(),
+                })
+            }
+            FnBody::Closure {
+                code,
+                func,
+                captures,
+                ..
+            } => Ok(HostCall::Enter {
+                code: code.clone(),
+                func: *func,
+                self_obj: creator,
+                args,
+                captures: captures.clone(),
+            }),
+        }
+    }
+
+    /// See [`Host::current_program`].
+    fn current_program(&self) -> R<Rc<dyn ProgramCode>> {
+        let id = self.self_object();
+        let prog = self
+            .registry
+            .get(id)
+            .ok_or_else(|| RtError::new("call on a destructed object"))?
+            .program
+            .clone();
+        Ok(prog as Rc<dyn ProgramCode>)
     }
 
     fn enter_self(&mut self, obj: ObjectId) {
@@ -1553,6 +1639,163 @@ pub fn go() -> int {
             Outcome::Failed(report) => panic!("check failed:\n{report}"),
             Outcome::Missing(msg) => panic!("{msg}"),
         }
+    }
+
+    // ---- OBI-79: closures / function-value runtime ----------------------
+
+    /// A named function reference (`let f = add_one`) is late-bound at
+    /// call time by `(creator, name)` on the creator's *current* program
+    /// (spec r5 §5.2.2): a private function — which `ob.f()` could never
+    /// reach — is still callable through a value formed from inside its
+    /// own program. Closures capture by value: `make_adder(10)`'s closure
+    /// keeps its own snapshot of `n` independent of the object's later
+    /// state.
+    #[test]
+    fn named_function_values_and_by_value_closure_capture() {
+        const WF: &str = r#"
+fn add_one(x: int) -> int {
+    return x + 1
+}
+
+pub fn named_ref() -> fn(int) -> int {
+    return add_one
+}
+
+pub fn call_named() -> int {
+    let g = named_ref()
+    return g(41)
+}
+
+pub fn make_adder(n: int) -> fn(int) -> int {
+    return fn(x: int) => x + n
+}
+
+var n: int = 999
+
+pub fn use_adder() -> int {
+    let f = make_adder(10)
+    n = -1
+    return f(5)
+}
+"#;
+        let module = compile("/obj/fns", &[("/obj/fns", WF)]);
+        let mut registry = Registry::default();
+        let prog = Rc::new(CompiledProgram::new(module, 1, None, Vec::new()));
+        registry.register_program(prog.clone());
+        let obj = make_object(&mut registry, prog);
+        let mut host = RegistryHost::new(&mut registry, obj);
+
+        let got = host.call_on(obj, "call_named", vec![]).unwrap();
+        assert!(
+            got.equals(&Value::Int(42)),
+            "private named ref, late-bound call: {got:?}"
+        );
+
+        // The closure's capture of `n` (the *parameter*, by value) must not
+        // be confused with the program variable of the same name that
+        // `use_adder` mutates right after creating the closure: `f(5)` must
+        // still see the captured `10`, not the object's `-1`.
+        let got = host.call_on(obj, "use_adder", vec![]).unwrap();
+        assert!(
+            got.equals(&Value::Int(15)),
+            "closure must capture its own parameter by value: {got:?}"
+        );
+    }
+
+    /// Invoking a function value whose creator object was destructed in the
+    /// meantime fails cleanly (a plain runtime error), not a panic or a
+    /// call into freed state (OBI-32 original AC, carried into OBI-79).
+    #[test]
+    fn calling_a_function_value_whose_creator_was_destructed_fails_cleanly() {
+        const OWNER_WF: &str = r#"
+pub fn make_cb() -> fn() -> int {
+    return fn() => 1
+}
+"#;
+        const CALLER_WF: &str = r#"
+pub fn call_stored(f: fn() -> int) -> int {
+    return f()
+}
+"#;
+        let owner_module = compile("/obj/owner", &[("/obj/owner", OWNER_WF)]);
+        let caller_module = compile("/obj/caller", &[("/obj/caller", CALLER_WF)]);
+        let mut registry = Registry::default();
+        let owner_prog = Rc::new(CompiledProgram::new(owner_module, 1, None, Vec::new()));
+        let caller_prog = Rc::new(CompiledProgram::new(caller_module, 1, None, Vec::new()));
+        registry.register_program(owner_prog.clone());
+        registry.register_program(caller_prog.clone());
+        let owner = make_object(&mut registry, owner_prog);
+        let caller = make_object(&mut registry, caller_prog);
+
+        let mut host = RegistryHost::new(&mut registry, owner);
+        let f = host.call_on(owner, "make_cb", vec![]).unwrap();
+        host.registry.remove(owner);
+
+        let err = host
+            .call_on(caller, "call_stored", vec![f])
+            .expect_err("the creator is gone: this must not panic or silently succeed");
+        assert!(err.report().contains("destructed"), "{}", err.report());
+    }
+
+    /// An anonymous closure keeps the creator's program version it was
+    /// created under, even after the creator is hot-reload-upgraded to a
+    /// new version: the old `CompiledProgram` is kept alive by the
+    /// closure's own `Rc` (spec r5 §5.2.2's "old version stays alive via
+    /// the closures' refcount, freed after the last one dies") and the
+    /// closure's body keeps running the *old* code, not the new one.
+    #[test]
+    fn anonymous_closures_pin_their_creators_program_version_across_an_upgrade() {
+        const V1: &str = r#"
+pub fn make_cb() -> fn() -> string {
+    return fn() => "v1"
+}
+
+pub fn call_stored(f: fn() -> string) -> string {
+    return f()
+}
+"#;
+        const V2: &str = r#"
+pub fn make_cb() -> fn() -> string {
+    return fn() => "v2"
+}
+
+pub fn call_stored(f: fn() -> string) -> string {
+    return f()
+}
+"#;
+        let module1 = compile("/obj/cb", &[("/obj/cb", V1)]);
+        let module2 = compile("/obj/cb", &[("/obj/cb", V2)]);
+        let mut registry = Registry::default();
+        let prog1 = Rc::new(CompiledProgram::new(module1, 1, None, Vec::new()));
+        registry.register_program(prog1.clone());
+        let obj = make_object(&mut registry, prog1.clone());
+        let mut host = RegistryHost::new(&mut registry, obj);
+
+        let f = host.call_on(obj, "make_cb", vec![]).unwrap();
+        match &f.as_fn().unwrap().body {
+            FnBody::Closure {
+                program_version, ..
+            } => assert_eq!(*program_version, 1),
+            other => panic!("expected a closure, got {other:?}"),
+        }
+
+        let with_pin = Rc::strong_count(&prog1);
+
+        let prog2 = Rc::new(CompiledProgram::new(module2, 2, None, Vec::new()));
+        host.registry.register_program(prog2.clone());
+        host.upgrade(obj, prog2).unwrap();
+        assert_eq!(host.registry.get(obj).unwrap().program.version, 2);
+
+        // Still callable after the upgrade, and still running the *old*
+        // body — the AC's "anonymous closures keep their program version".
+        let got = host.call_on(obj, "call_stored", vec![f.clone()]).unwrap();
+        assert_eq!(got.as_str(), Some("v1"));
+
+        drop(f);
+        assert!(
+            Rc::strong_count(&prog1) < with_pin,
+            "the pinned v1 program must be freed once the last closure holding it is dropped"
+        );
     }
 
     fn make_object(reg: &mut Registry, prog: Rc<CompiledProgram>) -> ObjectId {

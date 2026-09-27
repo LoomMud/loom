@@ -31,12 +31,12 @@
 //! `bcvm::registry`'s module doc.
 
 use loom_compiler::bytecode::{
-    BinOp, CalleeOp, ConstValue, IndexKind, IterKind, Module, Op, OpKind, Reg, Ty, UnOp,
+    BinOp, Callee, CalleeOp, ConstValue, IndexKind, IterKind, Module, Op, OpKind, Reg, Ty, UnOp,
 };
 
 use std::rc::Rc;
 
-use crate::bcvm::heap::{MapData, Value};
+use crate::bcvm::heap::{FnBody, FunctionValue, MapData, Principal, Value};
 use crate::object::ObjectId;
 
 /// A Weft runtime error: message (with `path.wf:line:col` when available)
@@ -108,6 +108,13 @@ pub type R<T> = Result<T, RtError>;
 /// frame stack (D26). Implemented by `bcvm::registry::CompiledProgram`.
 pub trait ProgramCode {
     fn module(&self) -> &Module;
+    /// The program version (spec r5 §5.2/§7.2, OBI-79's closure
+    /// program-version pin): `0` for anything that is not a versioned
+    /// hot-reloadable program (the hand-assembled test modules in this
+    /// file).
+    fn version(&self) -> u32 {
+        0
+    }
 }
 
 /// A call the interpreter could not resolve inside its own module.
@@ -131,6 +138,10 @@ pub enum HostCall {
         func: u32,
         self_obj: ObjectId,
         args: Vec<Value>,
+        /// Preload for the callee's `FunctionCode::capture_targets` (spec
+        /// r5 §5.2.2, OBI-79's closure invocation): empty for every
+        /// ordinary (non-closure) call.
+        captures: Vec<Value>,
     },
 }
 
@@ -179,6 +190,39 @@ pub trait Host {
     /// The frame pushed by the matching [`Host::enter_self`] was popped.
     fn leave_self(&mut self) {}
 
+    /// Resolve a `CallValue` on a function value (spec r5 §5.2.2, OBI-79):
+    /// `creator` is [`crate::bcvm::heap::FunctionValue::creator`], `body`
+    /// is [`crate::bcvm::heap::FunctionValue::body`]. Checking that
+    /// `creator` is still a live object (not destructed — "closures over
+    /// destructed objects fail cleanly") is this method's job, so both
+    /// function-value shapes get one clean error from one place. The
+    /// default refuses every function value: correct for a host that
+    /// never lets Weft code construct one (none of the hand-built test
+    /// hosts in this crate do).
+    fn dispatch_value(
+        &mut self,
+        _creator: ObjectId,
+        _body: &FnBody,
+        _args: Vec<Value>,
+    ) -> R<HostCall> {
+        Err(RtError::new(
+            "function values are not supported by this host",
+        ))
+    }
+
+    /// The `Rc` handle to the program the current call chain is running,
+    /// strong enough to outlive a later hot-reload `upgrade()` of the
+    /// running object (spec r5 §5.2.2, OBI-79's closure program-version
+    /// pin: "anonymous closures keep their program version"). Not derived
+    /// from the interpreter's own frame stack because the *outermost*
+    /// frame of a driver-started call (`RegistryHost::call_in`) only ever
+    /// borrows a `&Module`, never the owning `Rc` — the host is the one
+    /// thing that always still has it. The default errs: correct for a
+    /// host that never lets Weft code construct a closure.
+    fn current_program(&self) -> R<Rc<dyn ProgramCode>> {
+        Err(RtError::new("closures are not supported by this host"))
+    }
+
     /// `atomic fn` (spec r5 §5.2.1, OBI-32): entering an atomic-marked
     /// function opens a journal scope and returns its mark. Every
     /// object-variable write (including a container mutation — r5: that
@@ -224,6 +268,12 @@ struct Frame {
     /// on a normal return or [`Host::rollback_atomic`] if this frame is
     /// popped while an error unwinds past it.
     atomic_mark: Option<u64>,
+    /// This frame's effective principal (spec r5 §5.2.2, OBI-79): for an
+    /// ordinary call, the object the frame runs as; for a function-value
+    /// invocation, `Principal::min(caller, value)` — the hook OBI-35's
+    /// enforcement reads. See [`Principal`]'s doc for what "min" means
+    /// today (a placeholder pending OBI-35's real uid model).
+    principal: Principal,
 }
 
 /// Per-execution limits (spec §5.9): every tick-metered op consumes one
@@ -365,7 +415,8 @@ impl<'a, H: Host> Interpreter<'a, H> {
             .iter()
             .position(|f| &*self.module.strings[f.name as usize] == name)
             .ok_or_else(|| RtError::new(format!("no function `{name}` in {}", self.module.path)))?;
-        self.push_call(None, idx as u32, args, None, false)?;
+        let principal = Principal::of(self.host.self_object());
+        self.push_call(None, idx as u32, args, None, false, principal, Vec::new())?;
         self.run()
     }
 
@@ -377,6 +428,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
         self.run()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_call(
         &mut self,
         code: Option<Rc<dyn ProgramCode>>,
@@ -384,6 +436,8 @@ impl<'a, H: Host> Interpreter<'a, H> {
         args: Vec<Value>,
         ret_into: Option<Reg>,
         entered: bool,
+        principal: Principal,
+        captures: Vec<Value>,
     ) -> R<()> {
         if self.stack.len() as u32 >= self.limits.max_depth {
             return Err(self.err_with_trace_uncatchable(format!(
@@ -416,8 +470,15 @@ impl<'a, H: Host> Interpreter<'a, H> {
         let k = args.len() as u32 - f.min_arity;
         let pc = f.entry_points[k as usize];
         let atomic = f.atomic;
+        let capture_targets = f.capture_targets.clone();
         let mut regs: Vec<Value> = args;
         regs.resize(f.reg_types.len(), Value::Null);
+        // Preload a closure body's captured-by-value snapshot (spec r5
+        // §5.2.2, OBI-79) before the body runs — always empty for an
+        // ordinary call.
+        for (&treg, val) in capture_targets.iter().zip(captures) {
+            regs[treg as usize] = val;
+        }
         let atomic_mark = atomic.then(|| self.host.begin_atomic());
         self.stack.push(Frame {
             code,
@@ -428,6 +489,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
             ret_into,
             handlers: Vec::new(),
             atomic_mark,
+            principal,
         });
         Ok(())
     }
@@ -520,8 +582,16 @@ impl<'a, H: Host> Interpreter<'a, H> {
     }
 
     /// Push a resolved cross-module call, or store its already-computed
-    /// value, per the host's [`HostCall`] answer.
-    fn enter_or_store(&mut self, hc: HostCall, dst: Option<Reg>) -> R<Step> {
+    /// value, per the host's [`HostCall`] answer. `principal_override`
+    /// gives the pushed frame's principal directly (a `CallValue`'s
+    /// `Principal::min(caller, value)`, spec r5 §5.2.2); `None` for every
+    /// ordinary dispatch, which uses the callee object's own principal.
+    fn enter_or_store(
+        &mut self,
+        hc: HostCall,
+        dst: Option<Reg>,
+        principal_override: Option<Principal>,
+    ) -> R<Step> {
         match hc {
             HostCall::Done(v) => {
                 if let Some(dst) = dst {
@@ -533,8 +603,10 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 func,
                 self_obj,
                 args,
+                captures,
             } => {
-                self.push_call(Some(code), func, args, dst, true)?;
+                let principal = principal_override.unwrap_or(Principal::of(self_obj));
+                self.push_call(Some(code), func, args, dst, true, principal, captures)?;
                 self.host.enter_self(self_obj);
             }
         }
@@ -701,7 +773,8 @@ impl<'a, H: Host> Interpreter<'a, H> {
                             .ok_or_else(|| self.err_with_trace(format!("no function `{name}`")))?;
                         // Same module as the caller: share its code handle.
                         let code = self.stack.last().unwrap().code.clone();
-                        self.push_call(code, idx as u32, argv, dst, false)?;
+                        let principal = self.stack.last().unwrap().principal;
+                        self.push_call(code, idx as u32, argv, dst, false, principal, Vec::new())?;
                         Ok(Step::Continue)
                     }
                     CalleeOp::Static { program, name } => {
@@ -716,14 +789,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
                             },
                             argv,
                         )?;
-                        self.enter_or_store(hc, dst)
+                        self.enter_or_store(hc, dst, None)
                     }
                     CalleeOp::Virtual { name } => {
                         let name = self.str_of(name).to_string();
                         let hc = self
                             .host
                             .dispatch(CallTarget::Virtual { name: &name }, argv)?;
-                        self.enter_or_store(hc, dst)
+                        self.enter_or_store(hc, dst, None)
                     }
                 }
             }
@@ -739,7 +812,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 let hc = self
                     .host
                     .dispatch(CallTarget::Other { recv, name: &name }, argv)?;
-                self.enter_or_store(hc, Some(dst))
+                self.enter_or_store(hc, Some(dst), None)
             }
             Op::CallEfun { dst, name, args } => {
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
@@ -814,6 +887,65 @@ impl<'a, H: Host> Interpreter<'a, H> {
             Op::PopHandler => {
                 self.stack.last_mut().unwrap().handlers.pop();
                 Ok(Step::Continue)
+            }
+            Op::MakeFn { dst, callee } => {
+                let callee = match callee {
+                    CalleeOp::Virtual { name } => Callee::Virtual {
+                        name: Rc::from(self.str_of(name)),
+                    },
+                    CalleeOp::Static { program, name } => Callee::Static {
+                        program: Rc::from(self.str_of(program)),
+                        name: Rc::from(self.str_of(name)),
+                    },
+                };
+                let creator = self.host.self_object();
+                let principal = self.stack.last().unwrap().principal;
+                let v = Value::function(FunctionValue {
+                    creator,
+                    body: FnBody::Named(callee),
+                    principal,
+                });
+                set!(dst, v);
+                Ok(Step::Continue)
+            }
+            Op::MakeClosure {
+                dst,
+                func,
+                captures,
+            } => {
+                let captured: Vec<Value> = captures.iter().map(|r| reg!(*r)).collect();
+                let code = self.host.current_program()?;
+                let program_version = code.version();
+                let creator = self.host.self_object();
+                let principal = self.stack.last().unwrap().principal;
+                let v = Value::function(FunctionValue {
+                    creator,
+                    body: FnBody::Closure {
+                        code,
+                        func,
+                        captures: captured,
+                        program_version,
+                    },
+                    principal,
+                });
+                set!(dst, v);
+                Ok(Step::Continue)
+            }
+            Op::CallValue { dst, func, args } => {
+                let fval = reg!(func);
+                let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
+                let Some(f) = fval.as_fn() else {
+                    return Err(self.err_with_trace(format!(
+                        "cannot call a {} as a function",
+                        fval.type_name()
+                    )));
+                };
+                let creator = f.creator;
+                let body = f.body.clone();
+                let caller_principal = self.stack.last().unwrap().principal;
+                let effective = Principal::min(caller_principal, f.principal);
+                let hc = self.host.dispatch_value(creator, &body, argv)?;
+                self.enter_or_store(hc, dst, Some(effective))
             }
         }
     }
@@ -1234,6 +1366,7 @@ mod tests {
                 reg_types: vec![Ty::Int; 6],
                 entry_points: vec![0],
                 code,
+                capture_targets: Vec::new(),
             }],
         }
     }
@@ -1364,6 +1497,7 @@ mod tests {
                 reg_types: vec![Ty::array(Ty::Int), Ty::array(Ty::Int), Ty::Int, Ty::Int],
                 entry_points: vec![0],
                 code,
+                capture_targets: Vec::new(),
             }],
         };
         let mut host = NoHost;

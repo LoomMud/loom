@@ -287,6 +287,12 @@ pub struct ClosureFn {
     pub ret: Ty,
     pub locals: Vec<Local>,
     pub body: Block,
+    /// This closure's own local ids that must be preloaded, in order, from
+    /// the captured-by-value snapshot taken at the `Closure` expression
+    /// (spec r5 §5.2.2, OBI-79): index `i` here pairs with `Closure`'s
+    /// `captures[i]` (the *outer* local being captured). Empty for a
+    /// closure that captures nothing.
+    pub captures: Vec<LocalId>,
 }
 
 #[derive(Clone, Debug)]
@@ -306,11 +312,13 @@ pub enum ExprKind {
     SelfObj,
     /// A function of this program used as a value (`add_verb("x", do_x)`).
     FnRef(Callee),
-    /// A closure literal `fn(params) => …` / `fn(params) { … }`. V1 does not
-    /// capture the enclosing function's locals (a V5 runtime feature,
-    /// OBI-32): the body sees only its own parameters, program globals,
-    /// `self` and named functions.
-    Closure(Rc<ClosureFn>),
+    /// A closure literal `fn(params) => …` / `fn(params) { … }` (spec r5
+    /// §5.2.2, OBI-79): captures the enclosing function's locals **by
+    /// value**, snapshotted at this expression. The second field is the
+    /// *outer* local ids being captured, in the same order as
+    /// `ClosureFn::captures` (the closure's own local ids that receive
+    /// them).
+    Closure(Rc<ClosureFn>, Vec<LocalId>),
     Index {
         base: Box<Expr>,
         index: Box<Expr>,

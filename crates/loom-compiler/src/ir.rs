@@ -62,6 +62,12 @@ pub struct Function {
     /// [`crate::bytecode::FunctionCode::entry_points`]. Length is always
     /// `param_count - min_arity + 1`; the last entry is always `entry`.
     pub default_entries: Vec<BlockId>,
+    /// This function's own register ids that a [`Inst::MakeClosure`]
+    /// referencing it must preload from its captured-by-value snapshot,
+    /// before the callee's normal parameter prologue runs (spec r5
+    /// §5.2.2, OBI-79). Empty for every function that is not a closure
+    /// body.
+    pub capture_targets: Vec<Reg>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -193,6 +199,34 @@ pub enum Inst {
     CallEfun {
         dst: Option<Reg>,
         name: &'static str,
+        args: Vec<Reg>,
+    },
+    /// A named function reference used as a value (`add_verb("x", do_x)`,
+    /// spec r5 §5.2.2, OBI-79): no captures. Late-bound at call time — see
+    /// `Inst::CallValue`.
+    MakeFn {
+        dst: Reg,
+        callee: Callee,
+    },
+    /// An anonymous closure literal (spec r5 §5.2.2, OBI-79): `func` is the
+    /// index (into this program's *flattened* function list — named
+    /// functions first, then every closure body found anywhere in the
+    /// program, in the order they were lowered) of the closure's body;
+    /// `captures` are this function's registers to snapshot **by value**
+    /// right now, in the order `Function::capture_targets` on that body
+    /// expects them.
+    MakeClosure {
+        dst: Reg,
+        func: u32,
+        captures: Vec<Reg>,
+    },
+    /// Call a function *value* (`f(args)` where `f` is a local of type
+    /// `fn(...)` or `any`): late-bound, spec r5 §5.2.2. `func` is not
+    /// necessarily known statically; the VM resolves it from the runtime
+    /// value itself (a named reference, or a pinned closure body).
+    CallValue {
+        dst: Option<Reg>,
+        func: Reg,
         args: Vec<Reg>,
     },
     /// Runtime-checked conversion to `ty` (the gradual boundary, HIR

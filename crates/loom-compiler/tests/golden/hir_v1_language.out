@@ -19,7 +19,7 @@ program /main
   fn pub adder() -> fn(int) -> int
     local %0 f: fn(int) -> int
     let %0:f
-      closure(1 params) : fn(int) -> int
+      closure(1 params, 0 captures) : fn(int) -> int
         return
           Add Int : int
             %0:x : int

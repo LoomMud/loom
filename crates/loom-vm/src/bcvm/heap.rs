@@ -36,9 +36,101 @@
 
 use std::rc::Rc;
 
+use loom_compiler::bytecode::Callee;
 use loom_syntax::ast::{Type, TypeKind};
 
+use crate::bcvm::vm::ProgramCode;
 use crate::object::ObjectId;
+
+/// Least-privileged (uid, euid) on the stack at a function value's
+/// creation (spec r5 §5.2.2, OBI-79). **Deviation, tracked for OBI-35:**
+/// Loom has no uid/euid model yet, so this is a placeholder that only
+/// records *which object* the principal came from; `Principal::min` cannot
+/// yet implement a real least-privilege ordering and just keeps the
+/// creator's side (see its doc comment). OBI-35 replaces the payload with
+/// real (uid, euid) pairs and defines the real ordering; the call sites
+/// that need `min(creator, stack)` (the synthetic creator frame pushed by
+/// invocation) are already wired so that swap is the only change needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Principal {
+    pub of: ObjectId,
+}
+
+impl Principal {
+    pub fn of(id: ObjectId) -> Principal {
+        Principal { of: id }
+    }
+
+    /// `min(creator, stack)` (spec r5 §5.2.2): the effective principal a
+    /// function value's synthetic creator frame carries. Until OBI-35
+    /// lands a real uid/euid ordering there is no basis to compare two
+    /// `ObjectId`s by privilege, so this conservatively keeps the
+    /// *creator*'s principal — the identity the security model most cares
+    /// a caller cannot borrow past (a function value only ever runs code
+    /// its creator already had). OBI-35 must replace this with the real
+    /// least-privilege comparison before enforcement can rely on it.
+    pub fn min(_stack: Principal, creator: Principal) -> Principal {
+        creator
+    }
+}
+
+/// How a [`FunctionValue`] is invoked (spec r5 §5.2.2, OBI-79).
+#[derive(Clone)]
+pub enum FnBody {
+    /// A named reference (`add_verb("x", do_x)`, `&do_x`): no captures, no
+    /// pinned version. Late-bound: resolved by (creator, name) on the
+    /// creator's *current* program at call time (a missing name is a
+    /// runtime error).
+    Named(Callee),
+    /// An anonymous closure literal: captures by value, snapshotted at
+    /// creation (`captures[i]` preloads into `code`'s
+    /// `capture_targets[i]` register — see
+    /// `loom_compiler::bytecode::FunctionCode::capture_targets`). Pins the
+    /// creator's program version at creation time: `code` is the exact
+    /// `Rc<CompiledProgram>` alive then, kept alive by this value's own
+    /// refcount even across a later hot-reload `upgrade()` of the creator
+    /// (the AC's "old version stays alive via the closures' refcount,
+    /// freed after the last one dies").
+    Closure {
+        code: Rc<dyn ProgramCode>,
+        func: u32,
+        captures: Vec<Value>,
+        /// The creator's program version at creation, for the stale-call
+        /// warning/metric (`loom_stale_closure_calls_total{program}`):
+        /// compared against the creator's *current* program version at
+        /// call time by whoever drives the call (`RegistryHost`).
+        program_version: u32,
+    },
+}
+
+impl std::fmt::Debug for FnBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FnBody::Named(c) => write!(f, "Named({c:?})"),
+            FnBody::Closure {
+                func,
+                captures,
+                program_version,
+                ..
+            } => write!(
+                f,
+                "Closure {{ func: {func}, captures: {captures:?}, program_version: {program_version} }}"
+            ),
+        }
+    }
+}
+
+/// A function value (spec r5 §5.2.2, OBI-79): the runtime representation
+/// of a closure literal or a named function reference used as a value.
+#[derive(Clone, Debug)]
+pub struct FunctionValue {
+    /// The object whose code created this value — for a `Named` value,
+    /// also who `(creator, name)` late-binding resolves against; for a
+    /// `Closure`, who its body runs "as" (its own `self`/globals).
+    pub creator: ObjectId,
+    pub body: FnBody,
+    pub principal: Principal,
+}
 
 /// A heap-allocated Weft value: string, array, or map. Always reached
 /// through [`Value::Heap`]. No field here is interior-mutable; see the
@@ -48,6 +140,8 @@ pub enum HeapObj {
     Str(Box<str>),
     Array(Vec<Value>),
     Map(MapData),
+    /// A function value (spec r5 §5.2.2, OBI-79). See [`FunctionValue`].
+    Fn(FunctionValue),
 }
 
 /// Insertion-ordered entries backing a Weft map value. Order is preserved
@@ -124,6 +218,11 @@ impl Value {
         Value::Heap(Rc::new(HeapObj::Map(m)))
     }
 
+    /// See [`FunctionValue`].
+    pub fn function(f: FunctionValue) -> Value {
+        Value::Heap(Rc::new(HeapObj::Fn(f)))
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::Heap(h) => match &**h {
@@ -148,6 +247,16 @@ impl Value {
         match self {
             Value::Heap(h) => match &**h {
                 HeapObj::Map(m) => Some(m),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn as_fn(&self) -> Option<&FunctionValue> {
+        match self {
+            Value::Heap(h) => match &**h {
+                HeapObj::Fn(f) => Some(f),
                 _ => None,
             },
             _ => None,
@@ -189,6 +298,7 @@ impl Value {
                 HeapObj::Str(_) => "string",
                 HeapObj::Array(_) => "array",
                 HeapObj::Map(_) => "map",
+                HeapObj::Fn(_) => "function",
             },
         }
     }
@@ -196,7 +306,12 @@ impl Value {
     /// `==` semantics (spec r5 §5.2.1): primitives and strings by value,
     /// objects by identity, arrays and maps **structurally** (not by
     /// reference/identity — value semantics means two unrelated arrays
-    /// with equal elements are equal).
+    /// with equal elements are equal). Function values are not given any
+    /// value equality by the spec; this compares them by heap identity
+    /// (the same closure/reference, not merely an equivalent one), which
+    /// is at least never wrong to call "equal" even though it may under-
+    /// report (two independently-created references to the same named
+    /// function are `!=` here).
     pub fn equals(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Null, Value::Null) => true,
@@ -210,6 +325,7 @@ impl Value {
                     x.len() == y.len() && x.iter().zip(y).all(|(a, b)| a.equals(b))
                 }
                 (HeapObj::Map(x), HeapObj::Map(y)) => x == y,
+                (HeapObj::Fn(_), HeapObj::Fn(_)) => Rc::ptr_eq(a, b),
                 _ => false,
             },
             _ => false,
@@ -236,6 +352,7 @@ impl Value {
             (TypeKind::Object, Value::Object(_)) => true,
             (TypeKind::Array(_), Value::Heap(h)) => matches!(**h, HeapObj::Array(_)),
             (TypeKind::Map(..), Value::Heap(h)) => matches!(**h, HeapObj::Map(_)),
+            (TypeKind::Fn { .. }, Value::Heap(h)) => matches!(**h, HeapObj::Fn(_)),
             _ => false,
         }
     }
@@ -303,6 +420,9 @@ fn write_value(
                     write_value(out, e, name, depth + 1, true);
                 }
                 out.push('}');
+            }
+            HeapObj::Fn(f) => {
+                let _ = write!(out, "<function of {}>", name(f.creator));
             }
         },
     }

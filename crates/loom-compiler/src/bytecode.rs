@@ -74,6 +74,8 @@ pub struct FunctionCode {
     /// entirely. Length is always `params - min_arity + 1`.
     pub entry_points: Vec<PC>,
     pub code: Vec<Op>,
+    /// See [`crate::ir::Function::capture_targets`].
+    pub capture_targets: Vec<Reg>,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +171,23 @@ pub enum Op {
     CallEfun {
         dst: Option<Reg>,
         name: StrId,
+        args: Vec<Reg>,
+    },
+    /// See [`crate::ir::Inst::MakeFn`].
+    MakeFn {
+        dst: Reg,
+        callee: CalleeOp,
+    },
+    /// See [`crate::ir::Inst::MakeClosure`].
+    MakeClosure {
+        dst: Reg,
+        func: u32,
+        captures: Vec<Reg>,
+    },
+    /// See [`crate::ir::Inst::CallValue`].
+    CallValue {
+        dst: Option<Reg>,
+        func: Reg,
         args: Vec<Reg>,
     },
     Cast {
@@ -460,6 +479,7 @@ impl Writer {
         for op in &f.code {
             self.put_op(op);
         }
+        self.put_reg_vec(&f.capture_targets);
     }
     fn put_op(&mut self, op: &Op) {
         match op {
@@ -661,6 +681,37 @@ impl Writer {
                 self.put_opt_reg(*catch_reg);
             }
             Op::PopHandler => self.put_u8(23),
+            Op::MakeFn { dst, callee } => {
+                self.put_u8(24);
+                self.put_varu32(*dst);
+                match callee {
+                    CalleeOp::Virtual { name } => {
+                        self.put_u8(0);
+                        self.put_varu32(*name);
+                    }
+                    CalleeOp::Static { program, name } => {
+                        self.put_u8(1);
+                        self.put_varu32(*program);
+                        self.put_varu32(*name);
+                    }
+                }
+            }
+            Op::MakeClosure {
+                dst,
+                func,
+                captures,
+            } => {
+                self.put_u8(25);
+                self.put_varu32(*dst);
+                self.put_varu32(*func);
+                self.put_reg_vec(captures);
+            }
+            Op::CallValue { dst, func, args } => {
+                self.put_u8(26);
+                self.put_opt_reg(*dst);
+                self.put_varu32(*func);
+                self.put_reg_vec(args);
+            }
         }
     }
 }
@@ -877,6 +928,7 @@ impl<'a> Reader<'a> {
         for _ in 0..n_code {
             code.push(self.get_op()?);
         }
+        let capture_targets = self.get_reg_vec()?;
         Ok(FunctionCode {
             name,
             atomic,
@@ -886,6 +938,7 @@ impl<'a> Reader<'a> {
             reg_types,
             entry_points,
             code,
+            capture_targets,
         })
     }
     fn get_op(&mut self) -> Result<Op, DecodeError> {
@@ -1023,6 +1076,30 @@ impl<'a> Reader<'a> {
                 catch_reg: self.get_opt_reg()?,
             },
             23 => Op::PopHandler,
+            24 => {
+                let dst = self.get_varu32()?;
+                let callee = match self.get_u8()? {
+                    0 => CalleeOp::Virtual {
+                        name: self.get_varu32()?,
+                    },
+                    1 => CalleeOp::Static {
+                        program: self.get_varu32()?,
+                        name: self.get_varu32()?,
+                    },
+                    t => return Err(DecodeError(format!("bad callee tag {t}"))),
+                };
+                Op::MakeFn { dst, callee }
+            }
+            25 => Op::MakeClosure {
+                dst: self.get_varu32()?,
+                func: self.get_varu32()?,
+                captures: self.get_reg_vec()?,
+            },
+            26 => Op::CallValue {
+                dst: self.get_opt_reg()?,
+                func: self.get_varu32()?,
+                args: self.get_reg_vec()?,
+            },
             t => return Err(DecodeError(format!("bad opcode {t}"))),
         })
     }
@@ -1050,6 +1127,7 @@ mod tests {
                     Op::LoadConst { dst: 0, idx: 0 },
                     Op::Return { src: Some(0) },
                 ],
+                capture_targets: vec![0],
             }],
         };
         let bytes = encode(&m);
@@ -1057,6 +1135,7 @@ mod tests {
         assert_eq!(back.path.as_ref(), "/std/room");
         assert_eq!(back.functions.len(), 1);
         assert_eq!(back.functions[0].code.len(), 2);
+        assert_eq!(back.functions[0].capture_targets, vec![0]);
     }
 
     #[test]
@@ -1074,6 +1153,7 @@ mod tests {
                 reg_types: vec![],
                 entry_points: vec![0],
                 code: vec![Op::Return { src: None }],
+                capture_targets: vec![],
             }],
         };
         let bytes = encode(&m);
