@@ -378,6 +378,72 @@ fn cross_object_calls_need_existing_functions() {
     assert!(e.contains("no function `fly` on /domains/hall"), "{e}");
 }
 
+// OBI-76: suggested by the OBI-75 review — `self_ref.f()` still goes
+// through `CallTarget::Other` (any `recv.name()` call site does, `self()`
+// included; see `check.rs`'s `E::Method` handling), so a private `f` is
+// refused even when the receiver just happens to be the calling object
+// itself. Visibility is a property of the *call form*, not of who ends up
+// on the receiving end.
+#[test]
+fn self_ref_call_other_on_a_private_function_is_still_refused() {
+    let obj = r#"
+private fn secret() -> string {
+    return "hidden"
+}
+
+pub fn probe() -> string {
+    let self_ref = self()
+    return self_ref.secret()
+}
+"#;
+    let files = [
+        (
+            "/secure/master.wf",
+            "fn main() -> any {\n  return load_object(\"/obj/selfish\").probe()\n}\n",
+        ),
+        ("/obj/selfish.wf", obj),
+    ];
+    let e = run_files(&files).unwrap_err();
+    assert!(e.contains("`secret` in /obj/selfish is not `pub`"), "{e}");
+}
+
+// OBI-76: suggested by the OBI-75 review — the trace shape across a
+// driver-efun boundary. `load_object` on an object whose `create()` fails
+// nests a *second*, non-suspendable `Interpreter` (`RegistryHost::call_in`,
+// see `bcvm::vm`'s module doc on "the one remaining nesting"): that inner
+// interpreter's own unwind appends its own frames to `RtError::trace`
+// first, and `load_object`'s efun handler folds that into the *message*
+// of a brand new (trace-less) `RtError` — so when the error keeps
+// unwinding up through the *outer* interpreter (the one that called
+// `load_object`), the outer interpreter's own frames land in that new
+// error's `trace` field instead. `RtError::report()` prints the message
+// (inner frames already baked in) followed by the outer trace — the two
+// interpreters' frames appear in call order: innermost object's `create()`
+// first, then the caller's own frames, never interleaved or reversed.
+#[test]
+fn load_object_create_failure_combines_both_interpreters_traces_in_order() {
+    let broken = "fn create() {\n  let z = 0\n  let x = 1 / z\n}\n";
+    let files = [
+        (
+            "/secure/master.wf",
+            "fn main() -> any {\n  return load_object(\"/obj/broken\")\n}\n",
+        ),
+        ("/obj/broken.wf", broken),
+    ];
+    let e = run_files(&files).unwrap_err();
+    // Outer wrapping, from the `load_object` efun handler.
+    assert!(e.contains("load_object(\"/obj/broken\") failed:"), "{e}");
+    // Inner interpreter's own error and frame, baked into the message
+    // *before* anything from the outer interpreter.
+    assert!(e.contains("division by zero"), "{e}");
+    let create_at = e.find("in create()").expect("inner `create()` frame");
+    let main_at = e.find("in main()").expect("outer `main()` frame");
+    assert!(
+        create_at < main_at,
+        "inner frame must precede the outer caller's frame: {e}"
+    );
+}
+
 #[test]
 fn objects_clones_and_movement() {
     let thing = "pub fn id() -> string {\n  return \"thing\"\n}\npub fn go(dest: object) {\n  move_to(dest)\n}\n";
