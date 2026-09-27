@@ -3,7 +3,7 @@
 
 mod support;
 
-use loom_persist::{DbEvent, DbRequest, GrantKind, ObjectState, spawn_db_worker};
+use loom_persist::{DbEvent, DbRequest, GrantKind, ObjectState, Password, spawn_db_worker};
 use serde_json::json;
 use std::time::Duration;
 use support::{seed_account, seed_domain, seed_domain_member, seed_staff, staff_tier, unique_uid};
@@ -83,7 +83,7 @@ async fn async_worker_returns_event_while_world_ticks_continue() {
         return;
     };
 
-    let (request_tx, mut event_rx) = spawn_db_worker(fx.app.pool().clone(), 8);
+    let (request_tx, mut event_rx) = spawn_db_worker(fx.app.clone(), 8);
     request_tx
         .send(DbRequest::Sleep {
             correlation_id: 42,
@@ -109,6 +109,9 @@ async fn async_worker_returns_event_while_world_ticks_continue() {
                     DbEvent::QueryFailed { correlation_id, message } => {
                         panic!("sleep query failed for {correlation_id}: {message}");
                     }
+                    DbEvent::AccountResult { .. } => {
+                        panic!("unexpected AccountResult from a Sleep request");
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(2)) => {
@@ -121,6 +124,84 @@ async fn async_worker_returns_event_while_world_ticks_continue() {
         ticks >= 5,
         "world loop should continue ticking during slow query"
     );
+}
+
+/// D-27.7-style CI-DB coverage (skips locally if no DB is configured, per
+/// `support::setup`): `spawn_db_worker`'s `CreateAccount`/`VerifyLogin`
+/// against a real Postgres-backed `Persist`, including the unique-username
+/// -> `"exists"` and wrong-password -> `"bad_credentials"` mappings.
+#[tokio::test]
+async fn spawn_db_worker_account_create_and_login_against_postgres() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let (request_tx, mut event_rx) = spawn_db_worker(fx.app.clone(), 8);
+    let username = unique_uid("db-worker-ranger");
+
+    request_tx
+        .send(DbRequest::CreateAccount {
+            correlation_id: 1,
+            username: username.clone(),
+            password: Password::new("anduril-db-worker"),
+        })
+        .await
+        .expect("enqueue create");
+    let created = event_rx.recv().await.expect("create result");
+    let account_id = match created {
+        DbEvent::AccountResult {
+            correlation_id: 1,
+            ok: true,
+            detail,
+        } => detail,
+        other => panic!("expected a successful create, got {other:?}"),
+    };
+    assert!(uuid::Uuid::parse_str(&account_id).is_ok());
+
+    // Duplicate username -> "exists", not a raw DB error.
+    request_tx
+        .send(DbRequest::CreateAccount {
+            correlation_id: 2,
+            username: username.clone(),
+            password: Password::new("anduril-db-worker"),
+        })
+        .await
+        .expect("enqueue duplicate create");
+    let dup = event_rx.recv().await.expect("duplicate result");
+    assert!(matches!(
+        dup,
+        DbEvent::AccountResult { correlation_id: 2, ok: false, ref detail } if detail == "exists"
+    ));
+
+    // Wrong password -> "bad_credentials".
+    request_tx
+        .send(DbRequest::VerifyLogin {
+            correlation_id: 3,
+            username: username.clone(),
+            password: Password::new("wrong-password"),
+        })
+        .await
+        .expect("enqueue wrong-password login");
+    let bad = event_rx.recv().await.expect("wrong-password result");
+    assert!(matches!(
+        bad,
+        DbEvent::AccountResult { correlation_id: 3, ok: false, ref detail } if detail == "bad_credentials"
+    ));
+
+    // Right password -> success, same account id as the create.
+    request_tx
+        .send(DbRequest::VerifyLogin {
+            correlation_id: 4,
+            username,
+            password: Password::new("anduril-db-worker"),
+        })
+        .await
+        .expect("enqueue login");
+    let ok = event_rx.recv().await.expect("login result");
+    assert!(matches!(
+        ok,
+        DbEvent::AccountResult { correlation_id: 4, ok: true, ref detail } if *detail == account_id
+    ));
 }
 
 /// D-27.7: a direct write to `staff` must fail for `loom_app` -- an actual

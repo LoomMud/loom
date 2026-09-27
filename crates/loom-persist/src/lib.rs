@@ -32,6 +32,8 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde_json::Value;
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -102,6 +104,24 @@ pub enum DbRequest {
         correlation_id: u64,
         duration_ms: u64,
     },
+    /// `account_create()` (spec, OBI-85): create a new account. Answered
+    /// with [`DbEvent::AccountResult`] (`detail` is the new account's uuid
+    /// on success, or `"exists"`/`"unavailable"` on failure -- the driver
+    /// validates `name`/`password` shape itself before ever building one of
+    /// these, so `"invalid"` never comes from here).
+    CreateAccount {
+        correlation_id: u64,
+        username: String,
+        password: Password,
+    },
+    /// `account_login()`: verify a login. Answered with
+    /// [`DbEvent::AccountResult`] (`detail` is the account's uuid on
+    /// success, or `"bad_credentials"`/`"unavailable"` on failure).
+    VerifyLogin {
+        correlation_id: u64,
+        username: String,
+        password: Password,
+    },
 }
 
 #[derive(Debug)]
@@ -113,6 +133,37 @@ pub enum DbEvent {
         correlation_id: u64,
         message: String,
     },
+    /// The answer to a [`DbRequest::CreateAccount`]/[`DbRequest::VerifyLogin`].
+    AccountResult {
+        correlation_id: u64,
+        ok: bool,
+        detail: String,
+    },
+}
+
+/// A password in transit to/from the DB worker. The only way to read the
+/// contents back out is [`Password::expose`] -- everything else
+/// (`Debug`, and therefore anything that formats a [`DbRequest`] whole,
+/// including tracing/log/error-report call sites and any future field
+/// added to `DbRequest`) redacts it, per spec ("the password must never
+/// appear in tracing spans, logs, the privilege `AuditEntry`, error
+/// reports, or `Debug` output of `DbRequest`").
+pub struct Password(String);
+
+impl Password {
+    pub fn new(s: impl Into<String>) -> Password {
+        Password(s.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Password {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Password(<redacted>)")
+    }
 }
 
 /// Run schema migrations against `migrate_database_url`.
@@ -404,8 +455,23 @@ impl Persist {
     }
 }
 
+/// Detect a unique-constraint violation (Postgres code `23505`) so
+/// `account_create` can distinguish "this username already exists" from
+/// any other database failure.
+fn is_unique_violation(err: &sqlx::Error) -> bool {
+    matches!(
+        err.as_database_error().and_then(|d| d.code()),
+        Some(code) if code == "23505"
+    )
+}
+
+/// Spawn the world-facing async DB worker (OBI-33/OBI-85): everything the
+/// world thread sends on the returned [`DbRequest`] sender runs off the
+/// world thread (Argon2 hashing and any query against `persist`'s pool),
+/// and the answer comes back on the returned [`DbEvent`] receiver, which
+/// the world thread drains with `try_recv` (never `.await`s it).
 pub fn spawn_db_worker(
-    pool: PgPool,
+    persist: Persist,
     queue_depth: usize,
 ) -> (mpsc::Sender<DbRequest>, mpsc::Receiver<DbEvent>) {
     let (request_tx, mut request_rx) = mpsc::channel::<DbRequest>(queue_depth);
@@ -413,7 +479,7 @@ pub fn spawn_db_worker(
 
     tokio::spawn(async move {
         while let Some(request) = request_rx.recv().await {
-            match request {
+            let event = match request {
                 DbRequest::Sleep {
                     correlation_id,
                     duration_ms,
@@ -421,24 +487,300 @@ pub fn spawn_db_worker(
                     let seconds = duration_ms as f64 / 1000.0;
                     let result = sqlx::query("SELECT pg_sleep($1)")
                         .bind(seconds)
-                        .execute(&pool)
+                        .execute(persist.pool())
                         .await;
-
-                    let event = match result {
+                    match result {
                         Ok(_) => DbEvent::SleepDone { correlation_id },
                         Err(error) => DbEvent::QueryFailed {
                             correlation_id,
                             message: error.to_string(),
                         },
-                    };
-                    if event_tx.send(event).await.is_err() {
-                        warn!("db worker exiting: world event receiver dropped");
-                        break;
                     }
                 }
+                DbRequest::CreateAccount {
+                    correlation_id,
+                    username,
+                    password,
+                } => {
+                    let (ok, detail) =
+                        match persist.create_account(&username, password.expose()).await {
+                            Ok(account) => (true, account.id.to_string()),
+                            Err(PersistError::Db(e)) if is_unique_violation(&e) => {
+                                (false, "exists".to_string())
+                            }
+                            Err(_) => (false, "unavailable".to_string()),
+                        };
+                    DbEvent::AccountResult {
+                        correlation_id,
+                        ok,
+                        detail,
+                    }
+                }
+                DbRequest::VerifyLogin {
+                    correlation_id,
+                    username,
+                    password,
+                } => {
+                    let (ok, detail) =
+                        match persist.verify_login(&username, password.expose()).await {
+                            Ok(Some(account)) => (true, account.id.to_string()),
+                            Ok(None) => (false, "bad_credentials".to_string()),
+                            Err(_) => (false, "unavailable".to_string()),
+                        };
+                    DbEvent::AccountResult {
+                        correlation_id,
+                        ok,
+                        detail,
+                    }
+                }
+            };
+            if event_tx.send(event).await.is_err() {
+                warn!("db worker exiting: world event receiver dropped");
+                break;
             }
         }
     });
 
     (request_tx, event_rx)
+}
+
+/// The in-memory dev backend for `account_create`/`account_login` (spec,
+/// OBI-85): used when `DATABASE_URL` is unset. Same Argon2 hashing as
+/// [`Persist`] (off the calling task via `spawn_blocking`, matching the
+/// "never blocks" requirement), but nothing here survives a restart --
+/// callers should log a startup warning once, which this function does
+/// not do itself (it has no way to know if it is only ever constructed
+/// once), so `loom-cli` logs it at the call site instead.
+pub fn spawn_dev_account_worker(
+    queue_depth: usize,
+) -> (mpsc::Sender<DbRequest>, mpsc::Receiver<DbEvent>) {
+    let (request_tx, mut request_rx) = mpsc::channel::<DbRequest>(queue_depth);
+    let (event_tx, event_rx) = mpsc::channel::<DbEvent>(queue_depth);
+    let store: HashMap<String, (Uuid, String)> = HashMap::new();
+    let store = std::sync::Arc::new(Mutex::new(store));
+
+    tokio::spawn(async move {
+        while let Some(request) = request_rx.recv().await {
+            let event = match request {
+                DbRequest::Sleep { correlation_id, .. } => DbEvent::QueryFailed {
+                    correlation_id,
+                    message: "dev account backend does not support Sleep".to_string(),
+                },
+                DbRequest::CreateAccount {
+                    correlation_id,
+                    username,
+                    password,
+                } => {
+                    if store.lock().unwrap().contains_key(&username) {
+                        DbEvent::AccountResult {
+                            correlation_id,
+                            ok: false,
+                            detail: "exists".to_string(),
+                        }
+                    } else {
+                        let pass = password.expose().to_string();
+                        let hash = tokio::task::spawn_blocking(move || dev_hash(&pass)).await;
+                        match hash {
+                            Ok(Ok(hash)) => {
+                                let id = Uuid::new_v4();
+                                store.lock().unwrap().insert(username, (id, hash));
+                                DbEvent::AccountResult {
+                                    correlation_id,
+                                    ok: true,
+                                    detail: id.to_string(),
+                                }
+                            }
+                            _ => DbEvent::AccountResult {
+                                correlation_id,
+                                ok: false,
+                                detail: "unavailable".to_string(),
+                            },
+                        }
+                    }
+                }
+                DbRequest::VerifyLogin {
+                    correlation_id,
+                    username,
+                    password,
+                } => {
+                    let entry = store.lock().unwrap().get(&username).cloned();
+                    match entry {
+                        None => DbEvent::AccountResult {
+                            correlation_id,
+                            ok: false,
+                            detail: "bad_credentials".to_string(),
+                        },
+                        Some((id, hash)) => {
+                            let pass = password.expose().to_string();
+                            let verified =
+                                tokio::task::spawn_blocking(move || dev_verify(&pass, &hash)).await;
+                            match verified {
+                                Ok(true) => DbEvent::AccountResult {
+                                    correlation_id,
+                                    ok: true,
+                                    detail: id.to_string(),
+                                },
+                                _ => DbEvent::AccountResult {
+                                    correlation_id,
+                                    ok: false,
+                                    detail: "bad_credentials".to_string(),
+                                },
+                            }
+                        }
+                    }
+                }
+            };
+            if event_tx.send(event).await.is_err() {
+                warn!("dev account worker exiting: world event receiver dropped");
+                break;
+            }
+        }
+    });
+
+    (request_tx, event_rx)
+}
+
+fn dev_argon2() -> Argon2<'static> {
+    let params = Params::new(ARGON_M_COST_KIB, ARGON_T_COST, ARGON_P_COST, None)
+        .expect("static argon2 params are always valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+fn dev_hash(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    dev_argon2()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| PersistError::PasswordHash(e.to_string()))
+}
+
+fn dev_verify(password: &str, hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(hash) else {
+        return false;
+    };
+    dev_argon2()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Spec (OBI-85): "the password must never appear in ... `Debug`
+    /// output of `DbRequest`". Covers both request variants, and checks
+    /// the *whole* enum's `Debug`, not just `Password`'s in isolation, so
+    /// a future field added directly to `DbRequest` in plain `String`
+    /// would have to deliberately avoid this test rather than pass it by
+    /// accident.
+    #[test]
+    fn db_request_debug_output_never_contains_the_password() {
+        let secret = "correct horse battery staple";
+        let create = DbRequest::CreateAccount {
+            correlation_id: 1,
+            username: "legolas".to_string(),
+            password: Password::new(secret),
+        };
+        let login = DbRequest::VerifyLogin {
+            correlation_id: 2,
+            username: "legolas".to_string(),
+            password: Password::new(secret),
+        };
+        for req in [format!("{create:?}"), format!("{login:?}")] {
+            assert!(!req.contains(secret), "password leaked into Debug: {req}");
+            assert!(
+                req.contains("redacted"),
+                "expected a redaction marker: {req}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_account_worker_create_duplicate_and_wrong_password() {
+        let (tx, mut rx) = spawn_dev_account_worker(8);
+
+        tx.send(DbRequest::CreateAccount {
+            correlation_id: 1,
+            username: "ranger".to_string(),
+            password: Password::new("anduril123"),
+        })
+        .await
+        .unwrap();
+        let created = rx.recv().await.unwrap();
+        let DbEvent::AccountResult {
+            correlation_id: 1,
+            ok: true,
+            detail,
+        } = created
+        else {
+            panic!("expected a successful create, got {created:?}");
+        };
+        assert!(
+            uuid::Uuid::parse_str(&detail).is_ok(),
+            "detail should be a uuid: {detail}"
+        );
+
+        // Duplicate username.
+        tx.send(DbRequest::CreateAccount {
+            correlation_id: 2,
+            username: "ranger".to_string(),
+            password: Password::new("anduril123"),
+        })
+        .await
+        .unwrap();
+        let dup = rx.recv().await.unwrap();
+        assert!(matches!(
+            dup,
+            DbEvent::AccountResult { correlation_id: 2, ok: false, ref detail } if detail == "exists"
+        ));
+
+        // Wrong password.
+        tx.send(DbRequest::VerifyLogin {
+            correlation_id: 3,
+            username: "ranger".to_string(),
+            password: Password::new("wrong-password"),
+        })
+        .await
+        .unwrap();
+        let bad = rx.recv().await.unwrap();
+        assert!(matches!(
+            bad,
+            DbEvent::AccountResult { correlation_id: 3, ok: false, ref detail } if detail == "bad_credentials"
+        ));
+
+        // Right password.
+        tx.send(DbRequest::VerifyLogin {
+            correlation_id: 4,
+            username: "ranger".to_string(),
+            password: Password::new("anduril123"),
+        })
+        .await
+        .unwrap();
+        let ok = rx.recv().await.unwrap();
+        assert!(matches!(
+            ok,
+            DbEvent::AccountResult {
+                correlation_id: 4,
+                ok: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dev_account_worker_unknown_username_is_bad_credentials_not_exists_leak() {
+        let (tx, mut rx) = spawn_dev_account_worker(8);
+        tx.send(DbRequest::VerifyLogin {
+            correlation_id: 1,
+            username: "nobody".to_string(),
+            password: Password::new("whatever-password"),
+        })
+        .await
+        .unwrap();
+        let event = rx.recv().await.unwrap();
+        assert!(matches!(
+            event,
+            DbEvent::AccountResult { ok: false, ref detail, .. } if detail == "bad_credentials"
+        ));
+    }
 }
