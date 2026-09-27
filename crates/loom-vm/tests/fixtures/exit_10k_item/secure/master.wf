@@ -1,0 +1,5 @@
+// Master object for the OBI-91 P1 V4 exit test: hands every new
+// connection a fresh player.
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
