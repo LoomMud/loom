@@ -14,3 +14,13 @@ fn connect() -> object {
     player.set_name($"guest{guests}")
     return player
 }
+
+// Phase 0 policy (OBI-35): the driver fails closed without these applies.
+// Everyone may use every efun and recompile anything; real tiers are S2.
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}

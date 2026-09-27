@@ -222,10 +222,15 @@ fn compile_object_is_a_gated_p1_efun_and_gets_audited() {
         world.input(1, "update /std/player", &mut host);
         host.take(1);
 
+        // OBI-35: two decisions, the efun class gate (`valid_efun`) and
+        // then the path gate (`valid_compile`), both allowed by the
+        // fixture's Phase 0 master.
         let log = world.audit_log();
-        assert_eq!(log.len(), 1);
-        assert_eq!(log[0].efun, "compile_object");
+        assert_eq!(log.len(), 2);
+        assert!(log.iter().all(|e| e.efun == "compile_object" && e.allowed));
         assert_eq!(log[0].privilege, loom_vm::efuns::Privilege::P1);
-        assert!(log[0].allowed);
+        assert_eq!(log[0].apply, "valid_efun");
+        assert_eq!(log[1].apply, "valid_compile");
+        assert_eq!(&*log[1].arg, "/std/player");
     });
 }

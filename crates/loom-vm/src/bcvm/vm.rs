@@ -230,6 +230,23 @@ pub trait Host {
     /// A [`HostCall::Enter`] frame for `obj` was pushed: `self_object()`
     /// must now answer `obj` until the matching [`Host::leave_self`].
     fn enter_self(&mut self, _obj: ObjectId) {}
+    /// The current guard set (OBI-35 D-S1.6): what a function value
+    /// created right now captures as its creator principal.
+    fn current_guard(&self) -> crate::security::GuardSet {
+        crate::security::GuardSet::empty()
+    }
+    /// Push a function value's synthetic creator frame (OBI-35 D-S1.7):
+    /// the guard becomes `current ∪ guard` until the matching
+    /// [`Host::leave_creator_frame`]. The callee's own frame is pushed
+    /// after it through the usual [`Host::enter_self`].
+    fn enter_creator_frame(&mut self, _guard: &crate::security::GuardSet) {}
+    fn leave_creator_frame(&mut self) {}
+    /// Extra ticks the host wants charged for the efun that just returned
+    /// (policy-cache misses, OBI-35 D-S1.3). Polled after every
+    /// `call_efun`.
+    fn take_extra_ticks(&mut self) -> u64 {
+        0
+    }
     /// The frame pushed by the matching [`Host::enter_self`] was popped.
     fn leave_self(&mut self) {}
     /// `Value::array_mut`/`map_mut` actually cloned a shared buffer
@@ -899,7 +916,12 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 self.charge_ticks(crate::efuns::tick_cost(&name_s).unwrap_or(1) as u64)?;
                 let v = match self.call_efun(&name_s, &argv) {
                     Some(v) => v?,
-                    None => self.host.call_efun(&name_s, argv)?,
+                    None => {
+                        let r = self.host.call_efun(&name_s, argv);
+                        let extra = self.host.take_extra_ticks();
+                        self.charge_ticks(extra)?;
+                        r?
+                    }
                 };
                 if let Some(dst) = dst {
                     set!(dst, v);

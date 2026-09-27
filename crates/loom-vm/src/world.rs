@@ -21,8 +21,8 @@ use crate::bcvm::registry::{Compiler, Registry, RegistryHost};
 use crate::bcvm::vm::{Limits as VmLimits, RtError};
 use crate::host::{Host, NullHost};
 use crate::object::ObjectId;
-use crate::privilege::{AllowAllAudited, AuditEntry, PrivilegeCheck};
 use crate::scheduler::Scheduler;
+use crate::security::{AuditEntry, SecurityState};
 
 /// Path of the master object.
 pub const MASTER_PATH: &str = "/secure/master";
@@ -147,9 +147,6 @@ pub struct World {
     limits: Limits,
     /// `call_out`/heartbeat scheduler (OBI-33), advanced by `World::tick`.
     scheduler: Scheduler,
-    /// P1+ enforcement hook (OBI-33): stubbed allow-all + audit log until
-    /// S1's policy replaces it (see `crate::privilege`).
-    privilege: Box<dyn PrivilegeCheck>,
     /// `compile_object`/`update` requests dispatched to a background
     /// thread but not yet applied (OBI-90/D-P1.5): `World::tick` installs
     /// each one as soon as it finishes, so ticks in between are never
@@ -164,6 +161,9 @@ pub struct World {
     account_next_id: u64,
     account_pending: HashMap<u64, ObjectId>,
     account_results: VecDeque<(u64, ObjectId, bool, String)>,
+    /// Stack-based privilege check state (OBI-35): decision cache, policy
+    /// epoch, audit ring buffer.
+    security: SecurityState,
 }
 
 /// Identifies one [`World::begin_recompile`] call, so its eventual result
@@ -189,7 +189,6 @@ impl World {
             master: None,
             limits,
             scheduler: Scheduler::new(),
-            privilege: Box::new(AllowAllAudited::new()),
             pending_recompiles: Vec::new(),
             finished_recompiles: Vec::new(),
             next_recompile_token: 0,
@@ -197,6 +196,7 @@ impl World {
             account_next_id: 0,
             account_pending: HashMap::new(),
             account_results: VecDeque::new(),
+            security: SecurityState::new(),
         };
         let mut null = NullHost;
         let master = w
@@ -286,13 +286,13 @@ impl World {
             conn,
             self.master,
             &mut self.scheduler,
-            self.privilege.as_mut(),
             crate::world::AccountsCtx {
                 next_id: &mut self.account_next_id,
                 pending: &mut self.account_pending,
                 results: &mut self.account_results,
                 auth: self.account_auth.as_mut(),
             },
+            &mut self.security,
         );
         let result = body(&mut rh);
         self.registry.debug_assert_atomic_scope_closed();
@@ -465,10 +465,28 @@ impl World {
         }
     }
 
-    /// Every P1+ efun call recorded so far by the enforcement hook
-    /// (OBI-33; empty until an efun with a gated `Privilege` runs).
+    /// The retained window of privileged decisions (OBI-35): every P1+
+    /// efun's `valid_efun` gate plus every path/bind/seteuid decision,
+    /// allowed or denied, oldest first.
     pub fn audit_log(&self) -> &[AuditEntry] {
-        self.privilege.log()
+        self.security.log()
+    }
+
+    /// Stack-check state (OBI-35): cache hit/miss/denial counters, the
+    /// policy epoch, the audit window.
+    pub fn security(&self) -> &SecurityState {
+        &self.security
+    }
+
+    /// The uid/euid name behind a [`crate::security::Sym`] (audit entries).
+    pub fn principal_name(&self, s: crate::security::Sym) -> &str {
+        self.registry.syms.name(s)
+    }
+
+    /// Drop every cached privilege decision (OBI-35 D-S1.8), e.g. after a
+    /// roles snapshot swap.
+    pub fn flush_security_cache(&mut self) {
+        self.security.bump_epoch();
     }
 
     /// Pending `call_out` count (tests/introspection).
@@ -590,6 +608,12 @@ impl World {
     /// picked up by `poll_recompiles`/`tick`).
     pub fn recompile_pending(&self, token: RecompileToken) -> bool {
         self.pending_recompiles.iter().any(|(t, _)| *t == token)
+    }
+
+    /// Load (compile + create) `path` as the driver would for a preload.
+    pub fn load_object(&mut self, path: &str, host: &mut dyn Host) -> Result<ObjectId, String> {
+        self.exec(host, None, None, |h| h.load_object(path))
+            .map_err(|e| e.report())
     }
 
     /// Call a function on an object as the driver (visibility not enforced).

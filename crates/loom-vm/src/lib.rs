@@ -15,9 +15,9 @@ pub mod efuns;
 pub mod fileio;
 pub mod host;
 pub mod object;
-pub mod privilege;
 pub mod rng;
 pub mod scheduler;
+pub mod security;
 pub mod world;
 
 use std::path::Path;

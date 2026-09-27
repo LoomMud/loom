@@ -24,10 +24,9 @@
 /// Privilege class (§5.5): how sensitive an efun's effect is. `P0` is safe
 /// for any object to call unconditionally (pure queries, and the small set
 /// of side effects Phase 0-2 treat as always-available). `P1`+ efuns go
-/// through the enforcement hook (`crate::privilege::PrivilegeCheck`) before
-/// they run; the actual *policy* (which caller/tier may call which P1+
-/// efun) is S1's, this crate only fixes the hook point and audits calls
-/// until S1 lands (stubbed allow-all, see `crate::privilege`).
+/// through the stack-based check (`crate::security`, OBI-35) before they
+/// run: the master's `valid_efun` must allow the class for every euid on
+/// the stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Privilege {
     P0,
@@ -104,13 +103,26 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     // OBI-85: `destruct` on an object the caller doesn't own is P2, same
     // rationale as `disconnect` above (spec r5 §5.5).
     ("destruct", 1, 1, Privilege::P2, 5),
-    // OBI-85: mudlib-confined file I/O for the `ed`-lite builder command.
-    ("read_file", 1, 1, Privilege::P1, 20),
-    ("write_file", 2, 2, Privilege::P1, 20),
     // OBI-85: async R2-account logins (spec's `account_result` apply).
-    // Master-only in intent; S1 enforces, stub allow-all for now.
+    // Master-only: P3, so the S1 stack check routes it through
+    // `valid_efun`.
     ("account_create", 2, 2, Privilege::P3, 50),
     ("account_login", 2, 2, Privilege::P3, 50),
+    // OBI-35 (S1): identity and file efuns. `read_file` is P0 but its
+    // path is always checked with `valid_read`; `write_file` is P1 plus
+    // `valid_write`. Both then go through OBI-85's mudlib-confined
+    // `crate::fileio` (symlink-escape check, 1 MiB cap, `.wf`/`.txt`
+    // write allow-list). `seteuid` is P3 plus `valid_seteuid`.
+    // `unguarded` is P4-sensitive but gated by a driver rule (the
+    // caller's program is under /secure), not by `valid_efun` (design
+    // note D-S1.5).
+    ("getuid", 0, 0, Privilege::P0, 1),
+    ("geteuid", 0, 0, Privilege::P0, 1),
+    ("effective_principal", 0, 0, Privilege::P0, 1),
+    ("seteuid", 1, 1, Privilege::P3, 10),
+    ("read_file", 1, 1, Privilege::P0, 20),
+    ("write_file", 2, 2, Privilege::P1, 50),
+    ("unguarded", 1, 2, Privilege::P4, 10),
 ];
 
 /// `(min args, max args)` of efun `name`, if it exists.
@@ -119,6 +131,12 @@ pub fn arity(name: &str) -> Option<(usize, usize)> {
         .iter()
         .find(|(n, ..)| *n == name)
         .map(|(_, a, b, ..)| (*a, *b))
+}
+
+/// The registry's `'static` copy of efun `name` (so audit entries and
+/// policy-cache keys never allocate), if it exists.
+pub fn static_name(name: &str) -> Option<&'static str> {
+    EFUNS.iter().find(|(n, ..)| *n == name).map(|(n, ..)| *n)
 }
 
 /// The privilege class of efun `name`, if it exists.
