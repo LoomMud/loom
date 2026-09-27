@@ -3,3 +3,9 @@
 pub fn connect() -> object {
     return clone_object("/std/player")
 }
+
+// Phase 0 policy (OBI-35): the driver fails closed without this apply
+// (`upgrade_all` is P1).
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
