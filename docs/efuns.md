@@ -26,3 +26,13 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `call_out` | `call_out(String, Int) -> Int` | P0 | 5 |
 | `remove_call_out` | `remove_call_out(Int) -> Bool` | P0 | 2 |
 | `set_heartbeat` | `set_heartbeat(Bool) -> Void` | P0 | 2 |
+| `random` | `random(Int) -> Int` | P0 | 1 |
+| `time` | `time() -> Int` | P0 | 1 |
+| `users` | `users() -> Array(Object)` | P0 | 2 |
+| `lower` | `lower(String) -> String` | P0 | 1 |
+| `to_int` | `to_int(String) -> Optional(Int)` | P0 | 1 |
+| `destruct` | `destruct(Object) -> Void` | P2 | 5 |
+| `read_file` | `read_file(String) -> Optional(String)` | P1 | 20 |
+| `write_file` | `write_file(String, String) -> Bool` | P1 | 20 |
+| `account_create` | `account_create(String, String) -> Int` | P3 | 50 |
+| `account_login` | `account_login(String, String) -> Int` | P3 | 50 |

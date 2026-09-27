@@ -77,6 +77,16 @@ const NAMES: &[&str] = &[
     "call_out",
     "remove_call_out",
     "set_heartbeat",
+    "random",
+    "time",
+    "users",
+    "lower",
+    "to_int",
+    "destruct",
+    "read_file",
+    "write_file",
+    "account_create",
+    "account_login",
 ];
 
 /// All efun names known to the checker.
@@ -153,6 +163,49 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
             P0,
         ),
         "set_heartbeat" => ("set_heartbeat", vec![P(Ty::Bool)], 1, Ret::Ty(Ty::Void), P0),
+        // OBI-85 (Warp alpha S4 driver support): see `loom_vm::efuns` for
+        // the authoritative arity/privilege (kept in sync by
+        // `efun_table_matches_vm`).
+        "random" => ("random", vec![P(Ty::Int)], 1, Ret::Ty(Ty::Int), P0),
+        "time" => ("time", vec![], 0, Ret::Ty(Ty::Int), P0),
+        "users" => ("users", vec![], 0, Ret::Ty(Ty::array(Ty::Object)), P0),
+        "lower" => ("lower", vec![P(s.clone())], 1, Ret::Ty(s.clone()), P0),
+        "to_int" => (
+            "to_int",
+            vec![P(s.clone())],
+            1,
+            Ret::Ty(Ty::optional(Ty::Int)),
+            P0,
+        ),
+        "destruct" => ("destruct", vec![P(obj)], 1, Ret::Ty(Ty::Void), P2),
+        "read_file" => (
+            "read_file",
+            vec![P(s.clone())],
+            1,
+            Ret::Ty(Ty::optional(Ty::String)),
+            P1,
+        ),
+        "write_file" => (
+            "write_file",
+            vec![P(s.clone()), P(s.clone())],
+            2,
+            Ret::Ty(Ty::Bool),
+            P1,
+        ),
+        "account_create" => (
+            "account_create",
+            vec![P(s.clone()), P(s.clone())],
+            2,
+            Ret::Ty(Ty::Int),
+            P3,
+        ),
+        "account_login" => (
+            "account_login",
+            vec![P(s.clone()), P(s)],
+            2,
+            Ret::Ty(Ty::Int),
+            P3,
+        ),
         _ => return None,
     };
     Some(EfunSig {
