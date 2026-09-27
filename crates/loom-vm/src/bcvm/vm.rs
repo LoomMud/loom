@@ -12,20 +12,29 @@
 //! size — a 10k-deep Weft recursion fails with "Too deep recursion" the
 //! same way on a 64 KiB thread as on an 8 MiB one (see the test below).
 //!
-//! A cross-module call (`Virtual` dispatch, `CallOther`, `CallEfun`) is not
-//! something this module can resolve on its own (it needs the object
-//! table / program registry, which is `World`'s), so those go through the
-//! [`Host`] trait. `Host::call_static`/`call_efun`/etc. run to completion
-//! and return a [`Value`] or [`RtError`] to the calling frame; if a hosted
-//! call needs to run *more* Weft frames of its own (e.g. `call_other` into
-//! another object), the host's implementation must construct another
-//! [`Interpreter`] over its own `Vec<Frame>` rather than recursing on the
-//! Rust stack — this module cannot enforce that for a call it hands off,
-//! which is why it is the one exception the doc comment calls out.
+//! **D26: one flat frame stack across objects.** A cross-module call
+//! (`Virtual` dispatch, `super::`/`Static` into another program,
+//! `CallOther`) is resolved by the [`Host`] via [`Host::dispatch`], which
+//! may answer [`HostCall::Enter`]: "run function `func` of `code` as
+//! object `self_obj`". The interpreter then pushes that as an ordinary
+//! [`Frame`] on the *same* `Vec<Frame>` (bracketed by
+//! [`Host::enter_self`]/[`Host::leave_self`]), so the whole Weft call
+//! chain — across objects and programs — lives in one heap stack, is
+//! bounded by one `max_depth`, and can be suspended at a `TickCheck` and
+//! resumed ([`Interpreter::suspend_after_ticks`], [`Interpreter::resume`]).
+//! A host that cannot hand out code (the test hosts) answers
+//! [`HostCall::Done`] with an already-computed value instead.
+//!
+//! The one remaining nesting is a *driver efun* that itself runs Weft code
+//! (e.g. `load_object` running `create()`): that still builds a fresh
+//! [`Interpreter`] inside the host and is not suspendable; see
+//! `bcvm::registry`'s module doc.
 
 use loom_compiler::bytecode::{
     BinOp, CalleeOp, ConstValue, IndexKind, IterKind, Module, Op, OpKind, Reg, Ty, UnOp,
 };
+
+use std::rc::Rc;
 
 use crate::bcvm::heap::{MapData, Value};
 use crate::object::ObjectId;
@@ -58,6 +67,44 @@ impl RtError {
 
 pub type R<T> = Result<T, RtError>;
 
+/// Code a [`Host`] can hand back for the interpreter to run on its own
+/// frame stack (D26). Implemented by `bcvm::registry::CompiledProgram`.
+pub trait ProgramCode {
+    fn module(&self) -> &Module;
+}
+
+/// A call the interpreter could not resolve inside its own module.
+pub enum CallTarget<'s> {
+    /// `super::name` / `program::name`.
+    Static { program: &'s str, name: &'s str },
+    /// Unqualified `name(..)` on `self`.
+    Virtual { name: &'s str },
+    /// `recv.name(..)`.
+    Other { recv: Value, name: &'s str },
+}
+
+/// How a [`Host`] answers [`Host::dispatch`].
+pub enum HostCall {
+    /// The host ran the call itself (or it needed no Weft frames).
+    Done(Value),
+    /// Push function `func` of `code` as a new frame running as `self_obj`
+    /// on the caller's flat frame stack.
+    Enter {
+        code: Rc<dyn ProgramCode>,
+        func: u32,
+        self_obj: ObjectId,
+        args: Vec<Value>,
+    },
+}
+
+/// Result of driving an [`Interpreter`]: finished, or parked at a
+/// `TickCheck` with every frame intact (D26 suspend/resume hook).
+#[derive(Debug)]
+pub enum Exec {
+    Done(Value),
+    Suspended,
+}
+
 /// Callbacks for everything the interpreter cannot resolve from the
 /// [`Module`] it is running alone (§5.5, §5.9): cross-object/program calls,
 /// efuns, and `self`/program-variable access. `World` (OBI-31 follow-up)
@@ -77,12 +124,34 @@ pub trait Host {
     fn call_efun(&mut self, name: &str, args: Vec<Value>) -> R<Value>;
     fn load_global(&mut self, owner: &str, name: &str) -> Value;
     fn store_global(&mut self, owner: &str, name: &str, v: Value);
+
+    /// Resolve a cross-module call. The default runs it to completion via
+    /// the `call_*` methods above; a host that can hand out code overrides
+    /// this to return [`HostCall::Enter`] so the call stays on the
+    /// interpreter's one flat frame stack (D26).
+    fn dispatch(&mut self, target: CallTarget<'_>, args: Vec<Value>) -> R<HostCall> {
+        Ok(HostCall::Done(match target {
+            CallTarget::Static { program, name } => self.call_static(program, name, args)?,
+            CallTarget::Virtual { name } => self.call_virtual(name, args)?,
+            CallTarget::Other { recv, name } => self.call_other(recv, name, args)?,
+        }))
+    }
+    /// A [`HostCall::Enter`] frame for `obj` was pushed: `self_object()`
+    /// must now answer `obj` until the matching [`Host::leave_self`].
+    fn enter_self(&mut self, _obj: ObjectId) {}
+    /// The frame pushed by the matching [`Host::enter_self`] was popped.
+    fn leave_self(&mut self) {}
 }
 
 /// One activation: which function, at which instruction, with its own
 /// register file. Lives on [`Interpreter`]'s `Vec<Frame>`, never on the
 /// native stack.
 struct Frame {
+    /// The module this frame runs; `None` = the interpreter's base module.
+    code: Option<Rc<dyn ProgramCode>>,
+    /// Pushed via [`HostCall::Enter`], so popping it must call
+    /// [`Host::leave_self`].
+    entered: bool,
     func: u32,
     pc: u32,
     regs: Vec<Value>,
@@ -104,12 +173,21 @@ impl Default for Limits {
     }
 }
 
+/// What one [`Interpreter::step`] did.
+enum Step {
+    Continue,
+    Returned(Value),
+    Suspend,
+}
+
 pub struct Interpreter<'a, H: Host> {
     module: &'a Module,
     host: &'a mut H,
     limits: &'a Limits,
     ticks_left: &'a mut u64,
     stack: Vec<Frame>,
+    /// Suspend-at-`TickCheck` countdown (D26 test hook); `None` = never.
+    suspend_after: Option<u64>,
 }
 
 impl<'a, H: Host> Interpreter<'a, H> {
@@ -125,7 +203,20 @@ impl<'a, H: Host> Interpreter<'a, H> {
             limits,
             ticks_left,
             stack: Vec::new(),
+            suspend_after: None,
         }
+    }
+
+    /// D26 test hook: park the whole call chain at the `n`th `TickCheck`
+    /// from now (`n >= 1`), returning [`Exec::Suspended`] with every frame
+    /// — across objects — left intact for [`Interpreter::resume`].
+    pub fn suspend_after_ticks(&mut self, n: u64) {
+        self.suspend_after = Some(n.max(1));
+    }
+
+    /// Current Weft frame depth (all objects), for tests/diagnostics.
+    pub fn depth(&self) -> usize {
+        self.stack.len()
     }
 
     /// Every [`Value`] currently reachable from live frames. Not needed by
@@ -136,12 +227,28 @@ impl<'a, H: Host> Interpreter<'a, H> {
         self.stack.iter().flat_map(|f| f.regs.iter())
     }
 
-    fn func_name(&self, idx: u32) -> &str {
-        &self.module.strings[self.module.functions[idx as usize].name as usize]
+    fn module_of<'s>(&'s self, f: &'s Frame) -> &'s Module {
+        match &f.code {
+            Some(c) => c.module(),
+            None => self.module,
+        }
+    }
+
+    /// The module the top frame is running (the base module if idle).
+    fn cur(&self) -> &Module {
+        match self.stack.last() {
+            Some(f) => self.module_of(f),
+            None => self.module,
+        }
+    }
+
+    fn frame_name<'s>(&'s self, f: &'s Frame) -> &'s str {
+        let m = self.module_of(f);
+        &m.strings[m.functions[f.func as usize].name as usize]
     }
 
     fn str_of(&self, id: u32) -> &str {
-        &self.module.strings[id as usize]
+        &self.cur().strings[id as usize]
     }
 
     fn tick(&mut self) -> R<()> {
@@ -152,39 +259,73 @@ impl<'a, H: Host> Interpreter<'a, H> {
         Ok(())
     }
 
+    /// A runtime error raised by the current instruction. The frame trace
+    /// is appended once, by [`Interpreter::run`], when the error unwinds
+    /// the (single, flat) frame stack.
     fn err_with_trace(&self, msg: impl Into<String>) -> RtError {
-        let mut e = RtError::new(msg);
-        for f in self.stack.iter().rev().take(12) {
-            e.trace.push(format!("in {}()", self.func_name(f.func)));
-        }
-        e
+        RtError::new(msg)
     }
 
     /// Call `name` in this module with `args`, from outside any running
     /// frame (the World-facing entry point: `call_apply`, etc.).
     pub fn call(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
+        match self.start(name, args)? {
+            Exec::Done(v) => Ok(v),
+            Exec::Suspended => Err(RtError::new(
+                "internal: call suspended; use start/resume to drive a suspendable call",
+            )),
+        }
+    }
+
+    /// Like [`Interpreter::call`], but may return [`Exec::Suspended`] if
+    /// [`Interpreter::suspend_after_ticks`] was armed.
+    pub fn start(&mut self, name: &str, args: Vec<Value>) -> R<Exec> {
+        if !self.stack.is_empty() {
+            return Err(RtError::new(
+                "internal: interpreter already has a call in flight",
+            ));
+        }
         let idx = self
             .module
             .functions
             .iter()
-            .position(|f| self.str_of(f.name) == name)
+            .position(|f| &*self.module.strings[f.name as usize] == name)
             .ok_or_else(|| RtError::new(format!("no function `{name}` in {}", self.module.path)))?;
-        self.push_call(idx as u32, args, None)?;
+        self.push_call(None, idx as u32, args, None, false)?;
         self.run()
     }
 
-    fn push_call(&mut self, idx: u32, args: Vec<Value>, ret_into: Option<Reg>) -> R<()> {
+    /// Continue a call parked by [`Interpreter::suspend_after_ticks`].
+    pub fn resume(&mut self) -> R<Exec> {
+        if self.stack.is_empty() {
+            return Err(RtError::new("internal: nothing to resume"));
+        }
+        self.run()
+    }
+
+    fn push_call(
+        &mut self,
+        code: Option<Rc<dyn ProgramCode>>,
+        idx: u32,
+        args: Vec<Value>,
+        ret_into: Option<Reg>,
+        entered: bool,
+    ) -> R<()> {
         if self.stack.len() as u32 >= self.limits.max_depth {
             return Err(self.err_with_trace(format!(
                 "Too deep recursion (call depth limit {} exceeded)",
                 self.limits.max_depth
             )));
         }
-        let f = &self.module.functions[idx as usize];
+        let m: &Module = match &code {
+            Some(c) => c.module(),
+            None => self.module,
+        };
+        let f = &m.functions[idx as usize];
         if args.len() != f.params as usize {
+            let fname = m.strings[f.name as usize].to_string();
             return Err(self.err_with_trace(format!(
-                "{}() takes {} argument(s), got {}",
-                self.func_name(idx),
+                "{fname}() takes {} argument(s), got {}",
                 f.params,
                 args.len()
             )));
@@ -192,6 +333,8 @@ impl<'a, H: Host> Interpreter<'a, H> {
         let mut regs: Vec<Value> = args;
         regs.resize(f.reg_types.len(), Value::Null);
         self.stack.push(Frame {
+            code,
+            entered,
             func: idx,
             pc: 0,
             regs,
@@ -200,35 +343,74 @@ impl<'a, H: Host> Interpreter<'a, H> {
         Ok(())
     }
 
-    /// Drive frames until the outermost call returns.
-    fn run(&mut self) -> R<Value> {
-        let base_depth = self.stack.len() - 1;
+    /// Pop the top frame, restoring the host's `self` if it was entered.
+    fn pop_frame(&mut self) -> Frame {
+        let f = self.stack.pop().unwrap();
+        if f.entered {
+            self.host.leave_self();
+        }
+        f
+    }
+
+    /// Drive frames until the outermost call returns (or suspends).
+    fn run(&mut self) -> R<Exec> {
         loop {
             match self.step() {
-                Ok(Some(v)) if self.stack.len() == base_depth => return Ok(v),
+                Ok(Step::Returned(v)) if self.stack.is_empty() => return Ok(Exec::Done(v)),
+                Ok(Step::Suspend) => return Ok(Exec::Suspended),
                 Ok(_) => continue,
                 Err(mut e) => {
-                    // step() already pushed the innermost frame's name; add
-                    // any remaining frames beneath it once, then unwind.
+                    // Any trace already on `e` came from deeper, non-flat
+                    // execution (a driver efun's nested run); append every
+                    // live frame of this stack beneath it once, then unwind.
                     if e.trace.len() < 12 {
-                        for f in self.stack.iter().rev().skip(1).take(12 - e.trace.len()) {
-                            e.trace.push(format!("in {}()", self.func_name(f.func)));
-                        }
+                        let names: Vec<String> = self
+                            .stack
+                            .iter()
+                            .rev()
+                            .take(12 - e.trace.len())
+                            .map(|f| format!("in {}()", self.frame_name(f)))
+                            .collect();
+                        e.trace.extend(names);
                     }
-                    self.stack.truncate(base_depth);
+                    while !self.stack.is_empty() {
+                        self.pop_frame();
+                    }
                     return Err(e);
                 }
             }
         }
     }
 
-    /// Execute one instruction of the top frame. `Ok(Some(v))` means a
+    /// Push a resolved cross-module call, or store its already-computed
+    /// value, per the host's [`HostCall`] answer.
+    fn enter_or_store(&mut self, hc: HostCall, dst: Option<Reg>) -> R<Step> {
+        match hc {
+            HostCall::Done(v) => {
+                if let Some(dst) = dst {
+                    self.stack.last_mut().unwrap().regs[dst as usize] = v;
+                }
+            }
+            HostCall::Enter {
+                code,
+                func,
+                self_obj,
+                args,
+            } => {
+                self.push_call(Some(code), func, args, dst, true)?;
+                self.host.enter_self(self_obj);
+            }
+        }
+        Ok(Step::Continue)
+    }
+
+    /// Execute one instruction of the top frame. `Returned(v)` means a
     /// frame returned `v` (popped); the caller keeps looping until the
-    /// frame count is back to where `run` started.
-    fn step(&mut self) -> R<Option<Value>> {
+    /// frame stack is empty.
+    fn step(&mut self) -> R<Step> {
         let func_idx = self.stack.last().unwrap().func;
         let pc = self.stack.last().unwrap().pc as usize;
-        let code: &[Op] = &self.module.functions[func_idx as usize].code;
+        let code: &[Op] = &self.cur().functions[func_idx as usize].code;
         let op = code.get(pc).cloned().ok_or_else(|| {
             self.err_with_trace("internal: program counter ran off the end of the function")
         })?;
@@ -254,15 +436,15 @@ impl<'a, H: Host> Interpreter<'a, H> {
         match op {
             Op::LoadConst { dst, idx } => {
                 set!(dst, self.const_value(idx));
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::Copy { dst, src } => {
                 set!(dst, reg!(src));
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::LoadSelf { dst } => {
                 set!(dst, Value::Object(self.host.self_object()));
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::LoadGlobal {
                 dst, owner, name, ..
@@ -273,7 +455,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 );
                 let v = self.host.load_global(&owner, &name);
                 set!(dst, v);
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::StoreGlobal {
                 owner, name, src, ..
@@ -283,12 +465,12 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     self.str_of(name).to_string(),
                 );
                 self.host.store_global(&owner, &name, reg!(src));
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::UnOp { dst, op, kind, src } => {
                 let v = self.un_op(op, kind, reg!(src))?;
                 set!(dst, v);
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::BinOp {
                 dst,
@@ -299,12 +481,12 @@ impl<'a, H: Host> Interpreter<'a, H> {
             } => {
                 let v = self.bin_op(op, kind, reg!(a), reg!(b))?;
                 set!(dst, v);
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::NewArray { dst, elems, .. } => {
                 let v = Value::array(elems.iter().map(|r| reg!(*r)).collect());
                 set!(dst, v);
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::NewMap { dst, entries, .. } => {
                 let mut m = MapData::default();
@@ -312,7 +494,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     m.insert(reg!(k), reg!(v));
                 }
                 set!(dst, Value::map(m));
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::Index {
                 dst,
@@ -322,7 +504,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
             } => {
                 let v = self.index(kind, reg!(base), reg!(index))?;
                 set!(dst, v);
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::IndexSet {
                 base,
@@ -343,17 +525,17 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 let val = reg!(src);
                 let frame = self.stack.last_mut().unwrap();
                 Self::index_set(kind, &mut frame.regs[base as usize], key, val)?;
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::IterElems { dst, src, kind, .. } => {
                 let v = self.iter_elems(kind, reg!(src))?;
                 set!(dst, v);
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::ToStr { dst, src } => {
                 let s = self.show(&reg!(src));
                 set!(dst, Value::str(&s));
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::Cast { dst, src, ty } => {
                 let v = reg!(src);
@@ -365,42 +547,46 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     )));
                 }
                 set!(dst, v);
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::Call { dst, callee, args } => {
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
                 match callee {
                     CalleeOp::Static { program, name }
-                        if self.str_of(program) == &*self.module.path =>
+                        if self.str_of(program) == &*self.cur().path =>
                     {
                         let name = self.str_of(name).to_string();
                         let idx = self
-                            .module
+                            .cur()
                             .functions
                             .iter()
                             .position(|f| self.str_of(f.name) == name)
                             .ok_or_else(|| self.err_with_trace(format!("no function `{name}`")))?;
-                        self.push_call(idx as u32, argv, dst)?;
-                        Ok(None)
+                        // Same module as the caller: share its code handle.
+                        let code = self.stack.last().unwrap().code.clone();
+                        self.push_call(code, idx as u32, argv, dst, false)?;
+                        Ok(Step::Continue)
                     }
                     CalleeOp::Static { program, name } => {
                         let (program, name) = (
                             self.str_of(program).to_string(),
                             self.str_of(name).to_string(),
                         );
-                        let v = self.host.call_static(&program, &name, argv)?;
-                        if let Some(dst) = dst {
-                            set!(dst, v);
-                        }
-                        Ok(None)
+                        let hc = self.host.dispatch(
+                            CallTarget::Static {
+                                program: &program,
+                                name: &name,
+                            },
+                            argv,
+                        )?;
+                        self.enter_or_store(hc, dst)
                     }
                     CalleeOp::Virtual { name } => {
                         let name = self.str_of(name).to_string();
-                        let v = self.host.call_virtual(&name, argv)?;
-                        if let Some(dst) = dst {
-                            set!(dst, v);
-                        }
-                        Ok(None)
+                        let hc = self
+                            .host
+                            .dispatch(CallTarget::Virtual { name: &name }, argv)?;
+                        self.enter_or_store(hc, dst)
                     }
                 }
             }
@@ -413,9 +599,10 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 let recv = reg!(recv);
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
                 let name = self.str_of(name).to_string();
-                let v = self.host.call_other(recv, &name, argv)?;
-                set!(dst, v);
-                Ok(None)
+                let hc = self
+                    .host
+                    .dispatch(CallTarget::Other { recv, name: &name }, argv)?;
+                self.enter_or_store(hc, Some(dst))
             }
             Op::CallEfun { dst, name, args } => {
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
@@ -427,11 +614,11 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 if let Some(dst) = dst {
                     set!(dst, v);
                 }
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::Jump { target } => {
                 jump!(target);
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::Branch {
                 cond,
@@ -442,30 +629,37 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     return Err(self.err_with_trace("internal: branch condition was not bool"));
                 };
                 jump!(if b { then_target } else { else_target });
-                Ok(None)
+                Ok(Step::Continue)
             }
             Op::Return { src } => {
                 let v = match src {
                     Some(r) => reg!(r),
                     None => Value::Null,
                 };
-                let frame = self.stack.pop().unwrap();
+                let frame = self.pop_frame();
                 if let Some(caller) = self.stack.last_mut()
                     && let Some(dst) = frame.ret_into
                 {
                     caller.regs[dst as usize] = v.clone();
                 }
-                Ok(Some(v))
+                Ok(Step::Returned(v))
             }
             Op::TickCheck => {
                 self.tick()?;
-                Ok(None)
+                if let Some(n) = self.suspend_after.as_mut() {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.suspend_after = None;
+                        return Ok(Step::Suspend);
+                    }
+                }
+                Ok(Step::Continue)
             }
         }
     }
 
     fn const_value(&self, idx: u32) -> Value {
-        match &self.module.consts[idx as usize] {
+        match &self.cur().consts[idx as usize] {
             ConstValue::Int(n) => Value::Int(*n),
             ConstValue::Float(x) => Value::Float(*x),
             ConstValue::Bool(b) => Value::Bool(*b),

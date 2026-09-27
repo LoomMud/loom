@@ -8,26 +8,28 @@
 //! instead of the single-module stand-in `bcvm_e2e.rs` used for the first
 //! codegen-bridge slice.
 //!
-//! **Scope of this slice (OBI-31 continuation):** this proves cross-object
-//! dispatch, inheritance-aware `super::` calls, and value-semantics
-//! aliasing *across* objects on the bytecode VM. It is deliberately not
-//! yet wired into [`crate::world::World`] (which still runs the Phase 0
-//! tree-walker via `crate::interp`): that swap needs `World`'s disk-backed
-//! compile/recompile/upgrade machinery ported to build [`CompiledProgram`]s
-//! instead of `crate::program::Program`s, which is the next slice.
+//! [`crate::world::World`] runs every `.wf` program through this module
+//! (OBI-72): [`Compiler`] loads/recompiles programs from disk,
+//! [`RegistryHost`] is the production [`Host`].
 //!
-//! **Known gap (flagged, not hidden):** [`RegistryHost::call_virtual`]/
-//! `call_other` each construct a *new* [`crate::bcvm::Interpreter`] with
-//! its own heap-allocated frame `Vec` — no Weft-level recursion limit is
-//! bypassed — but constructing that interpreter and driving it to
-//! completion is still a plain (recursive) Rust function call from the
-//! calling interpreter's `step`. Spec r5 D26 asks for cross-object calls
-//! to push a frame onto *one* flat interpreter loop so the whole call
-//! chain is suspendable at a `TickCheck`; that trampoline (a single
-//! `Interpreter` whose frame stack can hold frames for more than one
-//! object/module, with a host-call continuation instead of a nested
-//! `call()`) is real work still open on this issue, tracked in the PR
-//! description rather than done quietly here.
+//! **Spec r5 D26 (flat, suspendable call chain):** Weft-level calls that
+//! leave the running module — unqualified `f()` (virtual dispatch),
+//! `super::`/`program::f()`, and `ob.f()` — are answered through
+//! [`Host::dispatch`] with [`HostCall::Enter`], so the calling
+//! [`Interpreter`] pushes the callee as a frame on its *own* stack (with
+//! `self` switched via `enter_self`/`leave_self`). One call chain across any
+//! number of objects is one heap `Vec<Frame>`, bounded by one `max_depth`,
+//! and suspendable at any `TickCheck` (see
+//! `cross_object_chain_is_one_flat_suspendable_stack`).
+//!
+//! **Remaining nesting (bounded, not suspendable):** a *driver* entry
+//! point that has to start Weft code from Rust — `World`'s applies,
+//! `$init`, and driver efuns that run code (`load_object`/`clone_object`
+//! running `create()`, `compile_object`) — still starts a fresh
+//! [`Interpreter`] via [`RegistryHost::call_in`], guarded by
+//! [`NESTED_CALL_STACK_BUDGET`]. Function values/`apply` do not exist in
+//! the VM yet; when they land they must dispatch through
+//! [`Host::dispatch`] too.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,7 +42,7 @@ use loom_compiler::ty::Ty;
 
 use crate::bcvm::Value;
 use crate::bcvm::compile::{CompileError, compile_and_verify};
-use crate::bcvm::vm::{Host, Interpreter, Limits, R, RtError};
+use crate::bcvm::vm::{CallTarget, Host, HostCall, Interpreter, Limits, ProgramCode, R, RtError};
 use crate::object::ObjectId;
 
 /// The name of the synthetic per-program initialiser function
@@ -390,6 +392,12 @@ pub struct CompiledProgram {
     pub non_public: std::collections::HashSet<Rc<str>>,
 }
 
+impl ProgramCode for CompiledProgram {
+    fn module(&self) -> &Module {
+        &self.module
+    }
+}
+
 impl CompiledProgram {
     pub fn new(
         module: Module,
@@ -691,34 +699,25 @@ fn stack_addr() -> usize {
     std::hint::black_box(&marker) as *const u8 as usize
 }
 
-/// Native-stack budget for [`RegistryHost::call_in`]'s nested-`Interpreter`
-/// recursion (spec r5 D26's known gap, see this module's doc comment):
-/// every `call_virtual`/`call_other`/`super::` call is a real Rust-level
-/// recursive call (codegen never emits `CalleeOp::Local`, so *every*
-/// unqualified Weft call — including simple same-module self-recursion
-/// like `fn dive() { dive() }` — goes through this path, not just
-/// cross-object calls). `self_stack.len()` alone is not a safe bound: a
-/// fixed call-*count* limit that is safe in an optimized release build can
-/// still overflow the native stack in an unoptimized debug build (each
-/// nested `Interpreter::call`/`run` costs far more stack per frame there),
-/// so — exactly like the tree-walker's own `max_stack_bytes` — this checks
-/// the *actual* stack pointer distance from where the call chain started,
-/// not just a counter. A stack overflow aborts the whole process; a Weft
-/// runtime error does not, so this is what keeps that true until D26's
-/// flat frame stack removes the native recursion entirely.
+/// Native-stack budget for [`RegistryHost::call_in`]'s nested
+/// `Interpreter`s. Ordinary Weft calls no longer nest (D26, see the module
+/// doc); this only bounds driver-started runs that recurse through efuns
+/// (e.g. `create()` calling `load_object` of an object whose `create()`
+/// calls `load_object` …). A stack-pointer distance, not a counter, for
+/// the same reason as the tree-walker's `max_stack_bytes`: a debug build
+/// costs far more native stack per nested run than a release build.
 const NESTED_CALL_STACK_BUDGET: usize = 1_000_000;
 
 impl<'a> RegistryHost<'a> {
-    /// Resolve `name` on `recv`'s program chain (most-derived first) and
-    /// run it as `recv`. With `require_pub`, a non-`pub` target is refused
-    /// with the same wording the Phase 0 tree-walker used.
-    fn dispatch_on(
-        &mut self,
+    /// Resolve `name` on `recv`'s program chain (most-derived first). With
+    /// `require_pub`, a non-`pub` target is refused with the same wording
+    /// the Phase 0 tree-walker used.
+    fn resolve_on(
+        &self,
         recv: Value,
         name: &str,
-        args: Vec<Value>,
         require_pub: bool,
-    ) -> R<Value> {
+    ) -> R<(ObjectId, Rc<CompiledProgram>, u32)> {
         let Value::Object(recv_id) = recv else {
             return Err(RtError::new(format!(
                 "cannot call `{name}` on a {}",
@@ -740,7 +739,51 @@ impl<'a> RegistryHost<'a> {
                 target.path
             )));
         }
-        self.call_in(recv_id, &target, idx, args)
+        Ok((recv_id, target, idx))
+    }
+
+    /// `super::name()` / `program::name()`: `name` declared in exactly
+    /// `program` (an ancestor of self's program), never an override.
+    fn resolve_static(&self, program: &str, name: &str) -> R<(ObjectId, Rc<CompiledProgram>, u32)> {
+        let self_id = self.self_object();
+        let prog = self
+            .registry
+            .get(self_id)
+            .ok_or_else(|| RtError::new("call on a destructed object"))?
+            .program
+            .clone();
+        let target = prog
+            .chain()
+            .into_iter()
+            .find(|p| &*p.path == program)
+            .ok_or_else(|| {
+                RtError::new(format!("`{program}` is not an ancestor of {}", prog.path))
+            })?;
+        let idx = target
+            .resolve_own(name)
+            .ok_or_else(|| RtError::new(format!("no function `{name}` in {program}")))?;
+        Ok((self_id, target, idx))
+    }
+
+    fn resolve_target(&self, t: CallTarget<'_>) -> R<(ObjectId, Rc<CompiledProgram>, u32)> {
+        match t {
+            CallTarget::Static { program, name } => self.resolve_static(program, name),
+            // Unqualified `f()` on self: internal/private visibility was
+            // already enforced by the checker, so no `pub` check here.
+            CallTarget::Virtual { name } => {
+                self.resolve_on(Value::Object(self.self_object()), name, false)
+            }
+            // `ob.f()`: `ob` may be generically typed (`object`/`any`), so
+            // the checker cannot always see the callee; enforce `pub` here.
+            CallTarget::Other { recv, name } => self.resolve_on(recv, name, true),
+        }
+    }
+
+    /// Run-to-completion form of a resolved call (nested [`Interpreter`]);
+    /// only reached via the non-flat `Host::call_*` entry points.
+    fn run_target(&mut self, t: CallTarget<'_>, args: Vec<Value>) -> R<Value> {
+        let (on, target, idx) = self.resolve_target(t)?;
+        self.call_in(on, &target, idx, args)
     }
 
     pub fn new(registry: &'a mut Registry, self_object: ObjectId) -> Self {
@@ -1052,22 +1095,12 @@ impl<'a> RegistryHost<'a> {
         }
     }
 
-    /// Call `name` declared in exactly `target` (no virtual dispatch) as
-    /// `on`. Used for `$init` (each ancestor's own initialiser, never an
-    /// override) and by [`Self::call_static`]/`call_on`/`call_other` once
-    /// they have already resolved which program+slot to run.
-    /// Cross-object/virtual dispatch (`call_virtual`/`call_other`/`super::`)
-    /// nests a *new* [`Interpreter`] here — a real (if bounded) Rust-level
-    /// recursive call, not a push onto one flat frame stack (spec r5 D26
-    /// wants the latter so the whole call chain is suspendable at a
-    /// `TickCheck`; tracked as a known gap, see this module's doc comment).
-    /// Until that lands, `self_stack.len()` *is* this call chain's nesting
-    /// depth (it grows by exactly one per `call_in`, nested or not), so it
-    /// doubles as the guard that keeps unbounded Weft-level recursion
-    /// (e.g. `pub fn f() { f() }`, compiled to `CalleeOp::Virtual` even for
-    /// same-module calls) from overflowing the *native* stack: each nested
-    /// `Interpreter` only sees its own single frame, so `push_call`'s own
-    /// `max_depth` check never trips for this pattern without this.
+    /// Run `name` declared in exactly `target` as `on` in a *fresh*
+    /// [`Interpreter`] — the driver-started path (applies, `$init`, efuns
+    /// that run Weft code, and the run-to-completion `Host::call_*`
+    /// methods). Weft-to-Weft calls inside that run stay on its one flat
+    /// stack via [`Host::dispatch`]; only driver re-entry nests here, and
+    /// both `self_stack.len()` and [`NESTED_CALL_STACK_BUDGET`] bound it.
     fn call_in(
         &mut self,
         on: ObjectId,
@@ -1284,41 +1317,36 @@ impl Host for RegistryHost<'_> {
     }
 
     fn call_static(&mut self, program: &str, name: &str, args: Vec<Value>) -> R<Value> {
-        // `super::name()`: resolve `name` declared in exactly `program`
-        // (an ancestor of the caller's own program), never an override
-        // further down the chain.
-        let self_id = self.self_object();
-        let prog = self
-            .registry
-            .get(self_id)
-            .ok_or_else(|| RtError::new("call on a destructed object"))?
-            .program
-            .clone();
-        let target = prog
-            .chain()
-            .into_iter()
-            .find(|p| &*p.path == program)
-            .ok_or_else(|| {
-                RtError::new(format!("`{program}` is not an ancestor of {}", prog.path))
-            })?;
-        let idx = target
-            .resolve_own(name)
-            .ok_or_else(|| RtError::new(format!("no function `{name}` in {program}")))?;
-        // Same `self`, different (ancestor) program/module.
-        self.call_in(self_id, &target, idx, args)
+        self.run_target(CallTarget::Static { program, name }, args)
     }
 
     fn call_virtual(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
-        // Unqualified `f()` on self: internal/private visibility was already
-        // enforced by the checker, so no `pub` check here.
-        let self_id = self.self_object();
-        self.dispatch_on(Value::Object(self_id), name, args, false)
+        self.run_target(CallTarget::Virtual { name }, args)
     }
 
     fn call_other(&mut self, recv: Value, name: &str, args: Vec<Value>) -> R<Value> {
-        // `ob.f()`: `ob` may be generically typed (`object`/`any`), so the
-        // checker cannot always see the callee; enforce `pub` at runtime.
-        self.dispatch_on(recv, name, args, true)
+        self.run_target(CallTarget::Other { recv, name }, args)
+    }
+
+    /// D26: hand the resolved function back to the interpreter so it runs
+    /// as a frame on the caller's own flat stack (no nested `Interpreter`,
+    /// no native recursion, suspendable at any `TickCheck`).
+    fn dispatch(&mut self, target: CallTarget<'_>, args: Vec<Value>) -> R<HostCall> {
+        let (self_obj, code, func) = self.resolve_target(target)?;
+        Ok(HostCall::Enter {
+            code,
+            func,
+            self_obj,
+            args,
+        })
+    }
+
+    fn enter_self(&mut self, obj: ObjectId) {
+        self.self_stack.push(obj);
+    }
+
+    fn leave_self(&mut self) {
+        self.self_stack.pop();
     }
 
     fn call_efun(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
@@ -1345,6 +1373,7 @@ impl Host for RegistryHost<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bcvm::vm::Exec;
     use loom_compiler::mudlib::{Outcome, Session};
 
     #[test]
@@ -1769,6 +1798,130 @@ fn create() {
         assert_eq!(short.as_str(), Some("The Great Hall"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Three objects `a -> b -> c` on disk, loaded through [`Compiler`].
+    fn three_object_chain(tag: &str) -> (std::path::PathBuf, Registry, [ObjectId; 3]) {
+        let root = tmp_mudlib_root(tag);
+        let write = |rel: &str, src: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, src).unwrap();
+        };
+        write(
+            "t/c.wf",
+            "pub fn spin(n: int) -> int {\n    var i = 0\n    var acc = 0\n    while i < n {\n        acc += i\n        i += 1\n    }\n    return acc\n}\n\npub fn dive(n: int) -> int {\n    return dive(n + 1)\n}\n",
+        );
+        write(
+            "t/b.wf",
+            "pub fn via(c: object, n: int) -> any {\n    return c.spin(n)\n}\n",
+        );
+        write(
+            "t/a.wf",
+            "pub fn top(b: object, c: object, n: int) -> any {\n    return [b.via(c, n), self]\n}\n",
+        );
+        let mut compiler = Compiler::new(root.clone());
+        let mut registry = Registry::default();
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut ids = [placeholder; 3];
+        for (i, path) in ["/t/a", "/t/b", "/t/c"].into_iter().enumerate() {
+            let prog = compiler.ensure_program(&mut registry, path).unwrap();
+            let mut host = RegistryHost::new(&mut registry, placeholder);
+            ids[i] = host.instantiate(prog).unwrap();
+        }
+        (root, registry, ids)
+    }
+
+    /// Spec r5 D26: a call chain spanning three objects runs on *one* flat
+    /// frame stack — suspending at a `TickCheck` inside `c.spin` (two
+    /// objects deep) parks all three frames, `self` is `c` while parked,
+    /// and resuming yields exactly the uninterrupted result with `self`
+    /// correctly restored on the way back out.
+    #[test]
+    fn cross_object_chain_is_one_flat_suspendable_stack() {
+        let (root, mut registry, [a, b, c]) = three_object_chain("d26-suspend");
+        let prog_a = registry.get(a).unwrap().program.clone();
+        let args = || vec![Value::Object(b), Value::Object(c), Value::Int(50)];
+        let limits = Limits::default();
+
+        // Uninterrupted reference run.
+        let expected = {
+            let mut host = RegistryHost::new(&mut registry, a);
+            let mut ticks = 1_000_000u64;
+            let mut interp = Interpreter::new(&prog_a.module, &mut host, &limits, &mut ticks);
+            match interp.start("top", args()).unwrap() {
+                Exec::Done(v) => v,
+                Exec::Suspended => panic!("not armed, must not suspend"),
+            }
+        };
+
+        let mut host = RegistryHost::new(&mut registry, a);
+        let mut ticks = 1_000_000u64;
+        let mut interp = Interpreter::new(&prog_a.module, &mut host, &limits, &mut ticks);
+        interp.suspend_after_ticks(20);
+        assert!(matches!(
+            interp.start("top", args()).unwrap(),
+            Exec::Suspended
+        ));
+        assert_eq!(interp.depth(), 3, "a.top -> b.via -> c.spin, one stack");
+        let mut suspensions = 1;
+        let got = loop {
+            interp.suspend_after_ticks(7);
+            match interp.resume().unwrap() {
+                Exec::Done(v) => break v,
+                Exec::Suspended => suspensions += 1,
+            }
+        };
+        drop(interp);
+        assert!(suspensions > 1);
+        assert_eq!(format!("{got:?}"), format!("{expected:?}"));
+        assert_eq!(host.self_stack, vec![a], "self restored after unwinding");
+        assert_eq!(
+            format!("{got:?}"),
+            format!(
+                "{:?}",
+                Value::array(vec![Value::Int(1225), Value::Object(a)])
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// D-P1.3 + D26: unbounded Weft recursion through the host
+    /// (`dive` compiles to `CalleeOp::Virtual`) hits the flat stack's own
+    /// 10k-frame limit on a small native thread, because every frame
+    /// lives on the interpreter's heap stack — no native recursion at all.
+    /// The thread is 512 KiB (the debug-build parser/checker needs more than
+    /// 64 KiB just to *compile* the fixture), below the old nested-call
+    /// guard's 1 MB budget, so 10k nested `Interpreter`s would abort here.
+    #[test]
+    fn host_dispatched_recursion_never_touches_the_native_stack() {
+        let out = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let (root, mut registry, [_, _, c]) = three_object_chain("d26-deep");
+                let prog = registry.get(c).unwrap().program.clone();
+                let limits = Limits { max_depth: 10_000 };
+                let mut host = RegistryHost::new(&mut registry, c);
+                let mut ticks = 10_000_000u64;
+                let mut interp = Interpreter::new(&prog.module, &mut host, &limits, &mut ticks);
+                let e = interp.call("dive", vec![Value::Int(0)]).unwrap_err();
+                drop(interp);
+                let depth_after = host.self_stack.len();
+                let _ = std::fs::remove_dir_all(&root);
+                (e.message, depth_after)
+            })
+            .unwrap()
+            .join()
+            .expect("no native stack overflow");
+        assert!(
+            out.0.contains("call depth limit 10000 exceeded"),
+            "{}",
+            out.0
+        );
+        assert_eq!(out.1, 1, "every entered self popped on unwind");
     }
 
     fn tmp_mudlib_root(tag: &str) -> std::path::PathBuf {
