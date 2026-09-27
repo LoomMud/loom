@@ -67,12 +67,10 @@ pub fn fixture(name: &str) -> PathBuf {
     dir
 }
 
-/// Run `f` on a thread with the stack size the world thread must have.
+/// Run `f` on a plain spawned thread. The bytecode VM keeps its call
+/// stack on the heap (D-P1.3), not the native stack, so unlike the old
+/// tree-walker the world thread no longer needs an oversized stack; this
+/// helper is kept only so callers don't need to care where `f` runs.
 pub fn on_world_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    std::thread::Builder::new()
-        .stack_size(loom_vm::WORLD_THREAD_STACK)
-        .spawn(f)
-        .expect("spawn")
-        .join()
-        .expect("world thread panicked")
+    std::thread::spawn(f).join().expect("world thread panicked")
 }

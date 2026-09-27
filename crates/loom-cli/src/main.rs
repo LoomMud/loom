@@ -192,7 +192,6 @@ fn spawn_world_thread(
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let handle = thread::Builder::new()
         .name("loom-world".to_string())
-        .stack_size(loom_vm::WORLD_THREAD_STACK)
         .spawn(move || {
             let mut world = match World::boot(&mudlib_root) {
                 Ok(world) => {
