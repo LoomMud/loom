@@ -170,3 +170,55 @@ fn upgrade_all_spreads_migration_across_ticks_within_its_budget_without_starving
         assert!(world.take_lazy_upgrade_warnings().is_empty());
     });
 }
+
+/// CTO review item 1 (OBI-89): `ensure_current` must never migrate an
+/// object that still has a live frame on the call stack. Here
+/// `/std/selfie`'s `m()` recompiles its own program (to a v2 whose var
+/// layout moves `a` to a different slot) and then calls `g()` and
+/// `self.g()` on itself. Migrating it right there would run the rest of
+/// `m()`'s v1 bytecode against the v2 variable layout. Both calls must
+/// still see v1 while `m()` runs; the object upgrades on its next
+/// top-level access instead.
+#[test]
+fn an_object_with_a_live_frame_is_not_migrated_until_its_frames_unwind() {
+    on_world_thread(|| {
+        let root = fixture("eager_upgrade");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host);
+        host.take(1);
+        world.input(1, "load_selfie", &mut host);
+        assert_eq!(host.take(1), "loaded /std/selfie\n");
+
+        // v2 prepends a var of a different type, so `a` moves from slot 0
+        // to slot 1: a real migration, not the equal-schema pointer swap.
+        std::fs::write(
+            root.join("std/selfie.wf"),
+            "var pad: string = \"pad\"\nvar a: int = 2\n\npub fn m() -> string {\n    return $\"v2m:{a}\"\n}\n\npub fn g() -> string {\n    return $\"v2:{a}\"\n}\n",
+        )
+        .unwrap();
+
+        world.input(1, "selfie", &mut host);
+        assert_eq!(
+            host.take(1),
+            "v1:1 v1:1 1\n",
+            "m() recompiled its own program: it and its self-calls must keep running v1"
+        );
+        let selfie = world.find_object("/std/selfie").expect("loaded");
+        assert_eq!(world.program_version("/std/selfie"), Some(2));
+        assert_eq!(
+            world.object_program_version(selfie),
+            Some(("/std/selfie".into(), 1)),
+            "not migrated while its own frame was live"
+        );
+
+        // Next top-level access: now it upgrades, carrying `a` over by name.
+        let v = world.call(selfie, "g", vec![], &mut host).expect("access");
+        assert_eq!(v.as_str(), Some("v2:1"));
+        assert_eq!(
+            world.object_program_version(selfie),
+            Some(("/std/selfie".into(), 2))
+        );
+        assert!(world.take_lazy_upgrade_warnings().is_empty());
+    });
+}

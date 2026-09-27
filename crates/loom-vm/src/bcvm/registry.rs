@@ -1401,12 +1401,25 @@ impl<'a> RegistryHost<'a> {
     /// swallowed — spec §7.2 step 6.4, "not fatal"). The object stays on
     /// its (rolled-back) old program and is not re-attempted until the
     /// *next* `install` bumps [`Registry::install_generation`] again.
+    ///
+    /// **Never migrates an object with a live frame** (OBI-89 CTO review):
+    /// if `id` is executing anywhere on the current call chain (e.g. its
+    /// `m()` just recompiled its own program and now calls `self.g()`, or
+    /// something it called calls back into it), swapping its program here
+    /// would run the rest of that frame's old bytecode against the new
+    /// program. Such an object is left stale *without* stamping
+    /// `checked_generation`, so it upgrades on its first access after its
+    /// frames unwind. This scan only runs on the slow path (generation
+    /// mismatch), never in steady state.
     fn ensure_current(&mut self, id: ObjectId) {
         let generation = self.registry.install_generation;
         let Some(o) = self.registry.get(id) else {
             return;
         };
         if o.checked_generation == generation {
+            return;
+        }
+        if self.has_live_frame(id) {
             return;
         }
         let current = self.registry.programs.get(&*o.program.path).cloned();
@@ -1419,6 +1432,15 @@ impl<'a> RegistryHost<'a> {
         if let Some(o) = self.registry.get_mut(id) {
             o.checked_generation = generation;
         }
+    }
+
+    /// True if `id` has a frame on the current call chain. `self_stack[0]`
+    /// is the entry's base `self` (the `this_player`/master placeholder a
+    /// `World` entry point starts from), not a running frame: every frame
+    /// that actually executes is pushed on top of it by
+    /// [`RegistryHost::call_in`] or [`Host::enter_self`].
+    pub(crate) fn has_live_frame(&self, id: ObjectId) -> bool {
+        self.self_stack.iter().skip(1).any(|&s| s == id)
     }
 
     pub fn new(registry: &'a mut Registry, self_object: ObjectId) -> Self {
@@ -1585,7 +1607,9 @@ impl<'a> RegistryHost<'a> {
                 .compiler
                 .finish_recompile(self.registry, root_path, begin_snapshot, outcome)?
         };
-        self.install(new_set)
+        // Lazy install (OBI-89): migration warnings surface later through
+        // `Registry::lazy_upgrade_warnings`, not here.
+        self.install(new_set).map(|_| ())
     }
 
     /// Call `name` on `on` (the object executing this call) as an
@@ -1800,10 +1824,10 @@ impl<'a> RegistryHost<'a> {
             // rather than blocking this call (or the whole tick queue) on
             // migrating all of them synchronously. A no-op (returns 0) for
             // an unregistered path or one with nothing stale to migrate.
-            // P1, mirroring `compile_object` (check with the CTO on the
-            // efun privilege/tier: OBI-89 flags this as not definitively
-            // settled — a mass upgrade is at least as sensitive as a single
-            // recompile).
+            // P1, same tier as `compile_object` (D-P1.6): it only brings
+            // forward what lazy mode would do on next access anyway.
+            // S2: gate like `compile_object` — `valid_write`-style
+            // confinement on `path` (OBI-36).
             "upgrade_all" => {
                 let p = a0
                     .as_str()
@@ -2114,9 +2138,8 @@ impl<'a> RegistryHost<'a> {
     /// [`Registry::eager_upgrade_queue`] for `World::tick` to migrate a
     /// bounded batch of per tick, rather than blocking. A per-program
     /// pragma choosing eager as the *default* for that program (spec §7.2
-    /// step 5) needs a source-level surface this slice does not add —
-    /// flagged to the CTO as a cross-seam decision (OBI-89), not decided
-    /// here.
+    /// step 5) is deferred to Phase 2 (D-P1.7): lazy everywhere, eager only
+    /// via an explicit `upgrade_all`.
     pub fn install(
         &mut self,
         new_set: HashMap<String, Rc<CompiledProgram>>,
