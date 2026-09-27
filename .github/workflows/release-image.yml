@@ -24,11 +24,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Install cargo-deny
-        run: cargo install --locked cargo-deny --version 0.18.5
-
+      # Same action as ci.yml's `deny` job, so release and PR gating agree
+      # (cargo-deny 0.18.5 cannot parse CVSS 4.0 advisories).
       - name: cargo deny (licenses, bans, sources, advisories)
-        run: cargo deny check licenses bans sources advisories
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources advisories
 
       - name: Install syft
         run: |
