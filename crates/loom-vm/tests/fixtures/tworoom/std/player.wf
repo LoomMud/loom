@@ -121,6 +121,10 @@ pub fn process_input(line: string) {
 
 pub fn account_result(id: int, ok: bool, detail: string) {
     send(self, $"account_result {id} {ok} {detail}\n")
+    // OBI-38: the apply runs in the issuer's connection context.
+    if this_player() == self {
+        send(self, "account_result context ok\n")
+    }
 }
 
 // Test-only helpers (OBI-85 CTO review): construct arbitrary
