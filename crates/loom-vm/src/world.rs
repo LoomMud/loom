@@ -34,6 +34,12 @@ pub struct Limits {
     /// Per-object (shallow) memory quota in bytes; see
     /// `bcvm::vm::Limits::mem_quota_bytes`.
     pub mem_quota_bytes: u64,
+    /// `upgrade_all(path)` (OBI-89, eager mode): how many queued objects
+    /// [`World::tick`] migrates per world tick. Bounded, not all-at-once,
+    /// so a mass upgrade spreads across ticks instead of starving every
+    /// other object/player's own call_out/heartbeat that tick (spec:
+    /// "bounded per-tick budget").
+    pub eager_upgrade_batch: usize,
 }
 
 impl Default for Limits {
@@ -42,6 +48,7 @@ impl Default for Limits {
             max_ticks: 1_000_000,
             max_depth: 512,
             mem_quota_bytes: VmLimits::default().mem_quota_bytes,
+            eager_upgrade_batch: 200,
         }
     }
 }
@@ -243,12 +250,14 @@ impl World {
 
     /// Advance the world by one tick (OBI-33): `heartbeat()` on every
     /// subscribed object, in subscription order, then every `call_out` now
-    /// due, in scheduling order (`Scheduler::advance`). Each call runs
-    /// against a fresh `RegistryHost` with its own metered tick budget
-    /// (`Limits::max_ticks`), exactly like `input`/`connect`, so one slow
-    /// callback cannot starve another. Errors have nowhere to report to
-    /// (neither path has a connection) and are swallowed, matching
-    /// `disconnect`'s `net_dead`.
+    /// due, in scheduling order (`Scheduler::advance`), then a bounded
+    /// batch (`Limits::eager_upgrade_batch`) of any `upgrade_all(path)`
+    /// queue (OBI-89, spec §7.2/§7.3 "upgrade_all spread across ticks").
+    /// Each call runs against a fresh `RegistryHost` with its own metered
+    /// tick budget (`Limits::max_ticks`), exactly like `input`/`connect`,
+    /// so one slow callback (or one slow migration) cannot starve
+    /// another. Errors have nowhere to report to (neither path has a
+    /// connection) and are swallowed, matching `disconnect`'s `net_dead`.
     pub fn tick(&mut self, host: &mut dyn Host) {
         self.poll_recompiles(host);
         for ob in self.scheduler.heartbeat_targets() {
@@ -265,6 +274,30 @@ impl World {
             }
             let _ = self.exec(host, None, None, move |h| {
                 h.call_apply(call.ob, &call.func, call.args)
+            });
+        }
+        let batch = self
+            .scheduler
+            .drain_eager_upgrades(self.limits.eager_upgrade_batch);
+        for (ob, path) in batch {
+            if self.registry.get(ob).is_none() {
+                continue; // destructed since `upgrade_all` queued it
+            }
+            let Some(current) = self.registry.program(&path) else {
+                continue; // path no longer registered at all
+            };
+            let _ = self.exec(host, None, None, move |h| {
+                // Someone may have already lazily upgraded `ob` (an
+                // ordinary access) between `upgrade_all` queuing it and
+                // this tick draining it — `RegistryHost::upgrade` itself
+                // does not check that, so guard it here.
+                if let Some(o) = h.registry.get(ob)
+                    && !std::rc::Rc::ptr_eq(&o.program, &current)
+                    && let Err(w) = h.upgrade(ob, current)
+                {
+                    h.registry.lazy_upgrade_warnings.push(w);
+                }
+                Ok(())
             });
         }
     }
@@ -318,6 +351,22 @@ impl World {
     /// Pending `call_out` count (tests/introspection).
     pub fn pending_call_outs(&self) -> usize {
         self.scheduler.pending_count()
+    }
+
+    /// Objects still queued by `upgrade_all(path)` waiting for a future
+    /// tick's batch (OBI-89, tests/introspection).
+    pub fn eager_upgrade_queue_len(&self) -> usize {
+        self.scheduler.eager_upgrade_queue_len()
+    }
+
+    /// Drain every warning recorded by a *lazy* per-instance upgrade since
+    /// the last call (OBI-89: an access-triggered migration or its
+    /// `upgrade()` hook that failed and rolled back that one object,
+    /// spec §7.2 step 6.4 — not fatal, so this is the only place it
+    /// surfaces, mirroring `compile_object`'s own `Vec<String>` return for
+    /// the eager-at-install-time case).
+    pub fn take_lazy_upgrade_warnings(&mut self) -> Vec<crate::bcvm::UpgradeWarning> {
+        std::mem::take(&mut self.registry.lazy_upgrade_warnings)
     }
 
     // ---- introspection / tooling (tests, `loom` admin commands) -----------

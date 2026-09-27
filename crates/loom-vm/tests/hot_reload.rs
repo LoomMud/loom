@@ -227,16 +227,34 @@ fn failing_initialiser_rolls_back_the_upgrade() {
         "inherit /std/room\n\nvar boom: int = 1 / 0\n\npub override fn long() -> string {\n    return \"new\"\n}\n",
     )
     .unwrap();
-    // Spec r5 amendment (§7.2 step 6.4): a per-object migration failure is
-    // reported, not fatal — `compile_object` itself still succeeds (the
-    // new program installs), but the one instance whose `$init` failed
-    // rolls back to its old version instead of the whole recompile being
-    // rejected.
+    // Spec r5 amendment (§7.2 step 6.4), now lazy by default (OBI-89): a
+    // per-object migration failure is reported, not fatal —
+    // `compile_object` itself still succeeds (the new program installs),
+    // but nothing is migrated *yet* — `install` no longer eagerly touches
+    // any object, so there is nothing to report until something actually
+    // accesses `hall`.
     let warnings = world
         .compile_object("/domains/start/hall", &mut host)
         .expect("install itself must not fail");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        world.object_program_version(hall),
+        Some(("/domains/start/hall".into(), 1)),
+        "not accessed yet: still reports its old version"
+    );
+
+    // `look` walks the player's environment chain onto `hall` — the
+    // access that lazily triggers its upgrade attempt, which fails and
+    // rolls back that one instance (spec §7.2 step 6.4: not fatal to
+    // anything else).
+    world.input(1, "look", &mut host);
+    host.take(1);
+    let warnings = world.take_lazy_upgrade_warnings();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
-    assert!(warnings[0].contains("division by zero"), "{warnings:?}");
+    assert!(
+        warnings[0].message.contains("division by zero"),
+        "{warnings:?}"
+    );
     // The registry-level program did install (spec r5: only the failing
     // *object's* migration rolled back, not the whole recompile) — new
     // clones from here on get v2; this pre-existing instance stays on v1.

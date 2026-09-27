@@ -17,6 +17,7 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `disconnect` | `disconnect(Optional(Object)) -> Void` | P2 | 2 |
 | `bind_connection` | `bind_connection(Object) -> Void` | P3 | 2 |
 | `compile_object` | `compile_object(String) -> Optional(String)` | P1 | 500 |
+| `upgrade_all` | `upgrade_all(String) -> Int` | P1 | 50 |
 | `len` | `len(string \| [T] \| {K: V}) -> Int` | P0 | 1 |
 | `split` | `split(String, String) -> Array(String)` | P0 | 5 |
 | `join` | `join(Array(String), String) -> String` | P0 | 5 |
