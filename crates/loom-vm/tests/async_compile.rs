@@ -25,7 +25,15 @@ use loom_vm::World;
 fn ticks_keep_advancing_during_a_slow_background_compile() {
     on_world_thread(|| {
         let root = fixture("tworoom");
-        let mut world = World::boot(&root).expect("boot");
+        // Heartbeat cadence defaults to once every 20 world ticks
+        // (OBI-82, spec r5 N2); this test predates that and wants the
+        // original one-tick-is-one-heartbeat cadence so it can assert on
+        // a handful of ticks without waiting out the interval.
+        let limits = loom_vm::Limits {
+            heartbeat_interval_ticks: 1,
+            ..Default::default()
+        };
+        let mut world = World::boot_with_limits(&root, limits).expect("boot");
         let mut host = FakeHost::default();
 
         world.connect(1, &mut host);
