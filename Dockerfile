@@ -19,7 +19,7 @@ RUN cargo build --release --locked -p loom-cli && install -Dm755 target/release/
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates libmimalloc2 \
+    && apt-get install --yes --no-install-recommends ca-certificates libmimalloc2.0 \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --create-home --home-dir /srv/loom loom
 WORKDIR /srv/loom
