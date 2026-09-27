@@ -34,7 +34,7 @@ use loom_syntax::Span;
 pub use loom_syntax::ast::{AssignOp, BinOp, UnOp};
 
 use crate::efuns::Privilege;
-use crate::ty::Ty;
+use crate::ty::{EnumTy, StructTy, Ty};
 
 /// Index into [`Function::locals`] (parameters first, in order).
 pub type LocalId = u32;
@@ -50,6 +50,10 @@ pub struct Program {
     /// first, each exactly once (virtual inheritance: a diamond shares one
     /// copy), ending with this program. Instance layout is per entry.
     pub linearization: Vec<Rc<str>>,
+    /// `struct`/`enum` declared *here* (spec r5 §7.3, D27, OBI-88), in
+    /// declaration order.
+    pub structs: Vec<StructDecl>,
+    pub enums: Vec<EnumDecl>,
     /// Program variables declared *here*, in declaration order.
     pub vars: Vec<Var>,
     /// `[vis] const NAME = expr` declared *here* (§5.3): a single value shared
@@ -58,6 +62,27 @@ pub struct Program {
     pub consts: Vec<Const>,
     /// Functions declared here, in declaration order.
     pub fns: Vec<Function>,
+}
+
+/// `[vis] struct Name { field: T [= default], … }` declared here. Codegen
+/// currently has no bytecode for constructing/reading a struct value
+/// (`check.rs` still rejects struct literals and field access as "not
+/// implemented by codegen yet" — OBI-88 scope): this is the type-level
+/// declaration only, exactly what a schema hash and `import` need.
+#[derive(Clone, Debug)]
+pub struct StructDecl {
+    pub name: Rc<str>,
+    pub vis: Visibility,
+    pub ty: Rc<StructTy>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct EnumDecl {
+    pub name: Rc<str>,
+    pub vis: Visibility,
+    pub ty: Rc<EnumTy>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]

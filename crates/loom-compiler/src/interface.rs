@@ -36,6 +36,10 @@ pub struct ProgramInfo {
     pub vars: HashMap<Rc<str>, Rc<VarInfo>>,
     /// Consts an inheritor sees (non-private), and `import` targets.
     pub consts: HashMap<Rc<str>, Rc<ConstInfo>>,
+    /// `struct`/`enum` types an inheritor sees (non-private), and `import`
+    /// targets (spec r5 §7.3, D27, OBI-88): only `pub` types are
+    /// importable, mirroring `pub const`.
+    pub types: HashMap<Rc<str>, Ty>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +117,8 @@ pub struct Inherited {
     pub ambiguous_fns: HashMap<Rc<str>, Vec<Rc<FnInfo>>>,
     pub vars: HashMap<Rc<str>, Rc<VarInfo>>,
     pub consts: HashMap<Rc<str>, Rc<ConstInfo>>,
+    /// `struct`/`enum` types inherited from a parent (spec r5 §7.3, OBI-88).
+    pub types: HashMap<Rc<str>, Ty>,
 }
 
 /// Merge the interfaces of `parents` (in source order). Diagnostics are for
@@ -230,6 +236,27 @@ pub fn merge_parents(parents: &[ParentInfo], diags: &mut Vec<Diagnostic>) -> Inh
             }
         }
     }
+    // Types: same clash rule as consts (structural equality decides a
+    // "same type" clash, since two identically-named-and-shaped types from
+    // a diamond ancestor are not actually a conflict).
+    for p in parents {
+        for (name, ty) in &p.info.types {
+            match out.types.get(name) {
+                Some(prev) if prev != ty => diags.push(
+                    Diagnostic::error(
+                        "W0104",
+                        p.span,
+                        format!("type `{name}` is inherited from more than one parent with different shapes"),
+                    )
+                    .with_hint("rename the type in one of the parents"),
+                ),
+                Some(_) => {}
+                None => {
+                    out.types.insert(name.clone(), ty.clone());
+                }
+            }
+        }
+    }
     out
 }
 
@@ -300,6 +327,7 @@ mod tests {
             fns: inh.fns,
             vars: inh.vars,
             consts: inh.consts,
+            types: inh.types,
         })
     }
 

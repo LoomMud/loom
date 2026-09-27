@@ -46,7 +46,10 @@ pub fn check_program(
     let mut diags = Vec::new();
     let inh = merge_parents(&parents, &mut diags);
     let imported = resolve_imports(&imports, &mut diags);
-    let decls = declare(&path, ast, &inh, &parents, &mut diags);
+    let imported_types = resolve_imported_types(&imports, &mut diags);
+    let (struct_decls, enum_decls, types) =
+        declare_types(&path, ast, &inh, &imported_types, &mut diags);
+    let decls = declare(&path, ast, &inh, &parents, &types, &mut diags);
 
     let mut cx = Cx {
         path: path.clone(),
@@ -54,6 +57,7 @@ pub fn check_program(
         inh: &inh,
         parents: &parents,
         imported: &imported,
+        types: &types,
         diags: &mut diags,
         var_tys: HashMap::new(),
         locals: Vec::new(),
@@ -232,6 +236,17 @@ pub fn check_program(
             );
         }
     }
+    let mut etypes = inh.types.clone();
+    for s in &struct_decls {
+        if s.vis != Visibility::Private {
+            etypes.insert(s.name.clone(), Ty::Struct(s.ty.clone()));
+        }
+    }
+    for e in &enum_decls {
+        if e.vis != Visibility::Private {
+            etypes.insert(e.name.clone(), Ty::Enum(e.ty.clone()));
+        }
+    }
     let mut linearization = inh.linearization.clone();
     linearization.push(path.clone());
     let info = Rc::new(ProgramInfo {
@@ -242,6 +257,7 @@ pub fn check_program(
         fns: efns,
         vars: evars,
         consts: econsts,
+        types: etypes,
     });
     let hir = hir::Program {
         path,
@@ -254,6 +270,8 @@ pub fn check_program(
             })
             .collect(),
         linearization,
+        structs: struct_decls,
+        enums: enum_decls,
         vars: hir_vars,
         consts: hir_consts,
         fns,
@@ -266,7 +284,7 @@ pub fn check_program(
 /// Merge `import` targets into one name table (`import`'s own resolver;
 /// separate from the inherit graph in `interface.rs`). A name clash between
 /// two imports, or an explicitly named import that the target does not
-/// export as a `const`, is an error here.
+/// export as a `pub const` or `pub struct`/`enum`, is an error here.
 fn resolve_imports(
     imports: &[ImportInfo],
     diags: &mut Vec<Diagnostic>,
@@ -278,13 +296,20 @@ fn resolve_imports(
                 for n in names {
                     match imp.info.consts.get(n) {
                         Some(c) => insert_import(&mut out, c.clone(), imp.span, diags),
+                        // A name that is not a const might be a type
+                        // (`resolve_imported_types` handles it there); only
+                        // report "unknown" once neither table has it.
+                        None if imp.info.types.contains_key(n) => {}
                         None => diags.push(
                             Diagnostic::error(
                                 "W0202",
                                 imp.span,
-                                format!("`{}` does not export a const named `{n}`", imp.info.path),
+                                format!(
+                                    "`{}` does not export a const, struct, or enum named `{n}`",
+                                    imp.info.path
+                                ),
                             )
-                            .with_hint("only `pub const` declarations can be imported"),
+                            .with_hint("only `pub const`/`pub struct`/`pub enum` declarations can be imported"),
                         ),
                     }
                 }
@@ -297,6 +322,73 @@ fn resolve_imports(
         }
     }
     out
+}
+
+/// `import`'s type half of [`resolve_imports`]: exported (`pub`)
+/// `struct`/`enum` types across modules (spec r5 §7.3, D27, OBI-88), feeding
+/// the schema-hash-folding import-edge tracking OBI-34 wires in.
+fn resolve_imported_types(
+    imports: &[ImportInfo],
+    diags: &mut Vec<Diagnostic>,
+) -> HashMap<Rc<str>, Ty> {
+    let mut out: HashMap<Rc<str>, (Rc<str>, Ty)> = HashMap::new();
+    for imp in imports {
+        match &imp.names {
+            Some(names) => {
+                for n in names {
+                    if let Some(ty) = imp.info.types.get(n) {
+                        insert_imported_type(
+                            &mut out,
+                            n.clone(),
+                            imp.info.path.clone(),
+                            ty.clone(),
+                            imp.span,
+                            diags,
+                        );
+                    }
+                    // Not a type: either a const (handled by
+                    // `resolve_imports`) or truly unknown (already reported
+                    // there).
+                }
+            }
+            None => {
+                for (n, ty) in &imp.info.types {
+                    insert_imported_type(
+                        &mut out,
+                        n.clone(),
+                        imp.info.path.clone(),
+                        ty.clone(),
+                        imp.span,
+                        diags,
+                    );
+                }
+            }
+        }
+    }
+    out.into_iter().map(|(n, (_, ty))| (n, ty)).collect()
+}
+
+fn insert_imported_type(
+    out: &mut HashMap<Rc<str>, (Rc<str>, Ty)>,
+    name: Rc<str>,
+    owner: Rc<str>,
+    ty: Ty,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match out.get(&name) {
+        Some((prev_owner, _)) if *prev_owner != owner => diags.push(
+            Diagnostic::error(
+                "W0292",
+                span,
+                format!("`{name}` is imported from both {prev_owner} and {owner}"),
+            )
+            .with_hint("import it with `.{Name as Alias}` from one of them (not yet supported: rename at the source)"),
+        ),
+        _ => {
+            out.insert(name, (owner, ty));
+        }
+    }
 }
 
 fn insert_import(
@@ -318,6 +410,204 @@ fn insert_import(
         ),
         _ => {
             out.insert(c.name.clone(), c);
+        }
+    }
+}
+
+// ---- pass 0: struct/enum types -------------------------------------------
+
+/// Type-check `struct`/`enum` declarations into HIR (spec r5 §7.3, D27,
+/// [OBI-52]): a separate pass *before* [`declare`], because a var/const/fn's
+/// declared type may itself be a struct/enum name, but struct/enum fields
+/// never depend on vars/consts/fns.
+///
+/// **Scope trim (see the OBI-88 task notes):** a field/variant payload type
+/// must name a struct/enum already fully known — inherited, imported, or
+/// declared *earlier in this file* — not one declared later or itself
+/// (forward references, mutual recursion between local types, and direct
+/// self-reference all report "unknown type" here, with a hint to reorder).
+/// Direct self/mutual reference would be an unbounded-size value type
+/// anyway (structs are values, not references) so only *forward-declared-
+/// later-in-the-same-file* is a real gap versus the spec, tracked as a
+/// follow-up once a real dependency-order/placeholder scheme is needed.
+///
+/// [OBI-52]: /OBI/issues/OBI-52
+fn declare_types(
+    path: &Rc<str>,
+    ast: &ast::Program,
+    inh: &Inherited,
+    imported_types: &HashMap<Rc<str>, Ty>,
+    diags: &mut Vec<Diagnostic>,
+) -> (
+    Vec<hir::StructDecl>,
+    Vec<hir::EnumDecl>,
+    HashMap<Rc<str>, Ty>,
+) {
+    let mut env: HashMap<Rc<str>, Ty> = inh.types.clone();
+    for (n, t) in imported_types {
+        env.entry(n.clone()).or_insert_with(|| t.clone());
+    }
+    let mut local_names: HashSet<Rc<str>> = HashSet::new();
+    let mut structs = Vec::new();
+    let mut enums = Vec::new();
+    for item in &ast.items {
+        match item {
+            ast::Item::Struct(s) => {
+                let name: Rc<str> = Rc::from(s.name.name.as_str());
+                if !local_names.insert(name.clone()) || env.contains_key(&name) {
+                    diags.push(Diagnostic::error(
+                        "W0286",
+                        s.name.span,
+                        format!("`{}` is declared twice in this program", s.name.name),
+                    ));
+                    continue;
+                }
+                let mut seen: HashSet<&str> = HashSet::new();
+                let mut fields = Vec::new();
+                for f in &s.fields {
+                    if !seen.insert(&f.name.name) {
+                        diags.push(Diagnostic::error(
+                            "W0287",
+                            f.name.span,
+                            format!(
+                                "field `{}` is declared twice in struct `{}`",
+                                f.name.name, s.name.name
+                            ),
+                        ));
+                        continue;
+                    }
+                    let ty = lower_type(&f.ty, &env, diags);
+                    let default = f.default.as_ref().and_then(|e| {
+                        let c = eval_const(e, diags)?;
+                        if const_matches_ty(&c, &ty) {
+                            Some(c)
+                        } else {
+                            diags.push(Diagnostic::error(
+                                "W0290",
+                                e.span,
+                                format!(
+                                    "a field's default must be a constant literal of type `{ty}`"
+                                ),
+                            ));
+                            None
+                        }
+                    });
+                    fields.push(crate::ty::FieldTy {
+                        name: Rc::from(f.name.name.as_str()),
+                        ty,
+                        default,
+                    });
+                }
+                let ty = Rc::new(crate::ty::StructTy {
+                    module: path.clone(),
+                    name: name.clone(),
+                    fields,
+                });
+                env.insert(name.clone(), Ty::Struct(ty.clone()));
+                structs.push(hir::StructDecl {
+                    name,
+                    vis: visibility(&s.mods),
+                    ty,
+                    span: s.span,
+                });
+            }
+            ast::Item::Enum(e) => {
+                let name: Rc<str> = Rc::from(e.name.name.as_str());
+                if !local_names.insert(name.clone()) || env.contains_key(&name) {
+                    diags.push(Diagnostic::error(
+                        "W0286",
+                        e.name.span,
+                        format!("`{}` is declared twice in this program", e.name.name),
+                    ));
+                    continue;
+                }
+                let mut seen: HashSet<&str> = HashSet::new();
+                let mut variants = Vec::new();
+                for v in &e.variants {
+                    if !seen.insert(&v.name.name) {
+                        diags.push(Diagnostic::error(
+                            "W0288",
+                            v.name.span,
+                            format!(
+                                "variant `{}` is declared twice in enum `{}`",
+                                v.name.name, e.name.name
+                            ),
+                        ));
+                        continue;
+                    }
+                    let payload = v
+                        .payload
+                        .iter()
+                        .map(|t| lower_type(t, &env, diags))
+                        .collect();
+                    variants.push(crate::ty::VariantTy {
+                        name: Rc::from(v.name.name.as_str()),
+                        payload,
+                    });
+                }
+                let ty = Rc::new(crate::ty::EnumTy {
+                    module: path.clone(),
+                    name: name.clone(),
+                    variants,
+                });
+                env.insert(name.clone(), Ty::Enum(ty.clone()));
+                enums.push(hir::EnumDecl {
+                    name,
+                    vis: visibility(&e.mods),
+                    ty,
+                    span: e.span,
+                });
+            }
+            _ => {}
+        }
+    }
+    (structs, enums, env)
+}
+
+/// Does a [`crate::ty::ConstVal`] look like a value of `ty` (spec r5 §7.3
+/// field defaults)? Shallow, mirroring `bcvm::schema_convert::value_matches_ty`.
+fn const_matches_ty(c: &crate::ty::ConstVal, ty: &Ty) -> bool {
+    use crate::ty::ConstVal as CV;
+    match (c, ty) {
+        (_, Ty::Any) => true,
+        (CV::Null, t) => t.is_nullable(),
+        (c, Ty::Optional(inner)) => const_matches_ty(c, inner),
+        (CV::Bool(_), Ty::Bool) => true,
+        (CV::Int(_), Ty::Int) => true,
+        (CV::Float(_), Ty::Float) => true,
+        (CV::Str(_), Ty::String) => true,
+        (CV::Array(elems), Ty::Array(elem_ty)) => {
+            elems.iter().all(|e| const_matches_ty(e, elem_ty))
+        }
+        _ => false,
+    }
+}
+
+/// A struct field's `= expr` default (spec r5 §7.3: "every added field has a
+/// default"), so migration can fill a missing field without running any
+/// code. Only literals — no efun calls, no reading other fields — are
+/// constant enough for that.
+fn eval_const(e: &ast::Expr, diags: &mut Vec<Diagnostic>) -> Option<crate::ty::ConstVal> {
+    use crate::ty::ConstVal as CV;
+    match &e.kind {
+        E::Int(n) => Some(CV::Int(*n)),
+        E::Float(f) => Some(CV::Float(*f)),
+        E::Bool(b) => Some(CV::Bool(*b)),
+        E::Str(s) => Some(CV::Str(Rc::from(s.as_str()))),
+        E::Null => Some(CV::Null),
+        E::Array(es) => {
+            let mut out = Vec::with_capacity(es.len());
+            for x in es {
+                out.push(eval_const(x, diags)?);
+            }
+            Some(CV::Array(out.into()))
+        }
+        _ => {
+            diags.push(
+                Diagnostic::error("W0290", e.span, "a field's default must be a constant literal")
+                    .with_hint("defaults are evaluated once, without an object, so they can only be literals (no efun calls, no reading other fields)"),
+            );
+            None
         }
     }
 }
@@ -368,6 +658,7 @@ fn declare<'a>(
     ast: &'a ast::Program,
     inh: &Inherited,
     parents: &[ParentInfo],
+    types: &HashMap<Rc<str>, Ty>,
     diags: &mut Vec<Diagnostic>,
 ) -> Decls<'a> {
     let mut d = Decls {
@@ -379,6 +670,20 @@ fn declare<'a>(
         const_index: HashMap::new(),
     };
     let mut names: HashSet<&str> = HashSet::new();
+    // Struct/enum names are already fully handled by `declare_types`; seed
+    // `names` with them so a var/const/fn in this same program cannot
+    // silently shadow a locally declared type.
+    for item in &ast.items {
+        match item {
+            ast::Item::Struct(s) => {
+                names.insert(&s.name.name);
+            }
+            ast::Item::Enum(e) => {
+                names.insert(&e.name.name);
+            }
+            _ => {}
+        }
+    }
     for item in &ast.items {
         match item {
             ast::Item::Var(v) => {
@@ -403,7 +708,7 @@ fn declare<'a>(
                         .with_hint("use the inherited variable, or pick another name"),
                     );
                 }
-                let ty = v.ty.as_ref().map(|t| lower_type(t, diags));
+                let ty = v.ty.as_ref().map(|t| lower_type(t, types, diags));
                 let name: Rc<str> = Rc::from(v.name.name.as_str());
                 d.var_index.insert(name.clone(), d.vars.len());
                 d.vars.push(VarDecl {
@@ -435,7 +740,7 @@ fn declare<'a>(
                         .with_hint("use the inherited const, or pick another name"),
                     );
                 }
-                let ty = c.ty.as_ref().map(|t| lower_type(t, diags));
+                let ty = c.ty.as_ref().map(|t| lower_type(t, types, diags));
                 let name: Rc<str> = Rc::from(c.name.name.as_str());
                 d.const_index.insert(name.clone(), d.consts.len());
                 d.consts.push(ConstDeclI {
@@ -445,27 +750,8 @@ fn declare<'a>(
                     vis: visibility(&c.mods),
                 });
             }
-            ast::Item::Struct(s) => {
-                names.insert(&s.name.name);
-                diags.push(
-                    Diagnostic::error(
-                        "W0208",
-                        s.name.span,
-                        "`struct` is not implemented by the type checker yet",
-                    )
-                    .with_hint("use a map `{string: any}` for now; struct support is future work"),
-                );
-            }
-            ast::Item::Enum(e) => {
-                names.insert(&e.name.name);
-                diags.push(
-                    Diagnostic::error(
-                        "W0209",
-                        e.name.span,
-                        "`enum` is not implemented by the type checker yet",
-                    )
-                    .with_hint("use strings or ints for now; enum support is future work"),
-                );
+            ast::Item::Struct(_) | ast::Item::Enum(_) => {
+                // Handled by `declare_types`, before this pass runs.
             }
             ast::Item::Fn(f) => {
                 if !names.insert(&f.name.name) {
@@ -476,7 +762,7 @@ fn declare<'a>(
                     ));
                     continue;
                 }
-                let info = Rc::new(fn_info(path, f, diags));
+                let info = Rc::new(fn_info(path, f, types, diags));
                 check_override(f, &info, inh, parents, diags);
                 d.fn_index.insert(info.name.clone(), d.fns.len());
                 d.fns.push(FnDecl { decl: f, info });
@@ -509,7 +795,12 @@ fn declare<'a>(
     d
 }
 
-fn fn_info(path: &Rc<str>, f: &ast::FnDecl, diags: &mut Vec<Diagnostic>) -> FnInfo {
+fn fn_info(
+    path: &Rc<str>,
+    f: &ast::FnDecl,
+    types: &HashMap<Rc<str>, Ty>,
+    diags: &mut Vec<Diagnostic>,
+) -> FnInfo {
     let mut seen_default = false;
     let mut pnames = HashSet::new();
     let mut params = Vec::new();
@@ -522,7 +813,7 @@ fn fn_info(path: &Rc<str>, f: &ast::FnDecl, diags: &mut Vec<Diagnostic>) -> FnIn
             ));
         }
         let ty = match &p.ty {
-            Some(t) => lower_type(t, diags),
+            Some(t) => lower_type(t, types, diags),
             None => {
                 diags.push(
                     Diagnostic::error(
@@ -559,7 +850,7 @@ fn fn_info(path: &Rc<str>, f: &ast::FnDecl, diags: &mut Vec<Diagnostic>) -> FnIn
     let ret = f
         .ret
         .as_ref()
-        .map(|t| lower_type(t, diags))
+        .map(|t| lower_type(t, types, diags))
         .unwrap_or(Ty::Void);
     FnInfo {
         name: Rc::from(f.name.name.as_str()),
@@ -691,7 +982,7 @@ fn signature(f: &FnInfo) -> String {
 }
 
 /// Lower a syntactic type; unknown names report and become `Ty::Error`.
-pub fn lower_type(t: &ast::Type, diags: &mut Vec<Diagnostic>) -> Ty {
+pub fn lower_type(t: &ast::Type, types: &HashMap<Rc<str>, Ty>, diags: &mut Vec<Diagnostic>) -> Ty {
     use ast::TypeKind as T;
     match &t.kind {
         T::Int => Ty::Int,
@@ -701,14 +992,14 @@ pub fn lower_type(t: &ast::Type, diags: &mut Vec<Diagnostic>) -> Ty {
         T::Object => Ty::Object,
         T::Any => Ty::Any,
         T::Null => Ty::Null,
-        T::Array(e) => Ty::array(lower_type(e, diags)),
-        T::Map(k, v) => Ty::map(lower_type(k, diags), lower_type(v, diags)),
-        T::Optional(e) => Ty::optional(lower_type(e, diags)),
+        T::Array(e) => Ty::array(lower_type(e, types, diags)),
+        T::Map(k, v) => Ty::map(lower_type(k, types, diags), lower_type(v, types, diags)),
+        T::Optional(e) => Ty::optional(lower_type(e, types, diags)),
         T::Fn { params, ret } => Ty::Fn(Rc::new(crate::ty::FnTy {
-            params: params.iter().map(|p| lower_type(p, diags)).collect(),
+            params: params.iter().map(|p| lower_type(p, types, diags)).collect(),
             ret: ret
                 .as_ref()
-                .map(|r| lower_type(r, diags))
+                .map(|r| lower_type(r, types, diags))
                 .unwrap_or(Ty::Void),
         })),
         T::Error => {
@@ -719,6 +1010,7 @@ pub fn lower_type(t: &ast::Type, diags: &mut Vec<Diagnostic>) -> Ty {
             Ty::Error
         }
         T::Named(n) if n == "float" => Ty::Float,
+        T::Named(n) if types.contains_key(n.as_str()) => types[n.as_str()].clone(),
         T::Named(n) => {
             let hint = match n.as_str() {
                 "str" | "String" => "did you mean `string`?".to_string(),
@@ -726,9 +1018,13 @@ pub fn lower_type(t: &ast::Type, diags: &mut Vec<Diagnostic>) -> Ty {
                 "array" => "arrays are written `[T]`".to_string(),
                 "void" => "leave out `-> T` for a function that returns nothing".to_string(),
                 "mixed" => "the dynamic type is `any`".to_string(),
-                _ => match suggest(n, TYPE_NAMES.iter().copied()) {
+                _ => match suggest(
+                    n,
+                    TYPE_NAMES.iter().copied().chain(types.keys().map(|s| &**s)),
+                ) {
                     Some(s) => format!("did you mean `{s}`?"),
-                    None => "types: int, float, bool, string, object, any, null, [T], {K: V}, T?"
+                    None => "types: int, float, bool, string, object, any, null, [T], {K: V}, T?, \
+                              or a struct/enum name"
                         .to_string(),
                 },
             };
@@ -809,6 +1105,9 @@ struct Cx<'a> {
     inh: &'a Inherited,
     parents: &'a [ParentInfo],
     imported: &'a HashMap<Rc<str>, Rc<ConstInfo>>,
+    /// Every struct/enum name visible here: local, inherited, imported
+    /// (spec r5 §7.3, OBI-88).
+    types: &'a HashMap<Rc<str>, Ty>,
     diags: &'a mut Vec<Diagnostic>,
     /// Final types of own program variables (filled in declaration order).
     var_tys: HashMap<Rc<str>, Ty>,
@@ -1206,7 +1505,7 @@ impl Cx<'_> {
                 ty,
                 init,
             } => {
-                let declared = ty.as_ref().map(|t| lower_type(t, self.diags));
+                let declared = ty.as_ref().map(|t| lower_type(t, self.types, self.diags));
                 let init = init.as_ref().map(|e| {
                     let x = self.expr(e, declared.as_ref());
                     match &declared {
@@ -1408,7 +1707,7 @@ impl Cx<'_> {
             } => {
                 self.expr(value, None);
                 if let Some(t) = ty {
-                    lower_type(t, self.diags);
+                    lower_type(t, self.types, self.diags);
                 }
                 self.block(then);
                 match els.as_deref() {
@@ -1979,7 +2278,7 @@ impl Cx<'_> {
     fn cast_expr(&mut self, e: &ast::Expr, ty: &ast::Type, span: Span) -> hir::Expr {
         let x = self.expr(e, None);
         let x = self.value(x);
-        let to = lower_type(ty, self.diags);
+        let to = lower_type(ty, self.types, self.diags);
         if matches!((&x.ty, &to), (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int)) {
             self.err_hint(
                 "W0258",
@@ -2010,7 +2309,7 @@ impl Cx<'_> {
         let mut param_tys = Vec::new();
         for p in &c.params {
             match &p.ty {
-                Some(t) => param_tys.push(lower_type(t, self.diags)),
+                Some(t) => param_tys.push(lower_type(t, self.types, self.diags)),
                 None => {
                     self.err_hint(
                         "W0260",
@@ -2036,7 +2335,10 @@ impl Cx<'_> {
                 );
             }
         }
-        let declared_ret = c.ret.as_ref().map(|t| lower_type(t, self.diags));
+        let declared_ret = c
+            .ret
+            .as_ref()
+            .map(|t| lower_type(t, self.types, self.diags));
 
         let saved_locals = std::mem::take(&mut self.locals);
         let saved_scopes = std::mem::take(&mut self.scopes);

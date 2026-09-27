@@ -1,0 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+// Clean: exported struct/enum types other programs `import` (OBI-88).
+pub struct Stats {
+    hp: int
+    name: string = "unnamed"
+}
+
+pub enum DamageKind {
+    Slash,
+    Fire(int),
+}

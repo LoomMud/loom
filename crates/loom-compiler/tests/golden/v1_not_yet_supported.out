@@ -1,13 +1,3 @@
-/main.wf:7:8: error[W0208]: `struct` is not implemented by the type checker yet
-  |
-7 | struct Point {
-  |        ^^^^^
-  = help: use a map `{string: any}` for now; struct support is future work
-/main.wf:12:6: error[W0209]: `enum` is not implemented by the type checker yet
-   |
-12 | enum Color {
-   |      ^^^^^
-   = help: use strings or ints for now; enum support is future work
 /main.wf:18:13: error[W0254]: struct literals are not implemented by the type checker yet
    |
 18 |     var p = Point { x: 1, y: 2 }

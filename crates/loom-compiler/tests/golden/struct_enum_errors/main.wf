@@ -1,0 +1,25 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+// Not clean: struct/enum declaration errors (OBI-88).
+struct Stats {
+    hp: int
+    hp: int
+}
+
+enum Color {
+    Red,
+    Red(int),
+}
+
+struct Stats {
+    x: int
+}
+
+struct Bad {
+    n: int = "not an int literal type, but still just a literal check"
+    m: int = get_default()
+}
+
+fn get_default() -> int {
+    return 1
+}
