@@ -73,7 +73,14 @@ pub struct FunctionCode {
     /// argument supplied" entry point that skips default evaluation
     /// entirely. Length is always `params - min_arity + 1`.
     pub entry_points: Vec<PC>,
-    pub code: Vec<Op>,
+    /// `Rc`, not `Vec`: [`crate::bcvm`]'s hot loop (`Interpreter::step`,
+    /// OBI-107) clones this handle once per call frame (a refcount bump)
+    /// instead of holding a borrow of the whole `Module` across a match
+    /// that also needs `&mut self` for host calls — and instead of cloning
+    /// every `Op` it steps over, which is what made `step()` copy an
+    /// 80-byte struct (with heap-allocating `Vec` fields, for `Call`/
+    /// `NewMap`/...) on every single instruction before this.
+    pub code: Rc<[Op]>,
     /// See [`crate::ir::Function::capture_targets`].
     pub capture_targets: Vec<Reg>,
 }
@@ -97,16 +104,20 @@ pub enum Op {
     LoadSelf {
         dst: Reg,
     },
+    // `ty` is boxed (spec OBI-107): a bare `Ty` is 24 bytes, which alone
+    // would make cold ops like this one dominate `size_of::<Op>()` for
+    // every hot op (`BinOp`, `Copy`, ...) that pays for the biggest variant
+    // whether it uses it or not. See the `size_of::<Op>()` assertion below.
     LoadGlobal {
         dst: Reg,
         owner: StrId,
         name: StrId,
-        ty: Ty,
+        ty: Box<Ty>,
     },
     StoreGlobal {
         owner: StrId,
         name: StrId,
-        ty: Ty,
+        ty: Box<Ty>,
         src: Reg,
     },
     UnOp {
@@ -124,13 +135,13 @@ pub enum Op {
     },
     NewArray {
         dst: Reg,
-        elem_ty: Ty,
+        elem_ty: Box<Ty>,
         elems: Vec<Reg>,
     },
     NewMap {
         dst: Reg,
-        key_ty: Ty,
-        val_ty: Ty,
+        key_ty: Box<Ty>,
+        val_ty: Box<Ty>,
         entries: Vec<(Reg, Reg)>,
     },
     Index {
@@ -149,7 +160,7 @@ pub enum Op {
         dst: Reg,
         src: Reg,
         kind: IterKind,
-        elem_ty: Ty,
+        elem_ty: Box<Ty>,
     },
     ToStr {
         dst: Reg,
@@ -193,7 +204,7 @@ pub enum Op {
     Cast {
         dst: Reg,
         src: Reg,
-        ty: Ty,
+        ty: Box<Ty>,
     },
     Jump {
         target: PC,
@@ -219,6 +230,14 @@ pub enum Op {
     /// See [`crate::ir::Inst::PopHandler`].
     PopHandler,
 }
+
+/// OBI-107: `step()`'s hot loop indexes an `Op` by reference out of an
+/// `Rc<[Op]>` (no per-instruction clone), so its size sets how much cache
+/// footprint a tight loop's instruction stream costs. The cold `Ty`
+/// payloads above are boxed to keep it well under one cache line; if a new
+/// variant needs more room, box its cold payload too rather than raising
+/// this bound.
+const _: () = assert!(std::mem::size_of::<Op>() <= 48);
 
 // ---------------------------------------------------------------------
 // Encoding: a small hand-rolled binary format (uleb128 varints, zigzag for
@@ -559,7 +578,7 @@ impl Writer {
             self.put_varu32(*pc);
         }
         self.put_varu32(f.code.len() as u32);
-        for op in &f.code {
+        for op in f.code.iter() {
             self.put_op(op);
         }
         self.put_reg_vec(&f.capture_targets);
@@ -1105,7 +1124,7 @@ impl<'a> Reader<'a> {
             ret,
             reg_types,
             entry_points,
-            code,
+            code: code.into(),
             capture_targets,
         })
     }
@@ -1126,12 +1145,12 @@ impl<'a> Reader<'a> {
                 dst: self.get_varu32()?,
                 owner: self.get_varu32()?,
                 name: self.get_varu32()?,
-                ty: self.get_ty()?,
+                ty: Box::new(self.get_ty()?),
             },
             4 => Op::StoreGlobal {
                 owner: self.get_varu32()?,
                 name: self.get_varu32()?,
-                ty: self.get_ty()?,
+                ty: Box::new(self.get_ty()?),
                 src: self.get_varu32()?,
             },
             5 => Op::UnOp {
@@ -1149,13 +1168,13 @@ impl<'a> Reader<'a> {
             },
             7 => Op::NewArray {
                 dst: self.get_varu32()?,
-                elem_ty: self.get_ty()?,
+                elem_ty: Box::new(self.get_ty()?),
                 elems: self.get_reg_vec()?,
             },
             8 => {
                 let dst = self.get_varu32()?;
-                let key_ty = self.get_ty()?;
-                let val_ty = self.get_ty()?;
+                let key_ty = Box::new(self.get_ty()?);
+                let val_ty = Box::new(self.get_ty()?);
                 let n = self.get_varu32()? as usize;
                 if n > self.buf.len() {
                     return Err(DecodeError("implausible map literal length".into()));
@@ -1187,7 +1206,7 @@ impl<'a> Reader<'a> {
                 dst: self.get_varu32()?,
                 src: self.get_varu32()?,
                 kind: self.get_iter_kind()?,
-                elem_ty: self.get_ty()?,
+                elem_ty: Box::new(self.get_ty()?),
             },
             12 => Op::ToStr {
                 dst: self.get_varu32()?,
@@ -1222,7 +1241,7 @@ impl<'a> Reader<'a> {
             16 => Op::Cast {
                 dst: self.get_varu32()?,
                 src: self.get_varu32()?,
-                ty: self.get_ty()?,
+                ty: Box::new(self.get_ty()?),
             },
             17 => Op::Jump {
                 target: self.get_varu32()?,
@@ -1294,7 +1313,8 @@ mod tests {
                 code: vec![
                     Op::LoadConst { dst: 0, idx: 0 },
                     Op::Return { src: Some(0) },
-                ],
+                ]
+                .into(),
                 capture_targets: vec![0],
             }],
         };
@@ -1320,7 +1340,7 @@ mod tests {
                 ret: Ty::Void,
                 reg_types: vec![],
                 entry_points: vec![0],
-                code: vec![Op::Return { src: None }],
+                code: vec![Op::Return { src: None }].into(),
                 capture_targets: vec![],
             }],
         };

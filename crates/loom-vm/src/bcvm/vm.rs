@@ -331,6 +331,14 @@ pub trait Host {
 struct Frame {
     /// The module this frame runs; `None` = the interpreter's base module.
     code: Option<Rc<dyn ProgramCode>>,
+    /// This function's instruction stream, an `Rc` clone of
+    /// `module_of(self)`'s `functions[func].code` taken once at push time
+    /// (OBI-107, spec: "cache the current function's consts/strings slice
+    /// ... in the frame, and refresh it on call/return"): `step()` clones
+    /// this handle (a refcount bump, not a per-`Op` clone) to index it by
+    /// reference without holding a borrow of `self` across match arms that
+    /// also need `&mut self` (host calls) — see `step()`'s doc comment.
+    code_ops: Rc<[Op]>,
     /// Pushed via [`HostCall::Enter`], so popping it must call
     /// [`Host::leave_self`].
     entered: bool,
@@ -603,6 +611,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
         let pc = f.entry_points[k as usize];
         let atomic = f.atomic;
         let capture_targets = f.capture_targets.clone();
+        let code_ops = f.code.clone();
         let mut regs: Vec<Value> = args;
         regs.resize(f.reg_types.len(), Value::Null);
         // Preload a closure body's captured-by-value snapshot (spec r5
@@ -617,6 +626,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
         }
         self.stack.push(Frame {
             code,
+            code_ops,
             entered,
             func: idx,
             pc,
@@ -756,18 +766,45 @@ impl<'a, H: Host> Interpreter<'a, H> {
     /// Execute one instruction of the top frame. `Returned(v)` means a
     /// frame returned `v` (popped); the caller keeps looping until the
     /// frame stack is empty.
+    /// Execute one instruction of the top frame. `Returned(v)` means a
+    /// frame returned `v` (popped); the caller keeps looping until the
+    /// frame stack is empty.
+    ///
+    /// **OBI-107:** `op` is a borrow out of `code_ops`, a local `Rc<[Op]>`
+    /// clone of the running function's instruction stream (a refcount
+    /// bump, not a per-`Op` clone — `size_of::<Op>() == 80` before this,
+    /// with heap-allocating `Vec` fields on `Call`/`NewMap`/...). `code_ops`
+    /// is a plain local, independent of `self`, so borrowing `op` out of it
+    /// does not hold any borrow of `self` across the match below, which is
+    /// exactly what lets the match arms freely use `&mut self` (host
+    /// calls, register writes) while still matching on `op`'s fields by
+    /// reference.
     fn step(&mut self) -> R<Step> {
         let func_idx = self.stack.last().unwrap().func;
         let pc = self.stack.last().unwrap().pc as usize;
-        let code: &[Op] = &self.cur().functions[func_idx as usize].code;
-        let op = code.get(pc).cloned().ok_or_else(|| {
+        let code_ops = self.stack.last().unwrap().code_ops.clone();
+        let op = code_ops.get(pc).ok_or_else(|| {
             self.err_with_trace("internal: program counter ran off the end of the function")
         })?;
         self.stack.last_mut().unwrap().pc += 1;
 
+        // Owning read: clones the `Value` (a refcount bump for a heap
+        // variant, a plain copy otherwise) — needed wherever the register's
+        // content must outlive/leave this register (assigned into another
+        // register or a container, handed to a callee, kept past a frame
+        // pop, ...).
         macro_rules! reg {
             ($r:expr) => {
                 self.stack.last().unwrap().regs[$r as usize].clone()
+            };
+        }
+        // Borrowing read (OBI-107 point 2): no clone at all. Only sound for
+        // an immediate read-only use (arithmetic/compare operands, a branch
+        // condition) that does not need the value past the expression it's
+        // used in.
+        macro_rules! reg_ref {
+            ($r:expr) => {
+                &self.stack.last().unwrap().regs[$r as usize]
             };
         }
         macro_rules! set {
@@ -784,41 +821,42 @@ impl<'a, H: Host> Interpreter<'a, H> {
 
         match op {
             Op::LoadConst { dst, idx } => {
-                set!(dst, self.const_value(idx));
+                let v = self.const_value(*idx);
+                set!(*dst, v);
                 Ok(Step::Continue)
             }
             Op::Copy { dst, src } => {
-                set!(dst, reg!(src));
+                set!(*dst, reg!(*src));
                 Ok(Step::Continue)
             }
             Op::LoadSelf { dst } => {
-                set!(dst, Value::Object(self.host.self_object()));
+                set!(*dst, Value::Object(self.host.self_object()));
                 Ok(Step::Continue)
             }
             Op::LoadGlobal {
                 dst, owner, name, ..
             } => {
                 let (owner, name) = (
-                    self.str_of(owner).to_string(),
-                    self.str_of(name).to_string(),
+                    self.str_of(*owner).to_string(),
+                    self.str_of(*name).to_string(),
                 );
                 let v = self.host.load_global(&owner, &name)?;
-                set!(dst, v);
+                set!(*dst, v);
                 Ok(Step::Continue)
             }
             Op::StoreGlobal {
                 owner, name, src, ..
             } => {
                 let (owner, name) = (
-                    self.str_of(owner).to_string(),
-                    self.str_of(name).to_string(),
+                    self.str_of(*owner).to_string(),
+                    self.str_of(*name).to_string(),
                 );
-                self.host.store_global(&owner, &name, reg!(src))?;
+                self.host.store_global(&owner, &name, reg!(*src))?;
                 Ok(Step::Continue)
             }
             Op::UnOp { dst, op, kind, src } => {
-                let v = self.un_op(op, kind, reg!(src))?;
-                set!(dst, v);
+                let v = self.un_op(*op, *kind, reg_ref!(*src))?;
+                set!(*dst, v);
                 Ok(Step::Continue)
             }
             Op::BinOp {
@@ -828,21 +866,21 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 a,
                 b,
             } => {
-                let v = self.bin_op(op, kind, reg!(a), reg!(b))?;
-                set!(dst, v);
+                let v = self.bin_op(*op, *kind, reg_ref!(*a), reg_ref!(*b))?;
+                set!(*dst, v);
                 Ok(Step::Continue)
             }
             Op::NewArray { dst, elems, .. } => {
                 let v = Value::array(elems.iter().map(|r| reg!(*r)).collect());
-                set!(dst, v);
+                set!(*dst, v);
                 Ok(Step::Continue)
             }
             Op::NewMap { dst, entries, .. } => {
                 let mut m = MapData::default();
                 for (k, v) in entries {
-                    m.insert(reg!(k), reg!(v));
+                    m.insert(reg!(*k), reg!(*v));
                 }
-                set!(dst, Value::map(m));
+                set!(*dst, Value::map(m));
                 Ok(Step::Continue)
             }
             Op::Index {
@@ -851,8 +889,8 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 index,
                 kind,
             } => {
-                let v = self.index(kind, reg!(base), reg!(index))?;
-                set!(dst, v);
+                let v = self.index(*kind, reg!(*base), reg!(*index))?;
+                set!(*dst, v);
                 Ok(Step::Continue)
             }
             Op::IndexSet {
@@ -870,50 +908,51 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 // to a program variable/other place this register was read
                 // from is the place-write lowering codegen must emit
                 // (OBI-53); this instruction only ever owns one register.
-                let key = reg!(index);
-                let val = reg!(src);
+                let key = reg!(*index);
+                let val = reg!(*src);
                 // `loom_cow_copies_total{program}` (spec r5 §5.2.1, D24):
                 // checked before the write that would trigger the clone, and
                 // attributed to whichever module's bytecode is doing it.
                 let path = self.cur().path.clone();
                 let frame = self.stack.last_mut().unwrap();
-                let place = &mut frame.regs[base as usize];
+                let place = &mut frame.regs[*base as usize];
                 let shared = place.is_shared();
-                Self::index_set(kind, place, key, val)?;
+                Self::index_set(*kind, place, key, val)?;
                 if shared {
                     self.host.record_cow_copy(&path);
                 }
                 Ok(Step::Continue)
             }
             Op::IterElems { dst, src, kind, .. } => {
-                let v = self.iter_elems(kind, reg!(src))?;
-                set!(dst, v);
+                let v = self.iter_elems(*kind, reg!(*src))?;
+                set!(*dst, v);
                 Ok(Step::Continue)
             }
             Op::ToStr { dst, src } => {
-                let s = self.show(&reg!(src));
-                set!(dst, Value::str(&s));
+                let s = self.show(reg_ref!(*src));
+                set!(*dst, Value::str(&s));
                 Ok(Step::Continue)
             }
             Op::Cast { dst, src, ty } => {
-                let v = reg!(src);
-                if !ty_accepts(&ty, &v) {
+                let v = reg!(*src);
+                if !ty_accepts(ty, &v) {
                     return Err(self.err_with_trace(format!(
                         "expected {}, got {}",
-                        ty_name(&ty),
+                        ty_name(ty),
                         v.type_name()
                     )));
                 }
-                set!(dst, v);
+                set!(*dst, v);
                 Ok(Step::Continue)
             }
             Op::Call { dst, callee, args } => {
+                let dst = *dst;
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
                 match callee {
                     CalleeOp::Static { program, name }
-                        if self.str_of(program) == &*self.cur().path =>
+                        if self.str_of(*program) == &*self.cur().path =>
                     {
-                        let name = self.str_of(name).to_string();
+                        let name = self.str_of(*name).to_string();
                         let idx = self
                             .cur()
                             .functions
@@ -926,6 +965,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                         Ok(Step::Continue)
                     }
                     CalleeOp::Static { program, name } => {
+                        let (program, name) = (*program, *name);
                         let site = CallSite {
                             code: self.code_identity(self.stack.last().unwrap()),
                             func: func_idx,
@@ -951,6 +991,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                         }
                     }
                     CalleeOp::Virtual { name } => {
+                        let name = *name;
                         let site = CallSite {
                             code: self.code_identity(self.stack.last().unwrap()),
                             func: func_idx,
@@ -977,7 +1018,9 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 name,
                 args,
             } => {
-                let recv = reg!(recv);
+                let dst = *dst;
+                let name = *name;
+                let recv = reg!(*recv);
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
                 let site = CallSite {
                     code: self.code_identity(self.stack.last().unwrap()),
@@ -998,8 +1041,9 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 }
             }
             Op::CallEfun { dst, name, args } => {
+                let dst = *dst;
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
-                let name_s = self.str_of(name).to_string();
+                let name_s = self.str_of(*name).to_string();
                 // Spec §5.9: efuns declare a tick cost (`crate::efuns::
                 // tick_cost`); charge it against the same budget
                 // `Op::TickCheck` meters, before running the efun, so a
@@ -1023,7 +1067,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 Ok(Step::Continue)
             }
             Op::Jump { target } => {
-                jump!(target);
+                jump!(*target);
                 Ok(Step::Continue)
             }
             Op::Branch {
@@ -1031,15 +1075,15 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 then_target,
                 else_target,
             } => {
-                let Value::Bool(b) = reg!(cond) else {
+                let Value::Bool(b) = reg_ref!(*cond) else {
                     return Err(self.err_with_trace("internal: branch condition was not bool"));
                 };
-                jump!(if b { then_target } else { else_target });
+                jump!(if *b { *then_target } else { *else_target });
                 Ok(Step::Continue)
             }
             Op::Return { src } => {
                 let v = match src {
-                    Some(r) => reg!(r),
+                    Some(r) => reg!(*r),
                     None => Value::Null,
                 };
                 let frame = self.pop_frame();
@@ -1065,7 +1109,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 Ok(Step::Continue)
             }
             Op::Throw { src } => {
-                let v = reg!(src);
+                let v = reg!(*src);
                 let msg = self.show(&v);
                 Err(RtError::thrown(v, msg))
             }
@@ -1077,7 +1121,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     .last_mut()
                     .unwrap()
                     .handlers
-                    .push((catch_pc, catch_reg));
+                    .push((*catch_pc, *catch_reg));
                 Ok(Step::Continue)
             }
             Op::PopHandler => {
@@ -1248,24 +1292,24 @@ impl<'a, H: Host> Interpreter<'a, H> {
         }
     }
 
-    fn un_op(&self, op: UnOp, _kind: OpKind, v: Value) -> R<Value> {
+    fn un_op(&self, op: UnOp, _kind: OpKind, v: &Value) -> R<Value> {
         match (op, v) {
             (UnOp::Neg, Value::Int(n)) => n
                 .checked_neg()
                 .map(Value::Int)
                 .ok_or_else(|| self.err_with_trace("integer overflow")),
             (UnOp::Neg, Value::Float(x)) => Ok(Value::Float(-x)),
-            (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
+            (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!*b)),
             (op, v) => {
                 Err(self.err_with_trace(format!("cannot apply {op:?} to {}", v.type_name())))
             }
         }
     }
 
-    fn bin_op(&self, op: BinOp, _kind: OpKind, l: Value, r: Value) -> R<Value> {
+    fn bin_op(&self, op: BinOp, _kind: OpKind, l: &Value, r: &Value) -> R<Value> {
         use Value::*;
         let overflow = || self.err_with_trace("integer overflow");
-        Ok(match (op, &l, &r) {
+        Ok(match (op, l, r) {
             (BinOp::Add, Int(a), Int(b)) => Int(a.checked_add(*b).ok_or_else(overflow)?),
             (BinOp::Sub, Int(a), Int(b)) => Int(a.checked_sub(*b).ok_or_else(overflow)?),
             (BinOp::Mul, Int(a), Int(b)) => Int(a.checked_mul(*b).ok_or_else(overflow)?),
@@ -1290,8 +1334,8 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 v.extend(b.as_array().unwrap().iter().cloned());
                 Value::array(v)
             }
-            (BinOp::Eq, _, _) => Bool(l.equals(&r)),
-            (BinOp::Ne, _, _) => Bool(!l.equals(&r)),
+            (BinOp::Eq, _, _) => Bool(l.equals(r)),
+            (BinOp::Ne, _, _) => Bool(!l.equals(r)),
             (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, Int(a), Int(b)) => {
                 cmp_bool(op, a.cmp(b))
             }
@@ -1584,7 +1628,7 @@ mod tests {
                 ret: Ty::Int,
                 reg_types: vec![Ty::Int; 6],
                 entry_points: vec![0],
-                code,
+                code: code.into(),
                 capture_targets: Vec::new(),
             }],
         }
@@ -1703,7 +1747,7 @@ mod tests {
             Op::LoadConst { dst: 3, idx: 1 }, // value 99
             Op::NewArray {
                 dst: 0,
-                elem_ty: Ty::Int,
+                elem_ty: Box::new(Ty::Int),
                 elems: vec![2],
             }, // arr = [0]
             Op::Copy { dst: 1, src: 0 },      // alias = arr (shares the buffer)
@@ -1727,7 +1771,7 @@ mod tests {
                 ret: Ty::array(Ty::Int),
                 reg_types: vec![Ty::array(Ty::Int), Ty::array(Ty::Int), Ty::Int, Ty::Int],
                 entry_points: vec![0],
-                code,
+                code: code.into(),
                 capture_targets: Vec::new(),
             }],
         };

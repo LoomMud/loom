@@ -226,7 +226,7 @@ impl Cx<'_> {
                 for &e in elems {
                     self.expect_assignable(e, elem_ty)?;
                 }
-                self.expect(*dst, &Ty::array(elem_ty.clone()))
+                self.expect(*dst, &Ty::array(elem_ty.as_ref().clone()))
             }
             Op::NewMap {
                 dst,
@@ -238,7 +238,10 @@ impl Cx<'_> {
                     self.expect_assignable(*k, key_ty)?;
                     self.expect_assignable(*v, val_ty)?;
                 }
-                self.expect(*dst, &Ty::map(key_ty.clone(), val_ty.clone()))
+                self.expect(
+                    *dst,
+                    &Ty::map(key_ty.as_ref().clone(), val_ty.as_ref().clone()),
+                )
             }
             Op::Index {
                 dst,
@@ -272,7 +275,7 @@ impl Cx<'_> {
             } => {
                 self.reg(*src)?;
                 let _ = kind;
-                self.expect(*dst, &Ty::array(elem_ty.clone()))
+                self.expect(*dst, &Ty::array(elem_ty.as_ref().clone()))
             }
             Op::ToStr { dst, src } => {
                 self.reg(*src)?;
@@ -680,7 +683,7 @@ mod tests {
             ret: Ty::Void,
             reg_types: vec![],
             entry_points: vec![0],
-            code: vec![Op::Return { src: None }],
+            code: vec![Op::Return { src: None }].into(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_ok());
@@ -696,7 +699,7 @@ mod tests {
             ret: Ty::Int,
             reg_types: vec![Ty::Int],
             entry_points: vec![0],
-            code: vec![Op::Return { src: Some(7) }],
+            code: vec![Op::Return { src: Some(7) }].into(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
@@ -712,7 +715,7 @@ mod tests {
             ret: Ty::String,
             reg_types: vec![Ty::Int],
             entry_points: vec![0],
-            code: vec![Op::Return { src: Some(0) }],
+            code: vec![Op::Return { src: Some(0) }].into(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
@@ -728,7 +731,7 @@ mod tests {
             ret: Ty::Void,
             reg_types: vec![],
             entry_points: vec![0],
-            code: vec![Op::Jump { target: 5 }],
+            code: vec![Op::Jump { target: 5 }].into(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
@@ -753,7 +756,8 @@ mod tests {
                     b: 0,
                 },
                 Op::Return { src: None },
-            ],
+            ]
+            .into(),
             capture_targets: vec![],
         };
         // dst is typed `string` but Add.Int must produce `int`.
@@ -779,7 +783,8 @@ mod tests {
                     b: 1,
                 },
                 Op::Return { src: Some(2) },
-            ],
+            ]
+            .into(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_ok());
