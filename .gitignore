@@ -2,3 +2,6 @@
 *.swp
 .env
 .env.*
+# CI-only loadtest-smoke output (OBI-40); real runs' results/*.json,*.md
+# are committed by hand.
+/results/ci-smoke.*
