@@ -1436,26 +1436,40 @@ impl Cx<'_> {
                 );
                 (hir::StmtKind::Expr(Self::poison(span)), false)
             }
-            S::Try { body, handler, .. } => {
-                self.block(body);
-                self.block(handler);
-                self.err_hint(
-                    "W0239",
-                    span,
-                    "`try`/`catch` is not implemented by the type checker yet",
-                    "tracked under OBI-32 (atomic rollback + try/catch/throw)",
-                );
-                (hir::StmtKind::Expr(Self::poison(span)), false)
+            S::Try {
+                body,
+                catch_var,
+                handler,
+            } => {
+                // The handler's `catch_var` (if any) is scoped to the
+                // handler block only, not the surrounding function: it
+                // must not be visible after the `try` statement, and must
+                // not shadow anything the try body itself declared.
+                let (body_hir, body_diverges) = self.block(body);
+                self.scopes.push(Vec::new());
+                let catch_local = catch_var
+                    .as_ref()
+                    .map(|v| self.declare(&v.name, Ty::Any, false, v.span));
+                let (handler_hir, handler_diverges) = self.block(handler);
+                self.scopes.pop();
+                (
+                    hir::StmtKind::Try {
+                        body: body_hir,
+                        catch_var: catch_local,
+                        handler: handler_hir,
+                    },
+                    // Both arms must diverge to guarantee the statement as
+                    // a whole diverges: if the body completes without
+                    // throwing, control falls through past the handler.
+                    body_diverges && handler_diverges,
+                )
             }
             S::Throw(e) => {
-                self.expr(e, None);
-                self.err_hint(
-                    "W0240",
-                    span,
-                    "`throw` is not implemented by the type checker yet",
-                    "tracked under OBI-32 (atomic rollback + try/catch/throw)",
-                );
-                (hir::StmtKind::Expr(Self::poison(span)), false)
+                // Any type may be thrown (spec: "typed error values"); the
+                // catcher sees whatever static type flowed in here at
+                // runtime, via `catch_var: any`.
+                let x = self.expr(e, None);
+                (hir::StmtKind::Throw(x), true)
             }
         };
         (hir::Stmt { kind, span }, diverges)

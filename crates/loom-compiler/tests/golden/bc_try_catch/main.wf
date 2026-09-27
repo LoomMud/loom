@@ -1,0 +1,26 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+// Clean: `try`/`catch`/`throw` (spec r5, OBI-32): the type checker's
+// divergence analysis (a `try` diverges only if both arms do), the catch
+// binding's `any` type, and the assembled `PushHandler`/`PopHandler`/
+// `Throw` bytecode (spec: not a Terminator::Unset dead end).
+pub fn risky() -> bool {
+    try {
+        oops()
+    } catch e {
+        return false
+    }
+    throw 1
+}
+
+fn oops() {}
+
+pub fn falls_through(n: int) -> int {
+    var result = 0
+    try {
+        result = n
+    } catch {
+        result = -1
+    }
+    return result
+}

@@ -152,8 +152,6 @@ codes! {
     CHECK_FNAME_MUST_RETURN_VALUE_TYPE = "W0236", "`{fname}` must return a value of type `{t}`";
     CHECK_IF_LET_NOT_IMPLEMENTED_TYPE = "W0237", "`if let` is not implemented by the type checker yet";
     CHECK_BREAK_AND_CONTINUE_NOT_IMPLEMENTED = "W0238", "`break` and `continue` are not implemented by the type checker yet";
-    CHECK_TRY_CATCH_NOT_IMPLEMENTED_TYPE = "W0239", "`try`/`catch` is not implemented by the type checker yet";
-    CHECK_THROW_NOT_IMPLEMENTED_TYPE_CHECKER = "W0240", "`throw` is not implemented by the type checker yet";
     CHECK_CANNOT_ASSIGN_N_WAS_DECLARED = "W0241", "cannot assign to `{n}`: it was declared with `let`";
     CHECK_CANNOT_ASSIGN_N_CONST = "W0242", "cannot assign to `{n}`: it is a `const`";
     CHECK_CANNOT_ASSIGN_SELF = "W0243", "cannot assign to `self`";
@@ -252,7 +250,16 @@ codes! {
 
 /// Codes that used to be emitted but no longer are. A retired number is
 /// never reassigned; new codes always take the next free number in range.
-pub const RETIRED: &[(&str, &str)] = &[];
+pub const RETIRED: &[(&str, &str)] = &[
+    (
+        "W0239",
+        "`try`/`catch` is not implemented by the type checker yet",
+    ),
+    (
+        "W0240",
+        "`throw` is not implemented by the type checker yet",
+    ),
+];
 
 #[cfg(test)]
 mod tests {

@@ -337,6 +337,43 @@ impl FnLower {
                 self.unreachable = true;
                 Ok(())
             }
+            hir::StmtKind::Try {
+                body,
+                catch_var,
+                handler,
+            } => {
+                let handler_blk = self.new_block();
+                let after_blk = self.new_block();
+                self.emit(Inst::PushHandler {
+                    catch_blk: handler_blk,
+                    catch_reg: *catch_var,
+                });
+                self.unreachable = false;
+                self.block(body)?;
+                let body_falls_through = !self.unreachable;
+                if body_falls_through {
+                    self.emit(Inst::PopHandler);
+                    self.seal_cur(Terminator::Jump(after_blk));
+                }
+
+                self.switch(handler_blk);
+                self.unreachable = false;
+                self.block(handler)?;
+                let handler_falls_through = !self.unreachable;
+                if handler_falls_through {
+                    self.seal_cur(Terminator::Jump(after_blk));
+                }
+
+                self.switch(after_blk);
+                self.unreachable = !body_falls_through && !handler_falls_through;
+                Ok(())
+            }
+            hir::StmtKind::Throw(e) => {
+                let r = self.expr(e)?;
+                self.seal_cur(Terminator::Throw(r));
+                self.unreachable = true;
+                Ok(())
+            }
             hir::StmtKind::Expr(e) => self.expr_stmt(e),
         }
     }
@@ -929,7 +966,7 @@ impl Assembler {
                 continue;
             }
             for inst in &blk.insts {
-                code.push(self.op(inst));
+                code.push(self.op(inst, &starts));
             }
             code.push(match &blk.term {
                 Terminator::Jump(t) => Op::Jump {
@@ -945,6 +982,7 @@ impl Assembler {
                     else_target: starts[*else_blk as usize],
                 },
                 Terminator::Return(r) => Op::Return { src: *r },
+                Terminator::Throw(r) => Op::Throw { src: *r },
                 Terminator::Unset => unreachable!(),
             });
         }
@@ -965,7 +1003,7 @@ impl Assembler {
         }
     }
 
-    fn op(&mut self, inst: &Inst) -> Op {
+    fn op(&mut self, inst: &Inst, starts: &[u32]) -> Op {
         match inst {
             Inst::Const { dst, value } => Op::LoadConst {
                 dst: *dst,
@@ -1099,6 +1137,14 @@ impl Assembler {
                 ty: ty.clone(),
             },
             Inst::TickCheck => Op::TickCheck,
+            Inst::PushHandler {
+                catch_blk,
+                catch_reg,
+            } => Op::PushHandler {
+                catch_pc: starts[*catch_blk as usize],
+                catch_reg: *catch_reg,
+            },
+            Inst::PopHandler => Op::PopHandler,
         }
     }
 }
