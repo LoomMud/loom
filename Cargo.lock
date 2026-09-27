@@ -661,6 +661,7 @@ version = "0.0.1"
 dependencies = [
  "loom-compiler",
  "loom-net",
+ "loom-persist",
  "loom-vm",
  "tokio",
  "tracing",

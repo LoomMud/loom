@@ -1,0 +1,25 @@
+// A minimal player exercising account_create/account_login (OBI-85).
+pub fn logon() {
+    send(self, "Welcome.\n")
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "create" and len(words) == 3 {
+        send(self, $"req {account_create(words[1], words[2])}\n")
+    } else if verb == "login" and len(words) == 3 {
+        send(self, $"req {account_login(words[1], words[2])}\n")
+    } else if verb == "look" {
+        send(self, "ok\n")
+    } else {
+        send(self, "What?\n")
+    }
+}
+
+pub fn account_result(id: int, ok: bool, detail: string) {
+    send(self, $"result {id} {ok} {detail}\n")
+}
+
+pub fn net_dead() {
+}
