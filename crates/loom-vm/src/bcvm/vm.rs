@@ -322,21 +322,32 @@ impl<'a, H: Host> Interpreter<'a, H> {
             None => self.module,
         };
         let f = &m.functions[idx as usize];
-        if args.len() != f.params as usize {
+        if args.len() < f.min_arity as usize || args.len() > f.params as usize {
             let fname = m.strings[f.name as usize].to_string();
-            return Err(self.err_with_trace(format!(
-                "{fname}() takes {} argument(s), got {}",
-                f.params,
-                args.len()
-            )));
+            return Err(self.err_with_trace(if f.min_arity == f.params {
+                format!(
+                    "{fname}() takes {} argument(s), got {}",
+                    f.params,
+                    args.len()
+                )
+            } else {
+                format!(
+                    "{fname}() takes {}..={} argument(s), got {}",
+                    f.min_arity,
+                    f.params,
+                    args.len()
+                )
+            }));
         }
+        let k = args.len() as u32 - f.min_arity;
+        let pc = f.entry_points[k as usize];
         let mut regs: Vec<Value> = args;
         regs.resize(f.reg_types.len(), Value::Null);
         self.stack.push(Frame {
             code,
             entered,
             func: idx,
-            pc: 0,
+            pc,
             regs,
             ret_into,
         });
@@ -1068,8 +1079,10 @@ mod tests {
             functions: vec![FunctionCode {
                 name: 1,
                 params: 1,
+                min_arity: 1,
                 ret: Ty::Int,
                 reg_types: vec![Ty::Int; 6],
+                entry_points: vec![0],
                 code,
             }],
         }
@@ -1195,8 +1208,10 @@ mod tests {
             functions: vec![FunctionCode {
                 name: 1,
                 params: 0,
+                min_arity: 0,
                 ret: Ty::array(Ty::Int),
                 reg_types: vec![Ty::array(Ty::Int), Ty::array(Ty::Int), Ty::Int, Ty::Int],
+                entry_points: vec![0],
                 code,
             }],
         };

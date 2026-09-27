@@ -66,8 +66,23 @@ fn verify_function(m: &Module, f: &FunctionCode) -> Result<(), VerifyError> {
     if f.params as usize > f.reg_types.len() {
         return Err(VerifyError("params exceeds register count".into()));
     }
+    if f.min_arity > f.params {
+        return Err(VerifyError("min_arity exceeds params".into()));
+    }
+    let want_entries = (f.params - f.min_arity + 1) as usize;
+    if f.entry_points.len() != want_entries {
+        return Err(VerifyError(format!(
+            "expected {want_entries} entry point(s) (params - min_arity + 1), got {}",
+            f.entry_points.len()
+        )));
+    }
     if f.code.is_empty() {
         return Err(VerifyError("empty function body".into()));
+    }
+    for &pc in &f.entry_points {
+        if pc as usize >= f.code.len() {
+            return Err(VerifyError(format!("entry point {pc:04} out of bounds")));
+        }
     }
     let cx = Cx { m, f };
     for (pc, op) in f.code.iter().enumerate() {
@@ -290,9 +305,12 @@ impl Cx<'_> {
                                         "no such function `{fn_name}` in this module"
                                     ))
                                 })?;
-                            if args.len() != target.params as usize {
+                            if args.len() < target.min_arity as usize
+                                || args.len() > target.params as usize
+                            {
                                 return Err(VerifyError(format!(
-                                    "`{fn_name}` takes {} argument(s), got {}",
+                                    "`{fn_name}` takes {}..={} argument(s), got {}",
+                                    target.min_arity,
                                     target.params,
                                     args.len()
                                 )));
@@ -543,8 +561,10 @@ mod tests {
         let f = FunctionCode {
             name: 0,
             params: 0,
+            min_arity: 0,
             ret: Ty::Void,
             reg_types: vec![],
+            entry_points: vec![0],
             code: vec![Op::Return { src: None }],
         };
         assert!(verify(&m1(f)).is_ok());
@@ -555,8 +575,10 @@ mod tests {
         let f = FunctionCode {
             name: 0,
             params: 0,
+            min_arity: 0,
             ret: Ty::Int,
             reg_types: vec![Ty::Int],
+            entry_points: vec![0],
             code: vec![Op::Return { src: Some(7) }],
         };
         assert!(verify(&m1(f)).is_err());
@@ -567,8 +589,10 @@ mod tests {
         let f = FunctionCode {
             name: 0,
             params: 0,
+            min_arity: 0,
             ret: Ty::String,
             reg_types: vec![Ty::Int],
+            entry_points: vec![0],
             code: vec![Op::Return { src: Some(0) }],
         };
         assert!(verify(&m1(f)).is_err());
@@ -579,8 +603,10 @@ mod tests {
         let f = FunctionCode {
             name: 0,
             params: 0,
+            min_arity: 0,
             ret: Ty::Void,
             reg_types: vec![],
+            entry_points: vec![0],
             code: vec![Op::Jump { target: 5 }],
         };
         assert!(verify(&m1(f)).is_err());
@@ -591,8 +617,10 @@ mod tests {
         let f = FunctionCode {
             name: 0,
             params: 0,
+            min_arity: 0,
             ret: Ty::Void,
             reg_types: vec![Ty::Int, Ty::String],
+            entry_points: vec![0],
             code: vec![
                 Op::BinOp {
                     dst: 1,
@@ -613,8 +641,10 @@ mod tests {
         let f = FunctionCode {
             name: 0,
             params: 0,
+            min_arity: 0,
             ret: Ty::Int,
             reg_types: vec![Ty::Int, Ty::Int, Ty::Int],
+            entry_points: vec![0],
             code: vec![
                 Op::BinOp {
                     dst: 2,

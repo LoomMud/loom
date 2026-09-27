@@ -227,3 +227,63 @@ fn safe_call_other() {
         verify(m).expect("verify");
     }
 }
+
+#[test]
+fn default_params_prologue_min_arity_and_entry_points() {
+    // Three params, two trailing defaults: `min_arity` is 1 and there must
+    // be one entry point per possible call arity (1, 2 or 3 args).
+    let m = compile_one(
+        r#"
+        fn greet(name: string, greeting: string = "hello", punct: string = "!") -> string {
+            return greeting + " " + name + punct
+        }
+        "#,
+    );
+    verify(&m).expect("verify");
+    let f = &m.functions[0];
+    assert_eq!(f.params, 3);
+    assert_eq!(f.min_arity, 1, "two trailing params have defaults");
+    assert_eq!(
+        f.entry_points.len(),
+        3,
+        "one entry point per arity in min_arity..=params: {}",
+        crate::disasm::module(&m)
+    );
+    // The "every argument supplied" entry point is the function's real
+    // body: codegen never disturbs it, so it stays at pc 0 and the
+    // shorter-arity entries are the newly appended default-eval blocks
+    // that fall through into it (or into each other).
+    assert_eq!(
+        f.entry_points[2],
+        0,
+        "full-arity entry point must be the unmodified function body:\n{}",
+        crate::disasm::module(&m)
+    );
+    assert_ne!(f.entry_points[0], f.entry_points[1]);
+    assert_ne!(f.entry_points[1], f.entry_points[2]);
+    // No jump target may point past the end of the code (also covered by
+    // `verify`, checked again here as the direct acceptance criterion).
+    for &pc in &f.entry_points {
+        assert!((pc as usize) < f.code.len());
+    }
+}
+
+#[test]
+fn default_params_reject_wrong_arity_at_verify() {
+    // The verifier's static-call arity check must widen from an exact
+    // match to the `[min_arity, params]` range (OBI-77).
+    let src = r#"
+    fn greet(name: string, greeting: string = "hi") -> string {
+        return greeting + name
+    }
+    fn main() -> any {
+        return greet()
+    }
+    "#;
+    let (ast, diags) = loom_syntax::parse(src);
+    assert!(diags.is_empty(), "{diags:?}");
+    // Too few arguments is a checker-level error (missing required
+    // argument), not something codegen ever sees: confirm the checker
+    // rejects it up front.
+    assert!(crate::check::check_program("/t", &ast, Vec::new(), Vec::new()).is_err());
+}

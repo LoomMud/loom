@@ -160,8 +160,29 @@ fn short_circuit_and_null_handling() {
     assert!(e.contains("name"), "{e}");
 }
 
+/// OBI-77: the bytecode VM's callee-side prologue for trailing default
+/// parameters, exercised at every possible call arity (not just "all
+/// defaults" or "no defaults"). Kept separate from the acceptance test
+/// below, which additionally exercises runtime argument/return type checks
+/// that are a pre-existing, unrelated gap (see the OBI-77 task notes: the
+/// V2 checker now catches those mismatches at compile time with a
+/// different message, not at runtime).
 #[test]
-#[ignore = "known gap (OBI-72 follow-up): default parameter values are a checker/HIR-only concept (hir::Param::default, filled callee-side) that bcvm::vm's bytecode Function/push_call never implemented; it still requires args.len() == params exactly"]
+fn default_parameters_at_every_call_arity() {
+    let src = r#"
+fn greet(name: string, greeting: string = "hello", punct: string = "!") -> string {
+    return greeting + " " + name + punct
+}
+
+fn main() -> any {
+    return [greet("bob"), greet("amy", "hi"), greet("cy", "hi", "?")]
+}
+"#;
+    assert_eq!(ok(src), "[\"hello bob!\", \"hi amy!\", \"hi cy?\"]");
+}
+
+#[test]
+#[ignore = "OBI-77: default parameter values are now implemented (see default_parameters_at_every_call_arity); the remaining failure here is a separate, pre-existing gap: fn f(n: int)... f(\"x\") is now a compile-time W0226 diagnostic ('mismatched types in argument 1 of `f`') under the V2 checker, not the Phase-0 tree-walker's runtime 'argument `n` must be int, got string'. Rewriting this test or changing checker policy to defer these to runtime is a spec-level call outside this task's scope (see OBI-77 notes) -- flagged to the CTO."]
 fn functions_defaults_and_runtime_type_checks() {
     let src = r#"
 fn greet(name: string, greeting: string = "hello") -> string {
