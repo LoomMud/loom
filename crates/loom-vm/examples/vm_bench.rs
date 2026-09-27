@@ -97,6 +97,24 @@ fn cross_object() -> any {
     return acc
 }
 
+var bench_arr: [int] = [ARRAY_ZEROS]
+
+fn array_fill() -> any {
+    // OBI-80: deep, O(1)-incremental per-object memory accounting must
+    // keep an index-write into a *global* array O(1) per write (cached
+    // `deep_bytes` delta on both the container and `store_global`'s quota
+    // recheck), not an O(n) walk of the whole array — so filling n
+    // elements here stays O(n), not O(n²). See
+    // `bcvm::registry::tests::filling_a_global_array_by_index_stays_roughly_linear`
+    // for the assertion this workload's numbers back up.
+    var i = 0
+    while i < 5000 {
+        bench_arr[i] = i
+        i += 1
+    }
+    return bench_arr[4999]
+}
+
 fn noop(n: int) -> int {
     return n
 }
@@ -271,7 +289,8 @@ fn main() {
 
 fn run(iters: usize) {
     let root = std::env::temp_dir().join(format!("loom-vm-bench-{}", std::process::id()));
-    let master_src = format!("{MASTER}{PRIV_POLICY}");
+    let master_src =
+        format!("{MASTER}{PRIV_POLICY}").replace("ARRAY_ZEROS", &vec!["0"; 5000].join(","));
     for (rel, src) in [
         ("secure/master.wf", master_src.as_str()),
         ("bench/b.wf", B),
@@ -297,6 +316,7 @@ fn run(iters: usize) {
         "strings",
         "containers",
         "containers_50k",
+        "array_fill",
         "cross_object",
         "monocall",
         "monocall_other",

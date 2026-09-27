@@ -22,7 +22,7 @@ pub mod schema_convert;
 pub mod vm;
 
 pub use compile::{CompileError, compile_and_verify};
-pub use heap::{HeapObj, MapData, Value, shallow_bytes};
+pub use heap::{ArrayData, HeapObj, MapData, Value, cost};
 pub use registry::{
     BcObject, CompiledProgram, Compiler, CowMetrics, Registry, RegistryHost, UpgradeWarning,
     compile_hir_program,
