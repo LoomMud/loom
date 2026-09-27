@@ -281,6 +281,7 @@ pub struct Compiler {
     /// synchronous path and `begin_recompile`/`finish_recompile` need to
     /// hash a program's `.wf` source (`compile_worker::source_hash`) to
     /// detect drift, and `Session`'s loader isn't exposed for that.
+    /// Also `read_file`/`write_file`'s confinement root (OBI-85).
     root: PathBuf,
 }
 
@@ -290,6 +291,12 @@ impl Compiler {
             session: Session::new(mudlib::FsLoader { root: root.clone() }),
             root,
         }
+    }
+
+    /// The mudlib root this compiler loads programs from (OBI-85:
+    /// `read_file`/`write_file`'s confinement root).
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Ensure `path` (and every ancestor it needs) is compiled and
@@ -855,6 +862,13 @@ pub struct Registry {
     /// Connection id → the object it is bound to (mirrors
     /// `crate::world::State::conns`).
     pub conns: HashMap<u64, ObjectId>,
+    /// Connection id → the order it was (most recently) bound in (OBI-85
+    /// `users()`: "in bind order"). Stale entries for connections no
+    /// longer in `conns` are harmless (never read except through `conns`).
+    bind_seq: HashMap<u64, u64>,
+    next_bind_seq: u64,
+    /// `random()`'s PRNG (OBI-85), seeded once at boot.
+    pub rng: crate::rng::Rng,
     /// `loom_cow_copies_total{program}` (spec r5 §5.2.1, D24); see
     /// [`CowMetrics`].
     pub cow_metrics: CowMetrics,
@@ -1043,10 +1057,65 @@ impl Registry {
             && old_conn != conn
         {
             self.conns.remove(&old_conn);
+            self.bind_seq.remove(&old_conn);
         }
         if let Some(o) = self.get_mut(id) {
             o.conn = Some(conn);
         }
+        self.next_bind_seq += 1;
+        self.bind_seq.insert(conn, self.next_bind_seq);
+    }
+
+    /// Every object with a bound connection, in bind order (OBI-85
+    /// `users()`).
+    pub fn users_in_bind_order(&self) -> Vec<ObjectId> {
+        let mut v: Vec<(u64, ObjectId)> = self.conns.iter().map(|(c, o)| (*c, *o)).collect();
+        v.sort_by_key(|(c, _)| self.bind_seq.get(c).copied().unwrap_or(0));
+        v.into_iter().map(|(_, o)| o).collect()
+    }
+
+    /// Destroy `ob` (spec: inventory moves up into its own environment or
+    /// is dropped loose, `call_out`/heartbeat cancelled, name/connection
+    /// unbound); a no-op if `ob` is already gone. Returns the connection
+    /// that was bound to `ob`, if any, so the caller can close it (OBI-85
+    /// `destruct()`: "If `ob` is bound to a connection, close the
+    /// connection too"). Shared by `World::destruct` (the pre-efun
+    /// primitive, used by tests) and the `destruct` efun itself.
+    pub fn destruct(
+        &mut self,
+        ob: ObjectId,
+        scheduler: &mut crate::scheduler::Scheduler,
+    ) -> Option<u64> {
+        let existing_env = self.get(ob).map(|o| o.env)?;
+        let inventory = self
+            .get(ob)
+            .map(|o| o.inventory.clone())
+            .unwrap_or_default();
+        for item in inventory {
+            match existing_env {
+                Some(dest) => self.move_object(item, dest),
+                None => {
+                    if let Some(i) = self.get_mut(item) {
+                        i.env = None;
+                    }
+                }
+            }
+        }
+        if let Some(env) = existing_env
+            && let Some(o) = self.get_mut(env)
+        {
+            o.inventory.retain(|i| *i != ob);
+        }
+        let conn = self.get(ob).and_then(|o| o.conn);
+        if let Some(c) = conn {
+            self.conns.remove(&c);
+            self.bind_seq.remove(&c);
+        }
+        let name = self.obj_name(ob);
+        self.names.remove(&name);
+        scheduler.remove_for_object(ob);
+        self.remove(ob);
+        conn
     }
 
     /// The name `id` is registered under, or a placeholder if it was
@@ -1227,6 +1296,9 @@ struct Driver<'a> {
     /// P1+ enforcement hook (OBI-33): stubbed allow-all + audit log until
     /// S1's security-model policy lands, see `crate::privilege`.
     privilege: &'a mut dyn crate::privilege::PrivilegeCheck,
+    /// `account_create`/`account_login` bookkeeping (OBI-85), owned by
+    /// `World`; see `crate::world::AccountsCtx`.
+    accounts: crate::world::AccountsCtx<'a>,
 }
 
 /// Approximate current native stack position (mirrors the tree-walker's
@@ -1470,6 +1542,7 @@ impl<'a> RegistryHost<'a> {
         master: Option<ObjectId>,
         scheduler: &'a mut crate::scheduler::Scheduler,
         privilege: &'a mut dyn crate::privilege::PrivilegeCheck,
+        accounts: crate::world::AccountsCtx<'a>,
     ) -> Self {
         RegistryHost {
             registry,
@@ -1484,6 +1557,7 @@ impl<'a> RegistryHost<'a> {
                 master,
                 scheduler,
                 privilege,
+                accounts,
             }),
             stack_base: stack_addr(),
             call_cache: HashMap::new(),
@@ -1901,10 +1975,105 @@ impl<'a> RegistryHost<'a> {
                     .set_heart_beat(me, on);
                 Ok(Value::Null)
             }
+            "random" => {
+                let Value::Int(n) = a0 else {
+                    return Err(RtError::new("random(): expected int"));
+                };
+                if n <= 0 {
+                    return Err(RtError::new("random(): n must be > 0"));
+                }
+                Ok(Value::Int(self.registry.rng.gen_range(n)))
+            }
+            "time" => {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                Ok(Value::Int(secs))
+            }
+            "users" => Ok(Value::array(
+                self.registry
+                    .users_in_bind_order()
+                    .into_iter()
+                    .map(Value::Object)
+                    .collect(),
+            )),
+            "destruct" => {
+                let id = self.want_obj(name, &a0)?;
+                let driver = self.driver.as_mut().expect("checked above");
+                let conn = self.registry.destruct(id, driver.scheduler);
+                if let Some(c) = conn {
+                    driver.net.close(c);
+                }
+                Ok(Value::Null)
+            }
+            "read_file" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("read_file(): expected string"))?
+                    .to_string();
+                let root = self.driver.as_ref().expect("checked above").compiler.root();
+                crate::fileio::read_file(root, &p)
+                    .map(|s| s.map_or(Value::Null, |s| Value::str(&s)))
+                    .map_err(|e| RtError::new(format!("read_file(\"{p}\") failed: {e}")))
+            }
+            "write_file" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("write_file(): expected string"))?
+                    .to_string();
+                let text = a1
+                    .as_str()
+                    .ok_or_else(|| RtError::new("write_file(): expected string"))?;
+                let root = self.driver.as_ref().expect("checked above").compiler.root();
+                crate::fileio::write_file(root, &p, text)
+                    .map(Value::Bool)
+                    .map_err(|e| RtError::new(format!("write_file(\"{p}\") failed: {e}")))
+            }
+            "account_create" => self.issue_account_request(true, &a0, &a1),
+            "account_login" => self.issue_account_request(false, &a0, &a1),
             _ => Err(RtError::new(format!(
                 "internal: efun `{name}` not implemented"
             ))),
         }
+    }
+
+    /// `account_create`/`account_login` (spec, OBI-85): validates `name`/
+    /// `password` synchronously (never touches the DB for that), assigns
+    /// a request id, and either queues the real async lookup with
+    /// [`crate::world::AccountAuth`] or -- for a validation failure --
+    /// enqueues the `"invalid"` result locally. Either way, `account_result`
+    /// is only ever delivered on a *later* top-level entry (`World::drain_account_results`),
+    /// never inside this call, so the caller always sees its own request id
+    /// returned before it sees the matching `account_result` apply.
+    fn issue_account_request(&mut self, create: bool, name: &Value, password: &Value) -> R<Value> {
+        let name = name
+            .as_str()
+            .ok_or_else(|| RtError::new("account_create/account_login: expected string name"))?;
+        let password = password.as_str().ok_or_else(|| {
+            RtError::new("account_create/account_login: expected string password")
+        })?;
+        let caller = self.self_object();
+        let driver = self.driver.as_mut().expect("checked above");
+        *driver.accounts.next_id += 1;
+        let id = *driver.accounts.next_id;
+        let valid_name = (3..=16).contains(&name.chars().count())
+            && name.chars().all(|c| c.is_ascii_lowercase());
+        let valid_password = (6..=128).contains(&password.len());
+        if !valid_name || !valid_password {
+            driver
+                .accounts
+                .results
+                .push_back((id, caller, false, "invalid".to_string()));
+        } else {
+            driver.accounts.pending.insert(id, caller);
+            if create {
+                driver.accounts.auth.create_account(id, name, password);
+            } else {
+                driver.accounts.auth.login(id, name, password);
+            }
+        }
+        Ok(Value::Int(id as i64))
     }
 
     /// Run `name` declared in exactly `target` as `on` in a *fresh*
