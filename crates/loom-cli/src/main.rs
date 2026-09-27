@@ -17,8 +17,10 @@ const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const COMMAND_CHANNEL_CAPACITY: usize = 1024;
 /// Bound on in-flight `account_create`/`account_login` requests (spec's
 /// bounded-queue engineering lens): past this many outstanding DB/dev-
-/// backend requests, `blocking_send` in [`ChannelAccountAuth`] applies
-/// backpressure to the world thread rather than growing unbounded.
+/// backend requests, [`ChannelAccountAuth`]'s `try_send` starts failing
+/// (never blocking the world thread; see its doc), and
+/// `World::issue_account_request` immediately queues an `"unavailable"`
+/// `account_result` instead of leaving the request pending forever.
 const ACCOUNT_QUEUE_DEPTH: usize = 256;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -237,30 +239,37 @@ async fn spawn_account_backend()
 
 /// [`AccountAuth`] wired to whichever `DbRequest` sender
 /// [`spawn_account_backend`] chose: `create_account`/`login` never block
-/// the world thread (they are one bounded-channel `blocking_send`), and
-/// the eventual [`DbEvent::AccountResult`] comes back through the
-/// `DbEvent` receiver the world thread drains every loop iteration (see
-/// `spawn_world_thread`; once `NetEvent::Tick`, OBI-82, lands, `World::tick`
-/// already drains it too -- see `World::tick`'s doc comment).
+/// the world thread (a `try_send` on a bounded channel, `Err` if it is
+/// full or the worker task is gone -- the caller then queues an
+/// `"unavailable"` result locally instead of leaving the request pending
+/// forever, spec/CTO review OBI-85), and the eventual
+/// [`DbEvent::AccountResult`] comes back through the `DbEvent` receiver
+/// the world thread drains every loop iteration (see `spawn_world_thread`;
+/// once `NetEvent::Tick`, OBI-82, lands, `World::tick` already drains it
+/// too -- see `World::tick`'s doc comment).
 struct ChannelAccountAuth {
     request_tx: mpsc::Sender<DbRequest>,
 }
 
 impl AccountAuth for ChannelAccountAuth {
-    fn create_account(&mut self, request_id: u64, name: &str, password: &str) {
-        let _ = self.request_tx.blocking_send(DbRequest::CreateAccount {
-            correlation_id: request_id,
-            username: name.to_string(),
-            password: Password::new(password),
-        });
+    fn create_account(&mut self, request_id: u64, name: &str, password: &str) -> bool {
+        self.request_tx
+            .try_send(DbRequest::CreateAccount {
+                correlation_id: request_id,
+                username: name.to_string(),
+                password: Password::new(password),
+            })
+            .is_ok()
     }
 
-    fn login(&mut self, request_id: u64, name: &str, password: &str) {
-        let _ = self.request_tx.blocking_send(DbRequest::VerifyLogin {
-            correlation_id: request_id,
-            username: name.to_string(),
-            password: Password::new(password),
-        });
+    fn login(&mut self, request_id: u64, name: &str, password: &str) -> bool {
+        self.request_tx
+            .try_send(DbRequest::VerifyLogin {
+                correlation_id: request_id,
+                username: name.to_string(),
+                password: Password::new(password),
+            })
+            .is_ok()
     }
 }
 
@@ -380,5 +389,42 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod account_auth_tests {
+    use super::*;
+
+    /// CTO review (OBI-85): a zero-capacity channel is always full, so
+    /// `try_send` always fails and `ChannelAccountAuth` must report that
+    /// as `false` (never block, never panic).
+    #[test]
+    fn zero_capacity_channel_reports_failure_not_a_block() {
+        let (tx, _rx) = mpsc::channel(1);
+        // Fill the one slot so the next `try_send` is guaranteed to see
+        // `Full`, deterministically, instead of racing a zero-capacity
+        // channel's exact semantics.
+        tx.try_send(DbRequest::Sleep {
+            correlation_id: 0,
+            duration_ms: 0,
+        })
+        .expect("fill the one slot");
+
+        let mut auth = ChannelAccountAuth { request_tx: tx };
+        assert!(!auth.create_account(1, "legolas", "hunter2pass"));
+        assert!(!auth.login(2, "legolas", "hunter2pass"));
+    }
+
+    /// A closed channel (the worker task is gone) must also report
+    /// failure, not panic.
+    #[test]
+    fn closed_channel_reports_failure_not_a_panic() {
+        let (tx, rx) = mpsc::channel(8);
+        drop(rx);
+
+        let mut auth = ChannelAccountAuth { request_tx: tx };
+        assert!(!auth.create_account(1, "legolas", "hunter2pass"));
+        assert!(!auth.login(2, "legolas", "hunter2pass"));
     }
 }

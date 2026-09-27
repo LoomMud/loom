@@ -72,8 +72,8 @@ impl Host for SingleProgramHost<'_> {
         Err(RtError::new(format!("efun `{name}` needs a World host")))
     }
 
-    fn load_global(&mut self, _owner: &str, name: &str) -> Value {
-        self.vars.get(name).cloned().unwrap_or(Value::Null)
+    fn load_global(&mut self, _owner: &str, name: &str) -> Result<Value, RtError> {
+        Ok(self.vars.get(name).cloned().unwrap_or(Value::Null))
     }
 
     fn store_global(&mut self, _owner: &str, name: &str, v: Value) -> Result<(), RtError> {

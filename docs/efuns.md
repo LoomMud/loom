@@ -31,6 +31,7 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `users` | `users() -> Array(Object)` | P0 | 2 |
 | `lower` | `lower(String) -> String` | P0 | 1 |
 | `to_int` | `to_int(String) -> Optional(Int)` | P0 | 1 |
+| `destructed` | `destructed(Optional(Object)) -> Bool` | P0 | 1 |
 | `destruct` | `destruct(Object) -> Void` | P2 | 5 |
 | `read_file` | `read_file(String) -> Optional(String)` | P1 | 20 |
 | `write_file` | `write_file(String, String) -> Bool` | P1 | 20 |

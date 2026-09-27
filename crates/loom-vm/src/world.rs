@@ -38,16 +38,24 @@ pub const MASTER_PATH: &str = "/secure/master";
 /// accounts, since a request that never completes is silently inert, not a
 /// hang (nothing awaits it synchronously).
 pub trait AccountAuth {
-    fn create_account(&mut self, request_id: u64, name: &str, password: &str);
-    fn login(&mut self, request_id: u64, name: &str, password: &str);
+    /// Issue the request; `false` (the queue to the real backend is full
+    /// or closed) means the caller must treat it as `unavailable` right
+    /// away (spec/CTO review OBI-85: never leave a request pending
+    /// forever just because the backend channel briefly backed up).
+    fn create_account(&mut self, request_id: u64, name: &str, password: &str) -> bool;
+    fn login(&mut self, request_id: u64, name: &str, password: &str) -> bool;
 }
 
 /// Default [`AccountAuth`]: never answers (see the trait's doc).
 pub struct NullAccountAuth;
 
 impl AccountAuth for NullAccountAuth {
-    fn create_account(&mut self, _request_id: u64, _name: &str, _password: &str) {}
-    fn login(&mut self, _request_id: u64, _name: &str, _password: &str) {}
+    fn create_account(&mut self, _request_id: u64, _name: &str, _password: &str) -> bool {
+        true
+    }
+    fn login(&mut self, _request_id: u64, _name: &str, _password: &str) -> bool {
+        true
+    }
 }
 
 /// `account_create`/`account_login` bookkeeping (OBI-85), borrowed by

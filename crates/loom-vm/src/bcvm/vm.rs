@@ -180,7 +180,12 @@ pub trait Host {
     /// An efun call not handled inline by the interpreter (see
     /// [`Interpreter::call_efun`] for the ones that are).
     fn call_efun(&mut self, name: &str, args: Vec<Value>) -> R<Value>;
-    fn load_global(&mut self, owner: &str, name: &str) -> Value;
+    /// Load a program variable. `Err` (spec, OBI-85 CTO review) if `self`
+    /// has been destructed since -- a plain "missing key defaults to
+    /// `null`" would silently paper over a stale reference instead of
+    /// surfacing it as the runtime error it is; see
+    /// `bcvm::registry::RegistryHost::load_global`.
+    fn load_global(&mut self, owner: &str, name: &str) -> R<Value>;
     /// Store a program variable. `Err` (with a Weft stack trace, like any
     /// other [`RtError`]) if the host enforces a per-object memory quota
     /// (spec r5 §5.2.1) and this write would exceed it — see
@@ -686,7 +691,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     self.str_of(owner).to_string(),
                     self.str_of(name).to_string(),
                 );
-                let v = self.host.load_global(&owner, &name);
+                let v = self.host.load_global(&owner, &name)?;
                 set!(dst, v);
                 Ok(Step::Continue)
             }
@@ -1336,8 +1341,8 @@ mod tests {
         fn call_efun(&mut self, name: &str, _args: Vec<Value>) -> R<Value> {
             Err(RtError::new(format!("unknown efun `{name}`")))
         }
-        fn load_global(&mut self, _owner: &str, _name: &str) -> Value {
-            Value::Null
+        fn load_global(&mut self, _owner: &str, _name: &str) -> R<Value> {
+            Ok(Value::Null)
         }
         fn store_global(&mut self, _owner: &str, _name: &str, _v: Value) -> R<()> {
             Ok(())
