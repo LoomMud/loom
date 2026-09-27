@@ -38,6 +38,8 @@ fn seed_module() -> Module {
             }
             return total
         }
+        var exit_map: {string: string} = {:}
+        pub fn set_exit(dir: string, dest: string) { exit_map[dir] = dest }
     "#;
     let (ast, diags) = loom_syntax::parse(src);
     assert!(diags.is_empty(), "{diags:?}");
@@ -114,6 +116,18 @@ fn assert_actually_in_bounds(m: &Module) {
                     base, index, src, ..
                 } => {
                     check_reg(*base);
+                    check_reg(*index);
+                    check_reg(*src);
+                }
+                Op::IndexSetGlobal {
+                    owner,
+                    name,
+                    index,
+                    src,
+                    ..
+                } => {
+                    assert!((*owner as usize) < m.strings.len());
+                    assert!((*name as usize) < m.strings.len());
                     check_reg(*index);
                     check_reg(*src);
                 }

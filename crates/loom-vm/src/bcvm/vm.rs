@@ -36,7 +36,7 @@ use loom_compiler::bytecode::{
 
 use std::rc::Rc;
 
-use crate::bcvm::heap::{FnBody, FunctionValue, MapData, Value};
+use crate::bcvm::heap::{FnBody, FunctionValue, MAP_ENTRY_BYTES, MapData, Value};
 use crate::object::ObjectId;
 use crate::security::GuardSet;
 
@@ -203,6 +203,55 @@ pub trait Host {
     /// (spec r5 §5.2.1) and this write would exceed it — see
     /// `bcvm::registry::RegistryHost::store_global`.
     fn store_global(&mut self, owner: &str, name: &str, v: Value) -> R<()>;
+
+    /// Move a program variable's value out for an in-place index-assign
+    /// (spec r5 D24, OBI-108): the slot is left holding `Null` until the
+    /// matching [`Host::commit_global`] (success) or
+    /// [`Host::restore_global`] (any error/tick-abort before that) puts a
+    /// value back. A real host implements this as a move out of its own
+    /// storage, not a clone — that is the whole point: a container coming
+    /// back from here has exactly one owner, so mutating it in place
+    /// (`Value::array_mut`/`map_mut`) never has to `Rc::make_mut`-clone the
+    /// whole buffer just because the global's own copy was still sitting
+    /// there at refcount 2. The default here (used by hosts that never run
+    /// an index-assign into a global, e.g. tests) falls back to a plain
+    /// `load_global` + `store_global(Null)`, which is correct but pays the
+    /// clone this method exists to avoid.
+    fn take_global(&mut self, owner: &str, name: &str) -> R<Value> {
+        let v = self.load_global(owner, name)?;
+        self.store_global(owner, name, Value::Null)?;
+        Ok(v)
+    }
+    /// Commit the (possibly mutated) value [`Host::take_global`] handed
+    /// out. Subject to the same per-object memory quota as
+    /// [`Host::store_global`] (a map insert can grow the container) —
+    /// though a real host checks that *before* mutating
+    /// ([`Host::reserve_global_growth`]), so this itself never fails for
+    /// that reason once the write has actually reached this call.
+    fn commit_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
+        self.store_global(owner, name, v)
+    }
+    /// Put the *untouched* value [`Host::take_global`] handed out straight
+    /// back: used when an error (index out of range, a type error) or a
+    /// tick/budget abort happens between `take_global` and the matching
+    /// `commit_global`, so the write never happened from the program's
+    /// point of view (spec r5 OBI-108: no semantic change when a write
+    /// fails). Never fails on the size the value already was before it was
+    /// taken (it fit then, it fits now) — `self` having been destructed
+    /// out from under the call is the only way this can still error.
+    fn restore_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
+        self.store_global(owner, name, v)
+    }
+    /// Would committing `added_bytes` more onto the global `take_global`
+    /// just emptied (a map insert of a genuinely new key, the one way an
+    /// `IndexSetGlobal` write can grow a container, spec r5 OBI-108) push
+    /// this object's memory quota over — checked *before* the mutation
+    /// that would need it, so a rejected write never has to be undone,
+    /// only never applied. `Ok(())` by default (used by hosts that do not
+    /// enforce a per-object quota at all).
+    fn reserve_global_growth(&mut self, _owner: &str, _name: &str, _added_bytes: u64) -> R<()> {
+        Ok(())
+    }
 
     /// Resolve a cross-module call. The default runs it to completion via
     /// the `call_*` methods above; a host that can hand out code overrides
@@ -920,6 +969,72 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     self.host.record_cow_copy(&path);
                 }
                 Ok(Step::Continue)
+            }
+            Op::IndexSetGlobal {
+                owner,
+                name,
+                index,
+                kind,
+                src,
+            } => {
+                // The real "take" (OBI-108 CTO review of PR #8): unlike
+                // `Op::IndexSet`, codegen only ever emits this for a plain
+                // `global[i] = v`/`global[i] op= v`, one level deep, never
+                // for a value also bound to a live local. That means
+                // `Host::take_global` handing back a uniquely-owned value
+                // (not a clone) is sound: nothing else can observe it
+                // between the take and the matching commit/restore below,
+                // both of which run before this instruction returns —
+                // through a Weft `try`/`catch`, a full unwind out of the
+                // call chain, or a tick/budget abort alike.
+                let (owner_s, name_s) = (
+                    self.str_of(owner).to_string(),
+                    self.str_of(name).to_string(),
+                );
+                let key = reg!(index);
+                let val = reg!(src);
+                let mut container = self.host.take_global(&owner_s, &name_s)?;
+                let shared = container.is_shared();
+                // A map insert of a genuinely new key is the one way this
+                // write can grow the container (an array's length never
+                // changes); `shallow_bytes` counts a map by `entries.len()`
+                // alone, so the exact growth is known *before* mutating,
+                // the same way the array bounds check already happens
+                // before its own mutation — a rejected write is simply
+                // never applied, nothing to undo.
+                let grows = matches!(
+                    kind,
+                    IndexKind::Map | IndexKind::MapPresent | IndexKind::Dyn
+                ) && container.as_map().is_some_and(|m| m.get(&key).is_none());
+                if grows
+                    && let Err(e) =
+                        self.host
+                            .reserve_global_growth(&owner_s, &name_s, MAP_ENTRY_BYTES)
+                {
+                    self.host.restore_global(&owner_s, &name_s, container)?;
+                    return Err(e);
+                }
+                match Self::index_set(kind, &mut container, key, val) {
+                    Ok(()) => {
+                        self.host.commit_global(&owner_s, &name_s, container)?;
+                        if shared {
+                            let path = self.cur().path.clone();
+                            self.host.record_cow_copy(&path);
+                        }
+                        Ok(Step::Continue)
+                    }
+                    Err(e) => {
+                        // `index_set` validates (bounds/key type) before it
+                        // ever mutates `container`, so on `Err` it is still
+                        // exactly what `take_global` handed out: putting it
+                        // straight back undoes the take with no semantic
+                        // change (spec r5 OBI-108 acceptance: an out-of-
+                        // range index on a global array leaves the global
+                        // intact).
+                        self.host.restore_global(&owner_s, &name_s, container)?;
+                        Err(e)
+                    }
+                }
             }
             Op::IterElems { dst, src, kind, .. } => {
                 let v = self.iter_elems(*kind, reg!(*src))?;

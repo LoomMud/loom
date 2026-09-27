@@ -464,6 +464,67 @@ impl FnLower<'_> {
                 index,
                 kind: ik,
             } => {
+                if let hir::ExprKind::Global(g) = &base.kind {
+                    // Real "take" (OBI-108 CTO review of PR #8): do not
+                    // materialize the container into an ordinary register
+                    // at all for the write side. The old codegen emitted
+                    // `LoadGlobal` (a clone of the global's own `Rc`) then
+                    // `IndexSet` on that clone, so the global's slot and
+                    // the register were *both* live owners the whole time
+                    // — `IndexSet` always saw refcount 2 and cloned the
+                    // whole container on every single element write
+                    // (O(n²) filling a global array/map by index).
+                    // `Op::IndexSetGlobal` takes the container straight out
+                    // of the global (leaving `Null` until it, or the
+                    // untouched original on any error, is written back),
+                    // so the one clone the interpreter's COW check can
+                    // still trigger is a real one — something else
+                    // actually held a second reference — not this pattern
+                    // itself.
+                    let index_r = self.expr(index)?;
+                    let v = self.expr(value)?;
+                    let final_r = if matches!(op, hir::AssignOp::Set) {
+                        v
+                    } else {
+                        // `op=` still needs the *current* element to
+                        // combine with `v`; reading one element is O(1)
+                        // regardless of container size (`Index` only
+                        // clones the element, not the container), so an
+                        // ordinary read-only global load is fine here —
+                        // it is never followed by a mutation of that
+                        // register.
+                        let base_r = self.new_reg(base.ty.clone());
+                        self.emit(Inst::LoadGlobal {
+                            dst: base_r,
+                            global: g.clone(),
+                            ty: base.ty.clone(),
+                        });
+                        let elem_ty = elem_type_of(&self.reg_types[base_r as usize]);
+                        let cur = self.new_reg(elem_ty.clone());
+                        self.emit(Inst::Index {
+                            dst: cur,
+                            base: base_r,
+                            index: index_r,
+                            kind: *ik,
+                        });
+                        let dst = self.new_reg(elem_ty);
+                        self.emit(Inst::BinOp {
+                            dst,
+                            op: assign_binop(op),
+                            kind,
+                            a: cur,
+                            b: v,
+                        });
+                        dst
+                    };
+                    self.emit(Inst::IndexSetGlobal {
+                        global: g.clone(),
+                        index: index_r,
+                        kind: *ik,
+                        src: final_r,
+                    });
+                    return Ok(());
+                }
                 let base_r = self.expr(base)?;
                 let index_r = self.expr(index)?;
                 let v = self.expr(value)?;
@@ -497,20 +558,11 @@ impl FnLower<'_> {
                 // Value semantics (spec r5 D24): `IndexSet` mutates
                 // `base_r`'s own register in place (copy-on-write), which
                 // is *a copy* of whatever `base` read from, not a shared
-                // reference back to it. If `base` is directly a program
-                // global (`exits[dir] = dest`, not e.g. a local array),
-                // the mutated container must be written back or the edit
-                // is invisible outside this function. This only covers the
-                // one-level case (`global[i] = v`); a chain rooted in a
-                // global two or more levels down (`global[i][j] = v`) needs
-                // the fuller place-write lowering tracked on OBI-53.
-                if let hir::ExprKind::Global(g) = &base.kind {
-                    self.emit(Inst::StoreGlobal {
-                        global: g.clone(),
-                        ty: base.ty.clone(),
-                        src: base_r,
-                    });
-                }
+                // reference back to it. The single-level global case is
+                // handled above (`Op::IndexSetGlobal`, OBI-108); a chain
+                // rooted in a global two or more levels down
+                // (`global[i][j] = v`) still needs the fuller place-write
+                // lowering tracked on OBI-53.
                 Ok(())
             }
         }
@@ -1220,6 +1272,18 @@ impl Assembler {
                 src,
             } => Op::IndexSet {
                 base: *base,
+                index: *index,
+                kind: *kind,
+                src: *src,
+            },
+            Inst::IndexSetGlobal {
+                global,
+                index,
+                kind,
+                src,
+            } => Op::IndexSetGlobal {
+                owner: self.intern(&global.owner),
+                name: self.intern(&global.name),
                 index: *index,
                 kind: *kind,
                 src: *src,

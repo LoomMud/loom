@@ -168,6 +168,13 @@ pub enum Inst {
         kind: IndexKind,
         src: Reg,
     },
+    /// See `bytecode::Op::IndexSetGlobal` (OBI-108).
+    IndexSetGlobal {
+        global: GlobalRef,
+        index: Reg,
+        kind: IndexKind,
+        src: Reg,
+    },
     /// The array of elements to walk for a `for` loop (spec §5.3): identity
     /// for [`IterKind::Array`], `keys(src)` for [`IterKind::MapKeys`], a
     /// runtime check of `src`'s actual value kind for [`IterKind::Dyn`].

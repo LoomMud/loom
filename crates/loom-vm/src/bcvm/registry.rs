@@ -3423,6 +3423,82 @@ impl Host for RegistryHost<'_> {
         Ok(())
     }
 
+    /// See `bcvm::vm::Host::take_global` (OBI-108 CTO review of PR #8): a
+    /// real move out of `o.vars`, not a clone — `LoadGlobal`'s `.cloned()`
+    /// (see `load_global` above) is exactly the extra `Rc` owner that made
+    /// `IndexSet` see refcount 2 and clone the whole container on every
+    /// single element write, an O(n²) fill of a global array/map by
+    /// index. `mem_bytes` is adjusted to match (this var's bytes are gone
+    /// until the matching `commit_global`/`restore_global` puts something
+    /// back), and the pre-take value is journaled once, right here, if an
+    /// atomic scope is open — the one place that still holds it whole.
+    fn take_global(&mut self, owner: &str, name: &str) -> R<Value> {
+        let self_id = self.self_object();
+        let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
+        let Some(o) = self.registry.get_mut(self_id) else {
+            return Err(RtError::new("self was destructed"));
+        };
+        let old_bytes = o.vars.get(&key).map(heap::shallow_bytes).unwrap_or(0);
+        let old = o
+            .vars
+            .insert(key.clone(), Value::Null)
+            .unwrap_or(Value::Null);
+        o.mem_bytes = o.mem_bytes.saturating_sub(old_bytes);
+        self.registry
+            .journal_var_write(self_id, key, Some(old.clone()));
+        Ok(old)
+    }
+
+    /// See `bcvm::vm::Host::commit_global`. No quota re-check: an array's
+    /// `shallow_bytes` never changes (`Op::IndexSet` cannot change its
+    /// length) and a map growth was already reserved, before the mutation,
+    /// by `reserve_global_growth` — this is just the actual write-back.
+    fn commit_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
+        let self_id = self.self_object();
+        let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
+        let new_bytes = heap::shallow_bytes(&v);
+        let Some(o) = self.registry.get_mut(self_id) else {
+            return Err(RtError::new("self was destructed"));
+        };
+        o.mem_bytes += new_bytes;
+        o.vars.insert(key, v);
+        Ok(())
+    }
+
+    /// See `bcvm::vm::Host::restore_global`. No quota check (it fit
+    /// before this take, it fits now) and no new journal entry
+    /// (`take_global` already recorded the one undo point for this
+    /// write).
+    fn restore_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
+        let self_id = self.self_object();
+        let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
+        let new_bytes = heap::shallow_bytes(&v);
+        let Some(o) = self.registry.get_mut(self_id) else {
+            return Err(RtError::new("self was destructed"));
+        };
+        o.mem_bytes += new_bytes;
+        o.vars.insert(key, v);
+        Ok(())
+    }
+
+    /// See `bcvm::vm::Host::reserve_global_growth`.
+    fn reserve_global_growth(&mut self, _owner: &str, name: &str, added_bytes: u64) -> R<()> {
+        let self_id = self.self_object();
+        let quota = self.limits.mem_quota_bytes;
+        let Some(o) = self.registry.get(self_id) else {
+            return Err(RtError::new("self was destructed"));
+        };
+        let new_total = o.mem_bytes + added_bytes;
+        if new_total > quota {
+            return Err(RtError::new(format!(
+                "{}: memory quota exceeded writing `{name}` ({new_total} bytes of vars would be \
+                 in use, quota is {quota} bytes)",
+                o.name
+            )));
+        }
+        Ok(())
+    }
+
     fn record_cow_copy(&mut self, program: &str) {
         self.registry.cow_metrics.record(program);
     }

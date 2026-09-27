@@ -156,6 +156,21 @@ pub enum Op {
         kind: IndexKind,
         src: Reg,
     },
+    /// `owner::name[index] = src`, one level deep (OBI-108): the real
+    /// "take" version of `Op::LoadGlobal` + `Op::IndexSet` +
+    /// `Op::StoreGlobal` — moves the container straight out of the global
+    /// slot instead of cloning an `Rc` that would still be sitting there
+    /// when `IndexSet` checks whether it needs to copy-on-write, mutates it
+    /// (now uniquely owned) in place, and writes it back, restoring the
+    /// untouched original on any error instead (`bcvm::vm::Host::take_global`/
+    /// `commit_global`/`restore_global`).
+    IndexSetGlobal {
+        owner: StrId,
+        name: StrId,
+        index: Reg,
+        kind: IndexKind,
+        src: Reg,
+    },
     IterElems {
         dst: Reg,
         src: Reg,
@@ -694,6 +709,20 @@ impl Writer {
                 self.put_index_kind(*kind);
                 self.put_varu32(*src);
             }
+            Op::IndexSetGlobal {
+                owner,
+                name,
+                index,
+                kind,
+                src,
+            } => {
+                self.put_u8(24);
+                self.put_varu32(*owner);
+                self.put_varu32(*name);
+                self.put_varu32(*index);
+                self.put_index_kind(*kind);
+                self.put_varu32(*src);
+            }
             Op::IterElems {
                 dst,
                 src,
@@ -1198,6 +1227,13 @@ impl<'a> Reader<'a> {
             },
             10 => Op::IndexSet {
                 base: self.get_varu32()?,
+                index: self.get_varu32()?,
+                kind: self.get_index_kind()?,
+                src: self.get_varu32()?,
+            },
+            24 => Op::IndexSetGlobal {
+                owner: self.get_varu32()?,
+                name: self.get_varu32()?,
                 index: self.get_varu32()?,
                 kind: self.get_index_kind()?,
                 src: self.get_varu32()?,

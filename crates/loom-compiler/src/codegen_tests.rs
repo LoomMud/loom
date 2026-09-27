@@ -166,12 +166,16 @@ fn compound_assign_to_global() {
     verify(&m).expect("verify");
 }
 
-/// r5 D24: containers are copy-on-write values, so `IndexSet` mutates a
-/// register that is *a copy* of what `LoadGlobal` produced, not the global
-/// storage itself. An index-assign into a global container (`exits[dir] =
-/// dest`) must therefore also `StoreGlobal` the mutated register back, or
-/// the edit is invisible to every other read of that global (found by the
-/// `loom-vm` end-to-end test running this exact shape against the VM).
+/// r5 D24 / OBI-108: an index-assign into a global container (`exits[dir]
+/// = dest`) must move the container out of the global (leaving `Null`)
+/// rather than clone the global's own `Rc` into a register and mutate
+/// that, then write the mutated register back — the codegen shape found
+/// (by the `loom-vm` end-to-end test running this exact shape against the
+/// VM) is a single `IndexSetGlobal` op, not a `LoadGlobal` + `IndexSet` +
+/// `StoreGlobal` triple (the latter always sees the global's slot and the
+/// register as two live owners of the same buffer, so `IndexSet` clones
+/// the whole container on every single write — O(n²) filling one by
+/// index).
 #[test]
 fn index_assign_into_a_global_container_writes_it_back() {
     let m = compile_one(
@@ -188,24 +192,25 @@ fn index_assign_into_a_global_container_writes_it_back() {
         .iter()
         .find(|f| &*m.strings[f.name as usize] == "add_exit")
         .unwrap();
-    let has_index_set = f
+    let has_index_set_global = f
         .code
         .iter()
-        .any(|op| matches!(op, crate::bytecode::Op::IndexSet { .. }));
-    let store_global_after_index_set = f
-        .code
-        .iter()
-        .position(|op| matches!(op, crate::bytecode::Op::IndexSet { .. }))
-        .and_then(|i| f.code.get(i + 1))
-        .is_some_and(|op| matches!(op, crate::bytecode::Op::StoreGlobal { .. }));
+        .any(|op| matches!(op, crate::bytecode::Op::IndexSetGlobal { .. }));
+    let has_old_shape = f.code.iter().any(|op| {
+        matches!(
+            op,
+            crate::bytecode::Op::IndexSet { .. } | crate::bytecode::Op::StoreGlobal { .. }
+        )
+    });
     assert!(
-        has_index_set,
-        "expected an IndexSet op:\n{}",
+        has_index_set_global,
+        "expected an IndexSetGlobal op:\n{}",
         crate::disasm::module(&m)
     );
     assert!(
-        store_global_after_index_set,
-        "IndexSet into a global must be followed by a StoreGlobal to write the mutated copy back:\n{}",
+        !has_old_shape,
+        "a plain `global[i] = v` should not need a separate LoadGlobal/IndexSet/StoreGlobal \
+         triple any more (OBI-108):\n{}",
         crate::disasm::module(&m)
     );
 }

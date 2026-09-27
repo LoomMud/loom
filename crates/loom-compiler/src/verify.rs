@@ -267,6 +267,20 @@ impl Cx<'_> {
                 let _ = kind;
                 Ok(())
             }
+            Op::IndexSetGlobal {
+                owner,
+                name,
+                index,
+                kind,
+                src,
+            } => {
+                self.str(*owner)?;
+                self.str(*name)?;
+                self.reg(*index)?;
+                self.reg(*src)?;
+                let _ = kind;
+                Ok(())
+            }
             Op::IterElems {
                 dst,
                 src,
