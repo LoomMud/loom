@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT object_path, key, program_path, program_version, schema_hash,\n                    state_json as \"state_json: serde_json::Value\"\n             FROM object_state\n             WHERE object_path = $1 AND key = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "object_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "program_path",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "program_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "schema_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "state_json: serde_json::Value",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c1bea265b9cd171b48f3a7495dc0fb8fac49ff0305f2d253894708368414701d"
+}

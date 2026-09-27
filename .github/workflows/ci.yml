@@ -8,6 +8,34 @@ permissions:
 jobs:
   rust:
     runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: loom_superuser
+          POSTGRES_PASSWORD: loom_superuser_ci_only
+          POSTGRES_DB: loom
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U loom_superuser -d loom"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # loom-persist (D-27.4): migrations never create logins or contain
+      # passwords. CI creates both logins below, as a setup step, using the
+      # Postgres service's superuser. loom_owner owns every table/function
+      # and runs migrations (LOOM_DB_MIGRATE_URL); loom_app is the
+      # world-runtime login under test and is not an owner (DATABASE_URL).
+      LOOM_DB_MIGRATE_URL: postgres://loom_owner:loom_owner_ci_only@localhost:5432/loom
+      DATABASE_URL: postgres://loom_app:loom_app_ci_only@localhost:5432/loom
+      # D-27.7: fail (not skip) DB-backed tests when the DB env isn't set.
+      LOOM_REQUIRE_DB: "1"
+      # Compile-time sqlx query! checks use the committed .sqlx cache; the
+      # schema doesn't exist yet at build time (migrations run inside the
+      # loom-persist tests themselves, at runtime, via run_migrations).
+      SQLX_OFFLINE: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -15,6 +43,14 @@ jobs:
           toolchain: "1.98.1"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Create loom_owner and loom_app logins
+        run: |
+          PGPASSWORD=loom_superuser_ci_only psql -h localhost -U loom_superuser -d loom -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE loom_owner LOGIN PASSWORD 'loom_owner_ci_only';
+          CREATE ROLE loom_app LOGIN PASSWORD 'loom_app_ci_only';
+          ALTER DATABASE loom OWNER TO loom_owner;
+          GRANT ALL ON DATABASE loom TO loom_owner;
+          SQL
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

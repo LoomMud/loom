@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT old_tier, new_tier, actor FROM role_changes\n         WHERE uid = $1 ORDER BY at DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "old_tier",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 1,
+        "name": "new_tier",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 2,
+        "name": "actor",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "8580b79d5a9c28f4ed68c2058b489482cea0c0a50e183cc40f9cf92876b8c7ff"
+}
