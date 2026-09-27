@@ -33,10 +33,84 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use loom_compiler::bytecode::Module;
+use loom_compiler::hir;
 
 use crate::bcvm::Value;
+use crate::bcvm::compile::{CompileError, compile_and_verify};
 use crate::bcvm::vm::{Host, Interpreter, Limits, R, RtError};
 use crate::object::ObjectId;
+
+/// The name of the synthetic per-program initialiser function
+/// [`synth_init_function`] adds, run once per ancestor (root first) when an
+/// object is created (spec §7.2's `init_vars`, done here instead of in the
+/// tree-walker's `World::init_vars`). Chosen to be unwritable Weft source
+/// (`$` cannot start an identifier), so a real program can never collide
+/// with or call it directly.
+pub const INIT_FN: &str = "$init";
+
+/// Build a synthetic, private, no-argument function whose body assigns
+/// every declared `var`'s initialiser expression to that global — exactly
+/// the statements `crate::program::link`'s tree-walker equivalent
+/// (`World::init_vars`) evaluates by hand, but lowered through the same
+/// `codegen`/`verify` pipeline as everything else so a var initialiser
+/// gets the same tick metering, dispatch, and verification as any other
+/// code (spec §5.8: nothing runs unverified). `None` if `p` declares no
+/// vars with an initialiser (no function is added).
+fn synth_init_function(p: &hir::Program) -> Option<hir::Function> {
+    let stmts: Vec<hir::Stmt> = p
+        .vars
+        .iter()
+        .filter_map(|v| {
+            let init = v.init.as_ref()?;
+            Some(hir::Stmt {
+                kind: hir::StmtKind::Assign {
+                    place: hir::Place::Global(hir::GlobalRef {
+                        owner: p.path.clone(),
+                        name: v.name.clone(),
+                    }),
+                    op: hir::AssignOp::Set,
+                    kind: hir::OpKind::Dyn,
+                    value: init.clone(),
+                },
+                span: v.span,
+            })
+        })
+        .collect();
+    if stmts.is_empty() {
+        return None;
+    }
+    let span = stmts[0].span;
+    Some(hir::Function {
+        name: Rc::from(INIT_FN),
+        vis: hir::Visibility::Private,
+        is_override: false,
+        params: Vec::new(),
+        ret: loom_compiler::ty::Ty::Void,
+        locals: Vec::new(),
+        body: hir::Block { stmts, span },
+        span,
+    })
+}
+
+/// Compile one already-checked `hir::Program` into a [`CompiledProgram`]:
+/// codegen + verify (never skipped, see [`compile_and_verify`]) plus the
+/// synthetic `$init` function (see [`synth_init_function`]) that lets
+/// [`Registry::instantiate`] run var initialisers on the bytecode VM
+/// instead of needing a separate tree-walking evaluator for them.
+pub fn compile_hir_program(
+    hir: &hir::Program,
+    version: u32,
+    parent: Option<Rc<CompiledProgram>>,
+) -> Result<CompiledProgram, CompileError> {
+    let module = if let Some(init_fn) = synth_init_function(hir) {
+        let mut augmented = hir.clone();
+        augmented.fns.push(init_fn);
+        compile_and_verify(&augmented)?
+    } else {
+        compile_and_verify(hir)?
+    };
+    Ok(CompiledProgram::new(module, version, parent))
+}
 
 /// A verified [`Module`] plus the metadata dispatch needs: its own
 /// (unmerged) name → function-slot table, and a link to its parent
@@ -176,6 +250,18 @@ impl Registry {
             .filter(|s| s.generation == id.generation)
             .and_then(|s| s.obj.as_mut())
     }
+
+    /// Remove an object; its id becomes stale (mirrors
+    /// `crate::object::ObjectTable::remove`).
+    pub fn remove(&mut self, id: ObjectId) -> Option<BcObject> {
+        let slot = self.slots.get_mut(id.index as usize)?;
+        if slot.generation != id.generation {
+            return None;
+        }
+        let obj = slot.obj.take()?;
+        self.free.push(id.index);
+        Some(obj)
+    }
 }
 
 /// A [`Host`] backed by a real [`Registry`] (multiple objects, multiple
@@ -214,6 +300,20 @@ impl<'a> RegistryHost<'a> {
         let (target, idx) = prog
             .resolve(name)
             .ok_or_else(|| RtError::new(format!("no function `{name}`")))?;
+        self.call_in(on, &target, idx, args)
+    }
+
+    /// Call `name` declared in exactly `target` (no virtual dispatch) as
+    /// `on`. Used for `$init` (each ancestor's own initialiser, never an
+    /// override) and by [`Self::call_static`]/`call_on`/`call_other` once
+    /// they have already resolved which program+slot to run.
+    fn call_in(
+        &mut self,
+        on: ObjectId,
+        target: &Rc<CompiledProgram>,
+        idx: u32,
+        args: Vec<Value>,
+    ) -> R<Value> {
         self.self_stack.push(on);
         let func_name =
             target.module.strings[target.module.functions[idx as usize].name as usize].to_string();
@@ -226,6 +326,30 @@ impl<'a> RegistryHost<'a> {
         self.ticks_left = ticks;
         self.self_stack.pop();
         result
+    }
+
+    /// Create a new object of `prog` and run every ancestor's own `$init`
+    /// (root first, spec §7.2 var-initialiser order — the same order
+    /// `crate::world::World::init_vars` uses for the tree-walker): each
+    /// ancestor only ever sets *its own* declared variables, in program
+    /// order, so a child's initialiser can already see (and read) a
+    /// parent's already-initialised variable, but never the reverse.
+    /// Rolls back (removes the half-built object) on the first failing
+    /// initialiser, matching `World::new_object`'s all-or-nothing create.
+    pub fn instantiate(&mut self, prog: Rc<CompiledProgram>) -> R<ObjectId> {
+        let id = self.registry.insert(BcObject {
+            program: prog.clone(),
+            vars: Vars::new(),
+        });
+        for ancestor in prog.chain() {
+            if let Some(idx) = ancestor.resolve_own(INIT_FN)
+                && let Err(e) = self.call_in(id, &ancestor, idx, Vec::new())
+            {
+                self.registry.remove(id);
+                return Err(e);
+            }
+        }
+        Ok(id)
     }
 }
 
@@ -258,19 +382,8 @@ impl Host for RegistryHost<'_> {
         let idx = target
             .resolve_own(name)
             .ok_or_else(|| RtError::new(format!("no function `{name}` in {program}")))?;
-        let func_name =
-            target.module.strings[target.module.functions[idx as usize].name as usize].to_string();
         // Same `self`, different (ancestor) program/module.
-        self.self_stack.push(self_id);
-        let limits = self.limits;
-        let mut ticks = self.ticks_left;
-        let result = {
-            let mut interp = Interpreter::new(&target.module, self, &limits, &mut ticks);
-            interp.call(&func_name, args)
-        };
-        self.ticks_left = ticks;
-        self.self_stack.pop();
-        result
+        self.call_in(self_id, &target, idx, args)
     }
 
     fn call_virtual(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
@@ -294,18 +407,7 @@ impl Host for RegistryHost<'_> {
         let (target, idx) = prog
             .resolve(name)
             .ok_or_else(|| RtError::new(format!("no function `{name}` on {}", prog.path)))?;
-        let func_name =
-            target.module.strings[target.module.functions[idx as usize].name as usize].to_string();
-        self.self_stack.push(recv_id);
-        let limits = self.limits;
-        let mut ticks = self.ticks_left;
-        let result = {
-            let mut interp = Interpreter::new(&target.module, self, &limits, &mut ticks);
-            interp.call(&func_name, args)
-        };
-        self.ticks_left = ticks;
-        self.self_stack.pop();
-        result
+        self.call_in(recv_id, &target, idx, args)
     }
 
     fn call_efun(&mut self, name: &str, _args: Vec<Value>) -> R<Value> {
@@ -345,6 +447,26 @@ mod tests {
         match session.compile(path) {
             Outcome::Ok(checked) => {
                 crate::bcvm::compile_and_verify(&checked.hir).expect("codegen + verify")
+            }
+            Outcome::Failed(report) => panic!("check failed:\n{report}"),
+            Outcome::Missing(msg) => panic!("{msg}"),
+        }
+    }
+
+    fn compile_program(
+        path: &str,
+        files: &[(&str, &str)],
+        version: u32,
+        parent: Option<Rc<CompiledProgram>>,
+    ) -> CompiledProgram {
+        let map: HashMap<String, String> = files
+            .iter()
+            .map(|(p, s)| (p.to_string(), s.to_string()))
+            .collect();
+        let mut session = Session::new(map);
+        match session.compile(path) {
+            Outcome::Ok(checked) => {
+                compile_hir_program(&checked.hir, version, parent).expect("codegen + verify")
             }
             Outcome::Failed(report) => panic!("check failed:\n{report}"),
             Outcome::Missing(msg) => panic!("{msg}"),
@@ -470,5 +592,57 @@ pub fn parent_greet() -> string {
 
         let via_super = host.call_on(child, "parent_greet", vec![]).unwrap();
         assert_eq!(via_super.as_str(), Some("hello from parent"));
+    }
+
+    /// `$init` (spec §7.2 var initialisers, synthesised by
+    /// [`synth_init_function`]) runs automatically on
+    /// [`RegistryHost::instantiate`], root ancestor first: a child's
+    /// variable initialiser can already read a parent's initialised
+    /// variable (via `super::`-free virtual dispatch reaching the parent's
+    /// `pub fn`), proving both the ordering and that no test needs to seed
+    /// vars by hand the way `bcvm_e2e.rs`/the earlier cross-object test
+    /// did.
+    #[test]
+    fn instantiate_runs_var_initialisers_root_first_without_manual_seeding() {
+        const PARENT_WF: &str = r#"
+var base: int = 10
+
+pub fn get_base() -> int {
+    return base
+}
+"#;
+        const CHILD_WF: &str = r#"
+inherit /obj/parent
+
+var derived: int = get_base() + 5
+
+pub fn get_derived() -> int {
+    return derived
+}
+"#;
+        let parent = compile_program("/obj/parent", &[("/obj/parent", PARENT_WF)], 1, None);
+        let parent_prog = Rc::new(parent);
+        let files = [("/obj/parent", PARENT_WF), ("/obj/child", CHILD_WF)];
+        let child = compile_program("/obj/child", &files, 1, Some(parent_prog.clone()));
+        let child_prog = Rc::new(child);
+
+        let mut registry = Registry::default();
+        registry.register_program(parent_prog);
+        registry.register_program(child_prog.clone());
+
+        // `RegistryHost::new` needs a starting `self`, but `instantiate`
+        // doesn't have an object yet — a placeholder id is fine, it is
+        // never read before `instantiate` pushes the real one.
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(child_prog).expect("instantiate");
+
+        let base = host.call_on(obj, "get_base", vec![]).unwrap();
+        assert!(base.equals(&Value::Int(10)));
+        let derived = host.call_on(obj, "get_derived", vec![]).unwrap();
+        assert!(derived.equals(&Value::Int(15)));
     }
 }

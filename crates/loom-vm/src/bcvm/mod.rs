@@ -21,5 +21,5 @@ pub mod vm;
 
 pub use compile::{CompileError, compile_and_verify};
 pub use heap::{HeapObj, MapData, Value};
-pub use registry::{BcObject, CompiledProgram, Registry, RegistryHost};
+pub use registry::{BcObject, CompiledProgram, Registry, RegistryHost, compile_hir_program};
 pub use vm::{Host, Interpreter, Limits, RtError};
