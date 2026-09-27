@@ -34,6 +34,7 @@ use std::rc::Rc;
 
 use loom_compiler::bytecode::Module;
 use loom_compiler::hir;
+use loom_compiler::ty::Ty;
 
 use crate::bcvm::Value;
 use crate::bcvm::compile::{CompileError, compile_and_verify};
@@ -48,21 +49,65 @@ use crate::object::ObjectId;
 /// with or call it directly.
 pub const INIT_FN: &str = "$init";
 
-/// Build a synthetic, private, no-argument function whose body assigns
+/// One program variable's migration-relevant metadata (spec §7.2/§7.3: hot
+/// reload matches state by *(declaring program, name)* and keeps the old
+/// value only if it still type-conforms; a var with no initialiser has
+/// nothing to (re-)run and always keeps whatever is already stored, or
+/// `null` if nothing is). Built once per [`CompiledProgram`] from its
+/// `hir::Program.vars`, in declaration order.
+#[derive(Clone, Debug)]
+pub struct VarSpec {
+    pub name: Rc<str>,
+    pub ty: Ty,
+    pub has_init: bool,
+}
+
+/// Build a synthetic, private function whose body conditionally assigns
 /// every declared `var`'s initialiser expression to that global — exactly
 /// the statements `crate::program::link`'s tree-walker equivalent
 /// (`World::init_vars`) evaluates by hand, but lowered through the same
 /// `codegen`/`verify` pipeline as everything else so a var initialiser
 /// gets the same tick metering, dispatch, and verification as any other
-/// code (spec §5.8: nothing runs unverified). `None` if `p` declares no
-/// vars with an initialiser (no function is added).
+/// code (spec §5.8: nothing runs unverified).
+///
+/// One `bool` parameter per var-with-an-initialiser (in declaration order,
+/// matching [`CompiledProgram::init_specs`]) lets a caller say "keep the
+/// value already stored for this var, don't run its initialiser" — the
+/// hot-reload migration decision (spec §7.2/D-hot-reload: a recompile keeps
+/// a var's old value when it still type-conforms, and only re-runs the
+/// initialiser when it doesn't, or on first creation when nothing is kept).
+/// `None` if `p` declares no vars with an initialiser (no function is
+/// added, and [`RegistryHost::run_init`] is a no-op for that program).
 fn synth_init_function(p: &hir::Program) -> Option<hir::Function> {
-    let stmts: Vec<hir::Stmt> = p
-        .vars
+    let with_init: Vec<&hir::Var> = p.vars.iter().filter(|v| v.init.is_some()).collect();
+    if with_init.is_empty() {
+        return None;
+    }
+    let locals: Vec<hir::Local> = with_init
         .iter()
-        .filter_map(|v| {
-            let init = v.init.as_ref()?;
-            Some(hir::Stmt {
+        .enumerate()
+        .map(|(i, v)| hir::Local {
+            name: Rc::from(format!("$keep{i}").as_str()),
+            ty: Ty::Bool,
+            mutable: false,
+            span: v.span,
+        })
+        .collect();
+    let params: Vec<hir::Param> = (0..with_init.len() as u32)
+        .map(|local| hir::Param {
+            local,
+            default: None,
+        })
+        .collect();
+    let stmts: Vec<hir::Stmt> = with_init
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let init = v
+                .init
+                .clone()
+                .expect("filtered to vars with an initialiser");
+            let assign = hir::Stmt {
                 kind: hir::StmtKind::Assign {
                     place: hir::Place::Global(hir::GlobalRef {
                         owner: p.path.clone(),
@@ -70,23 +115,44 @@ fn synth_init_function(p: &hir::Program) -> Option<hir::Function> {
                     }),
                     op: hir::AssignOp::Set,
                     kind: hir::OpKind::Dyn,
-                    value: init.clone(),
+                    value: init,
                 },
                 span: v.span,
-            })
+            };
+            // `if !$keep_i { global = init_expr }`
+            hir::Stmt {
+                kind: hir::StmtKind::If {
+                    cond: hir::Expr {
+                        kind: hir::ExprKind::Unary {
+                            op: hir::UnOp::Not,
+                            kind: hir::OpKind::Bool,
+                            expr: Box::new(hir::Expr {
+                                kind: hir::ExprKind::Local(i as u32),
+                                ty: Ty::Bool,
+                                span: v.span,
+                            }),
+                        },
+                        ty: Ty::Bool,
+                        span: v.span,
+                    },
+                    then: hir::Block {
+                        stmts: vec![assign],
+                        span: v.span,
+                    },
+                    els: None,
+                },
+                span: v.span,
+            }
         })
         .collect();
-    if stmts.is_empty() {
-        return None;
-    }
     let span = stmts[0].span;
     Some(hir::Function {
         name: Rc::from(INIT_FN),
         vis: hir::Visibility::Private,
         is_override: false,
-        params: Vec::new(),
-        ret: loom_compiler::ty::Ty::Void,
-        locals: Vec::new(),
+        params,
+        ret: Ty::Void,
+        locals,
         body: hir::Block { stmts, span },
         span,
     })
@@ -102,6 +168,15 @@ pub fn compile_hir_program(
     version: u32,
     parent: Option<Rc<CompiledProgram>>,
 ) -> Result<CompiledProgram, CompileError> {
+    let var_specs: Vec<VarSpec> = hir
+        .vars
+        .iter()
+        .map(|v| VarSpec {
+            name: v.name.clone(),
+            ty: v.ty.clone(),
+            has_init: v.init.is_some(),
+        })
+        .collect();
     let module = if let Some(init_fn) = synth_init_function(hir) {
         let mut augmented = hir.clone();
         augmented.fns.push(init_fn);
@@ -109,7 +184,7 @@ pub fn compile_hir_program(
     } else {
         compile_and_verify(hir)?
     };
-    Ok(CompiledProgram::new(module, version, parent))
+    Ok(CompiledProgram::new(module, version, parent, var_specs))
 }
 
 /// A verified [`Module`] plus the metadata dispatch needs: its own
@@ -125,10 +200,20 @@ pub struct CompiledProgram {
     /// linear scan of `module.functions`.
     dispatch: HashMap<Rc<str>, u32>,
     pub parent: Option<Rc<CompiledProgram>>,
+    /// Every `var` declared *here* (not ancestors), in declaration order —
+    /// the hot-reload migration key (spec §7.2/§7.3) and, filtered to
+    /// `has_init`, the order [`synth_init_function`]'s `$init` parameters
+    /// expect (see [`CompiledProgram::init_specs`]).
+    pub var_specs: Vec<VarSpec>,
 }
 
 impl CompiledProgram {
-    pub fn new(module: Module, version: u32, parent: Option<Rc<CompiledProgram>>) -> Self {
+    pub fn new(
+        module: Module,
+        version: u32,
+        parent: Option<Rc<CompiledProgram>>,
+        var_specs: Vec<VarSpec>,
+    ) -> Self {
         let path = module.path.clone();
         let dispatch = module
             .functions
@@ -142,7 +227,16 @@ impl CompiledProgram {
             module,
             dispatch,
             parent,
+            var_specs,
         }
+    }
+
+    /// `var_specs` filtered to the ones with an initialiser, in the order
+    /// `$init`'s `bool` parameters expect (must track `synth_init_function`'s
+    /// filter+order exactly — both iterate `var_specs`/`hir::Program.vars`
+    /// in declaration order and filter on the same predicate).
+    pub fn init_specs(&self) -> impl Iterator<Item = &VarSpec> {
+        self.var_specs.iter().filter(|v| v.has_init)
     }
 
     /// Resolve `name` starting at this program and walking toward the
@@ -342,14 +436,107 @@ impl<'a> RegistryHost<'a> {
             vars: Vars::new(),
         });
         for ancestor in prog.chain() {
-            if let Some(idx) = ancestor.resolve_own(INIT_FN)
-                && let Err(e) = self.call_in(id, &ancestor, idx, Vec::new())
-            {
+            let keep = vec![false; ancestor.init_specs().count()];
+            if let Err(e) = self.run_init(id, &ancestor, &keep) {
                 self.registry.remove(id);
                 return Err(e);
             }
         }
         Ok(id)
+    }
+
+    /// Run `target`'s own `$init` (if it has one) as `on`, with `keep[i]`
+    /// true for each var-with-an-initialiser (in [`CompiledProgram::init_specs`]
+    /// order) whose old value should be left alone rather than
+    /// re-initialised. A no-op if `target` declares no vars with an
+    /// initialiser (`resolve_own(INIT_FN)` is `None`).
+    fn run_init(&mut self, on: ObjectId, target: &Rc<CompiledProgram>, keep: &[bool]) -> R<()> {
+        let Some(idx) = target.resolve_own(INIT_FN) else {
+            return Ok(());
+        };
+        let args = keep.iter().map(|&k| Value::Bool(k)).collect();
+        self.call_in(on, target, idx, args)?;
+        Ok(())
+    }
+
+    /// Recompile-in-place `id` onto `new_prog` (spec §7.2/§7.3: `update()`),
+    /// migrating every var whose old value is still present and
+    /// type-conforms to its (possibly changed) declared type; every other
+    /// var re-runs its initialiser (or is `null` if it has none), exactly
+    /// like `crate::world::World::install`'s tree-walker equivalent. Vars
+    /// declared by a program no longer in the chain are dropped. All the
+    /// migration decisions are made and applied to a fresh `vars` map
+    /// before any `$init` runs, so a failing initialiser rolls back to the
+    /// caller's snapshot (see `RegistryHost::upgrade_or_err`'s caller in
+    /// `Registry`/`World` integration) rather than leaving the object
+    /// half-migrated.
+    pub fn upgrade(&mut self, id: ObjectId, new_prog: Rc<CompiledProgram>) -> R<()> {
+        let old_vars = self
+            .registry
+            .get(id)
+            .ok_or_else(|| RtError::new("upgrade of a destructed object"))?
+            .vars
+            .clone();
+        let mut new_vars = Vars::new();
+        let mut plan: Vec<(Rc<CompiledProgram>, Vec<bool>)> = Vec::new();
+        for ancestor in new_prog.chain() {
+            let mut keep = Vec::new();
+            for spec in ancestor.init_specs() {
+                let key = (ancestor.path.clone(), spec.name.clone());
+                match old_vars.get(&key).filter(|v| value_conforms(v, &spec.ty)) {
+                    Some(v) => {
+                        new_vars.insert(key, v.clone());
+                        keep.push(true);
+                    }
+                    None => keep.push(false),
+                }
+            }
+            // Vars without an initialiser always keep whatever was already
+            // stored (or stay absent, reading back as `null`): there is no
+            // initialiser to fall back to if the type no longer conforms.
+            for spec in ancestor.var_specs.iter().filter(|s| !s.has_init) {
+                let key = (ancestor.path.clone(), spec.name.clone());
+                if let Some(v) = old_vars.get(&key).filter(|v| value_conforms(v, &spec.ty)) {
+                    new_vars.insert(key, v.clone());
+                }
+            }
+            plan.push((ancestor, keep));
+        }
+        if let Some(o) = self.registry.get_mut(id) {
+            o.program = new_prog;
+            o.vars = new_vars;
+        }
+        for (ancestor, keep) in plan {
+            self.run_init(id, &ancestor, &keep)?;
+        }
+        Ok(())
+    }
+}
+
+/// Shallow runtime conformance check of a stored value against a HIR type,
+/// used by [`RegistryHost::upgrade`] to decide whether a var's old value
+/// survives a recompile (spec §7.2/§7.3). Mirrors `Value::conforms`
+/// (`crate::bcvm::heap`), which checks against the AST-level `Type` the
+/// checker builds expressions with; this checks against
+/// `loom_compiler::ty::Ty`, the HIR-level type `hir::Var::ty` uses,
+/// because `CompiledProgram` only keeps the HIR var declarations.
+fn value_conforms(v: &Value, ty: &Ty) -> bool {
+    match ty {
+        Ty::Any => true,
+        Ty::Optional(inner) => matches!(v, Value::Null) || value_conforms(v, inner),
+        Ty::Null => matches!(v, Value::Null),
+        Ty::Int => matches!(v, Value::Int(_)),
+        Ty::Float => matches!(v, Value::Float(_)),
+        Ty::Bool => matches!(v, Value::Bool(_)),
+        Ty::String => v.as_str().is_some(),
+        Ty::Object => matches!(v, Value::Object(_)),
+        Ty::Array(_) => v.as_array().is_some(),
+        Ty::Map(..) => v.as_map().is_some(),
+        // Vars can't declare `void`/`never`/`fn`/`error` (spec r5 §5.2.2
+        // rule 4 bans function-typed persistents; the checker never lets
+        // the others through as a var's declared type) — conservative
+        // false rather than a panic if one ever does.
+        Ty::Void | Ty::Never | Ty::Fn(_) | Ty::Error => false,
     }
 }
 
@@ -507,8 +694,8 @@ pub fn mutate_and_return(m: {string: int}) -> {string: int} {
         let caller_module = compile("/obj/caller", &[("/obj/caller", CALLER_WF)]);
 
         let mut registry = Registry::default();
-        let owner_prog = Rc::new(CompiledProgram::new(owner_module, 1, None));
-        let caller_prog = Rc::new(CompiledProgram::new(caller_module, 1, None));
+        let owner_prog = Rc::new(CompiledProgram::new(owner_module, 1, None, Vec::new()));
+        let caller_prog = Rc::new(CompiledProgram::new(caller_module, 1, None, Vec::new()));
         registry.register_program(owner_prog.clone());
         registry.register_program(caller_prog.clone());
 
@@ -578,9 +765,14 @@ pub fn parent_greet() -> string {
         let child_module = compile("/obj/child", &files);
 
         let mut registry = Registry::default();
-        let parent_prog = Rc::new(CompiledProgram::new(parent_module, 1, None));
+        let parent_prog = Rc::new(CompiledProgram::new(parent_module, 1, None, Vec::new()));
         registry.register_program(parent_prog.clone());
-        let child_prog = Rc::new(CompiledProgram::new(child_module, 1, Some(parent_prog)));
+        let child_prog = Rc::new(CompiledProgram::new(
+            child_module,
+            1,
+            Some(parent_prog),
+            Vec::new(),
+        ));
         registry.register_program(child_prog.clone());
 
         let mut registry2 = registry;
@@ -644,5 +836,124 @@ pub fn get_derived() -> int {
         assert!(base.equals(&Value::Int(10)));
         let derived = host.call_on(obj, "get_derived", vec![]).unwrap();
         assert!(derived.equals(&Value::Int(15)));
+    }
+
+    /// `RegistryHost::upgrade` (spec §7.2/§7.3 `update()`): a var whose
+    /// declared type didn't change keeps its live value across the
+    /// upgrade — the initialiser does *not* re-run — proven by mutating
+    /// the var away from its initialiser's value before upgrading.
+    #[test]
+    fn upgrade_keeps_a_type_compatible_var_instead_of_rerunning_its_initialiser() {
+        const V1_WF: &str = r#"
+var counter: int = 1
+
+pub fn get_counter() -> int {
+    return counter
+}
+
+pub fn set_counter(n: int) {
+    counter = n
+}
+"#;
+        // Same var, same type, but a new function and a changed initialiser
+        // expression — recompiling must not reset an already-mutated value.
+        const V2_WF: &str = r#"
+var counter: int = 1
+
+pub fn get_counter() -> int {
+    return counter
+}
+
+pub fn set_counter(n: int) {
+    counter = n
+}
+
+pub fn doubled() -> int {
+    return counter * 2
+}
+"#;
+        let v1 = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", V1_WF)],
+            1,
+            None,
+        ));
+        let mut registry = Registry::default();
+        registry.register_program(v1.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(v1).expect("instantiate");
+        host.call_on(obj, "set_counter", vec![Value::Int(42)])
+            .unwrap();
+
+        let v2 = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", V2_WF)],
+            2,
+            None,
+        ));
+        registry.register_program(v2.clone());
+        let mut host = RegistryHost::new(&mut registry, obj);
+        host.upgrade(obj, v2).expect("upgrade");
+
+        let counter = host.call_on(obj, "get_counter", vec![]).unwrap();
+        assert!(
+            counter.equals(&Value::Int(42)),
+            "upgrade must keep the mutated value, not rerun `var counter: int = 1`"
+        );
+        let doubled = host.call_on(obj, "doubled", vec![]).unwrap();
+        assert!(doubled.equals(&Value::Int(84)));
+    }
+
+    /// A var whose declared type *changed* incompatibly can't keep its old
+    /// value (spec §7.2/§7.3: migrate by declaring-program+name+type, else
+    /// re-run the initialiser) — the upgrade re-initialises it instead of
+    /// leaving a value of the wrong type behind.
+    #[test]
+    fn upgrade_reinitialises_a_var_whose_type_changed() {
+        const V1_WF: &str = r#"
+var data: int = 1
+
+pub fn get_data() -> int {
+    return data
+}
+"#;
+        const V2_WF: &str = r#"
+var data: string = "fresh"
+
+pub fn get_data() -> string {
+    return data
+}
+"#;
+        let v1 = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", V1_WF)],
+            1,
+            None,
+        ));
+        let mut registry = Registry::default();
+        registry.register_program(v1.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(v1).expect("instantiate");
+
+        let v2 = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", V2_WF)],
+            2,
+            None,
+        ));
+        registry.register_program(v2.clone());
+        let mut host = RegistryHost::new(&mut registry, obj);
+        host.upgrade(obj, v2).expect("upgrade");
+
+        let data = host.call_on(obj, "get_data", vec![]).unwrap();
+        assert_eq!(data.as_str(), Some("fresh"));
     }
 }
