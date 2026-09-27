@@ -8,7 +8,9 @@ mod common;
 use common::{FakeHost, scratch};
 use loom_vm::World;
 
-const MASTER: &str = "pub fn connect() -> object {\n    return clone_object(\"/std/player\")\n}\n";
+// `disconnect` is P2: the master must allow it (OBI-35 fails closed).
+const MASTER: &str = "pub fn connect() -> object {\n    return clone_object(\"/std/player\")\n}\n\
+fn valid_efun(name: string, class: int, ob: object) -> bool {\n    return true\n}\n";
 const PLAYER: &str = r#"var dead: int = 0
 
 pub fn logon() {

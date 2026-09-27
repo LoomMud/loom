@@ -47,7 +47,21 @@ use crate::bcvm::heap;
 use crate::bcvm::vm::{
     CallSite, CallTarget, Host, HostCall, Interpreter, Limits, ProgramCode, R, RtError,
 };
+use crate::efuns::Privilege;
 use crate::object::ObjectId;
+use crate::security::{
+    self, APPLY_TICKS, AuditEntry, GuardSet, Interner, MISS_CHARGE, Operation, Principal, ROOT,
+    SecurityState, Sym,
+};
+
+/// `(uid, euid)` of `obj`, or root for an id that is not (or no longer)
+/// in the registry (the synthetic `World::exec` base object).
+fn principal_of(registry: &Registry, obj: ObjectId) -> Principal {
+    registry.get(obj).map_or(Principal::ROOT, |o| Principal {
+        uid: o.uid,
+        euid: o.euid,
+    })
+}
 
 /// The name of the synthetic per-program initialiser function
 /// [`synth_init_function`] adds, run once per ancestor (root first) when an
@@ -782,6 +796,12 @@ pub struct BcObject {
     /// dispatch never re-does the program-registry lookup per call once no
     /// recompile is in flight, only the one `u64` compare.
     pub checked_generation: u64,
+    /// Owner (spec §5.7, OBI-35 D-S1.1): from the master's
+    /// `creator_file(path)` at load/clone, never changes.
+    pub uid: Sym,
+    /// Effective uid for rights: starts equal to `uid`, changed only by a
+    /// master-validated `seteuid`.
+    pub euid: Sym,
 }
 
 impl BcObject {
@@ -799,6 +819,8 @@ impl BcObject {
             conn: None,
             mem_bytes: 0,
             checked_generation: 0,
+            uid: ROOT,
+            euid: ROOT,
         }
     }
 
@@ -903,6 +925,8 @@ pub struct Registry {
     /// `World::tick`'s heartbeat/call_out errors have nowhere to report
     /// to either (spec §7.2 step 6.4: "not fatal").
     pub lazy_upgrade_warnings: Vec<UpgradeWarning>,
+    /// uid/euid interner (OBI-35 D-S1.1); index 0 is `root`.
+    pub syms: Interner,
 }
 
 /// One undoable effect recorded while an `atomic fn` scope is open.
@@ -1249,6 +1273,21 @@ pub struct RegistryHost<'a> {
     /// The object each currently-running (possibly nested) call is
     /// executing as; `self_object()` is always the top.
     self_stack: Vec<ObjectId>,
+    /// Guard stack (OBI-35 D-S1.2): `guards.last()` is the set of distinct
+    /// principals on the stack down to the nearest cut. Pushed with every
+    /// `self_stack` push, by creator frames and by cuts.
+    guards: Vec<GuardSet>,
+    /// Euid currently being evaluated by a `valid_*` apply, innermost
+    /// last (`effective_principal()`).
+    evaluating: Vec<Sym>,
+    /// Ticks to charge the running interpreter after the current efun
+    /// returns (policy cache misses, D-S1.3); see `Host::take_extra_ticks`.
+    extra_ticks: u64,
+    /// One-entry memo for [`Self::push_self`]: `(parent, principal) →
+    /// parent ∪ {principal}`. A loop calling into another principal's
+    /// object would otherwise allocate a fresh set on every call; holding
+    /// `parent` keeps its `Rc` alive, so pointer equality is sound.
+    push_memo: Option<(GuardSet, Principal, GuardSet)>,
     pub limits: Limits,
     pub ticks_left: u64,
     /// Driver-level context (network host, compiler, `this_player`,
@@ -1293,12 +1332,13 @@ struct Driver<'a> {
     master: Option<ObjectId>,
     /// `call_out`/heartbeat scheduler (OBI-33), owned by `World`.
     scheduler: &'a mut crate::scheduler::Scheduler,
-    /// P1+ enforcement hook (OBI-33): stubbed allow-all + audit log until
-    /// S1's security-model policy lands, see `crate::privilege`.
-    privilege: &'a mut dyn crate::privilege::PrivilegeCheck,
     /// `account_create`/`account_login` bookkeeping (OBI-85), owned by
     /// `World`; see `crate::world::AccountsCtx`.
     accounts: crate::world::AccountsCtx<'a>,
+    /// Decision cache, policy epoch and audit (OBI-35), owned by `World`.
+    security: &'a mut SecurityState,
+    /// Mudlib root, for the `read_file`/`write_file` VFS.
+    root: PathBuf,
 }
 
 /// Approximate current native stack position (mirrors the tree-walker's
@@ -1516,9 +1556,14 @@ impl<'a> RegistryHost<'a> {
     }
 
     pub fn new(registry: &'a mut Registry, self_object: ObjectId) -> Self {
+        let base = GuardSet::empty().with(principal_of(registry, self_object));
         RegistryHost {
             registry,
             self_stack: vec![self_object],
+            guards: vec![base],
+            evaluating: Vec::new(),
+            extra_ticks: 0,
+            push_memo: None,
             limits: Limits::default(),
             ticks_left: 1_000_000,
             driver: None,
@@ -1541,12 +1586,18 @@ impl<'a> RegistryHost<'a> {
         conn: Option<u64>,
         master: Option<ObjectId>,
         scheduler: &'a mut crate::scheduler::Scheduler,
-        privilege: &'a mut dyn crate::privilege::PrivilegeCheck,
         accounts: crate::world::AccountsCtx<'a>,
+        security: &'a mut SecurityState,
     ) -> Self {
+        let base = GuardSet::empty().with(principal_of(registry, self_object));
+        let root = compiler.root().to_path_buf();
         RegistryHost {
             registry,
             self_stack: vec![self_object],
+            guards: vec![base],
+            evaluating: Vec::new(),
+            extra_ticks: 0,
+            push_memo: None,
             limits,
             ticks_left,
             driver: Some(Driver {
@@ -1556,8 +1607,9 @@ impl<'a> RegistryHost<'a> {
                 conn,
                 master,
                 scheduler,
-                privilege,
                 accounts,
+                security,
+                root,
             }),
             stack_base: stack_addr(),
             call_cache: HashMap::new(),
@@ -1655,7 +1707,15 @@ impl<'a> RegistryHost<'a> {
                 .expect("recompile needs a driver context");
             driver.compiler.recompile(self.registry, &path)?
         };
-        self.install(new_set)
+        let touches_secure =
+            path.starts_with("/secure/") || new_set.keys().any(|k| k.starts_with("/secure/"));
+        let r = self.install(new_set);
+        if touches_secure && let Some(d) = self.driver.as_mut() {
+            // D-S1.8: a master (or anything under /secure) recompile
+            // invalidates every cached decision.
+            d.security.bump_epoch();
+        }
+        r
     }
 
     /// Apply a background [`compile_worker::RecompileJob`]'s outcome
@@ -1703,6 +1763,198 @@ impl<'a> RegistryHost<'a> {
         self.call_in(on, &target, idx, args)
     }
 
+    // ---- security (OBI-35) -------------------------------------------
+
+    fn top_guard(&self) -> &GuardSet {
+        self.guards
+            .last()
+            .expect("guards is never empty while a Host call is in flight")
+    }
+
+    /// Push a frame running as `obj`: `self_stack` and the guard stack
+    /// move together (D-S1.2 rule 1).
+    fn push_self(&mut self, obj: ObjectId) {
+        // A call on the same object (virtual self-call, `super::`) adds
+        // nothing: re-use the current entry without touching the object
+        // table. (After a `seteuid` in the calling frame this keeps the
+        // old euid too, i.e. it is at most more restrictive: D-S1.2 rule 3.)
+        if self.self_stack.last() == Some(&obj) {
+            let g = self.top_guard().clone();
+            self.self_stack.push(obj);
+            self.guards.push(g);
+            return;
+        }
+        let p = principal_of(self.registry, obj);
+        let top = self.top_guard();
+        let g = match &self.push_memo {
+            Some((parent, mp, out)) if *mp == p && parent.ptr_eq(top) => out.clone(),
+            _ => {
+                let out = top.with(p);
+                if !out.ptr_eq(top) {
+                    self.push_memo = Some((top.clone(), p, out.clone()));
+                }
+                out
+            }
+        };
+        self.self_stack.push(obj);
+        self.guards.push(g);
+    }
+
+    fn pop_self(&mut self) {
+        self.self_stack.pop();
+        self.guards.pop();
+    }
+
+    /// The guard set a privileged check made right now would evaluate.
+    pub fn guard(&self) -> &GuardSet {
+        self.top_guard()
+    }
+
+    /// The euid names in the current guard set (tests, diagnostics).
+    pub fn guard_names(&self) -> Vec<String> {
+        let g = self.top_guard();
+        g.euids()
+            .map(|e| self.registry.syms.name(e).to_string())
+            .collect()
+    }
+
+    /// The master, if booted and alive.
+    fn master(&self) -> Option<ObjectId> {
+        self.driver
+            .as_ref()
+            .and_then(|d| d.master)
+            .filter(|m| self.registry.get(*m).is_some())
+    }
+
+    /// uid for a new object of program `path` (D-S1.1): the master's
+    /// `creator_file(path)` if it has one and returns a string, else the
+    /// built-in fallback. `/secure/**` is always `root` (the master cannot
+    /// hand root to code outside `/secure`, nor take it from `/secure`).
+    fn uid_for(&mut self, path: &str) -> Sym {
+        let secure = path.starts_with("/secure/");
+        let name = if secure {
+            "root".to_string()
+        } else {
+            let from_master = match self.master() {
+                Some(m) => self
+                    .run_cut(m, "creator_file", vec![Value::str(path)], None)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .filter(|u| !u.is_empty() && u != "root"),
+                None => None,
+            };
+            from_master.unwrap_or_else(|| security::default_creator(path))
+        };
+        self.registry.syms.intern(&name)
+    }
+
+    /// Run apply `name` on `on` from a **cut** (an empty guard stack
+    /// entry, D-S1.2 rule 5) with its own [`APPLY_TICKS`] budget, not
+    /// charged to the caller. `evaluating` is the euid
+    /// `effective_principal()` reports inside it. `Ok(None)`: no such apply.
+    fn run_cut(
+        &mut self,
+        on: ObjectId,
+        name: &str,
+        args: Vec<Value>,
+        evaluating: Option<Sym>,
+    ) -> R<Option<Value>> {
+        let saved_ticks = std::mem::replace(&mut self.ticks_left, APPLY_TICKS);
+        self.guards.push(GuardSet::empty());
+        if let Some(e) = evaluating {
+            self.evaluating.push(e);
+        }
+        let r = self.call_apply(on, name, args);
+        if evaluating.is_some() {
+            self.evaluating.pop();
+        }
+        self.guards.pop();
+        self.ticks_left = saved_ticks;
+        r
+    }
+
+    /// Decide `op` for the current guard set (D-S1.2/D-S1.3): allowed iff
+    /// the guard set is empty (all root) or the master's apply returns
+    /// `true` for **every** euid in it. Fails closed: no master, no apply,
+    /// an error or a non-bool result all deny. Audited either way.
+    fn authorize(&mut self, efun: &str, class: Privilege, op: Operation<'_>) -> R<()> {
+        let efun = crate::efuns::static_name(efun).unwrap_or("?");
+        let guard = self.top_guard().clone();
+        let caller = self.self_object();
+        let mut denied_by = None;
+        if !guard.is_empty() {
+            let master = self.master();
+            for euid in guard.euids() {
+                let looked = self
+                    .driver
+                    .as_mut()
+                    .expect("authorize needs a driver")
+                    .security
+                    .lookup(&op, euid);
+                let allowed = match looked {
+                    Ok(b) => b,
+                    Err(miss) => {
+                        self.extra_ticks += MISS_CHARGE;
+                        let b = match master {
+                            None => false,
+                            Some(m) => {
+                                let args = self.apply_args(&op, caller);
+                                matches!(
+                                    self.run_cut(m, op.apply(), args, Some(euid)),
+                                    Ok(Some(Value::Bool(true)))
+                                )
+                            }
+                        };
+                        let sec = &mut self.driver.as_mut().expect("driver").security;
+                        sec.misses += 1;
+                        if let Some(miss) = miss {
+                            sec.store(miss, b);
+                        }
+                        b
+                    }
+                };
+                if !allowed {
+                    denied_by = Some(euid);
+                    break;
+                }
+            }
+        }
+        let sec = &mut self.driver.as_mut().expect("driver").security;
+        sec.record(
+            caller,
+            efun,
+            class,
+            &op,
+            &guard,
+            denied_by.is_none(),
+            denied_by,
+        );
+        match denied_by {
+            None => Ok(()),
+            Some(who) => Err(RtError::new(format!(
+                "{efun}(): permission denied ({} for `{}`)",
+                op.describe(),
+                self.registry.syms.name(who)
+            ))),
+        }
+    }
+
+    fn apply_args(&self, op: &Operation<'_>, caller: ObjectId) -> Vec<Value> {
+        let ob = Value::Object(caller);
+        match op {
+            Operation::Efun { name, class } => {
+                vec![Value::str(name), Value::Int(*class as i64), ob]
+            }
+            Operation::Read { path, op } | Operation::Write { path, op } => {
+                vec![Value::str(path), ob, Value::str(op)]
+            }
+            Operation::Compile { path } => vec![Value::str(path), ob],
+            Operation::Bind { target } => vec![ob, Value::Object(*target)],
+            Operation::SetEuid { euid } => vec![ob, Value::str(euid)],
+        }
+    }
+
     fn want_obj(&self, efun: &str, v: &Value) -> R<ObjectId> {
         match v {
             Value::Object(id) if self.registry.get(*id).is_some() => Ok(*id),
@@ -1740,15 +1992,22 @@ impl<'a> RegistryHost<'a> {
                 "efun `{name}` is not available in this Host (needs full World integration)"
             )));
         }
+        // `unguarded` is P4-sensitive but gated by a driver rule (caller's
+        // program under /secure), not by `valid_efun`: every caller it
+        // exists for has lower-privileged frames below it (D-S1.5).
         if let Some(p) = crate::efuns::privilege(name)
             && p.gated()
+            && name != "unguarded"
         {
-            let caller = self.self_object();
-            let driver = self.driver.as_mut().expect("checked above");
-            driver
-                .privilege
-                .check(caller, name, p)
-                .map_err(|e| RtError::new(format!("{name}(): {e}")))?;
+            let sname = crate::efuns::static_name(name).unwrap_or("?");
+            self.authorize(
+                name,
+                p,
+                Operation::Efun {
+                    name: sname,
+                    class: p,
+                },
+            )?;
         }
         let a0 = args.first().cloned().unwrap_or(Value::Null);
         let a1 = args.get(1).cloned().unwrap_or(Value::Null);
@@ -1875,6 +2134,7 @@ impl<'a> RegistryHost<'a> {
                     ));
                 }
                 let id = self.want_obj(name, &a0)?;
+                self.authorize(name, Privilege::P3, Operation::Bind { target: id })?;
                 let Some(conn) = self.driver.as_ref().and_then(|d| d.conn) else {
                     return Err(RtError::new(
                         "bind_connection(): no connection in this execution",
@@ -1888,6 +2148,8 @@ impl<'a> RegistryHost<'a> {
                     .as_str()
                     .ok_or_else(|| RtError::new("compile_object(): expected string"))?
                     .to_string();
+                let norm = mudlib::normalize_path(&p).map_err(RtError::new)?;
+                self.authorize(name, Privilege::P1, Operation::Compile { path: &norm })?;
                 Ok(match self.recompile(&p) {
                     // Per-object migration failures are reported (not
                     // fatal, spec §7.2 step 6.4) but there is no
@@ -2033,12 +2295,57 @@ impl<'a> RegistryHost<'a> {
                 }
                 Ok(Value::Null)
             }
+            "getuid" | "geteuid" => {
+                let me = self.self_object();
+                let o = self.registry.get(me);
+                let sym = o.map_or(ROOT, |o| if name == "getuid" { o.uid } else { o.euid });
+                Ok(Value::str(self.registry.syms.name(sym)))
+            }
+            "effective_principal" => match self.evaluating.last() {
+                Some(e) => Ok(Value::str(self.registry.syms.name(*e))),
+                None => Err(RtError::new(
+                    "effective_principal(): only valid inside a valid_* apply",
+                )),
+            },
+            "seteuid" => {
+                let e = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("seteuid(): expected string"))?
+                    .to_string();
+                if e.is_empty() {
+                    return Err(RtError::new("seteuid(): empty euid"));
+                }
+                self.authorize(name, Privilege::P3, Operation::SetEuid { euid: &e })?;
+                let me = self.self_object();
+                let new = self.registry.syms.intern(&e);
+                let uid = match self.registry.get_mut(me) {
+                    Some(o) => {
+                        o.euid = new;
+                        o.uid
+                    }
+                    None => return Err(RtError::new("seteuid(): object was destructed")),
+                };
+                // D-S1.2 rule 3: monotone within the frame. The current
+                // guard keeps the old euid and gains the new one; only
+                // frames pushed later see the new euid alone.
+                let top = self.guards.pop().expect("guards non-empty");
+                self.guards.push(top.with(Principal { uid, euid: new }));
+                Ok(Value::Null)
+            }
             "read_file" => {
                 let p = a0
                     .as_str()
-                    .ok_or_else(|| RtError::new("read_file(): expected string"))?
-                    .to_string();
-                let root = self.driver.as_ref().expect("checked above").compiler.root();
+                    .ok_or_else(|| RtError::new("read_file(): expected string"))?;
+                let p = security::normalize_file_path(p).map_err(RtError::new)?;
+                self.authorize(
+                    name,
+                    Privilege::P0,
+                    Operation::Read {
+                        path: &p,
+                        op: "read_file",
+                    },
+                )?;
+                let root = &self.driver.as_ref().expect("checked above").root;
                 crate::fileio::read_file(root, &p)
                     .map(|s| s.map_or(Value::Null, |s| Value::str(&s)))
                     .map_err(|e| RtError::new(format!("read_file(\"{p}\") failed: {e}")))
@@ -2046,18 +2353,27 @@ impl<'a> RegistryHost<'a> {
             "write_file" => {
                 let p = a0
                     .as_str()
-                    .ok_or_else(|| RtError::new("write_file(): expected string"))?
-                    .to_string();
+                    .ok_or_else(|| RtError::new("write_file(): expected string path"))?;
+                let p = security::normalize_file_path(p).map_err(RtError::new)?;
                 let text = a1
                     .as_str()
-                    .ok_or_else(|| RtError::new("write_file(): expected string"))?;
-                let root = self.driver.as_ref().expect("checked above").compiler.root();
+                    .ok_or_else(|| RtError::new("write_file(): expected string contents"))?;
+                self.authorize(
+                    name,
+                    Privilege::P1,
+                    Operation::Write {
+                        path: &p,
+                        op: "write_file",
+                    },
+                )?;
+                let root = &self.driver.as_ref().expect("checked above").root;
                 crate::fileio::write_file(root, &p, text)
                     .map(Value::Bool)
                     .map_err(|e| RtError::new(format!("write_file(\"{p}\") failed: {e}")))
             }
             "account_create" => self.issue_account_request(true, &a0, &a1),
             "account_login" => self.issue_account_request(false, &a0, &a1),
+            "unguarded" => self.unguarded(a0, a1),
             _ => Err(RtError::new(format!(
                 "internal: efun `{name}` not implemented"
             ))),
@@ -2111,6 +2427,58 @@ impl<'a> RegistryHost<'a> {
         Ok(Value::Int(id as i64))
     }
 
+    /// `unguarded(fname, args)` (OBI-35 D-S1.5): call `self.<fname>(args…)`
+    /// from a cut whose guard restarts at `{self.euid}`. Only for code
+    /// compiled from `/secure/**` (a driver rule, not master policy); takes
+    /// a function *name*, never a function value, so a captured guard can
+    /// never be laundered through it. Always audited.
+    fn unguarded(&mut self, fname: Value, args: Value) -> R<Value> {
+        let fname = fname
+            .as_str()
+            .ok_or_else(|| RtError::new("unguarded(): expected string function name"))?
+            .to_string();
+        let argv = match args {
+            Value::Null => Vec::new(),
+            v => v
+                .as_array()
+                .map(|a| a.to_vec())
+                .ok_or_else(|| RtError::new("unguarded(): expected array of arguments"))?,
+        };
+        let me = self.self_object();
+        let prog = self
+            .registry
+            .get(me)
+            .map(|o| o.program.clone())
+            .ok_or_else(|| RtError::new("unguarded(): object was destructed"))?;
+        let secure = prog.path.starts_with("/secure/");
+        let guard = self.top_guard().clone();
+        let d = self.driver.as_mut().expect("unguarded needs a driver");
+        d.security.push(AuditEntry {
+            caller: me,
+            efun: "unguarded",
+            privilege: Privilege::P4,
+            apply: "unguarded",
+            arg: fname.as_str().into(),
+            guard,
+            allowed: secure,
+            denied_by: None,
+        });
+        if !secure {
+            return Err(RtError::new(format!(
+                "unguarded(): only code under /secure may cut the stack ({} may not)",
+                prog.path
+            )));
+        }
+        let (target, idx) = prog
+            .resolve(&fname)
+            .ok_or_else(|| RtError::new(format!("unguarded(): no function `{fname}`")))?;
+        // The cut: an empty entry; `call_in`'s push adds self's own euid.
+        self.guards.push(GuardSet::empty());
+        let r = self.call_in(me, &target, idx, argv);
+        self.guards.pop();
+        r
+    }
+
     /// Run `name` declared in exactly `target` as `on` in a *fresh*
     /// [`Interpreter`] — the driver-started path (applies, `$init`, efuns
     /// that run Weft code, and the run-to-completion `Host::call_*`
@@ -2135,7 +2503,7 @@ impl<'a> RegistryHost<'a> {
             e.trace.push(format!("in {func_name}()"));
             return Err(e);
         }
-        self.self_stack.push(on);
+        self.push_self(on);
         let limits = self.limits;
         let mut ticks = self.ticks_left;
         let result = {
@@ -2143,7 +2511,7 @@ impl<'a> RegistryHost<'a> {
             interp.call(&func_name, args)
         };
         self.ticks_left = ticks;
-        self.self_stack.pop();
+        self.pop_self();
         result
     }
 
@@ -2156,16 +2524,17 @@ impl<'a> RegistryHost<'a> {
     /// Rolls back (removes the half-built object) on the first failing
     /// initialiser, matching `World::new_object`'s all-or-nothing create.
     pub fn instantiate(&mut self, prog: Rc<CompiledProgram>) -> R<ObjectId> {
-        let id = self.registry.insert(BcObject::new(prog.clone()));
+        let uid = self.uid_for(&prog.path);
+        let mut obj = BcObject::new(prog.clone());
+        obj.uid = uid;
+        obj.euid = uid;
         // Freshly created against whatever is registered right now:
         // nothing to lazily migrate until a *later* install changes it
         // (spec §7.2/§7.3, OBI-89). Stamping this now (rather than leaving
         // the `BcObject::new` default of 0) skips one no-op
         // `ensure_current` lookup the first time this object is touched.
-        let generation = self.registry.install_generation;
-        if let Some(o) = self.registry.get_mut(id) {
-            o.checked_generation = generation;
-        }
+        obj.checked_generation = self.registry.install_generation;
+        let id = self.registry.insert(obj);
         for ancestor in prog.chain() {
             let keep = vec![false; ancestor.init_specs().count()];
             if let Err(e) = self.run_init(id, &ancestor, &keep) {
@@ -2508,11 +2877,28 @@ impl Host for RegistryHost<'_> {
     }
 
     fn enter_self(&mut self, obj: ObjectId) {
-        self.self_stack.push(obj);
+        self.push_self(obj);
     }
 
     fn leave_self(&mut self) {
-        self.self_stack.pop();
+        self.pop_self();
+    }
+
+    fn current_guard(&self) -> GuardSet {
+        self.top_guard().clone()
+    }
+
+    fn enter_creator_frame(&mut self, guard: &GuardSet) {
+        let g = self.top_guard().union(guard);
+        self.guards.push(g);
+    }
+
+    fn leave_creator_frame(&mut self) {
+        self.guards.pop();
+    }
+
+    fn take_extra_ticks(&mut self) -> u64 {
+        std::mem::take(&mut self.extra_ticks)
     }
 
     fn call_efun(&mut self, name: &str, args: Vec<Value>) -> R<Value> {

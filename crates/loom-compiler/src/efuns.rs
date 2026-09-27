@@ -84,10 +84,15 @@ const NAMES: &[&str] = &[
     "to_int",
     "destructed",
     "destruct",
-    "read_file",
-    "write_file",
     "account_create",
     "account_login",
+    "getuid",
+    "geteuid",
+    "effective_principal",
+    "seteuid",
+    "read_file",
+    "write_file",
+    "unguarded",
 ];
 
 /// All efun names known to the checker.
@@ -186,20 +191,6 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
             P0,
         ),
         "destruct" => ("destruct", vec![P(obj)], 1, Ret::Ty(Ty::Void), P2),
-        "read_file" => (
-            "read_file",
-            vec![P(s.clone())],
-            1,
-            Ret::Ty(Ty::optional(Ty::String)),
-            P1,
-        ),
-        "write_file" => (
-            "write_file",
-            vec![P(s.clone()), P(s.clone())],
-            2,
-            Ret::Ty(Ty::Bool),
-            P1,
-        ),
         "account_create" => (
             "account_create",
             vec![P(s.clone()), P(s.clone())],
@@ -209,10 +200,36 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
         ),
         "account_login" => (
             "account_login",
-            vec![P(s.clone()), P(s)],
+            vec![P(s.clone()), P(s.clone())],
             2,
             Ret::Ty(Ty::Int),
             P3,
+        ),
+        // OBI-35 (S1): see `loom_vm::efuns` for the gating rationale.
+        "getuid" => ("getuid", vec![], 0, Ret::Ty(s.clone()), P0),
+        "geteuid" => ("geteuid", vec![], 0, Ret::Ty(s.clone()), P0),
+        "effective_principal" => ("effective_principal", vec![], 0, Ret::Ty(s.clone()), P0),
+        "seteuid" => ("seteuid", vec![P(s.clone())], 1, Ret::Ty(Ty::Void), P3),
+        "read_file" => (
+            "read_file",
+            vec![P(s.clone())],
+            1,
+            Ret::Ty(Ty::optional(Ty::String)),
+            P0,
+        ),
+        "write_file" => (
+            "write_file",
+            vec![P(s.clone()), P(s.clone())],
+            2,
+            Ret::Ty(Ty::Bool),
+            P1,
+        ),
+        "unguarded" => (
+            "unguarded",
+            vec![P(s), P(Ty::array(Ty::Any))],
+            1,
+            Ret::Ty(Ty::Any),
+            P4,
         ),
         _ => return None,
     };

@@ -111,6 +111,100 @@ fn monocall_other() -> any {
 }
 "#;
 
+// OBI-35 stack-check workloads run on objects under /builders/<u>/ (uid
+// `u`), so every gated efun really goes through the guard set + master
+// policy cache. `seteuid(own euid)` is the cheapest gated efun with no I/O:
+// valid_efun (P3) + valid_seteuid, no guard growth.
+const PRIV_POLICY: &str = r#"
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_seteuid(ob: object, euid: string) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return true
+}
+"#;
+
+const PRIV_B: &str = r#"
+pub fn priv_check_hot() -> any {
+    var i = 0
+    while i < 10000 {
+        seteuid("b")
+        i += 1
+    }
+    return i
+}
+
+// Control for priv_check_*: the same loop around an ungated P0 efun, so
+// (priv_check_hot - priv_control) / 10000 is the per-call cost of the two
+// cached checks (valid_efun + valid_seteuid) plus their audit entries.
+pub fn priv_control() -> any {
+    var i = 0
+    while i < 10000 {
+        geteuid()
+        i += 1
+    }
+    return i
+}
+
+// Same loop with three distinct principals on the stack (b → c → d).
+pub fn priv_check_guard3() -> any {
+    return load_object("/builders/c/p").relay()
+}
+
+// Same loop at call depth 150: the check reads the top guard entry, it
+// never walks the stack, so this should match priv_check_hot.
+pub fn priv_check_deep() -> any {
+    return dive(150)
+}
+
+fn dive(n: int) -> int {
+    if n == 0 {
+        return priv_check_hot()
+    }
+    return dive(n - 1)
+}
+
+// 1000 distinct paths: the harness flushes the policy cache before each
+// timed run of priv_miss (every check is a miss: one valid_read apply
+// execution), and not before priv_read_hit (every check is a hit). The
+// difference between the two is the miss cost; both include the same
+// (failed) file open.
+pub fn priv_read_hit() -> any {
+    var i = 0
+    while i < 1000 {
+        read_file($"/builders/b/nope{i}")
+        i += 1
+    }
+    return i
+}
+
+pub fn priv_miss() -> any {
+    return priv_read_hit()
+}
+"#;
+
+const PRIV_C: &str = r#"
+pub fn relay() -> any {
+    return load_object("/builders/d/p").hot()
+}
+"#;
+
+const PRIV_D: &str = r#"
+pub fn hot() -> any {
+    var i = 0
+    while i < 10000 {
+        seteuid("d")
+        i += 1
+    }
+    return i
+}
+"#;
+
 const B: &str = r#"
 pub fn inc(n: int) -> int {
     return n + 1
@@ -133,7 +227,14 @@ fn main() {
 
 fn run(iters: usize) {
     let root = std::env::temp_dir().join(format!("loom-vm-bench-{}", std::process::id()));
-    for (rel, src) in [("secure/master.wf", MASTER), ("bench/b.wf", B)] {
+    let master_src = format!("{MASTER}{PRIV_POLICY}");
+    for (rel, src) in [
+        ("secure/master.wf", master_src.as_str()),
+        ("bench/b.wf", B),
+        ("builders/b/p.wf", PRIV_B),
+        ("builders/c/p.wf", PRIV_C),
+        ("builders/d/p.wf", PRIV_D),
+    ] {
         let p = root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, src).unwrap();
@@ -154,15 +255,32 @@ fn run(iters: usize) {
         "cross_object",
         "monocall",
         "monocall_other",
+        "priv_control",
+        "priv_check_hot",
+        "priv_check_guard3",
+        "priv_check_deep",
+        "priv_read_hit",
+        "priv_miss",
     ] {
+        let on = if w.starts_with("priv_") {
+            world
+                .load_object("/builders/b/p", &mut NullHost)
+                .unwrap_or_else(|e| panic!("{w}: {e}"))
+        } else {
+            master
+        };
+        let flush = w == "priv_miss";
         let first = world
-            .call(master, w, vec![], &mut NullHost)
+            .call(on, w, vec![], &mut NullHost)
             .unwrap_or_else(|e| panic!("{w}: {e}"));
         let shown = world.display(&first);
         let mut t: Vec<Duration> = (0..iters)
             .map(|_| {
+                if flush {
+                    world.flush_security_cache();
+                }
                 let s = Instant::now();
-                world.call(master, w, vec![], &mut NullHost).unwrap();
+                world.call(on, w, vec![], &mut NullHost).unwrap();
                 s.elapsed()
             })
             .collect();

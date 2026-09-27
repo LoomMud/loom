@@ -462,5 +462,7 @@ fn bind_connection_is_master_only() {
     let other = "pub fn steal() {\n  bind_connection(self)\n}\n";
     let master = "fn main() -> any {\n  load_object(\"/obj/other\").steal()\n  return 0\n}\n";
     let e = run_files(&[("/secure/master.wf", master), ("/obj/other.wf", other)]).unwrap_err();
-    assert!(e.contains("may only be called by the master object"), "{e}");
+    // OBI-35: the stack check (P3, `/obj/other`'s euid on the stack, no
+    // `valid_efun` in this master) denies before the master-only rule.
+    assert!(e.contains("permission denied"), "{e}");
 }

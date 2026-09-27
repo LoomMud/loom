@@ -267,11 +267,12 @@ fn read_file_and_write_file_round_trip_and_confine_to_root() {
         world.input(1, "readfile /domains/x/notes.txt", &mut host);
         assert_eq!(host.take(1), "hello\n");
 
-        // `..` must not escape the mudlib root.
+        // `..` must not escape the mudlib root. Since OBI-35 the S1 path
+        // normaliser rejects it before `fileio`'s own lexical check does.
         world.input(1, "readfile /../../etc/passwd", &mut host);
         assert!(
             host.take(1)
-                .contains("read_file(\"/../../etc/passwd\") failed: path must not contain `..`"),
+                .contains("`/../../etc/passwd`: invalid file path"),
         );
 
         // Only .wf/.txt may be written.

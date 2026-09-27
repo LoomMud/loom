@@ -33,7 +33,12 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `to_int` | `to_int(String) -> Optional(Int)` | P0 | 1 |
 | `destructed` | `destructed(Optional(Object)) -> Bool` | P0 | 1 |
 | `destruct` | `destruct(Object) -> Void` | P2 | 5 |
-| `read_file` | `read_file(String) -> Optional(String)` | P1 | 20 |
-| `write_file` | `write_file(String, String) -> Bool` | P1 | 20 |
 | `account_create` | `account_create(String, String) -> Int` | P3 | 50 |
 | `account_login` | `account_login(String, String) -> Int` | P3 | 50 |
+| `getuid` | `getuid() -> String` | P0 | 1 |
+| `geteuid` | `geteuid() -> String` | P0 | 1 |
+| `effective_principal` | `effective_principal() -> String` | P0 | 1 |
+| `seteuid` | `seteuid(String) -> Void` | P3 | 10 |
+| `read_file` | `read_file(String) -> Optional(String)` | P0 | 20 |
+| `write_file` | `write_file(String, String) -> Bool` | P1 | 50 |
+| `unguarded` | `unguarded(String, Array(Any)?) -> Any` | P4 | 10 |
