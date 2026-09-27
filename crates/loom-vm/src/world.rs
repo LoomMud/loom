@@ -322,12 +322,24 @@ impl World {
 
     // ---- introspection / tooling (tests, `loom` admin commands) -----------
 
-    /// Recompile a program as `compile_object` would. `None` on success,
-    /// else the diagnostics.
-    pub fn compile_object(&mut self, path: &str, host: &mut dyn Host) -> Option<String> {
+    /// Recompile a program as `compile_object` would. `Ok(warnings)` on
+    /// success — empty unless some existing instance's migration failed
+    /// and was rolled back (spec r5 amendment §7.2 step 6.4: per-object,
+    /// not fatal) — `Err(diagnostics)` only for a genuine compile-stage
+    /// failure (nothing installed at all).
+    pub fn compile_object(
+        &mut self,
+        path: &str,
+        host: &mut dyn Host,
+    ) -> Result<Vec<String>, String> {
         self.exec(host, None, None, |h| Ok(h.recompile(path)))
             .unwrap_or_else(|e| Err(e.report()))
-            .err()
+            .map(|warnings| {
+                warnings
+                    .into_iter()
+                    .map(|w| format!("object {:?} on {}: {}", w.object, w.program, w.message))
+                    .collect()
+            })
     }
 
     /// `compile_object`/`update` (spec §7.2), off the world thread
