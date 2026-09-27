@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ${{ vars.CI_RUNS_ON || 'ubuntu-latest' }}
+    runs-on: ${{ (vars.CI_RUNS_ON && !github.event.pull_request.head.repo.fork) && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'ubuntu-latest' }}
     env:
       IMAGE: ghcr.io/loommud/loom
       TAG: ${{ github.ref_name }}
@@ -51,7 +51,9 @@ jobs:
       - name: Set up buildx
         run: |
           set -euo pipefail
-          docker buildx create --name loom-builder --driver docker-container --use
+          # Idempotent: a persistent self-hosted runner keeps the builder.
+          docker buildx use loom-builder 2>/dev/null \
+            || docker buildx create --name loom-builder --driver docker-container --use
           docker buildx inspect --bootstrap
 
       - name: Build and push image
@@ -106,3 +108,7 @@ jobs:
             gh release create "${TAG}" --generate-notes || gh release edit "${TAG}" --latest --title "${TAG}"
           fi
           gh release upload "${TAG}" "loom-${TAG}-sbom.cdx.json" --clobber
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io || true
