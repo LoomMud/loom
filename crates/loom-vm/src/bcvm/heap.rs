@@ -495,7 +495,11 @@ impl Value {
                 }
                 // Not a valid map key (checker-enforced); no stable hash
                 // worth computing.
-                HeapObj::Array(_) | HeapObj::Map(_) | HeapObj::Struct(_) | HeapObj::Enum(_) => {
+                HeapObj::Array(_)
+                | HeapObj::Map(_)
+                | HeapObj::Struct(_)
+                | HeapObj::Enum(_)
+                | HeapObj::Fn(_) => {
                     return None;
                 }
             },

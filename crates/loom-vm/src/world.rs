@@ -164,6 +164,12 @@ pub struct World {
     /// Stack-based privilege check state (OBI-35): decision cache, policy
     /// epoch, audit ring buffer.
     security: SecurityState,
+    /// The `quota_uid` (OBI-35 D-S1.6) of the most recently executed
+    /// call_out, for tests/introspection asserting AC 3 ("its execution
+    /// reports quota uid = the apprentice's"). `None` until the first
+    /// call_out runs; tier quota *enforcement* against this uid is S2
+    /// (OBI-36).
+    last_call_out_quota_uid: Option<crate::security::Sym>,
 }
 
 /// Identifies one [`World::begin_recompile`] call, so its eventual result
@@ -197,10 +203,17 @@ impl World {
             account_pending: HashMap::new(),
             account_results: VecDeque::new(),
             security: SecurityState::new(),
+            last_call_out_quota_uid: None,
         };
         let mut null = NullHost;
+        let sentinel = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
         let master = w
-            .exec(&mut null, None, None, |h| h.load_object(MASTER_PATH))
+            .exec(&mut null, sentinel, None, None, None, |h| {
+                h.load_object(MASTER_PATH)
+            })
             .map_err(|e| BootError::Master(e.report()))?;
         w.master = Some(master);
         Ok(w)
@@ -245,7 +258,7 @@ impl World {
             if let Some(o) = self.registry.get(ob) {
                 let conn = o.conn;
                 let this_player = conn.map(|_| ob);
-                let _ = self.exec(host, this_player, conn, |h| {
+                let _ = self.exec(host, ob, this_player, conn, None, |h| {
                     h.call_apply(
                         ob,
                         "account_result",
@@ -263,21 +276,25 @@ impl World {
 
     /// Run `body` against a fresh [`RegistryHost`] with driver context
     /// wired up (network host, `this_player`, bound connection, master).
+    /// `acting` is the object whose own euid seeds this execution's guard
+    /// cut (OBI-35 D-S1.2 rule 5), independent of `this_player` (the
+    /// connected user, if any — `this_player()`'s answer). `cut_guard`
+    /// overrides that derived cut for a scheduled call_out, whose guard
+    /// must be exactly its captured set (D-S1.7).
+    #[allow(clippy::too_many_arguments)]
     fn exec<T>(
         &mut self,
         host: &mut dyn Host,
+        acting: ObjectId,
         this_player: Option<ObjectId>,
         conn: Option<u64>,
+        cut_guard: Option<crate::security::GuardSet>,
         body: impl FnOnce(&mut RegistryHost<'_>) -> Result<T, RtError>,
     ) -> Result<T, RtError> {
         self.registry.debug_assert_atomic_scope_closed();
-        let self_object = this_player.or(self.master).unwrap_or(ObjectId {
-            index: u32::MAX,
-            generation: 0,
-        });
         let mut rh = RegistryHost::with_driver(
             &mut self.registry,
-            self_object,
+            acting,
             self.limits.vm_limits(),
             self.limits.max_ticks,
             &mut self.compiler,
@@ -293,6 +310,7 @@ impl World {
                 auth: self.account_auth.as_mut(),
             },
             &mut self.security,
+            cut_guard,
         );
         let result = body(&mut rh);
         self.registry.debug_assert_atomic_scope_closed();
@@ -303,6 +321,15 @@ impl World {
         host.send(conn, &format!("*Error: {}\n", e.report()));
     }
 
+    /// `self.master`, or the boot-time sentinel if it is not yet set (only
+    /// possible while `boot_with_limits` is still loading it).
+    fn master_or_sentinel(&self) -> ObjectId {
+        self.master.unwrap_or(ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        })
+    }
+
     /// A new connection arrived: master `connect()` returns the player
     /// object, the driver binds the connection to it, then calls `logon()`.
     pub fn connect(&mut self, conn: u64, host: &mut dyn Host) {
@@ -310,7 +337,7 @@ impl World {
             host.close(conn);
             return;
         };
-        let r = self.exec(host, None, Some(conn), |h| {
+        let r = self.exec(host, master, None, Some(conn), None, |h| {
             match h.call_apply(master, "connect", Vec::new())? {
                 Some(Value::Object(id)) if h.registry.get(id).is_some() => Ok(id),
                 Some(v) => Err(RtError::new(format!(
@@ -329,7 +356,7 @@ impl World {
             }
         };
         self.registry.bind(conn, player);
-        if let Err(e) = self.exec(host, Some(player), Some(conn), |h| {
+        if let Err(e) = self.exec(host, player, Some(player), Some(conn), None, |h| {
             h.call_apply(player, "logon", Vec::new())
         }) {
             World::report(host, conn, &e);
@@ -341,7 +368,7 @@ impl World {
         let Some(&ob) = self.registry.conns.get(&conn) else {
             return;
         };
-        let r = self.exec(host, Some(ob), Some(conn), |h| {
+        let r = self.exec(host, ob, Some(ob), Some(conn), None, |h| {
             match h.call_apply(ob, "process_input", vec![Value::str(line)])? {
                 Some(_) => Ok(()),
                 None => Err(RtError::new(format!(
@@ -364,7 +391,7 @@ impl World {
             o.conn = None;
         }
         // Errors have nowhere to go (the connection is gone).
-        let _ = self.exec(host, Some(ob), None, |h| {
+        let _ = self.exec(host, ob, Some(ob), None, None, |h| {
             h.call_apply(ob, "net_dead", Vec::new())
         });
     }
@@ -388,6 +415,13 @@ impl World {
     /// cannot starve another. Errors have nowhere to report to (neither
     /// path has a connection) and are swallowed, matching `disconnect`'s
     /// `net_dead`.
+    ///
+    /// **OBI-35 D-S1.2 rule 5 / D-S1.7:** a heartbeat is a cut of exactly
+    /// `[ob.euid]` (`acting = ob`, no `cut_guard` override — the default
+    /// derivation from `acting` already gives that). A call_out's cut is
+    /// exactly its captured `guard` (`cut_guard = Some(call.guard)`), and
+    /// its quota root uid is `call.quota_uid`, recorded here for tests
+    /// (AC 3: "its execution reports quota uid = the apprentice's").
     pub fn tick(&mut self, host: &mut dyn Host) {
         self.poll_recompiles(host);
         let due = self.scheduler.advance();
@@ -398,7 +432,7 @@ impl World {
                 if self.registry.get(ob).is_none() {
                     continue; // destructed since it subscribed
                 }
-                let _ = self.exec(host, None, None, |h| {
+                let _ = self.exec(host, ob, None, None, None, |h| {
                     h.call_apply(ob, "heartbeat", Vec::new())
                 });
             }
@@ -407,7 +441,9 @@ impl World {
             if self.registry.get(call.ob).is_none() {
                 continue; // destructed in the same tick it was scheduled for
             }
-            let _ = self.exec(host, None, None, move |h| {
+            self.last_call_out_quota_uid = Some(call.quota_uid);
+            let guard = call.guard.clone();
+            let _ = self.exec(host, call.ob, None, None, Some(guard), move |h| {
                 h.call_apply(call.ob, &call.func, call.args)
             });
         }
@@ -421,7 +457,8 @@ impl World {
             let Some(current) = self.registry.program(&path) else {
                 continue; // path no longer registered at all
             };
-            let _ = self.exec(host, None, None, move |h| {
+            let master = self.master_or_sentinel();
+            let _ = self.exec(host, master, None, None, None, move |h| {
                 // Someone may have already lazily upgraded `ob` (an
                 // ordinary access) between `upgrade_all` queuing it and
                 // this tick draining it -- `RegistryHost::upgrade` itself
@@ -510,6 +547,19 @@ impl World {
         std::mem::take(&mut self.registry.lazy_upgrade_warnings)
     }
 
+    /// The `quota_uid` (OBI-35 D-S1.6, AC 3) the most recently executed
+    /// call_out charged against, resolved to its uid string. `None` before
+    /// any call_out has run.
+    ///
+    /// **Test-only introspection.** S2 (OBI-36) replaces this single-slot
+    /// snapshot with real per-uid tick/memory quota accounting; this stays
+    /// only as long as nothing but tests reads it.
+    #[doc(hidden)]
+    pub fn last_call_out_quota_uid(&self) -> Option<&str> {
+        self.last_call_out_quota_uid
+            .map(|s| self.registry.syms.name(s))
+    }
+
     // ---- introspection / tooling (tests, `loom` admin commands) -----------
 
     /// Recompile a program as `compile_object` would. `Ok(warnings)` on
@@ -522,7 +572,8 @@ impl World {
         path: &str,
         host: &mut dyn Host,
     ) -> Result<Vec<String>, String> {
-        self.exec(host, None, None, |h| Ok(h.recompile(path)))
+        let master = self.master_or_sentinel();
+        self.exec(host, master, None, None, None, |h| Ok(h.recompile(path)))
             .unwrap_or_else(|e| Err(e.report()))
             .map(|warnings| {
                 warnings
@@ -585,8 +636,9 @@ impl World {
                 Some(outcome) => {
                     let root_path = job.path().to_string();
                     let begin_snapshot = job.begin_snapshot().clone();
+                    let master = self.master_or_sentinel();
                     let result = self
-                        .exec(host, None, None, |h| {
+                        .exec(host, master, None, None, None, |h| {
                             Ok(h.finish_recompile(&root_path, &begin_snapshot, outcome))
                         })
                         .unwrap_or_else(|e| Err(e.report()));
@@ -612,7 +664,8 @@ impl World {
 
     /// Load (compile + create) `path` as the driver would for a preload.
     pub fn load_object(&mut self, path: &str, host: &mut dyn Host) -> Result<ObjectId, String> {
-        self.exec(host, None, None, |h| h.load_object(path))
+        let master = self.master_or_sentinel();
+        self.exec(host, master, None, None, None, |h| h.load_object(path))
             .map_err(|e| e.report())
     }
 
@@ -624,7 +677,8 @@ impl World {
         args: Vec<Value>,
         host: &mut dyn Host,
     ) -> Result<Value, String> {
-        self.exec(host, None, None, |h| {
+        let master = self.master_or_sentinel();
+        self.exec(host, master, None, None, None, |h| {
             h.call_apply(ob, func, args)?
                 .ok_or_else(|| RtError::new(format!("no function `{func}`")))
         })

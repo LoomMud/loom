@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 
 use crate::bcvm::Value;
 use crate::object::ObjectId;
+use crate::security::{GuardSet, Sym};
 
 /// One pending `call_out`, not yet due.
 #[derive(Clone, Debug)]
@@ -26,6 +27,18 @@ pub struct PendingCall {
     pub due_tick: u64,
     pub func: String,
     pub args: Vec<Value>,
+    /// The guard set at the moment `call_out("name", …)` was called
+    /// (OBI-35 D-S1.6/D-S1.7): `World::tick` runs this call from a cut
+    /// whose guard is exactly this set, not `[ob.euid]` (that is only for
+    /// heartbeats, D-S1.2 rule 5) — a call_out is self-scoped (D-S1.4
+    /// kind 2), so `ob`'s own euid is already in here from the frame that
+    /// called `call_out`.
+    pub guard: GuardSet,
+    /// The quota root uid this execution charges ticks/memory against
+    /// (OBI-35 D-S1.6): the uid of the lowest-tier principal in `guard` at
+    /// schedule time (with no roles/tier snapshot yet, S2/OBI-36, the
+    /// calling object's own uid).
+    pub quota_uid: Sym,
 }
 
 /// Pending calls and heartbeat subscriptions. Owned by `World`; advanced
@@ -61,8 +74,19 @@ impl Scheduler {
     /// Schedule `func(args)` on `ob` to run `delay` ticks from now (a
     /// `delay` of 0 still waits for the *next* tick, matching the
     /// traditional `call_out(f, 0)` "as soon as possible, not
-    /// reentrantly" idiom). Returns an id `remove_call_out` can cancel.
-    pub fn call_out(&mut self, ob: ObjectId, delay: u64, func: String, args: Vec<Value>) -> u64 {
+    /// reentrantly" idiom). `guard`/`quota_uid` are captured by the caller
+    /// at the moment of this call (OBI-35 D-S1.6) via `Host::current_guard`
+    /// / `Host::current_uid`. Returns an id `remove_call_out` can cancel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_out(
+        &mut self,
+        ob: ObjectId,
+        delay: u64,
+        func: String,
+        args: Vec<Value>,
+        guard: GuardSet,
+        quota_uid: Sym,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let due_tick = self.tick + delay.max(1);
@@ -72,6 +96,8 @@ impl Scheduler {
             due_tick,
             func,
             args,
+            guard,
+            quota_uid,
         });
         id
     }
@@ -170,8 +196,8 @@ mod tests {
     #[test]
     fn due_calls_run_in_delay_order() {
         let mut s = Scheduler::new();
-        let a = s.call_out(ob(1), 3, "a".into(), vec![]);
-        let b = s.call_out(ob(2), 1, "b".into(), vec![]);
+        let a = s.call_out(ob(1), 3, "a".into(), vec![], GuardSet::empty(), 0);
+        let b = s.call_out(ob(2), 1, "b".into(), vec![], GuardSet::empty(), 0);
         assert_eq!(s.pending_count(), 2);
 
         let due = s.advance(); // tick 1: only b (due tick 1) is due
@@ -185,8 +211,8 @@ mod tests {
     #[test]
     fn same_tick_ties_break_fifo_by_scheduling_order() {
         let mut s = Scheduler::new();
-        let first = s.call_out(ob(9), 1, "first".into(), vec![]);
-        let second = s.call_out(ob(1), 1, "second".into(), vec![]);
+        let first = s.call_out(ob(9), 1, "first".into(), vec![], GuardSet::empty(), 0);
+        let second = s.call_out(ob(1), 1, "second".into(), vec![], GuardSet::empty(), 0);
         let due = s.advance();
         let ids: Vec<u64> = due.iter().map(|p| p.id).collect();
         // ob(9) scheduled first: it runs first even though ob(1)'s id is
@@ -197,7 +223,7 @@ mod tests {
     #[test]
     fn remove_call_out_cancels_a_pending_call() {
         let mut s = Scheduler::new();
-        let id = s.call_out(ob(1), 3, "f".into(), vec![]);
+        let id = s.call_out(ob(1), 3, "f".into(), vec![], GuardSet::empty(), 0);
         assert!(s.remove_call_out(ob(1), id));
         assert!(!s.remove_call_out(ob(1), id)); // already gone
         for _ in 0..5 {
@@ -210,7 +236,7 @@ mod tests {
         let mut s = Scheduler::new();
         let owner = ob(1);
         let attacker = ob(2);
-        let id = s.call_out(owner, 3, "f".into(), vec![]);
+        let id = s.call_out(owner, 3, "f".into(), vec![], GuardSet::empty(), 0);
         // The attacker guesses (or brute-forces) the id but does not own
         // it: the call must survive, and the attempt must not be
         // distinguishable from "unknown id" (both return `false`).
@@ -224,8 +250,8 @@ mod tests {
     fn destruction_removes_pending_calls_and_heartbeat() {
         let mut s = Scheduler::new();
         let target = ob(5);
-        s.call_out(target, 1, "f".into(), vec![]);
-        s.call_out(ob(6), 1, "g".into(), vec![]);
+        s.call_out(target, 1, "f".into(), vec![], GuardSet::empty(), 0);
+        s.call_out(ob(6), 1, "g".into(), vec![], GuardSet::empty(), 0);
         s.set_heart_beat(target, true);
         assert_eq!(s.heartbeat_targets(), vec![target]);
 
@@ -251,7 +277,7 @@ mod tests {
     #[test]
     fn call_out_with_zero_delay_waits_for_the_next_tick() {
         let mut s = Scheduler::new();
-        s.call_out(ob(1), 0, "f".into(), vec![]);
+        s.call_out(ob(1), 0, "f".into(), vec![], GuardSet::empty(), 0);
         assert_eq!(s.advance().len(), 1);
     }
 }
