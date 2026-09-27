@@ -145,8 +145,6 @@ or retiring a code in `crates/loom-syntax/src/codes.rs`.
 | `W0236` | `{fname}` must return a value of type `{t}` |
 | `W0237` | `if let` is not implemented by the type checker yet |
 | `W0238` | `break` and `continue` are not implemented by the type checker yet |
-| `W0239` | `try`/`catch` is not implemented by the type checker yet |
-| `W0240` | `throw` is not implemented by the type checker yet |
 | `W0241` | cannot assign to `{n}`: it was declared with `let` |
 | `W0242` | cannot assign to `{n}`: it is a `const` |
 | `W0243` | cannot assign to `self` |
@@ -246,5 +244,12 @@ or retiring a code in `crates/loom-syntax/src/codes.rs`.
 | `W0428` | Phase 0 gate: `match` is not yet supported by the tree-walking evaluator |
 | `W0429` | Phase 0 gate: struct literals is not yet supported by the tree-walking evaluator |
 | `W0430` | Phase 0 gate: enum variants is not yet supported by the tree-walking evaluator |
+
+### Retired
+
+| Code | Description |
+| --- | --- |
+| `W0239` | `try`/`catch` is not implemented by the type checker yet |
+| `W0240` | `throw` is not implemented by the type checker yet |
 
 <!-- END GENERATED CODE TABLE -->

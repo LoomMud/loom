@@ -1,0 +1,30 @@
+ok
+module /main
+  const 0 = false
+  const 1 = 1
+  const 2 = 0
+  const 3 = -1
+  fn risky() -> bool  [regs: %0: any, %1: bool, %2: int]
+    0000  PushHandler 0005, %0
+    0001  TickCheck
+    0002  Call virtual oops()
+    0003  PopHandler
+    0004  Jump 0007
+    0005  LoadConst %1, #0 = false : bool
+    0006  Return %1
+    0007  LoadConst %2, #1 = 1 : int
+    0008  Throw %2
+  fn oops() -> no value  [regs: ]
+    0000  Return
+  fn falls_through(%0) -> int  [regs: %0: int, %1: int, %2: int, %3: int]
+    0000  LoadConst %2, #2 = 0 : int
+    0001  Copy %1, %2 : int
+    0002  PushHandler 0006
+    0003  Copy %1, %0 : int
+    0004  PopHandler
+    0005  Jump 0009
+    0006  LoadConst %3, #3 = -1 : int
+    0007  Copy %1, %3 : int
+    0008  Jump 0009
+    0009  Return %1
+

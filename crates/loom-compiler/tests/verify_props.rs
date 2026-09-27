@@ -164,6 +164,17 @@ fn assert_actually_in_bounds(m: &Module) {
                     }
                 }
                 Op::TickCheck => {}
+                Op::Throw { src } => check_reg(*src),
+                Op::PushHandler {
+                    catch_pc,
+                    catch_reg,
+                } => {
+                    check_pc(*catch_pc);
+                    if let Some(r) = catch_reg {
+                        check_reg(*r);
+                    }
+                }
+                Op::PopHandler => {}
             }
         }
     }

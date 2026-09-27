@@ -186,6 +186,17 @@ pub enum Op {
         src: Option<Reg>,
     },
     TickCheck,
+    /// `throw src`: see [`crate::ir::Terminator::Throw`].
+    Throw {
+        src: Reg,
+    },
+    /// See [`crate::ir::Inst::PushHandler`].
+    PushHandler {
+        catch_pc: PC,
+        catch_reg: Option<Reg>,
+    },
+    /// See [`crate::ir::Inst::PopHandler`].
+    PopHandler,
 }
 
 // ---------------------------------------------------------------------
@@ -634,6 +645,19 @@ impl Writer {
                 self.put_opt_reg(*src);
             }
             Op::TickCheck => self.put_u8(20),
+            Op::Throw { src } => {
+                self.put_u8(21);
+                self.put_varu32(*src);
+            }
+            Op::PushHandler {
+                catch_pc,
+                catch_reg,
+            } => {
+                self.put_u8(22);
+                self.put_varu32(*catch_pc);
+                self.put_opt_reg(*catch_reg);
+            }
+            Op::PopHandler => self.put_u8(23),
         }
     }
 }
@@ -986,6 +1010,14 @@ impl<'a> Reader<'a> {
                 src: self.get_opt_reg()?,
             },
             20 => Op::TickCheck,
+            21 => Op::Throw {
+                src: self.get_varu32()?,
+            },
+            22 => Op::PushHandler {
+                catch_pc: self.get_varu32()?,
+                catch_reg: self.get_opt_reg()?,
+            },
+            23 => Op::PopHandler,
             t => return Err(DecodeError(format!("bad opcode {t}"))),
         })
     }

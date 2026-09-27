@@ -211,5 +211,14 @@ fn op_text(m: &Module, f: &FunctionCode, op: &Op) -> String {
             None => "Return".to_string(),
         },
         Op::TickCheck => "TickCheck".to_string(),
+        Op::Throw { src } => format!("Throw %{src}"),
+        Op::PushHandler {
+            catch_pc,
+            catch_reg,
+        } => match catch_reg {
+            Some(r) => format!("PushHandler {catch_pc:04}, %{r}"),
+            None => format!("PushHandler {catch_pc:04}"),
+        },
+        Op::PopHandler => "PopHandler".to_string(),
     }
 }

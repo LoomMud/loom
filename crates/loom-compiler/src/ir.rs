@@ -79,6 +79,11 @@ pub enum Terminator {
         else_blk: BlockId,
     },
     Return(Option<Reg>),
+    /// `throw src` (spec r5 OBI-32): always transfers control, either to
+    /// the nearest active handler on this frame's handler stack or, if
+    /// none, to the caller as an `RtError` (uncaught throw). Never falls
+    /// through, like `Return`.
+    Throw(Reg),
 }
 
 #[derive(Clone, Debug)]
@@ -197,4 +202,17 @@ pub enum Inst {
     },
     /// Tick-metering checkpoint (§5.9); see the module docs for placement.
     TickCheck,
+    /// Push a `try`/`catch` handler onto this frame's handler stack: while
+    /// active, a catchable error raised anywhere in this call chain (this
+    /// frame or any frame it calls into) unwinds straight to `catch_blk`
+    /// with the thrown/synthesised value in `catch_reg` (spec r5 OBI-32).
+    /// Paired with a [`Inst::PopHandler`] at the end of the guarded region
+    /// on every path that falls through normally.
+    PushHandler {
+        catch_blk: BlockId,
+        catch_reg: Option<Reg>,
+    },
+    /// Pop the innermost handler pushed by [`Inst::PushHandler`] in this
+    /// frame (the `try` region completed without throwing).
+    PopHandler,
 }

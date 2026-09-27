@@ -175,6 +175,18 @@ pub enum StmtKind {
         body: Block,
     },
     Return(Option<Expr>),
+    /// `try { body } catch [catch_var] { handler }` (spec r5 §5.5.?, OBI-32).
+    /// `catch_var`'s type is always `Ty::Any`: a `throw`n value keeps
+    /// whatever type it was thrown at, and a caught built-in runtime error
+    /// (not caused by an explicit `throw`) surfaces as a string message.
+    /// Tick/depth exhaustion is not catchable (never reaches a handler).
+    Try {
+        body: Block,
+        catch_var: Option<LocalId>,
+        handler: Block,
+    },
+    /// `throw expr`: always diverges (never falls through).
+    Throw(Expr),
     Expr(Expr),
 }
 
