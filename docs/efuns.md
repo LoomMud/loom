@@ -14,7 +14,7 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `inventory` | `inventory(Object) -> Array(Object)` | P0 | 2 |
 | `move_to` | `move_to(Object) -> Void` | P0 | 2 |
 | `send` | `send(Optional(Object), String) -> Void` | P0 | 2 |
-| `disconnect` | `disconnect(Optional(Object)) -> Void` | P0 | 2 |
+| `disconnect` | `disconnect(Optional(Object)) -> Void` | P2 | 2 |
 | `bind_connection` | `bind_connection(Object) -> Void` | P3 | 2 |
 | `compile_object` | `compile_object(String) -> Optional(String)` | P1 | 500 |
 | `len` | `len(string \| [T] \| {K: V}) -> Int` | P0 | 1 |
@@ -22,6 +22,6 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `join` | `join(Array(String), String) -> String` | P0 | 5 |
 | `keys` | `keys({K: V}) -> [K]` | P0 | 2 |
 | `trim` | `trim(String) -> String` | P0 | 1 |
-| `call_out` | `call_out(String, Int) -> Int` | P1 | 5 |
-| `remove_call_out` | `remove_call_out(Int) -> Bool` | P1 | 2 |
-| `set_heart_beat` | `set_heart_beat(Bool) -> Void` | P1 | 2 |
+| `call_out` | `call_out(String, Int) -> Int` | P0 | 5 |
+| `remove_call_out` | `remove_call_out(Int) -> Bool` | P0 | 2 |
+| `set_heartbeat` | `set_heartbeat(Bool) -> Void` | P0 | 2 |

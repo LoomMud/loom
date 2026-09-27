@@ -219,7 +219,7 @@ impl World {
         });
     }
 
-    /// Advance the world by one tick (OBI-33): `heart_beat()` on every
+    /// Advance the world by one tick (OBI-33): `heartbeat()` on every
     /// subscribed object, in subscription order, then every `call_out` now
     /// due, in scheduling order (`Scheduler::advance`). Each call runs
     /// against a fresh `RegistryHost` with its own metered tick budget
@@ -233,7 +233,7 @@ impl World {
                 continue; // destructed since it subscribed
             }
             let _ = self.exec(host, None, None, |h| {
-                h.call_apply(ob, "heart_beat", Vec::new())
+                h.call_apply(ob, "heartbeat", Vec::new())
             });
         }
         for call in self.scheduler.advance() {

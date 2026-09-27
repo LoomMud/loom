@@ -66,10 +66,16 @@ impl Scheduler {
         id
     }
 
-    /// Cancel a pending call by id. `true` if it was still pending.
-    pub fn remove_call_out(&mut self, id: u64) -> bool {
+    /// Cancel a pending call by id, but only if it belongs to `caller`
+    /// (spec: an object may only cancel its own `call_out`s; ids are
+    /// sequential, so without this check any object could cancel
+    /// another's pending calls by guessing a nearby id). Returns `false`
+    /// both when the id is unknown and when it belongs to someone else,
+    /// so a caller cannot distinguish "not mine" from "already gone" and
+    /// cannot use this to probe other objects' ids.
+    pub fn remove_call_out(&mut self, caller: ObjectId, id: u64) -> bool {
         let before = self.pending.len();
-        self.pending.retain(|p| p.id != id);
+        self.pending.retain(|p| !(p.id == id && p.ob == caller));
         self.pending.len() != before
     }
 
@@ -159,11 +165,26 @@ mod tests {
     fn remove_call_out_cancels_a_pending_call() {
         let mut s = Scheduler::new();
         let id = s.call_out(ob(1), 3, "f".into(), vec![]);
-        assert!(s.remove_call_out(id));
-        assert!(!s.remove_call_out(id)); // already gone
+        assert!(s.remove_call_out(ob(1), id));
+        assert!(!s.remove_call_out(ob(1), id)); // already gone
         for _ in 0..5 {
             assert!(s.advance().is_empty());
         }
+    }
+
+    #[test]
+    fn remove_call_out_cannot_cancel_another_objects_call() {
+        let mut s = Scheduler::new();
+        let owner = ob(1);
+        let attacker = ob(2);
+        let id = s.call_out(owner, 3, "f".into(), vec![]);
+        // The attacker guesses (or brute-forces) the id but does not own
+        // it: the call must survive, and the attempt must not be
+        // distinguishable from "unknown id" (both return `false`).
+        assert!(!s.remove_call_out(attacker, id));
+        assert_eq!(s.pending_count(), 1);
+        assert!(s.remove_call_out(owner, id));
+        assert_eq!(s.pending_count(), 0);
     }
 
     #[test]

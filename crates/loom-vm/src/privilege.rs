@@ -14,6 +14,13 @@
 
 use crate::efuns::Privilege;
 use crate::object::ObjectId;
+use std::collections::VecDeque;
+
+/// Entries retained by [`AllowAllAudited`]'s ring buffer (spec §5.5's
+/// audit trail is for recent-activity inspection, not an unbounded
+/// history; `serve` runs for the life of the server, so an
+/// ever-growing `Vec` here is a memory leak).
+const AUDIT_LOG_CAPACITY: usize = 1024;
 
 /// One P1+ efun call, recorded whether or not it was allowed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,30 +49,53 @@ pub trait PrivilegeCheck {
 /// [`AuditEntry`] for each one so the hook point, the audit-log shape and
 /// the tests that exercise them do not have to change again when the real
 /// policy replaces this.
+///
+/// The log is a bounded ring buffer (last [`AUDIT_LOG_CAPACITY`] entries):
+/// `serve` runs for the life of the server, so an unbounded `Vec` here
+/// would be a slow memory leak. [`AllowAllAudited::total`] is a
+/// monotonic count of every call ever recorded (including ones the ring
+/// buffer has since evicted), for ops tooling that wants a rate rather
+/// than the retained window.
 #[derive(Default)]
 pub struct AllowAllAudited {
-    pub log: Vec<AuditEntry>,
+    log: VecDeque<AuditEntry>,
+    total: u64,
 }
 
 impl AllowAllAudited {
     pub fn new() -> AllowAllAudited {
         AllowAllAudited::default()
     }
+
+    /// Every call ever recorded, including ones the ring buffer has since
+    /// evicted (monotonic, never resets).
+    pub fn total(&self) -> u64 {
+        self.total
+    }
 }
 
 impl PrivilegeCheck for AllowAllAudited {
     fn check(&mut self, caller: ObjectId, efun: &str, privilege: Privilege) -> Result<(), String> {
-        self.log.push(AuditEntry {
+        if self.log.len() >= AUDIT_LOG_CAPACITY {
+            self.log.pop_front();
+        }
+        self.log.push_back(AuditEntry {
             caller,
             efun: efun.to_string(),
             privilege,
             allowed: true,
         });
+        self.total += 1;
+        // `log()` returns `&self`'s single contiguous slice (the trait's
+        // shape); keep the ring buffer laid out contiguously so that
+        // slice is always the *entire* retained window, not just
+        // whichever half `VecDeque` currently starts at.
+        self.log.make_contiguous();
         Ok(())
     }
 
     fn log(&self) -> &[AuditEntry] {
-        &self.log
+        self.log.as_slices().0
     }
 }
 
@@ -86,7 +116,7 @@ mod tests {
         assert!(p.check(ob(1), "compile_object", Privilege::P1).is_ok());
         assert!(p.check(ob(2), "bind_connection", Privilege::P3).is_ok());
         assert_eq!(
-            p.log,
+            p.log(),
             vec![
                 AuditEntry {
                     caller: ob(1),
@@ -101,6 +131,24 @@ mod tests {
                     allowed: true,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn allow_all_audited_log_is_a_bounded_ring_buffer() {
+        let mut p = AllowAllAudited::new();
+        // One more than capacity: the oldest entry must be evicted, but
+        // `total()` keeps counting every call, including evicted ones.
+        for i in 0..(AUDIT_LOG_CAPACITY as u32 + 1) {
+            assert!(p.check(ob(i), "compile_object", Privilege::P1).is_ok());
+        }
+        assert_eq!(p.log().len(), AUDIT_LOG_CAPACITY);
+        assert_eq!(p.total(), AUDIT_LOG_CAPACITY as u64 + 1);
+        // Entry 0 (the first call) was evicted; the window starts at 1.
+        assert_eq!(p.log().first().unwrap().caller, ob(1));
+        assert_eq!(
+            p.log().last().unwrap().caller,
+            ob(AUDIT_LOG_CAPACITY as u32)
         );
     }
 }

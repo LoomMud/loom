@@ -135,7 +135,7 @@ fn destructing_an_object_drops_its_pending_call_outs_and_heartbeat() {
 }
 
 #[test]
-fn call_out_is_a_gated_p1_efun_and_gets_audited() {
+fn call_out_is_ungated_p0_and_not_audited() {
     on_world_thread(|| {
         let root = fixture("tworoom");
         let mut world = World::boot(&root).expect("boot");
@@ -147,9 +147,34 @@ fn call_out_is_a_gated_p1_efun_and_gets_audited() {
         world.input(1, "sched", &mut host);
         host.take(1);
 
+        // call_out is Timing (spec r5 §5.5), reclassified P0: every
+        // object must be able to schedule itself, so it is neither gated
+        // nor audited (per-tier quotas, not privilege class, bound abuse
+        // - OBI-36).
+        assert_eq!(
+            loom_vm::efuns::privilege("call_out"),
+            Some(loom_vm::efuns::Privilege::P0)
+        );
+        assert!(world.audit_log().is_empty());
+    });
+}
+
+#[test]
+fn compile_object_is_a_gated_p1_efun_and_gets_audited() {
+    on_world_thread(|| {
+        let root = fixture("tworoom");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host);
+        host.out.clear();
+        assert!(world.audit_log().is_empty());
+
+        world.input(1, "update /std/player", &mut host);
+        host.take(1);
+
         let log = world.audit_log();
         assert_eq!(log.len(), 1);
-        assert_eq!(log[0].efun, "call_out");
+        assert_eq!(log[0].efun, "compile_object");
         assert_eq!(log[0].privilege, loom_vm::efuns::Privilege::P1);
         assert!(log[0].allowed);
     });
