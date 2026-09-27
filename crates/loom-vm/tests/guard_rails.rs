@@ -137,7 +137,7 @@ fn master_connect_failure_closes_only_that_connection() {
     assert!(world.connection_object(2).is_some());
     // Recompile to the broken-at-runtime version succeeds (it links), but
     // create() fails for new clones: connect errors, conn 3 is closed.
-    assert_eq!(world.compile_object("/std/player", &mut host), None);
+    assert_eq!(world.compile_object("/std/player", &mut host), Ok(vec![]));
     world.connect(3, &mut host);
     let out = host.take(3);
     assert!(out.contains("division by zero"), "{out}");
