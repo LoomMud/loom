@@ -7,7 +7,7 @@
 mod common;
 
 use common::{FakeHost, fixture, on_world_thread};
-use loom_vm::World;
+use loom_vm::{Limits, World};
 
 #[test]
 fn call_out_fires_after_the_scheduled_number_of_ticks_not_before() {
@@ -82,9 +82,17 @@ fn call_outs_due_the_same_tick_run_in_scheduling_order_across_objects() {
 
 #[test]
 fn heart_beat_runs_every_tick_for_every_subscribed_object() {
+    // `heartbeat_interval_ticks: 1` pins the OBI-33 wiring (heartbeat runs
+    // on `heart_beat()`-subscribed objects, in subscription order, on
+    // every `World::tick()` call) independent of OBI-82's default 20-tick
+    // cadence, covered separately below.
     on_world_thread(|| {
         let root = fixture("tworoom");
-        let mut world = World::boot(&root).expect("boot");
+        let limits = Limits {
+            heartbeat_interval_ticks: 1,
+            ..Default::default()
+        };
+        let mut world = World::boot_with_limits(&root, limits).expect("boot");
         let mut host = FakeHost::default();
         world.connect(1, &mut host);
         host.out.clear();
@@ -105,6 +113,48 @@ fn heart_beat_runs_every_tick_for_every_subscribed_object() {
         world.tick(&mut host);
         world.input(1, "beats", &mut host);
         assert_eq!(host.take(1), "3\n", "stopped counting after hboff");
+    });
+}
+
+#[test]
+fn heart_beat_default_cadence_is_every_twenty_world_ticks() {
+    // Spec r5 N2 / OBI-82 CTO decision: with the default `Limits`, a
+    // heartbeat-subscribed object's `heart_beat()` fires once every 20
+    // world ticks (2 s at the 100 ms world-tick granularity `serve()`
+    // drives `World::tick` at), not on every `World::tick()` call.
+    on_world_thread(|| {
+        let root = fixture("tworoom");
+        let mut world = World::boot(&root).expect("boot"); // default Limits
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host);
+        host.out.clear();
+
+        world.input(1, "hbon", &mut host);
+        host.take(1);
+
+        for _ in 0..19 {
+            world.tick(&mut host);
+        }
+        world.input(1, "beats", &mut host);
+        assert_eq!(host.take(1), "0\n", "no heartbeat before tick 20");
+
+        world.tick(&mut host); // tick 20: first heartbeat
+        world.input(1, "beats", &mut host);
+        assert_eq!(host.take(1), "1\n");
+
+        for _ in 0..19 {
+            world.tick(&mut host);
+        }
+        world.input(1, "beats", &mut host);
+        assert_eq!(
+            host.take(1),
+            "1\n",
+            "still no second heartbeat before tick 40"
+        );
+
+        world.tick(&mut host); // tick 40: second heartbeat
+        world.input(1, "beats", &mut host);
+        assert_eq!(host.take(1), "2\n");
     });
 }
 

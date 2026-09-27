@@ -71,6 +71,11 @@ pub struct AccountsCtx<'a> {
     pub results: &'a mut VecDeque<(u64, ObjectId, bool, String)>,
     pub auth: &'a mut dyn AccountAuth,
 }
+/// Heartbeat cadence (spec r5 N2): with a 100 ms world-tick granularity
+/// (`loom-cli::serve`'s timer, OBI-82), a heartbeat every 20 world ticks
+/// is once every 2 s. A `Limits` field, not a magic number in `World::tick`,
+/// so tests (and eventually builder config) can dial it down.
+pub const DEFAULT_HEARTBEAT_INTERVAL_TICKS: u64 = 20;
 
 /// Per-execution guard rails (§5.8).
 #[derive(Clone, Copy, Debug)]
@@ -86,6 +91,10 @@ pub struct Limits {
     /// other object/player's own call_out/heartbeat that tick (spec:
     /// "bounded per-tick budget").
     pub eager_upgrade_batch: usize,
+    /// Every `heart_beat()`-subscribed object is called once every this
+    /// many `World::tick()` calls (world ticks), not every tick (OBI-82).
+    /// `call_out` delays remain in world ticks and are unaffected by this.
+    pub heartbeat_interval_ticks: u64,
 }
 
 impl Default for Limits {
@@ -95,6 +104,7 @@ impl Default for Limits {
             max_depth: 512,
             mem_quota_bytes: VmLimits::default().mem_quota_bytes,
             eager_upgrade_batch: 200,
+            heartbeat_interval_ticks: DEFAULT_HEARTBEAT_INTERVAL_TICKS,
         }
     }
 }
@@ -350,27 +360,41 @@ impl World {
         });
     }
 
-    /// Advance the world by one tick (OBI-33): `heartbeat()` on every
-    /// subscribed object, in subscription order, then every `call_out` now
-    /// due, in scheduling order (`Scheduler::advance`), then a bounded
+    /// Advance the world by one world tick (100 ms granularity, OBI-82's
+    /// `serve()` timer): `Scheduler::advance()` first (so `call_out` due
+    /// times and the world-tick counter used below agree), then every
+    /// `heart_beat()`-subscribed object, in subscription order, but only
+    /// once every `Limits::heartbeat_interval_ticks` world ticks (default
+    /// 20, i.e. every 2 s) -- not every call, unlike OBI-33's original
+    /// one-tick-is-one-heartbeat design, superseded by the CTO's OBI-82 N2
+    /// decision once `World::tick` started being driven by a real 100 ms
+    /// timer instead of standing in for the heartbeat interval itself --
+    /// then every `call_out` now due, in scheduling order, then a bounded
     /// batch (`Limits::eager_upgrade_batch`) of any `upgrade_all(path)`
-    /// queue (OBI-89, spec §7.2/§7.3 "upgrade_all spread across ticks").
-    /// Each call runs against a fresh `RegistryHost` with its own metered
-    /// tick budget (`Limits::max_ticks`), exactly like `input`/`connect`,
-    /// so one slow callback (or one slow migration) cannot starve
-    /// another. Errors have nowhere to report to (neither path has a
-    /// connection) and are swallowed, matching `disconnect`'s `net_dead`.
+    /// queue (OBI-89, spec §7.2/§7.3 "upgrade_all spread across ticks"),
+    /// which runs every world tick and is *not* gated by the heartbeat
+    /// interval. Each call runs against a fresh `RegistryHost` with its
+    /// own metered tick budget (`Limits::max_ticks`), exactly like
+    /// `input`/`connect`, so one slow callback (or one slow migration)
+    /// cannot starve another. Errors have nowhere to report to (neither
+    /// path has a connection) and are swallowed, matching `disconnect`'s
+    /// `net_dead`.
     pub fn tick(&mut self, host: &mut dyn Host) {
         self.poll_recompiles(host);
-        for ob in self.scheduler.heartbeat_targets() {
-            if self.registry.get(ob).is_none() {
-                continue; // destructed since it subscribed
+        let due = self.scheduler.advance();
+        let world_tick = self.scheduler.tick();
+        let interval = self.limits.heartbeat_interval_ticks.max(1);
+        if world_tick.is_multiple_of(interval) {
+            for ob in self.scheduler.heartbeat_targets() {
+                if self.registry.get(ob).is_none() {
+                    continue; // destructed since it subscribed
+                }
+                let _ = self.exec(host, None, None, |h| {
+                    h.call_apply(ob, "heartbeat", Vec::new())
+                });
             }
-            let _ = self.exec(host, None, None, |h| {
-                h.call_apply(ob, "heartbeat", Vec::new())
-            });
         }
-        for call in self.scheduler.advance() {
+        for call in due {
             if self.registry.get(call.ob).is_none() {
                 continue; // destructed in the same tick it was scheduled for
             }
@@ -412,6 +436,12 @@ impl World {
         // since the last tick, so login latency is bounded even on an
         // otherwise idle world.
         self.drain_account_results(host);
+    }
+
+    /// The current world tick (`Scheduler::advance`'s counter; advanced by
+    /// `World::tick`), for tests/introspection.
+    pub fn world_tick(&self) -> u64 {
+        self.scheduler.tick()
     }
 
     /// Destroy `ob`: move its inventory up into its own environment (or
