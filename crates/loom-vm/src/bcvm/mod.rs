@@ -15,6 +15,7 @@
 //! next slice of OBI-31.
 
 pub mod compile;
+pub mod compile_worker;
 pub mod heap;
 pub mod registry;
 pub mod vm;

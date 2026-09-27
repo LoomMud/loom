@@ -32,7 +32,7 @@
 //! [`Host::dispatch`] too.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use loom_compiler::bytecode::Module;
@@ -42,6 +42,7 @@ use loom_compiler::ty::Ty;
 
 use crate::bcvm::Value;
 use crate::bcvm::compile::{CompileError, compile_and_verify};
+use crate::bcvm::compile_worker;
 use crate::bcvm::heap;
 use crate::bcvm::vm::{
     CallSite, CallTarget, Host, HostCall, Interpreter, Limits, ProgramCode, R, RtError,
@@ -166,16 +167,28 @@ fn synth_init_function(p: &hir::Program) -> Option<hir::Function> {
     })
 }
 
-/// Compile one already-checked `hir::Program` into a [`CompiledProgram`]:
-/// codegen + verify (never skipped, see [`compile_and_verify`]) plus the
-/// synthetic `$init` function (see [`synth_init_function`]) that lets
+/// The compile-only (parse/check already done by the caller; this is
+/// codegen + verify, see [`compile_and_verify`]) output of
+/// [`compile_hir_unit`] — everything [`compile_hir_program`] needs to
+/// build a [`CompiledProgram`] *except* `version`/`parent`, which only
+/// matter once the result is being linked into a live [`Registry`].
+/// Deliberately holds no `Rc<CompiledProgram>` (only `Module`'s own
+/// `Rc<str>`, which never leaves whichever thread built it): this is the
+/// seam [`crate::bcvm::compile_worker`] hangs a background compile off of
+/// (OBI-90/D-P1.5) — it calls this same function on a background OS
+/// thread, then encodes the result across the `Send` boundary instead of
+/// handing back a live `Rc`.
+pub(crate) struct CompiledUnit {
+    pub module: Module,
+    pub var_specs: Vec<VarSpec>,
+    pub non_public: std::collections::HashSet<Rc<str>>,
+}
+
+/// Codegen + verify one already-checked `hir::Program`, plus the synthetic
+/// `$init` function (see [`synth_init_function`]) that lets
 /// [`Registry::instantiate`] run var initialisers on the bytecode VM
 /// instead of needing a separate tree-walking evaluator for them.
-pub fn compile_hir_program(
-    hir: &hir::Program,
-    version: u32,
-    parent: Option<Rc<CompiledProgram>>,
-) -> Result<CompiledProgram, CompileError> {
+pub(crate) fn compile_hir_unit(hir: &hir::Program) -> Result<CompiledUnit, CompileError> {
     let var_specs: Vec<VarSpec> = hir
         .vars
         .iter()
@@ -192,17 +205,34 @@ pub fn compile_hir_program(
     } else {
         compile_and_verify(hir)?
     };
-    let mut prog = CompiledProgram::new(module, version, parent, var_specs);
     // `ob.f()` may only reach `pub` functions (spec §5.3; the deleted
     // tree-walker enforced this in `call_other` too). The synthetic
     // `$init` is never `pub`.
-    prog.non_public = hir
+    let non_public = hir
         .fns
         .iter()
         .filter(|f| f.vis != hir::Visibility::Public)
         .map(|f| f.name.clone())
         .chain(std::iter::once(Rc::from(INIT_FN)))
         .collect();
+    Ok(CompiledUnit {
+        module,
+        var_specs,
+        non_public,
+    })
+}
+
+/// Compile one already-checked `hir::Program` into a [`CompiledProgram`]
+/// (the synchronous path: [`Compiler::ensure_program`]/[`Compiler::recompile`]).
+/// See [`compile_hir_unit`] for the codegen+verify itself.
+pub fn compile_hir_program(
+    hir: &hir::Program,
+    version: u32,
+    parent: Option<Rc<CompiledProgram>>,
+) -> Result<CompiledProgram, CompileError> {
+    let unit = compile_hir_unit(hir)?;
+    let mut prog = CompiledProgram::new(unit.module, version, parent, unit.var_specs);
+    prog.non_public = unit.non_public;
     Ok(prog)
 }
 
@@ -366,6 +396,102 @@ impl Compiler {
             let compiled =
                 compile_hir_program(&anc_hir, version, parent).map_err(|e| format!("{p}: {e}"))?;
             new_set.insert(p.clone(), Rc::new(compiled));
+        }
+        Ok(new_set)
+    }
+
+    /// Send-safe snapshot of `registry`'s current program topology (OBI-90/
+    /// D-P1.5): everything [`compile_worker::run_recompile`] needs to find
+    /// `path`'s dependents and assign versions, without a `Rc<CompiledProgram>`
+    /// (or the `Rc<str>` inside its `Module`) ever crossing to the
+    /// background thread — `Rc` is never `Send`, no matter who allocated it.
+    pub fn snapshot(&self, registry: &Registry) -> compile_worker::ProgramSnapshot {
+        compile_worker::ProgramSnapshot::capture(registry)
+    }
+
+    /// Kick off `recompile`'s parse/check/codegen/verify on a background OS
+    /// thread (OBI-90/D-P1.5, spec §7.2 steps 1–3): returns immediately.
+    /// Does not touch `registry` or `self.session` again — only the
+    /// snapshot captured right now — until [`Compiler::finish_recompile`]
+    /// applies its result. `root` is `World`'s mudlib root (the background
+    /// thread does its own disk reads through a private `Session`, never
+    /// `self.session`, so a `recompile` from the world thread and a
+    /// `finish_recompile` for an earlier background job never race on the
+    /// same cache).
+    pub fn begin_recompile(
+        &self,
+        root: &Path,
+        registry: &Registry,
+        path: &str,
+    ) -> compile_worker::RecompileJob {
+        self.begin_recompile_after(root, registry, path, std::time::Duration::ZERO)
+    }
+
+    /// [`Compiler::begin_recompile`], but the background thread sleeps for
+    /// `delay` before compiling — test/tooling support for standing in for
+    /// a large/slow compile, see `compile_worker::spawn_recompile_after`.
+    pub fn begin_recompile_after(
+        &self,
+        root: &Path,
+        registry: &Registry,
+        path: &str,
+        delay: std::time::Duration,
+    ) -> compile_worker::RecompileJob {
+        let snapshot = self.snapshot(registry);
+        compile_worker::spawn_recompile_after(root.to_path_buf(), path.to_string(), snapshot, delay)
+    }
+
+    /// Apply a finished [`compile_worker::RecompileJob`]'s outcome (OBI-90,
+    /// spec §7.2 step 4 up to `install`): invalidate every recompiled path
+    /// in `self.session` — exactly like the synchronous [`Compiler::recompile`]
+    /// does before it starts, just deferred until here so a concurrent
+    /// `ensure_program` for a brand-new file during the background compile
+    /// still sees the *old*, still-installed interface — then decode and
+    /// **re-verify** (spec §5.8/§5.9: nothing runs unverified, including a
+    /// `Module` that round-tripped across this `Send` boundary the same way
+    /// it would across `encode`/`decode`) each program the background
+    /// thread produced, wiring `parent` to whichever `Rc<CompiledProgram>`
+    /// is live for that path (this batch first, then `registry`). Returns
+    /// the new [`CompiledProgram`]s exactly like [`Compiler::recompile`],
+    /// **not yet installed** — the caller still passes this to
+    /// [`RegistryHost::install`].
+    pub fn finish_recompile(
+        &mut self,
+        registry: &Registry,
+        outcome: compile_worker::CompileOutcome,
+    ) -> Result<HashMap<String, Rc<CompiledProgram>>, String> {
+        let programs = match outcome {
+            compile_worker::CompileOutcome::Ready(p) => p,
+            compile_worker::CompileOutcome::Failed(e) => return Err(e),
+        };
+        for p in &programs {
+            self.session.invalidate(&p.path);
+        }
+        let mut new_set: HashMap<String, Rc<CompiledProgram>> = HashMap::new();
+        for wp in programs {
+            let module = loom_compiler::bytecode::decode(&wp.module_bytes)
+                .map_err(|e| format!("{}: corrupt background compile result: {e}", wp.path))?;
+            loom_compiler::verify::verify(&module)
+                .map_err(|e| format!("{}: failed re-verification: {e}", wp.path))?;
+            let var_specs: Vec<VarSpec> = wp
+                .var_specs
+                .iter()
+                .map(|v| {
+                    Ok(VarSpec {
+                        name: Rc::from(v.name.as_str()),
+                        ty: loom_compiler::bytecode::decode_ty(&v.ty_bytes)
+                            .map_err(|e| format!("{}: corrupt var type: {e}", wp.path))?,
+                        has_init: v.has_init,
+                    })
+                })
+                .collect::<Result<_, String>>()?;
+            let parent = wp
+                .parent_path
+                .as_ref()
+                .and_then(|pp| new_set.get(pp).cloned().or_else(|| registry.program(pp)));
+            let mut prog = CompiledProgram::new(module, wp.version, parent, var_specs);
+            prog.non_public = wp.non_public.iter().map(|s| Rc::from(s.as_str())).collect();
+            new_set.insert(wp.path.clone(), Rc::new(prog));
         }
         Ok(new_set)
     }
@@ -1212,6 +1338,27 @@ impl<'a> RegistryHost<'a> {
                 .as_mut()
                 .expect("recompile needs a driver context");
             driver.compiler.recompile(self.registry, &path)?
+        };
+        self.install(new_set)
+    }
+
+    /// Apply a background [`compile_worker::RecompileJob`]'s outcome
+    /// (OBI-90/D-P1.5, spec §7.2 step 4): decode + re-verify each program
+    /// the background thread produced, wire up `Rc<CompiledProgram>` parent
+    /// links against the *current* registry, then [`Self::install`] —
+    /// registry mutation + per-object migration — exactly like the
+    /// synchronous [`Self::recompile`], all still on the world thread, all
+    /// still all-or-nothing.
+    pub fn finish_recompile(
+        &mut self,
+        outcome: compile_worker::CompileOutcome,
+    ) -> Result<(), String> {
+        let new_set = {
+            let driver = self
+                .driver
+                .as_mut()
+                .expect("finish_recompile needs a driver context");
+            driver.compiler.finish_recompile(self.registry, outcome)?
         };
         self.install(new_set)
     }

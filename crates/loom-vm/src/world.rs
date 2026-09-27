@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::bcvm::Value;
+use crate::bcvm::compile_worker::RecompileJob;
 use crate::bcvm::registry::{Compiler, Registry, RegistryHost};
 use crate::bcvm::vm::{Limits as VmLimits, RtError};
 use crate::host::{Host, NullHost};
@@ -86,7 +87,22 @@ pub struct World {
     /// P1+ enforcement hook (OBI-33): stubbed allow-all + audit log until
     /// S1's policy replaces it (see `crate::privilege`).
     privilege: Box<dyn PrivilegeCheck>,
+    /// `compile_object`/`update` requests dispatched to a background
+    /// thread but not yet applied (OBI-90/D-P1.5): `World::tick` installs
+    /// each one as soon as it finishes, so ticks in between are never
+    /// blocked on a slow compile.
+    pending_recompiles: Vec<(RecompileToken, RecompileJob)>,
+    /// Every background compile `World::tick`/`poll_recompiles` has
+    /// installed (or failed to) since the last `take_finished_recompiles`.
+    finished_recompiles: Vec<(RecompileToken, Result<(), String>)>,
+    next_recompile_token: u64,
 }
+
+/// Identifies one [`World::begin_recompile`] call, so its eventual result
+/// (in [`World::take_finished_recompiles`]) can be matched back to the
+/// caller that asked for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RecompileToken(u64);
 
 impl World {
     /// Boot a world from `mudlib_root`: compile and load `/secure/master.wf`.
@@ -106,6 +122,9 @@ impl World {
             limits,
             scheduler: Scheduler::new(),
             privilege: Box::new(AllowAllAudited::new()),
+            pending_recompiles: Vec::new(),
+            finished_recompiles: Vec::new(),
+            next_recompile_token: 0,
         };
         let mut null = NullHost;
         let master = w
@@ -231,6 +250,7 @@ impl World {
     /// (neither path has a connection) and are swallowed, matching
     /// `disconnect`'s `net_dead`.
     pub fn tick(&mut self, host: &mut dyn Host) {
+        self.poll_recompiles(host);
         for ob in self.scheduler.heartbeat_targets() {
             if self.registry.get(ob).is_none() {
                 continue; // destructed since it subscribed
@@ -308,6 +328,79 @@ impl World {
         self.exec(host, None, None, |h| Ok(h.recompile(path)))
             .unwrap_or_else(|e| Err(e.report()))
             .err()
+    }
+
+    /// `compile_object`/`update` (spec §7.2), off the world thread
+    /// (OBI-90/D-P1.5): kicks off parse/check/codegen/verify on a
+    /// background OS thread and returns immediately — nothing about this
+    /// call touches `self.registry`, so `tick`/`input`/`connect` in the
+    /// meantime are unaffected. `World::tick` (via `poll_recompiles`)
+    /// installs the result — registry mutation + per-object migration —
+    /// on the world thread as soon as the background thread finishes;
+    /// poll [`Self::take_finished_recompiles`] for the outcome, or
+    /// [`Self::recompile_pending`] to check without draining it.
+    ///
+    /// `compile_object` above is unchanged and still fully synchronous
+    /// (existing callers/tests keep working); this is the additive path a
+    /// driver that wants non-blocking `update` should move to.
+    pub fn begin_recompile(&mut self, path: &str) -> RecompileToken {
+        self.begin_recompile_after(path, std::time::Duration::ZERO)
+    }
+
+    /// [`Self::begin_recompile`], but the background thread sleeps for
+    /// `delay` before it starts compiling — stands in for a large/slow
+    /// compile in tests without needing an actually huge dependent tree
+    /// (spec r5 amendment's own suggested alternative).
+    pub fn begin_recompile_after(
+        &mut self,
+        path: &str,
+        delay: std::time::Duration,
+    ) -> RecompileToken {
+        let token = RecompileToken(self.next_recompile_token);
+        self.next_recompile_token += 1;
+        let job = self
+            .compiler
+            .begin_recompile_after(&self.root, &self.registry, path, delay);
+        self.pending_recompiles.push((token, job));
+        token
+    }
+
+    /// Non-blocking: install every background compile that has finished
+    /// since the last call. `World::tick` calls this automatically; it is
+    /// also exposed directly for a caller that drives `begin_recompile`
+    /// without ticking (e.g. a test, or a `loom` admin command run between
+    /// ticks).
+    pub fn poll_recompiles(&mut self, host: &mut dyn Host) {
+        if self.pending_recompiles.is_empty() {
+            return;
+        }
+        let jobs = std::mem::take(&mut self.pending_recompiles);
+        let mut still_pending = Vec::new();
+        for (token, job) in jobs {
+            match job.poll() {
+                None => still_pending.push((token, job)),
+                Some(outcome) => {
+                    let result = self
+                        .exec(host, None, None, |h| Ok(h.finish_recompile(outcome)))
+                        .unwrap_or_else(|e| Err(e.report()));
+                    self.finished_recompiles.push((token, result));
+                }
+            }
+        }
+        self.pending_recompiles = still_pending;
+    }
+
+    /// Every background compile that has finished (successfully installed,
+    /// or failed) since the last call, oldest first. Draining is
+    /// destructive: call it once per token you care about.
+    pub fn take_finished_recompiles(&mut self) -> Vec<(RecompileToken, Result<(), String>)> {
+        std::mem::take(&mut self.finished_recompiles)
+    }
+
+    /// True while `token`'s background compile is still running (not yet
+    /// picked up by `poll_recompiles`/`tick`).
+    pub fn recompile_pending(&self, token: RecompileToken) -> bool {
+        self.pending_recompiles.iter().any(|(t, _)| *t == token)
     }
 
     /// Call a function on an object as the driver (visibility not enforced).
