@@ -694,6 +694,8 @@ dependencies = [
 name = "loom-net"
 version = "0.0.1"
 dependencies = [
+ "proptest",
+ "serde_json",
  "tokio",
  "tracing",
 ]
