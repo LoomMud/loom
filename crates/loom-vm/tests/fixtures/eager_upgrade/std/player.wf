@@ -28,6 +28,12 @@ pub fn process_input(line: string) {
     } else if verb == "hboff" {
         set_heartbeat(false)
         send(self, "heartbeat off\n")
+    } else if verb == "load_selfie" {
+        let s = load_object("/std/selfie")
+        send(self, $"loaded {object_name(s)}\n")
+    } else if verb == "selfie" {
+        let s = load_object("/std/selfie")
+        send(self, $"{s.m()}\n")
     } else if verb == "beats" {
         send(self, $"{beats}\n")
     } else {

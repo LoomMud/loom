@@ -291,6 +291,12 @@ impl World {
                 // ordinary access) between `upgrade_all` queuing it and
                 // this tick draining it — `RegistryHost::upgrade` itself
                 // does not check that, so guard it here.
+                // Runs at tick top level, so `ob` can't have a live frame
+                // (OBI-89 CTO review: never migrate under a running frame).
+                debug_assert!(
+                    !h.has_live_frame(ob),
+                    "eager upgrade drain must run at top level"
+                );
                 if let Some(o) = h.registry.get(ob)
                     && !std::rc::Rc::ptr_eq(&o.program, &current)
                     && let Err(w) = h.upgrade(ob, current)

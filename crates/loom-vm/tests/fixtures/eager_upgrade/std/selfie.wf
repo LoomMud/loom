@@ -1,0 +1,18 @@
+// OBI-89 CTO review item 1: an object that recompiles its own program
+// while one of its own frames is still running must not be migrated
+// underneath that frame.
+var a: int = 1
+
+pub fn m() -> string {
+    let err = compile_object("/std/selfie")
+    if err != null {
+        return "compile failed"
+    }
+    let r1 = g()
+    let r2 = self.g()
+    return $"{r1} {r2} {a}"
+}
+
+pub fn g() -> string {
+    return $"v1:{a}"
+}

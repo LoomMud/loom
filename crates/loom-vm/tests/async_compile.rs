@@ -137,8 +137,12 @@ fn a_stale_background_compile_is_rejected_not_installed() {
 
         // ...then, while it's still asleep, recompile the very same path
         // synchronously (a second admin `update`, or a driver retry).
-        let sync_err = world.compile_object("/std/room", &mut host);
-        assert_eq!(sync_err, None, "synchronous compile_object should succeed");
+        let sync = world.compile_object("/std/room", &mut host);
+        assert_eq!(
+            sync,
+            Ok(Vec::new()),
+            "synchronous compile_object should succeed"
+        );
         assert_eq!(world.program_version("/std/room"), Some(2));
 
         // Now wait for the background job: it must notice the registry
