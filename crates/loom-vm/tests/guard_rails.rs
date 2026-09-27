@@ -52,6 +52,41 @@ fn tick_cost_is_charged_at_call_efun_not_just_declared() {
 }
 
 #[test]
+fn tick_exhaustion_from_efun_cost_is_not_catchable() {
+    // CTO re-review (OBI-32, rebase onto OBI-33's efun tick cost): a
+    // `try`/`catch` around a loop of an efun with a large declared cost
+    // (`compile_object`, 500 ticks) must still fail with "Too long
+    // evaluation" and must never run the `catch` body — `charge_ticks`
+    // raises the *uncatchable* error, exactly like the bare `TickCheck`
+    // path `tick_exhaustion_is_not_catchable`
+    // (crates/loom-vm/tests/try_catch.rs) already pins for a plain loop
+    // with no efun calls in it.
+    on_world_thread(|| {
+        let root = fixture("tworoom");
+        let limits = loom_vm::Limits {
+            max_ticks: 5_000,
+            max_depth: 512,
+            ..Default::default()
+        };
+        let mut world = World::boot_with_limits(&root, limits).expect("boot");
+        let mut host = FakeHost::default();
+
+        world.connect(1, &mut host);
+        host.take(1);
+        world.input(1, "burncompile_try", &mut host);
+        let out = host.take(1);
+        assert!(
+            out.contains("Too long evaluation"),
+            "tick exhaustion from efun cost must still surface as an error: {out}"
+        );
+        assert!(
+            !out.contains("CAUGHT"),
+            "the catch body must never run for tick exhaustion: {out}"
+        );
+    });
+}
+
+#[test]
 fn infinite_loop_and_runaway_recursion_abort_and_world_keeps_serving() {
     on_world_thread(|| {
         let root = fixture("tworoom");
