@@ -129,6 +129,7 @@ impl World {
         conn: Option<u64>,
         body: impl FnOnce(&mut RegistryHost<'_>) -> Result<T, RtError>,
     ) -> Result<T, RtError> {
+        self.registry.debug_assert_atomic_scope_closed();
         let self_object = this_player.or(self.master).unwrap_or(ObjectId {
             index: u32::MAX,
             generation: 0,
@@ -146,7 +147,9 @@ impl World {
             &mut self.scheduler,
             self.privilege.as_mut(),
         );
-        body(&mut rh)
+        let result = body(&mut rh);
+        self.registry.debug_assert_atomic_scope_closed();
+        result
     }
 
     fn report(host: &mut dyn Host, conn: u64, e: &RtError) {
