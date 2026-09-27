@@ -919,7 +919,6 @@ struct CacheEntry {
     guard: Rc<CompiledProgram>,
     target: Rc<CompiledProgram>,
     func: u32,
-    self_obj: ObjectId,
 }
 
 /// Everything a driver efun (`send`, `bind_connection`, `compile_object`,
@@ -1070,13 +1069,17 @@ impl<'a> RegistryHost<'a> {
     /// None`), or `recv`'s for `Other`. `None` if the relevant object is
     /// already destructed or `recv` is not an object (the slow path's own
     /// error reporting handles those cases).
-    fn current_guard(&self, recv: Option<&Value>) -> Option<Rc<CompiledProgram>> {
+    ///
+    /// Also returns the receiver object itself: a cache hit must run the
+    /// callee on *this* receiver, never on the object the entry was
+    /// resolved for (two clones of one program share the guard).
+    fn current_guard(&self, recv: Option<&Value>) -> Option<(ObjectId, Rc<CompiledProgram>)> {
         let id = match recv {
             None => self.self_object(),
             Some(Value::Object(id)) => *id,
             Some(_) => return None,
         };
-        self.registry.get(id).map(|o| o.program.clone())
+        self.registry.get(id).map(|o| (id, o.program.clone()))
     }
 
     pub fn new(registry: &'a mut Registry, self_object: ObjectId) -> Self {
@@ -1724,7 +1727,6 @@ impl Host for RegistryHost<'_> {
                     guard,
                     target: code.clone(),
                     func,
-                    self_obj,
                 },
             );
         }
@@ -1757,10 +1759,10 @@ impl Host for RegistryHost<'_> {
             return Err(args);
         };
         match self.current_guard(recv) {
-            Some(g) if Rc::ptr_eq(&g, &entry.guard) => Ok(HostCall::Enter {
+            Some((receiver, g)) if Rc::ptr_eq(&g, &entry.guard) => Ok(HostCall::Enter {
                 code: entry.target.clone(),
                 func: entry.func,
-                self_obj: entry.self_obj,
+                self_obj: receiver,
                 args,
             }),
             _ => Err(args),
@@ -2762,6 +2764,50 @@ override fn kind() -> string {
             host.call_on(obj_a, "describe", vec![]).unwrap().as_str(),
             Some("A")
         );
+    }
+
+    /// Regression (OBI-38): two clones of the *same* program share the
+    /// inline-cache guard, so a cache hit must run on the current
+    /// receiver, not on the object the entry was first resolved for.
+    /// Before the fix `b.outer()` (and the nested unqualified `inner()`
+    /// call inside it) ran on `a` and returned "A".
+    #[test]
+    fn inline_cache_hit_runs_on_the_current_receiver_not_the_cached_one() {
+        const KID_WF: &str = r#"
+var name: string = ""
+pub fn set_name(n: string) {
+    name = n
+}
+pub fn inner() -> string {
+    return name
+}
+pub fn outer() -> string {
+    return inner()
+}
+"#;
+        let mut registry = Registry::default();
+        let prog = Rc::new(compile_program(
+            "/obj/kid",
+            &[("/obj/kid", KID_WF)],
+            1,
+            None,
+        ));
+        registry.register_program(prog.clone());
+        let a = make_object(&mut registry, prog.clone());
+        let b = make_object(&mut registry, prog);
+        let mut host = RegistryHost::new(&mut registry, a);
+        host.call_on(a, "set_name", vec![Value::str("A")]).unwrap();
+        host.call_on(b, "set_name", vec![Value::str("B")]).unwrap();
+        for (ob, want) in [(a, "A"), (b, "B"), (a, "A"), (b, "B")] {
+            assert_eq!(
+                host.call_on(ob, "outer", vec![]).unwrap().as_str(),
+                Some(want)
+            );
+            assert_eq!(
+                host.call_on(ob, "inner", vec![]).unwrap().as_str(),
+                Some(want)
+            );
+        }
     }
 
     #[test]
