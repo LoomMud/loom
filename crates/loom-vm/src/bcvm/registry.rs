@@ -32,6 +32,8 @@
 //! [`Host::dispatch`] too.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -67,6 +69,18 @@ pub struct VarSpec {
     pub name: Rc<str>,
     pub ty: Ty,
     pub has_init: bool,
+}
+
+/// One object whose migration to a newer program version failed and was
+/// rolled back to its previous program/vars (spec §7.2 step 6.4: "On
+/// error → rollback, object stays on vN, error reported to builder &
+/// master `runtime_error`"). Not fatal to [`RegistryHost::install`] —
+/// every other affected object still migrates.
+#[derive(Clone, Debug)]
+pub struct UpgradeWarning {
+    pub object: ObjectId,
+    pub program: String,
+    pub message: String,
 }
 
 /// Build a synthetic, private function whose body conditionally assigns
@@ -394,6 +408,33 @@ pub struct CompiledProgram {
     /// [`compile_hir_program`] from HIR visibility; empty for hand-assembled
     /// test modules built directly with [`CompiledProgram::new`].
     pub non_public: std::collections::HashSet<Rc<str>>,
+    /// Hash of this program's **variable layout** (spec §7.2/§7.3): every
+    /// declared-here var's `(name, Ty)`, folded with the parent's own
+    /// `schema_hash` so a change anywhere in the inherit chain propagates.
+    /// Two versions with an *equal* `schema_hash` differ only in function
+    /// bodies, so [`RegistryHost::upgrade`] can skip straight to an O(1)
+    /// pointer swap: no var copy, no `$init` re-run, no `upgrade()` call
+    /// (spec §7.3 "the common case"). Does not yet fold in imported
+    /// struct/enum type schema hashes (spec r5 D27) — no user-defined
+    /// struct/enum types exist in the checker yet (`check.rs` W0208/W0209);
+    /// tracked as a follow-up once that lands.
+    pub schema_hash: u64,
+}
+
+/// [`CompiledProgram::schema_hash`]: fold `parent_hash` with every
+/// declared-here var's `(name, Ty)`, in declaration order. Declaration
+/// order (not sorted) is enough here because these are a *program*'s own
+/// vars, not a struct/enum's fields — reordering `var` declarations in
+/// source is not a change spec r5 promises is hash-stable (only struct
+/// fields/enum variants are, via their own recursive type schema hash).
+fn compute_schema_hash(var_specs: &[VarSpec], parent_hash: u64) -> u64 {
+    let mut h = DefaultHasher::new();
+    parent_hash.hash(&mut h);
+    for v in var_specs {
+        v.name.hash(&mut h);
+        v.ty.hash(&mut h);
+    }
+    h.finish()
 }
 
 impl ProgramCode for CompiledProgram {
@@ -416,6 +457,8 @@ impl CompiledProgram {
             .enumerate()
             .map(|(i, f)| (module.strings[f.name as usize].clone(), i as u32))
             .collect();
+        let parent_hash = parent.as_ref().map(|p| p.schema_hash).unwrap_or(0);
+        let schema_hash = compute_schema_hash(&var_specs, parent_hash);
         CompiledProgram {
             path,
             version,
@@ -424,6 +467,7 @@ impl CompiledProgram {
             parent,
             var_specs,
             non_public: Default::default(),
+            schema_hash,
         }
     }
 
@@ -1198,10 +1242,12 @@ impl<'a> RegistryHost<'a> {
         }
     }
 
-    /// `compile_object`/`update` (§7.2): recompile `path` and install it,
-    /// all-or-nothing (mirrors `crate::world::Exec::recompile` +
-    /// [`RegistryHost::install`]).
-    pub fn recompile(&mut self, path: &str) -> Result<(), String> {
+    /// `compile_object`/`update` (§7.2): recompile `path` (all-or-nothing
+    /// at the *compile* stage — see [`Compiler::recompile`]) and install
+    /// it. Per-object migration failures are reported as
+    /// [`UpgradeWarning`]s rather than aborting the whole recompile (spec
+    /// r5 amendment, mirrors [`RegistryHost::install`]).
+    pub fn recompile(&mut self, path: &str) -> Result<Vec<UpgradeWarning>, String> {
         let path = mudlib::normalize_path(path)?;
         let new_set = {
             let driver = self
@@ -1398,7 +1444,22 @@ impl<'a> RegistryHost<'a> {
                     .ok_or_else(|| RtError::new("compile_object(): expected string"))?
                     .to_string();
                 Ok(match self.recompile(&p) {
-                    Ok(()) => Value::Null,
+                    // Per-object migration failures are reported (not
+                    // fatal, spec §7.2 step 6.4) but there is no
+                    // builder/master `runtime_error` apply wired up yet to
+                    // hand them to (tracked on OBI-34, not silently
+                    // dropped): surface them on stderr for now so a
+                    // recompile with partial migration failures is at
+                    // least visible somewhere.
+                    Ok(warnings) => {
+                        for w in &warnings {
+                            eprintln!(
+                                "upgrade warning: object {:?} on {}: {}",
+                                w.object, w.program, w.message
+                            );
+                        }
+                        Value::Null
+                    }
                     Err(e) => Value::str(&e),
                 })
             }
@@ -1535,16 +1596,44 @@ impl<'a> RegistryHost<'a> {
     /// caller's snapshot (see `RegistryHost::upgrade_or_err`'s caller in
     /// `Registry`/`World` integration) rather than leaving the object
     /// half-migrated.
-    pub fn upgrade(&mut self, id: ObjectId, new_prog: Rc<CompiledProgram>) -> R<()> {
-        let old_vars = self
-            .registry
-            .get(id)
-            .ok_or_else(|| RtError::new("upgrade of a destructed object"))?
-            .vars
-            .clone();
+    pub fn upgrade(
+        &mut self,
+        id: ObjectId,
+        new_prog: Rc<CompiledProgram>,
+    ) -> Result<(), UpgradeWarning> {
+        let program_label = new_prog.path.to_string();
+        let warn = |message: String| UpgradeWarning {
+            object: id,
+            program: program_label.clone(),
+            message,
+        };
+        let Some(old_program) = self.registry.get(id).map(|o| o.program.clone()) else {
+            return Err(warn("upgrade of a destructed object".to_string()));
+        };
+        // Spec §7.3 "the common case": an unchanged variable layout is an
+        // O(1) pointer swap — no var copy, no `$init` re-run, no
+        // `upgrade()` call, because there is nothing for either to do.
+        if old_program.schema_hash == new_prog.schema_hash {
+            if let Some(o) = self.registry.get_mut(id) {
+                o.program = new_prog;
+            }
+            self.call_cache.clear();
+            return Ok(());
+        }
+        let old_vars = self.registry.get(id).expect("checked above").vars.clone();
+        let from_version = old_program.version;
+        let chain = new_prog.chain();
+        let new_spec_by_key: HashMap<(Rc<str>, Rc<str>), &VarSpec> = chain
+            .iter()
+            .flat_map(|anc| {
+                anc.var_specs
+                    .iter()
+                    .map(move |s| ((anc.path.clone(), s.name.clone()), s))
+            })
+            .collect();
         let mut new_vars = Vars::new();
         let mut plan: Vec<(Rc<CompiledProgram>, Vec<bool>)> = Vec::new();
-        for ancestor in new_prog.chain() {
+        for ancestor in &chain {
             let mut keep = Vec::new();
             for spec in ancestor.init_specs() {
                 let key = (ancestor.path.clone(), spec.name.clone());
@@ -1565,34 +1654,79 @@ impl<'a> RegistryHost<'a> {
                     new_vars.insert(key, v.clone());
                 }
             }
-            plan.push((ancestor, keep));
+            plan.push((ancestor.clone(), keep));
         }
-        if let Some(o) = self.registry.get_mut(id) {
-            o.program = new_prog;
-            o.vars = new_vars;
-            o.recompute_mem_bytes();
+        // Spec §7.2 step 6.3: variables removed or whose type changed
+        // incompatibly are handed to `upgrade(from_version, old)` in
+        // portable form. For the types the checker supports today (no
+        // struct/enum yet, W0208/W0209) "portable form" is just the raw
+        // stored value; struct/enum by-name conversion (spec r5 D27) is
+        // out of scope until those types exist (tracked separately).
+        let mut old_map = heap::MapData::default();
+        for (key, old_val) in old_vars.iter() {
+            let survives = new_spec_by_key
+                .get(key)
+                .is_some_and(|spec| value_conforms(old_val, &spec.ty));
+            if !survives {
+                old_map.insert(Value::str(&key.1), old_val.clone());
+            }
         }
-        // The object's program just changed; drop every inline-cache entry
-        // rather than reason about which call sites it could affect.
-        self.call_cache.clear();
-        for (ancestor, keep) in plan {
-            self.run_init(id, &ancestor, &keep)?;
+        // Everything from here on must be all-or-nothing for *this object*
+        // (spec §7.2 step 6.4): on any failure the object stays on
+        // `old_program`/`old_vars`, the error is reported (not fatal), and
+        // `create()` is never re-run (D-P1.4) — only `$init` for vars whose
+        // value didn't survive, and the user's own `upgrade()`, if defined.
+        let outcome: R<()> = (|| {
+            if let Some(o) = self.registry.get_mut(id) {
+                o.program = new_prog.clone();
+                o.vars = new_vars.clone();
+                o.recompute_mem_bytes();
+            }
+            self.call_cache.clear();
+            for (ancestor, keep) in &plan {
+                self.run_init(id, ancestor, keep)?;
+            }
+            if let Some((target, idx)) = new_prog.resolve("upgrade") {
+                let mark = self.begin_atomic();
+                let args = vec![Value::Int(from_version as i64), Value::map(old_map.clone())];
+                match self.call_in(id, &target, idx, args) {
+                    Ok(_) => self.commit_atomic(mark),
+                    Err(e) => {
+                        self.rollback_atomic(mark);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Some(o) = self.registry.get_mut(id) {
+                    o.program = old_program;
+                    o.vars = old_vars;
+                    o.recompute_mem_bytes();
+                }
+                self.call_cache.clear();
+                Err(warn(e.report()))
+            }
         }
-        Ok(())
     }
 
     /// Install the output of [`Compiler::recompile`]: register every new
-    /// [`CompiledProgram`] and upgrade every existing object whose
-    /// *current* program is one of them, all-or-nothing (spec §7.2) — the
-    /// bytecode-VM analogue of `World::install`. On the first failing
-    /// object upgrade, every program registration and every object already
-    /// upgraded in this call are rolled back to their pre-`install` state,
-    /// and the (rendered) error is returned; nothing is left half-migrated.
-    pub fn install(&mut self, new_set: HashMap<String, Rc<CompiledProgram>>) -> Result<(), String> {
-        let old_programs: Vec<(String, Option<Rc<CompiledProgram>>)> = new_set
-            .keys()
-            .map(|k| (k.clone(), self.registry.program(k)))
-            .collect();
+    /// [`CompiledProgram`] (the compile wave is already all-or-nothing —
+    /// see [`Compiler::recompile`] — so registering it here never fails)
+    /// and migrate every existing object whose *current* program is one of
+    /// them (spec r5 amendment: per-object migration failure rolls back
+    /// only that object and is reported, not fatal to the install or to
+    /// any other object — the bytecode-VM analogue of `World::install`,
+    /// upgraded from Phase 0/1's all-or-nothing-across-every-object
+    /// behaviour). Returns one [`UpgradeWarning`] per object that failed
+    /// to migrate (empty if every affected object upgraded cleanly).
+    pub fn install(
+        &mut self,
+        new_set: HashMap<String, Rc<CompiledProgram>>,
+    ) -> Result<Vec<UpgradeWarning>, String> {
         for v in new_set.values() {
             self.registry.register_program(v.clone());
         }
@@ -1605,16 +1739,13 @@ impl<'a> RegistryHost<'a> {
                 new_set.get(&*o.program.path).map(|p| (id, p.clone()))
             })
             .collect();
-        let mut saved: Vec<(ObjectId, Rc<CompiledProgram>, Vars)> = Vec::new();
-        let mut failure: Option<(ObjectId, RtError)> = None;
+        let mut warnings = Vec::new();
         for (id, new_prog) in affected {
-            let Some(o) = self.registry.get(id) else {
+            if self.registry.get(id).is_none() {
                 continue;
-            };
-            saved.push((id, o.program.clone(), o.vars.clone()));
-            if let Err(e) = self.upgrade(id, new_prog) {
-                failure = Some((id, e));
-                break;
+            }
+            if let Err(w) = self.upgrade(id, new_prog) {
+                warnings.push(w);
             }
         }
         // Programs were replaced: an old `Rc<CompiledProgram>` may now be
@@ -1622,32 +1753,7 @@ impl<'a> RegistryHost<'a> {
         // stale `CallSite` (keyed by code address) collide with a live one.
         // Clear the per-call-site inline cache on every install outcome.
         self.call_cache.clear();
-        let Some((id, e)) = failure else {
-            return Ok(());
-        };
-        // Roll back everything: programs, then every touched object.
-        for (k, old) in old_programs {
-            match old {
-                Some(p) => {
-                    self.registry.register_program(p);
-                }
-                None => {
-                    self.registry.programs.remove(&k);
-                }
-            }
-        }
-        for (sid, prog, vars) in saved {
-            if let Some(o) = self.registry.get_mut(sid) {
-                o.program = prog;
-                o.vars = vars;
-                o.recompute_mem_bytes();
-            }
-        }
-        self.call_cache.clear();
-        Err(format!(
-            "upgrade of object {id:?} failed, nothing was changed:\n{}",
-            e.report()
-        ))
+        Ok(warnings)
     }
 }
 
@@ -2235,6 +2341,224 @@ var other: int = 1
             0,
             "`blob` was dropped by the upgrade; it must no longer be charged"
         );
+    }
+
+    /// Spec §7.3 "the common case": recompiling a program without
+    /// touching its variable layout (only a function body changed) must
+    /// leave `schema_hash` unchanged, so `upgrade` takes the O(1)
+    /// pointer-swap path — proven here by checking the hash directly and
+    /// by upgrading an object whose var was mutated away from its
+    /// initialiser: a body-only change must not re-run `$init` either.
+    #[test]
+    fn unchanged_var_layout_keeps_the_same_schema_hash_and_skips_reinit() {
+        const V1_WF: &str = r#"
+var counter: int = 1
+
+pub fn get_counter() -> int {
+    return counter
+}
+
+pub fn set_counter(n: int) {
+    counter = n
+}
+"#;
+        const V2_WF: &str = r#"
+var counter: int = 1
+
+pub fn get_counter() -> int {
+    return counter
+}
+
+pub fn set_counter(n: int) {
+    counter = n
+}
+
+pub fn tripled() -> int {
+    return counter * 3
+}
+"#;
+        let v1 = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", V1_WF)],
+            1,
+            None,
+        ));
+        let v2 = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", V2_WF)],
+            2,
+            None,
+        ));
+        assert_eq!(
+            v1.schema_hash, v2.schema_hash,
+            "only a function body changed; the variable layout did not"
+        );
+
+        let mut registry = Registry::default();
+        registry.register_program(v1.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(v1).expect("instantiate");
+        host.call_on(obj, "set_counter", vec![Value::Int(7)])
+            .unwrap();
+
+        registry.register_program(v2.clone());
+        let mut host = RegistryHost::new(&mut registry, obj);
+        host.upgrade(obj, v2).expect("upgrade");
+
+        let counter = host.call_on(obj, "get_counter", vec![]).unwrap();
+        assert!(counter.equals(&Value::Int(7)));
+        let tripled = host.call_on(obj, "tripled", vec![]).unwrap();
+        assert!(tripled.equals(&Value::Int(21)));
+    }
+
+    /// Spec §7.2 step 6.3/6.4: a var whose type changed incompatibly is
+    /// handed to `upgrade(from_version, old)` in `old` (keyed by name, raw
+    /// value — no struct/enum types exist yet to need portable form); a
+    /// user-defined `upgrade()` can inspect it and set the new var itself,
+    /// overriding the freshly-run initialiser.
+    #[test]
+    fn upgrade_hook_receives_from_version_and_the_dropped_vars_old_value() {
+        const V1_WF: &str = r#"
+var data: int = 41
+"#;
+        const V2_WF: &str = r#"
+var data: string = "unset"
+
+pub fn upgrade(from_version: int, old: {string: any}) {
+    if "data" in old {
+        if old["data"] == 41 and from_version == 1 {
+            data = "was 41 from v1"
+        } else {
+            data = "unexpected"
+        }
+    }
+}
+
+pub fn get_data() -> string {
+    return data
+}
+"#;
+        let v1 = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", V1_WF)],
+            1,
+            None,
+        ));
+        let mut registry = Registry::default();
+        registry.register_program(v1.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(v1.clone()).expect("instantiate");
+
+        let v2 = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", V2_WF)],
+            2,
+            None,
+        ));
+        assert_ne!(v1.schema_hash, v2.schema_hash, "the var's type changed");
+        registry.register_program(v2.clone());
+        let mut host = RegistryHost::new(&mut registry, obj);
+        host.upgrade(obj, v2).expect("upgrade");
+
+        let data = host.call_on(obj, "get_data", vec![]).unwrap();
+        assert_eq!(data.as_str(), Some("was 41 from v1"));
+    }
+
+    /// Spec §7.2 step 6.4 (r5 amendment): a failing `upgrade()` rolls back
+    /// *that object* (program and vars) and is reported, not fatal — and
+    /// [`RegistryHost::install`] still migrates every *other* affected
+    /// object instead of aborting the whole set.
+    #[test]
+    fn a_failing_upgrade_hook_rolls_back_only_that_object_not_the_whole_install() {
+        const ROOM_V1: &str = r#"
+var short_desc: string = "An empty room"
+
+pub fn short() -> string {
+    return short_desc
+}
+
+pub fn set_short(s: string) {
+    short_desc = s
+}
+"#;
+        // `short_desc`'s type is unchanged, so it survives the automatic
+        // carry-over *before* `upgrade()` runs, letting `upgrade()` see
+        // each object's own prior value through `self` and decide per
+        // object whether to fail — proving a failure only rolls back the
+        // one object it happened on, not the whole install.
+        const ROOM_V2: &str = r#"
+var short_desc: string = "An empty room"
+var upgraded_marker: bool = false
+
+pub fn short() -> string {
+    return short_desc
+}
+
+pub fn set_short(s: string) {
+    short_desc = s
+}
+
+pub fn upgrade(from_version: int, old: {string: any}) {
+    if short_desc == "BREAK ME" {
+        throw "boom"
+    }
+}
+"#;
+        let v1 = Rc::new(compile_program(
+            "/std/room",
+            &[("/std/room", ROOM_V1)],
+            1,
+            None,
+        ));
+        let mut registry = Registry::default();
+        registry.register_program(v1.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let (broken, fine) = {
+            let mut host = RegistryHost::new(&mut registry, placeholder);
+            let broken = host.instantiate(v1.clone()).expect("instantiate");
+            let fine = host.instantiate(v1.clone()).expect("instantiate");
+            host.call_on(broken, "set_short", vec![Value::str("BREAK ME")])
+                .unwrap();
+            (broken, fine)
+        };
+
+        let v2 = Rc::new(compile_program(
+            "/std/room",
+            &[("/std/room", ROOM_V2)],
+            2,
+            None,
+        ));
+        let mut new_set = HashMap::new();
+        new_set.insert("/std/room".to_string(), v2.clone());
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let warnings = host.install(new_set).expect("install itself does not fail");
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly the broken object's upgrade should fail"
+        );
+        assert_eq!(warnings[0].object, broken);
+
+        // The broken object stayed on v1 (old program, old var untouched);
+        // the fine object migrated to v2.
+        let short = host.call_on(fine, "short", vec![]).unwrap();
+        assert_eq!(short.as_str(), Some("An empty room"));
+        let broken_short = host.call_on(broken, "short", vec![]).unwrap();
+        assert_eq!(broken_short.as_str(), Some("BREAK ME"));
+        assert_eq!(registry.get(broken).unwrap().program.version, 1);
+        assert_eq!(registry.get(fine).unwrap().program.version, 2);
     }
 
     /// End-to-end proof that the disk-backed [`Compiler`] (spec §7.2's

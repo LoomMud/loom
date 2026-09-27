@@ -143,7 +143,7 @@ fn recompiling_a_parent_upgrades_dependents_and_clones() {
         "Ways out: {join(names, \" and \")}",
     );
     std::fs::write(&room, src).unwrap();
-    assert_eq!(world.compile_object("/std/room", &mut host), None);
+    assert_eq!(world.compile_object("/std/room", &mut host), Ok(vec![]));
     assert_eq!(world.program_version("/std/room"), Some(2));
     assert_eq!(world.program_version("/domains/start/hall"), Some(2));
     assert_eq!(world.program_version("/domains/start/yard"), Some(2));
@@ -199,7 +199,7 @@ fn failing_dependent_rejects_the_whole_set() {
     std::fs::write(&room, src.replace("long()", "long_desc()")).unwrap();
     let err = world
         .compile_object("/std/room", &mut host)
-        .expect("must fail");
+        .expect_err("must fail");
     // Deviation from the tree-walker (spec r5, flagged not hidden):
     // `bcvm::registry::Compiler::recompile` doesn't wrap a failing
     // dependent's diagnostic with "{path} changed, but dependent {d.path}
@@ -227,12 +227,20 @@ fn failing_initialiser_rolls_back_the_upgrade() {
         "inherit /std/room\n\nvar boom: int = 1 / 0\n\npub override fn long() -> string {\n    return \"new\"\n}\n",
     )
     .unwrap();
-    let err = world
+    // Spec r5 amendment (§7.2 step 6.4): a per-object migration failure is
+    // reported, not fatal — `compile_object` itself still succeeds (the
+    // new program installs), but the one instance whose `$init` failed
+    // rolls back to its old version instead of the whole recompile being
+    // rejected.
+    let warnings = world
         .compile_object("/domains/start/hall", &mut host)
-        .expect("must fail");
-    assert!(err.contains("division by zero"), "{err}");
-    assert!(err.contains("nothing was changed"), "{err}");
-    assert_eq!(world.program_version("/domains/start/hall"), Some(1));
+        .expect("install itself must not fail");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("division by zero"), "{warnings:?}");
+    // The registry-level program did install (spec r5: only the failing
+    // *object's* migration rolled back, not the whole recompile) — new
+    // clones from here on get v2; this pre-existing instance stays on v1.
+    assert_eq!(world.program_version("/domains/start/hall"), Some(2));
     assert_eq!(
         world.object_program_version(hall),
         Some(("/domains/start/hall".into(), 1))
