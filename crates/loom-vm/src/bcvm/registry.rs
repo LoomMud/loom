@@ -520,6 +520,15 @@ impl BcObject {
             mem_bytes: 0,
         }
     }
+
+    /// Re-derive [`BcObject::mem_bytes`] from `vars` from scratch. Needed
+    /// wherever `vars` is replaced wholesale rather than written through
+    /// [`RegistryHost::store_global`] (hot-reload `upgrade`, `install`
+    /// rollback), or the incremental count drifts: vars dropped by a
+    /// migration would stay charged forever.
+    pub fn recompute_mem_bytes(&mut self) {
+        self.mem_bytes = self.vars.values().map(heap::shallow_bytes).sum();
+    }
 }
 
 struct Slot {
@@ -1319,7 +1328,11 @@ impl<'a> RegistryHost<'a> {
         if let Some(o) = self.registry.get_mut(id) {
             o.program = new_prog;
             o.vars = new_vars;
+            o.recompute_mem_bytes();
         }
+        // The object's program just changed; drop every inline-cache entry
+        // rather than reason about which call sites it could affect.
+        self.call_cache.clear();
         for (ancestor, keep) in plan {
             self.run_init(id, &ancestor, &keep)?;
         }
@@ -1362,6 +1375,11 @@ impl<'a> RegistryHost<'a> {
                 break;
             }
         }
+        // Programs were replaced: an old `Rc<CompiledProgram>` may now be
+        // freed and its address reused by new code, which would make a
+        // stale `CallSite` (keyed by code address) collide with a live one.
+        // Clear the per-call-site inline cache on every install outcome.
+        self.call_cache.clear();
         let Some((id, e)) = failure else {
             return Ok(());
         };
@@ -1380,8 +1398,10 @@ impl<'a> RegistryHost<'a> {
             if let Some(o) = self.registry.get_mut(sid) {
                 o.program = prog;
                 o.vars = vars;
+                o.recompute_mem_bytes();
             }
         }
+        self.call_cache.clear();
         Err(format!(
             "upgrade of object {id:?} failed, nothing was changed:\n{}",
             e.report()
@@ -1538,7 +1558,7 @@ impl Host for RegistryHost<'_> {
             return Ok(());
         };
         let old_bytes = o.vars.get(&key).map(heap::shallow_bytes).unwrap_or(0);
-        let new_total = o.mem_bytes - old_bytes + new_bytes;
+        let new_total = o.mem_bytes.saturating_sub(old_bytes) + new_bytes;
         if new_total > quota {
             return Err(RtError::new(format!(
                 "{}: memory quota exceeded writing `{name}` ({new_total} bytes of vars would be \
@@ -1914,6 +1934,50 @@ pub fn get_data() -> string {
 
         let data = host.call_on(obj, "get_data", vec![]).unwrap();
         assert_eq!(data.as_str(), Some("fresh"));
+    }
+
+    /// OBI-78 review: `upgrade` replaces `vars` wholesale, so `mem_bytes`
+    /// must be re-derived, not carried over. Otherwise a var dropped by the
+    /// migration stays charged forever and repeated hot-reloads push the
+    /// object toward a false quota error.
+    #[test]
+    fn upgrade_recomputes_mem_bytes_instead_of_carrying_dropped_vars() {
+        const V1_WF: &str = r#"
+var blob: string = "0123456789012345678901234567890123456789"
+"#;
+        const V2_WF: &str = r#"
+var other: int = 1
+"#;
+        let v1 = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", V1_WF)],
+            1,
+            None,
+        ));
+        let mut registry = Registry::default();
+        registry.register_program(v1.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(v1).expect("instantiate");
+        assert_eq!(registry.get(obj).unwrap().mem_bytes, 40);
+
+        let v2 = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", V2_WF)],
+            2,
+            None,
+        ));
+        registry.register_program(v2.clone());
+        let mut host = RegistryHost::new(&mut registry, obj);
+        host.upgrade(obj, v2).expect("upgrade");
+        assert_eq!(
+            registry.get(obj).unwrap().mem_bytes,
+            0,
+            "`blob` was dropped by the upgrade; it must no longer be charged"
+        );
     }
 
     /// End-to-end proof that the disk-backed [`Compiler`] (spec §7.2's
