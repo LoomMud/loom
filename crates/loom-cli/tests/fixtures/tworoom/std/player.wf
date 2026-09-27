@@ -1,0 +1,107 @@
+// Minimal player: a handful of verbs, enough to walk and update.
+var name: string = "guest"
+persistent var moves: int = 0
+persistent var beats: int = 0
+persistent var last_call_out: int = -1
+persistent var burn_count: int = 0
+
+pub fn logon() {
+    send(self, "Welcome to Loom!\n")
+    move_to(load_object("/domains/start/hall"))
+    send(self, environment()?.look())
+}
+
+pub fn heartbeat() {
+    beats += 1
+}
+
+pub fn pong() {
+    send(self, $"pong {last_call_out}\n")
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "look" {
+        send(self, environment()?.look())
+    } else if verb == "go" and len(words) == 2 {
+        let dest = environment()?.exit_dest(words[1])
+        if dest == null {
+            send(self, "You can't go that way.\n")
+            return
+        }
+        move_to(load_object(dest))
+        moves += 1
+        send(self, environment()?.look())
+    } else if verb == "update" and len(words) == 2 {
+        let err = compile_object(words[1])
+        if err == null {
+            send(self, $"Updated {words[1]}.\n")
+        } else {
+            send(self, $"{err}\n")
+        }
+    } else if verb == "name" and len(words) == 2 {
+        name = words[1]
+        send(self, $"You are now {name}.\n")
+    } else if verb == "loop" {
+        var i = 0
+        while true {
+            i += 1
+        }
+    } else if verb == "burncompile" {
+        while true {
+            compile_object("/std/player")
+            burn_count += 1
+        }
+    } else if verb == "burncompile_try" {
+        // OBI-32 CTO follow-up: tick exhaustion caused by efun cost
+        // (`compile_object` at 500 ticks, not a per-backedge `TickCheck`)
+        // must still be uncatchable — the `catch` body below must never
+        // run, no matter how small the tick budget.
+        try {
+            while true {
+                compile_object("/std/player")
+                burn_count += 1
+            }
+        } catch e {
+            send(self, "CAUGHT (should never happen)\n")
+        }
+    } else if verb == "burnlen" {
+        while true {
+            len(words)
+            burn_count += 1
+        }
+    } else if verb == "burncount" {
+        send(self, $"{burn_count}\n")
+    } else if verb == "recurse" {
+        dive(0)
+    } else if verb == "sched" {
+        last_call_out = call_out("pong", 2)
+        send(self, $"scheduled {last_call_out}\n")
+    } else if verb == "sched3" {
+        // OBI-82: a fixed 3-world-tick delay, for the serve()-driven
+        // NetEvent::Tick integration test (loom-cli/tests/net_tick.rs).
+        last_call_out = call_out("pong", 3)
+        send(self, $"scheduled {last_call_out}\n")
+    } else if verb == "cancel" {
+        let ok = remove_call_out(last_call_out)
+        send(self, $"cancelled {ok}\n")
+    } else if verb == "hbon" {
+        set_heartbeat(true)
+        send(self, "heartbeat on\n")
+    } else if verb == "hboff" {
+        set_heartbeat(false)
+        send(self, "heartbeat off\n")
+    } else if verb == "beats" {
+        send(self, $"{beats}\n")
+    } else {
+        send(self, "What?\n")
+    }
+}
+
+fn dive(n: int) -> int {
+    return dive(n + 1)
+}
+
+pub fn net_dead() {
+}

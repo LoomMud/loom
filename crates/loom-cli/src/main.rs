@@ -4,7 +4,10 @@
 //! `loom` command-line entry point (`serve`, `check`, ...).
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use loom_net::{NetCommand, NetConfig, NetEvent};
 use loom_persist::{DbEvent, DbRequest, Password};
@@ -22,6 +25,13 @@ const COMMAND_CHANNEL_CAPACITY: usize = 1024;
 /// `World::issue_account_request` immediately queues an `"unavailable"`
 /// `account_result` instead of leaving the request pending forever.
 const ACCOUNT_QUEUE_DEPTH: usize = 256;
+
+/// World tick granularity (spec r5 N2): `World::tick` (heartbeats,
+/// `call_out`s) is driven once per this interval by `serve()`'s timer
+/// (OBI-82). `call_out` delays and the heartbeat cadence
+/// (`loom_vm::Limits::heartbeat_interval_ticks`) are both counted in world
+/// ticks, i.e. multiples of this duration, not wall-clock time directly.
+const WORLD_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -162,6 +172,7 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
     let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let tick_pending = Arc::new(AtomicBool::new(false));
 
     let (account_req_tx, account_event_rx) = spawn_account_backend().await?;
 
@@ -171,6 +182,7 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         command_tx.clone(),
         account_req_tx,
         account_event_rx,
+        tick_pending.clone(),
     )?;
 
     info!(bind = %actual_addr, mudlib = %mudlib_root.display(), "loom server started");
@@ -178,9 +190,15 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
     let mut server = tokio::spawn(loom_net::run_server(
         listener,
         NetConfig::default(),
-        event_tx,
+        event_tx.clone(),
         command_rx,
+        shutdown_rx.clone(),
+    ));
+    let mut ticker = tokio::spawn(run_world_tick_timer(
+        event_tx,
         shutdown_rx,
+        tick_pending,
+        WORLD_TICK_INTERVAL,
     ));
 
     tokio::select! {
@@ -202,6 +220,9 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
             .map_err(|err| format!("network server task failed: {err}"))?
             .map_err(|err| format!("network server failed: {err}"))?;
     }
+    if !ticker.is_finished() {
+        let _ = (&mut ticker).await;
+    }
     drop(command_tx);
 
     world_handle
@@ -209,6 +230,44 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         .map_err(|_| "world thread panicked".to_string())?;
 
     Ok(())
+}
+
+/// The `serve()` world-tick timer (spec r5 N2, OBI-82): every `interval`
+/// (`WORLD_TICK_INTERVAL`, 100 ms, in production; a shorter one in tests),
+/// send one `NetEvent::Tick` so the world thread advances `World::tick`. No
+/// busy-wait: `tokio::time::interval` parks the task between ticks.
+/// `tick_pending` is shared with the world thread (cleared there right
+/// after `World::tick` returns, see `spawn_world_thread`): if the world
+/// thread is still catching up on the previous tick (a slow callback, GC
+/// pause, ...) the flag is still `true` and this loop skips sending
+/// another `Tick` for that interval instead of queuing one up -- at most
+/// one `Tick` is ever in-flight (queued in `event_tx` or being processed),
+/// so a world thread that falls behind coalesces missed ticks instead of
+/// racing to drain an unbounded backlog of them once it catches up.
+async fn run_world_tick_timer(
+    event_tx: mpsc::Sender<NetEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    tick_pending: Arc<AtomicBool>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            _ = ticker.tick() => {
+                if tick_pending.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+                    && event_tx.send(NetEvent::Tick).await.is_err()
+                {
+                    break;
+                }
+                // else: either the previous Tick has not been processed yet
+                // (coalesce by skipping this one), or the event channel is
+                // gone (shutting down).
+            }
+        }
+    }
 }
 
 /// Spawn the world thread. The `World` is not `Send` (single-threaded heap,
@@ -279,6 +338,7 @@ fn spawn_world_thread(
     command_tx: mpsc::Sender<NetCommand>,
     account_req_tx: mpsc::Sender<DbRequest>,
     mut account_event_rx: mpsc::Receiver<DbEvent>,
+    tick_pending: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let handle = thread::Builder::new()
@@ -326,6 +386,15 @@ fn spawn_world_thread(
                     NetEvent::Connected(conn) => world.connect(conn, &mut host),
                     NetEvent::Line(conn, line) => world.input(conn, &line, &mut host),
                     NetEvent::Disconnected(conn) => world.disconnect(conn, &mut host),
+                    NetEvent::Tick => {
+                        world.tick(&mut host);
+                        // Cleared only after `World::tick` returns: the
+                        // timer must not queue up a second `Tick` while
+                        // this one is still (synchronously) running, so
+                        // this is the coalescing boundary, not just a
+                        // "received" acknowledgement.
+                        tick_pending.store(false, Ordering::Release);
+                    }
                 }
                 drain_account_events(&mut world, &mut host);
             }
@@ -426,5 +495,92 @@ mod account_auth_tests {
         let mut auth = ChannelAccountAuth { request_tx: tx };
         assert!(!auth.create_account(1, "legolas", "hunter2pass"));
         assert!(!auth.login(2, "legolas", "hunter2pass"));
+    }
+}
+
+#[cfg(test)]
+mod tick_timer_tests {
+    use super::*;
+
+    /// A `Tick` fires every interval when something (standing in for the
+    /// world thread) clears `tick_pending` promptly, i.e. the timer does
+    /// not stall just because it *can* coalesce.
+    #[tokio::test(start_paused = true)]
+    async fn sends_one_tick_per_interval_when_promptly_cleared() {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let tick_pending = Arc::new(AtomicBool::new(false));
+        let interval = Duration::from_millis(10);
+
+        let handle = tokio::spawn(run_world_tick_timer(
+            event_tx,
+            shutdown_rx,
+            tick_pending.clone(),
+            interval,
+        ));
+
+        for _ in 0..5 {
+            tokio::time::advance(interval).await;
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("timed out waiting for Tick")
+                .expect("event channel closed");
+            assert_eq!(event, NetEvent::Tick);
+            // Stand in for the world thread finishing `World::tick`.
+            tick_pending.store(false, Ordering::Release);
+        }
+
+        handle.abort();
+    }
+
+    /// Bounded coalescing (OBI-82 acceptance criterion): if `tick_pending`
+    /// is never cleared (the world thread never catches up), letting many
+    /// intervals elapse must still leave at most one `Tick` sitting in the
+    /// channel -- not one per missed interval.
+    #[tokio::test(start_paused = true)]
+    async fn falling_behind_never_queues_more_than_one_pending_tick() {
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let tick_pending = Arc::new(AtomicBool::new(false));
+        let interval = Duration::from_millis(10);
+
+        let handle = tokio::spawn(run_world_tick_timer(
+            event_tx,
+            shutdown_rx,
+            tick_pending.clone(),
+            interval,
+        ));
+
+        // Let 50 intervals' worth of (virtual) time pass without ever
+        // clearing `tick_pending`: an unbounded design would queue up to
+        // 50 `Tick`s; a coalescing one sends exactly the first and then
+        // skips the rest.
+        tokio::time::advance(interval * 50).await;
+        tokio::task::yield_now().await;
+
+        let first = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("timed out waiting for the first Tick")
+            .expect("event channel closed");
+        assert_eq!(first, NetEvent::Tick);
+
+        // Nothing else should be queued behind it.
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a second Tick was queued while the first was still pending: coalescing is not bounded"
+        );
+
+        // Now let the (still-pending) world catch up: only after that does
+        // the next Tick get sent, and still only one at a time.
+        tick_pending.store(false, Ordering::Release);
+        tokio::time::advance(interval).await;
+        let second = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("timed out waiting for the second Tick")
+            .expect("event channel closed");
+        assert_eq!(second, NetEvent::Tick);
+        assert!(event_rx.try_recv().is_err());
+
+        handle.abort();
     }
 }
