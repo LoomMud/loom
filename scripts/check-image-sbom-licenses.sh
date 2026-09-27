@@ -20,11 +20,13 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-missing_count=$(jq '[.components[]? | select(((.licenses // []) | length) == 0)] | length' "$sbom_path")
+# Only package components carry licenses; syft also emits one `file` component
+# per cataloged file and an `operating-system` component, which never do.
+missing_count=$(jq '[.components[]? | select(.type != "file" and .type != "operating-system") | select(((.licenses // []) | length) == 0)] | length' "$sbom_path")
 
 if [[ "$missing_count" -gt 0 ]]; then
   echo "found ${missing_count} SBOM components with no declared license:" >&2
-  jq -r '.components[]? | select(((.licenses // []) | length) == 0) | "- \(.name)@\(.version // "unknown")"' "$sbom_path" | head -n 50 >&2
+  jq -r '.components[]? | select(.type != "file" and .type != "operating-system") | select(((.licenses // []) | length) == 0) | "- \(.name)@\(.version // "unknown")"' "$sbom_path" | head -n 50 >&2
   exit 1
 fi
 
