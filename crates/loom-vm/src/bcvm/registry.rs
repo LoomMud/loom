@@ -766,6 +766,15 @@ pub struct BcObject {
     /// maintained incrementally by [`RegistryHost::store_global`] so a
     /// quota check never has to re-walk `vars`.
     pub mem_bytes: u64,
+    /// [`Registry::install_generation`] as of the last time
+    /// [`RegistryHost::ensure_current`] checked whether this object's
+    /// program is still the one currently registered for its path (spec
+    /// §7.2/§7.3 "lazy per-instance upgrade on access", OBI-89). Equal to
+    /// the *current* `install_generation` means "already checked, nothing
+    /// to do" — the common steady-state case between recompiles — so a
+    /// dispatch never re-does the program-registry lookup per call once no
+    /// recompile is in flight, only the one `u64` compare.
+    pub checked_generation: u64,
 }
 
 impl BcObject {
@@ -782,6 +791,7 @@ impl BcObject {
             inventory: Vec::new(),
             conn: None,
             mem_bytes: 0,
+            checked_generation: 0,
         }
     }
 
@@ -861,6 +871,24 @@ pub struct Registry {
     /// that itself commits does not clear entries an *outer* atomic scope
     /// may still need to roll back if it later fails.
     atomic_active: u32,
+    /// Bumped by every [`RegistryHost::install`] call (spec §7.2/§7.3,
+    /// OBI-89: "lazy per-instance upgrade on access"): the cheap
+    /// per-object staleness check ([`RegistryHost::ensure_current`])
+    /// compares this to [`BcObject::checked_generation`] instead of doing
+    /// a `programs` lookup on every single call — a mismatch is what
+    /// tells `ensure_current` it actually has to look, and possibly
+    /// migrate.
+    pub install_generation: u64,
+    /// Warnings from a *lazy* per-instance upgrade (an object accessed
+    /// after a recompile whose migration or `upgrade()` hook failed and
+    /// was rolled back), appended by [`RegistryHost::ensure_current`] and
+    /// drained by `World::take_lazy_upgrade_warnings` for
+    /// introspection/tests — a lazy trigger has no direct caller to hand
+    /// an [`UpgradeWarning`] to the way [`RegistryHost::install`]'s own
+    /// (eager, at-install-time) callers do, mirroring how
+    /// `World::tick`'s heartbeat/call_out errors have nowhere to report
+    /// to either (spec §7.2 step 6.4: "not fatal").
+    pub lazy_upgrade_warnings: Vec<UpgradeWarning>,
 }
 
 /// One undoable effect recorded while an `atomic fn` scope is open.
@@ -1244,7 +1272,7 @@ impl<'a> RegistryHost<'a> {
     /// or not `name` is inherited from an ancestor of it (see
     /// [`RegistryHost::dispatch`]).
     fn resolve_on(
-        &self,
+        &mut self,
         recv: Value,
         name: &str,
         require_pub: bool,
@@ -1255,6 +1283,11 @@ impl<'a> RegistryHost<'a> {
                 recv.type_name()
             )));
         };
+        // Spec §7.2/§7.3 "lazy per-instance upgrade on access" (OBI-89):
+        // any cross-object call is exactly such an access, whether or not
+        // `recv` is `self` — bring it up to whatever program is currently
+        // registered for its path before resolving `name` against it.
+        self.ensure_current(recv_id);
         let prog = self
             .registry
             .get(recv_id)
@@ -1303,7 +1336,7 @@ impl<'a> RegistryHost<'a> {
     }
 
     fn resolve_target(
-        &self,
+        &mut self,
         t: CallTarget<'_>,
     ) -> R<(ObjectId, Rc<CompiledProgram>, Rc<CompiledProgram>, u32)> {
         match t {
@@ -1343,6 +1376,49 @@ impl<'a> RegistryHost<'a> {
             Some(_) => return None,
         };
         self.registry.get(id).map(|o| (id, o.program.clone()))
+    }
+
+    /// Spec §7.2/§7.3 "lazy per-instance upgrade on access" (default mode,
+    /// OBI-89): before running anything *as* or *against* `id` from an
+    /// entry point that did not just create it — a cross-object call
+    /// ([`RegistryHost::resolve_on`]), a driver-started apply
+    /// (`create()`/`heartbeat()`/a `call_out` callback/`process_input`/…,
+    /// see [`RegistryHost::call_apply`]/[`RegistryHost::call_on`]), or the
+    /// inline-cache fast path ([`RegistryHost::dispatch_cached`]) — bring
+    /// it up to whatever program is now registered for its path, if
+    /// anything has changed since [`BcObject::checked_generation`] was
+    /// last stamped. A no-op (one `u64` compare, no lookup) once nothing
+    /// has installed since `id` was last checked: the common steady-state
+    /// case between recompiles, so this never re-does a
+    /// `Registry::programs` lookup per call while no recompile is in
+    /// flight.
+    ///
+    /// A failing migration (rolled back to the old program/vars by
+    /// [`RegistryHost::upgrade`]) is queued to
+    /// [`Registry::lazy_upgrade_warnings`] rather than propagated: a lazy
+    /// trigger has no direct caller to hand an [`UpgradeWarning`] to
+    /// (mirrors how `World::tick`'s heartbeat/call_out errors are
+    /// swallowed — spec §7.2 step 6.4, "not fatal"). The object stays on
+    /// its (rolled-back) old program and is not re-attempted until the
+    /// *next* `install` bumps [`Registry::install_generation`] again.
+    fn ensure_current(&mut self, id: ObjectId) {
+        let generation = self.registry.install_generation;
+        let Some(o) = self.registry.get(id) else {
+            return;
+        };
+        if o.checked_generation == generation {
+            return;
+        }
+        let current = self.registry.programs.get(&*o.program.path).cloned();
+        if let Some(current) = current
+            && !Rc::ptr_eq(&current, &o.program)
+            && let Err(w) = self.upgrade(id, current)
+        {
+            self.registry.lazy_upgrade_warnings.push(w);
+        }
+        if let Some(o) = self.registry.get_mut(id) {
+            o.checked_generation = generation;
+        }
     }
 
     pub fn new(registry: &'a mut Registry, self_object: ObjectId) -> Self {
@@ -1396,6 +1472,11 @@ impl<'a> RegistryHost<'a> {
     /// driver). `Ok(None)` if the object does not define `name` (mirrors
     /// `crate::interp::Exec::call_apply`).
     pub fn call_apply(&mut self, on: ObjectId, name: &str, args: Vec<Value>) -> R<Option<Value>> {
+        // Spec §7.2/§7.3 (OBI-89): a driver-started apply is exactly the
+        // kind of "access" a lazily-stale object upgrades on —
+        // `heartbeat()`, a `call_out` callback, `create()`, `connect()`/
+        // `logon()`/`process_input()`/`net_dead()`, …
+        self.ensure_current(on);
         let Some(prog) = self.registry.get(on).map(|o| o.program.clone()) else {
             return Ok(None);
         };
@@ -1510,6 +1591,8 @@ impl<'a> RegistryHost<'a> {
     /// Call `name` on `on` (the object executing this call) as an
     /// outermost entry point (a `World`-facing `call_apply` equivalent).
     pub fn call_on(&mut self, on: ObjectId, name: &str, args: Vec<Value>) -> R<Value> {
+        // Spec §7.2/§7.3 (OBI-89): see `RegistryHost::call_apply`.
+        self.ensure_current(on);
         let prog = self
             .registry
             .get(on)
@@ -1711,6 +1794,43 @@ impl<'a> RegistryHost<'a> {
                     Err(e) => Value::str(&e),
                 })
             }
+            // Eager mode (spec §7.2/§7.3, OBI-89): queue every live instance
+            // of `path` still on a stale program for `World::tick` to
+            // migrate a bounded batch of per tick (`Registry::eager_upgrade_queue`),
+            // rather than blocking this call (or the whole tick queue) on
+            // migrating all of them synchronously. A no-op (returns 0) for
+            // an unregistered path or one with nothing stale to migrate.
+            // P1, mirroring `compile_object` (check with the CTO on the
+            // efun privilege/tier: OBI-89 flags this as not definitively
+            // settled — a mass upgrade is at least as sensitive as a single
+            // recompile).
+            "upgrade_all" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("upgrade_all(): expected string"))?;
+                let path = mudlib::normalize_path(p).map_err(RtError::new)?;
+                let Some(current) = self.registry.program(&path) else {
+                    return Err(RtError::new(format!(
+                        "upgrade_all(): no program registered for {path}"
+                    )));
+                };
+                let stale: Vec<ObjectId> = self
+                    .registry
+                    .ids()
+                    .into_iter()
+                    .filter(|id| {
+                        self.registry.get(*id).is_some_and(|o| {
+                            !Rc::ptr_eq(&o.program, &current) && *o.program.path == *path
+                        })
+                    })
+                    .collect();
+                let queued = stale.len() as i64;
+                let driver = self.driver.as_mut().expect("checked above");
+                for id in stale {
+                    driver.scheduler.enqueue_eager_upgrade(id, path.clone());
+                }
+                Ok(Value::Int(queued))
+            }
             "call_out" => {
                 let func = a0
                     .as_str()
@@ -1809,6 +1929,15 @@ impl<'a> RegistryHost<'a> {
     /// initialiser, matching `World::new_object`'s all-or-nothing create.
     pub fn instantiate(&mut self, prog: Rc<CompiledProgram>) -> R<ObjectId> {
         let id = self.registry.insert(BcObject::new(prog.clone()));
+        // Freshly created against whatever is registered right now:
+        // nothing to lazily migrate until a *later* install changes it
+        // (spec §7.2/§7.3, OBI-89). Stamping this now (rather than leaving
+        // the `BcObject::new` default of 0) skips one no-op
+        // `ensure_current` lookup the first time this object is touched.
+        let generation = self.registry.install_generation;
+        if let Some(o) = self.registry.get_mut(id) {
+            o.checked_generation = generation;
+        }
         for ancestor in prog.chain() {
             let keep = vec![false; ancestor.init_specs().count()];
             if let Err(e) = self.run_init(id, &ancestor, &keep) {
@@ -1963,14 +2092,31 @@ impl<'a> RegistryHost<'a> {
 
     /// Install the output of [`Compiler::recompile`]: register every new
     /// [`CompiledProgram`] (the compile wave is already all-or-nothing —
-    /// see [`Compiler::recompile`] — so registering it here never fails)
-    /// and migrate every existing object whose *current* program is one of
-    /// them (spec r5 amendment: per-object migration failure rolls back
-    /// only that object and is reported, not fatal to the install or to
-    /// any other object — the bytecode-VM analogue of `World::install`,
-    /// upgraded from Phase 0/1's all-or-nothing-across-every-object
-    /// behaviour). Returns one [`UpgradeWarning`] per object that failed
-    /// to migrate (empty if every affected object upgraded cleanly).
+    /// see [`Compiler::recompile`] — so registering it here never fails).
+    ///
+    /// **Lazy by default (spec §7.2/§7.3, OBI-89):** unlike the eager,
+    /// synchronous-migrate-everything behaviour this replaces, `install`
+    /// itself does not touch any existing object's program pointer at all
+    /// — it only bumps [`Registry::install_generation`], which is what
+    /// makes every affected object *stale* the next time anything checks
+    /// ([`RegistryHost::ensure_current`], run from every cross-object
+    /// call, driver-started apply, and the inline-cache fast path). An
+    /// object not accessed since this call still reports its old program
+    /// version until it is. This always returns `Ok(vec![])` now — there
+    /// is nothing left to attempt synchronously — kept as
+    /// `Result<Vec<UpgradeWarning>, String>` for source compatibility with
+    /// existing callers (`World::compile_object`); lazy migration failures
+    /// surface instead through [`Registry::lazy_upgrade_warnings`].
+    ///
+    /// **Eager mode** is not install-time at all in this slice: a builder
+    /// (or the mudlib) opts a path into it explicitly with the
+    /// `upgrade_all(path)` efun, which queues every affected object onto
+    /// [`Registry::eager_upgrade_queue`] for `World::tick` to migrate a
+    /// bounded batch of per tick, rather than blocking. A per-program
+    /// pragma choosing eager as the *default* for that program (spec §7.2
+    /// step 5) needs a source-level surface this slice does not add —
+    /// flagged to the CTO as a cross-seam decision (OBI-89), not decided
+    /// here.
     pub fn install(
         &mut self,
         new_set: HashMap<String, Rc<CompiledProgram>>,
@@ -1978,30 +2124,18 @@ impl<'a> RegistryHost<'a> {
         for v in new_set.values() {
             self.registry.register_program(v.clone());
         }
-        let affected: Vec<(ObjectId, Rc<CompiledProgram>)> = self
-            .registry
-            .ids()
-            .into_iter()
-            .filter_map(|id| {
-                let o = self.registry.get(id)?;
-                new_set.get(&*o.program.path).map(|p| (id, p.clone()))
-            })
-            .collect();
-        let mut warnings = Vec::new();
-        for (id, new_prog) in affected {
-            if self.registry.get(id).is_none() {
-                continue;
-            }
-            if let Err(w) = self.upgrade(id, new_prog) {
-                warnings.push(w);
-            }
-        }
+        self.registry.install_generation += 1;
         // Programs were replaced: an old `Rc<CompiledProgram>` may now be
         // freed and its address reused by new code, which would make a
-        // stale `CallSite` (keyed by code address) collide with a live one.
-        // Clear the per-call-site inline cache on every install outcome.
+        // stale `CallSite` (keyed by code address) collide with a live
+        // one. Clear the per-call-site inline cache on every install
+        // outcome (still needed even though no object is touched here: a
+        // path with zero live instances drops its old `CompiledProgram`
+        // to refcount 0 immediately on `register_program`, and any cache
+        // entry naming it would otherwise be the only thing keeping that
+        // address's reuse unsafe to ignore).
         self.call_cache.clear();
-        Ok(warnings)
+        Ok(Vec::new())
     }
 }
 
@@ -2113,6 +2247,24 @@ impl Host for RegistryHost<'_> {
     ) -> Result<HostCall, Vec<Value>> {
         if inline_cache_disabled() {
             return Err(args);
+        }
+        // Spec §7.2/§7.3 (OBI-89): a cache hit would otherwise keep
+        // serving a *stale* target forever — the cached guard is the
+        // receiver's own leaf program at resolution time, which never
+        // changes just because `Registry::programs` now holds something
+        // newer for its path, only `RegistryHost::upgrade` changes it.
+        // `ensure_current` is the one `u64` compare in the common case
+        // (nothing installed since last checked); only an actual stale
+        // object pays for the lookup, and it always changes `o.program`
+        // when it migrates, which then naturally misses the guard check
+        // below.
+        let target_id = match recv {
+            None => Some(self.self_object()),
+            Some(Value::Object(id)) => Some(*id),
+            Some(_) => None,
+        };
+        if let Some(id) = target_id {
+            self.ensure_current(id);
         }
         let Some(entry) = self.call_cache.get(&site) else {
             return Err(args);
@@ -2799,21 +2951,29 @@ pub fn upgrade(from_version: int, old: {string: any}) {
         let mut host = RegistryHost::new(&mut registry, placeholder);
         let warnings = host.install(new_set).expect("install itself does not fail");
 
-        assert_eq!(
-            warnings.len(),
-            1,
-            "exactly the broken object's upgrade should fail"
-        );
-        assert_eq!(warnings[0].object, broken);
+        // Lazy by default (spec §7.2/§7.3, OBI-89): `install` itself no
+        // longer touches any object, so there is nothing to report yet —
+        // both objects are still on v1 until something accesses them.
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(host.registry.get(broken).unwrap().program.version, 1);
+        assert_eq!(host.registry.get(fine).unwrap().program.version, 1);
 
-        // The broken object stayed on v1 (old program, old var untouched);
-        // the fine object migrated to v2.
+        // The broken object stayed on v1 (old program, old var untouched)
+        // once accessed — its lazy upgrade attempt fails and rolls back;
+        // the fine object's lazy upgrade succeeds and it migrates to v2.
         let short = host.call_on(fine, "short", vec![]).unwrap();
         assert_eq!(short.as_str(), Some("An empty room"));
         let broken_short = host.call_on(broken, "short", vec![]).unwrap();
         assert_eq!(broken_short.as_str(), Some("BREAK ME"));
-        assert_eq!(registry.get(broken).unwrap().program.version, 1);
-        assert_eq!(registry.get(fine).unwrap().program.version, 2);
+        assert_eq!(host.registry.get(broken).unwrap().program.version, 1);
+        assert_eq!(host.registry.get(fine).unwrap().program.version, 2);
+
+        assert_eq!(
+            host.registry.lazy_upgrade_warnings.len(),
+            1,
+            "exactly the broken object's lazy upgrade should have failed"
+        );
+        assert_eq!(host.registry.lazy_upgrade_warnings[0].object, broken);
     }
 
     /// End-to-end proof that the disk-backed [`Compiler`] (spec §7.2's

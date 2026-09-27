@@ -68,6 +68,7 @@ const NAMES: &[&str] = &[
     "disconnect",
     "bind_connection",
     "compile_object",
+    "upgrade_all",
     "len",
     "split",
     "join",
@@ -119,6 +120,10 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
             Ret::Ty(Ty::optional(Ty::String)),
             P1,
         ),
+        // Spec §7.2/§7.3, OBI-89 (eager mode); see `loom_vm::efuns` for the
+        // authoritative arity/privilege/tick cost and rationale. Returns
+        // the number of instances queued for a future tick's batch.
+        "upgrade_all" => ("upgrade_all", vec![P(s.clone())], 1, Ret::Ty(Ty::Int), P1),
         "len" => ("len", vec![Param::Sized], 1, Ret::Ty(Ty::Int), P0),
         "split" => (
             "split",

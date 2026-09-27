@@ -1,0 +1,6 @@
+// Cloned in bulk by the OBI-89 upgrade_all/tick-budget test.
+var counter: int = 0
+
+pub fn get_counter() -> int {
+    return counter
+}

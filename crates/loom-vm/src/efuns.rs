@@ -69,6 +69,12 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     ("disconnect", 1, 1, Privilege::P2, 2),
     ("bind_connection", 1, 1, Privilege::P3, 2),
     ("compile_object", 1, 1, Privilege::P1, 500),
+    // Spec §7.2/§7.3, OBI-89 (eager mode): migrates every live instance of
+    // a program still on a stale version, spread across ticks rather than
+    // done synchronously. At least as sensitive as `compile_object` (a
+    // mass upgrade, not a single recompile), so P1 pending the CTO's
+    // sign-off on efun privilege/tier (flagged, not decided here).
+    ("upgrade_all", 1, 1, Privilege::P1, 50),
     ("len", 1, 1, Privilege::P0, 1),
     ("split", 2, 2, Privilege::P0, 5),
     ("join", 2, 2, Privilege::P0, 5),

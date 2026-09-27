@@ -1,0 +1,39 @@
+// Minimal player: just enough verbs to drive the OBI-89
+// lazy-upgrade/upgrade_all/tick-budget test.
+persistent var beats: int = 0
+
+pub fn heartbeat() {
+    beats += 1
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "clone_thing" {
+        let t = clone_object("/std/thing")
+        send(self, $"cloned {object_name(t)}\n")
+    } else if verb == "update" and len(words) == 2 {
+        let err = compile_object(words[1])
+        if err == null {
+            send(self, $"Updated {words[1]}.\n")
+        } else {
+            send(self, $"{err}\n")
+        }
+    } else if verb == "upgrade_all" and len(words) == 2 {
+        let n = upgrade_all(words[1])
+        send(self, $"queued {n}\n")
+    } else if verb == "hbon" {
+        set_heartbeat(true)
+        send(self, "heartbeat on\n")
+    } else if verb == "hboff" {
+        set_heartbeat(false)
+        send(self, "heartbeat off\n")
+    } else if verb == "beats" {
+        send(self, $"{beats}\n")
+    } else {
+        send(self, "What?\n")
+    }
+}
+
+pub fn net_dead() {
+}

@@ -13,6 +13,8 @@
 //! any means available through the efuns (`call_out` does not take a
 //! priority argument).
 
+use std::collections::VecDeque;
+
 use crate::bcvm::Value;
 use crate::object::ObjectId;
 
@@ -36,6 +38,14 @@ pub struct Scheduler {
     /// Objects with `set_heart_beat(true)`, in subscription order (also
     /// the order `World::tick` calls `heart_beat()` in).
     heartbeat: Vec<ObjectId>,
+    /// `upgrade_all(path)` efun (OBI-89, eager mode): object ids still on
+    /// a stale program for a path, queued by `RegistryHost::driver_efun`
+    /// and drained a bounded batch per world tick by `World::tick` —
+    /// spread across ticks rather than migrated all at once, so a
+    /// builder-triggered mass upgrade cannot block the tick queue (spec
+    /// §7.2/§7.3: "upgrade_all spread across ticks, bounded per-tick
+    /// budget").
+    eager_upgrades: VecDeque<(ObjectId, String)>,
 }
 
 impl Scheduler {
@@ -84,6 +94,7 @@ impl Scheduler {
     pub fn remove_for_object(&mut self, ob: ObjectId) {
         self.pending.retain(|p| p.ob != ob);
         self.heartbeat.retain(|o| *o != ob);
+        self.eager_upgrades.retain(|(o, _)| *o != ob);
     }
 
     /// `set_heart_beat` efun: subscribe/unsubscribe `ob`. A no-op if
@@ -103,6 +114,28 @@ impl Scheduler {
     /// subscription order.
     pub fn heartbeat_targets(&self) -> Vec<ObjectId> {
         self.heartbeat.clone()
+    }
+
+    /// `upgrade_all(path)` efun (OBI-89): queue `ob` for a batched eager
+    /// migration by [`Scheduler::drain_eager_upgrades`].
+    pub fn enqueue_eager_upgrade(&mut self, ob: ObjectId, path: String) {
+        self.eager_upgrades.push_back((ob, path));
+    }
+
+    /// Number of objects still queued for an eager `upgrade_all` migration
+    /// (tests/introspection).
+    pub fn eager_upgrade_queue_len(&self) -> usize {
+        self.eager_upgrades.len()
+    }
+
+    /// Pop up to `budget` queued eager upgrades, oldest first — the
+    /// per-tick migration slice `World::tick` runs (spec: "bounded
+    /// per-tick budget", so one `upgrade_all` of N objects never blocks a
+    /// single tick past its budget, and every other object/player's own
+    /// call still gets its own tick this same world tick).
+    pub fn drain_eager_upgrades(&mut self, budget: usize) -> Vec<(ObjectId, String)> {
+        let n = budget.min(self.eager_upgrades.len());
+        self.eager_upgrades.drain(..n).collect()
     }
 
     /// Number of pending (not yet due) `call_out`s, for tests/introspection.
