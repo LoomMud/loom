@@ -160,6 +160,17 @@ fn op_text(m: &Module, f: &FunctionCode, op: &Op) -> String {
             kind,
             src,
         } => format!("IndexSet.{kind:?} %{base}[%{index}], %{src}"),
+        Op::IndexSetGlobal {
+            owner,
+            name,
+            index,
+            kind,
+            src,
+        } => format!(
+            "IndexSetGlobal.{kind:?} {}::{}[%{index}], %{src}",
+            str_at(m, *owner),
+            str_at(m, *name)
+        ),
         Op::IterElems {
             dst,
             src,

@@ -86,6 +86,55 @@ fn containers_50k() -> any {
     return total
 }
 
+// OBI-108: fills a *global* (object-variable) map by index, not a local
+// one (`containers`/`containers_50k` above already cover the local case,
+// fixed by OBI-74's O(1) `MapData` lookup — a different bug). Before the
+// real "take" (`Op::IndexSetGlobal`), `LoadGlobal`'s clone of the global's
+// own `Rc` left the global's slot and the register as two live owners the
+// whole time, so every single `IndexSet` saw refcount 2 and cloned the
+// *entire* map: an O(n²) fill. 5k -> 50k (10x the entries) should now cost
+// ~10x, not ~100x.
+fn global_map_fill() -> any {
+    g_map = {:}
+    var i = 0
+    while i < 5000 {
+        g_map[i] = i * 2
+        i += 1
+    }
+    return len(g_map)
+}
+
+fn global_map_fill_50k() -> any {
+    g_map = {:}
+    var i = 0
+    while i < 50000 {
+        g_map[i] = i * 2
+        i += 1
+    }
+    return len(g_map)
+}
+
+// Same bug, the array-element shape: an array's `IndexSet` never grows
+// it (bounds-checked, spec §5.3), so this is a pure element-replace fill,
+// the shape the acceptance test's out-of-range-index case also uses.
+fn global_array_fill_5k() -> any {
+    var i = 0
+    while i < 5000 {
+        g_arr_5k[i] = i
+        i += 1
+    }
+    return g_arr_5k[4999]
+}
+
+fn global_array_fill_50k() -> any {
+    var i = 0
+    while i < 50000 {
+        g_arr_50k[i] = i
+        i += 1
+    }
+    return g_arr_50k[49999]
+}
+
 fn cross_object() -> any {
     let b = load_object("/bench/b")
     var i = 0
@@ -273,6 +322,18 @@ pub fn inc(n: int) -> int {
 }
 "#;
 
+fn array_literal(n: usize) -> String {
+    let mut s = String::from("[");
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('0');
+    }
+    s.push(']');
+    s
+}
+
 fn main() {
     let iters: usize = std::env::args()
         .nth(1)
@@ -289,8 +350,20 @@ fn main() {
 
 fn run(iters: usize) {
     let root = std::env::temp_dir().join(format!("loom-vm-bench-{}", std::process::id()));
-    let master_src =
-        format!("{MASTER}{PRIV_POLICY}").replace("ARRAY_ZEROS", &vec!["0"; 5000].join(","));
+    // Two fixed-length global arrays (OBI-108 `global_array_fill_*`): an
+    // array's own length never changes under `IndexSet` (bounds-checked,
+    // spec §5.3), so the workload has to start from one already the right
+    // size — built here, once, as a literal big enough to just fill by
+    // index in the timed loop.
+    let arr_5k = array_literal(5000);
+    let arr_50k = array_literal(50000);
+    let globals = format!(
+        "var g_map: {{int: int}} = {{:}}\n\
+         var g_arr_5k: [int] = {arr_5k}\n\
+         var g_arr_50k: [int] = {arr_50k}\n"
+    );
+    let master_src = format!("{globals}{MASTER}{PRIV_POLICY}")
+        .replace("ARRAY_ZEROS", &vec!["0"; 5000].join(","));
     for (rel, src) in [
         ("secure/master.wf", master_src.as_str()),
         ("bench/b.wf", B),
@@ -317,6 +390,10 @@ fn run(iters: usize) {
         "containers",
         "containers_50k",
         "array_fill",
+        "global_map_fill",
+        "global_map_fill_50k",
+        "global_array_fill_5k",
+        "global_array_fill_50k",
         "cross_object",
         "monocall",
         "monocall_other",
