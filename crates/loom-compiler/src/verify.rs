@@ -579,6 +579,7 @@ mod tests {
     fn accepts_trivial_void_return() {
         let f = FunctionCode {
             name: 0,
+            atomic: false,
             params: 0,
             min_arity: 0,
             ret: Ty::Void,
@@ -593,6 +594,7 @@ mod tests {
     fn rejects_out_of_bounds_register() {
         let f = FunctionCode {
             name: 0,
+            atomic: false,
             params: 0,
             min_arity: 0,
             ret: Ty::Int,
@@ -607,6 +609,7 @@ mod tests {
     fn rejects_type_mismatch_on_return() {
         let f = FunctionCode {
             name: 0,
+            atomic: false,
             params: 0,
             min_arity: 0,
             ret: Ty::String,
@@ -621,6 +624,7 @@ mod tests {
     fn rejects_out_of_bounds_jump() {
         let f = FunctionCode {
             name: 0,
+            atomic: false,
             params: 0,
             min_arity: 0,
             ret: Ty::Void,
@@ -635,6 +639,7 @@ mod tests {
     fn rejects_bad_binop_kind() {
         let f = FunctionCode {
             name: 0,
+            atomic: false,
             params: 0,
             min_arity: 0,
             ret: Ty::Void,
@@ -659,6 +664,7 @@ mod tests {
     fn accepts_arithmetic_matching_types() {
         let f = FunctionCode {
             name: 0,
+            atomic: false,
             params: 0,
             min_arity: 0,
             ret: Ty::Int,

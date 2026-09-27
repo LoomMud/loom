@@ -157,6 +157,7 @@ fn synth_init_function(p: &hir::Program) -> Option<hir::Function> {
         name: Rc::from(INIT_FN),
         vis: hir::Visibility::Private,
         is_override: false,
+        atomic: false,
         params,
         ret: Ty::Void,
         locals,
@@ -584,6 +585,43 @@ pub struct Registry {
     /// `loom_cow_copies_total{program}` (spec r5 §5.2.1, D24); see
     /// [`CowMetrics`].
     pub cow_metrics: CowMetrics,
+    /// `atomic fn` journal (spec r5 §5.2.1, OBI-32): every object-variable
+    /// write and `clone_object` while [`Self::atomic_active`] is nonzero,
+    /// oldest first, undoable back to any earlier mark by
+    /// [`Self::journal_rollback`]. Empty (and every write skips recording)
+    /// whenever no atomic scope is open — journaling has no cost outside
+    /// one.
+    journal: Vec<JournalEntry>,
+    /// Depth of nested `atomic fn` calls currently on the interpreter's
+    /// frame stack. The journal is only cleared (nothing left that could
+    /// ever need undoing) when this returns to zero: a nested atomic call
+    /// that itself commits does not clear entries an *outer* atomic scope
+    /// may still need to roll back if it later fails.
+    atomic_active: u32,
+}
+
+/// One undoable effect recorded while an `atomic fn` scope is open.
+enum JournalEntry {
+    /// An object-variable write (`Op::StoreGlobal`): includes an array/map
+    /// mutation written back through `IndexSet` + `StoreGlobal` (r5
+    /// amendment: a container is a value, so mutating one *is* an
+    /// object-variable write, journaled as one `Rc` clone of the old
+    /// value — that clone is exactly `old`, cheap by construction since
+    /// containers are copy-on-write).
+    VarWrite {
+        obj: ObjectId,
+        key: (Rc<str>, Rc<str>),
+        /// `None` if the variable had no entry yet (a fresh object whose
+        /// initialiser had not run for it); rollback removes the entry
+        /// rather than inserting a spurious one.
+        old: Option<Value>,
+    },
+    /// `clone_object`: rollback deletes the clone. Does not attempt to
+    /// undo anything the clone's own `create()` did to *other* objects
+    /// beyond their variables (those are separately journaled `VarWrite`
+    /// entries) — `move_to`/inventory linkage is not yet journaled (scope
+    /// note below).
+    Clone { obj: ObjectId, name: String },
 }
 
 impl Registry {
@@ -703,6 +741,67 @@ impl Registry {
         self.get(id)
             .map(|o| o.name.clone())
             .unwrap_or_else(|| format!("<destructed:{id:?}>"))
+    }
+
+    /// [`Host::begin_atomic`]: open a journal scope, returning its mark
+    /// (the journal length at this instant — rollback undoes everything
+    /// recorded after it).
+    fn journal_begin(&mut self) -> u64 {
+        self.atomic_active += 1;
+        self.journal.len() as u64
+    }
+
+    /// [`Host::commit_atomic`]: the scope at `mark` returned normally.
+    /// Only actually discards journal entries once no atomic scope is
+    /// left open at all (see [`Registry::atomic_active`]'s doc) — an
+    /// enclosing scope may still need everything recorded so far.
+    fn journal_commit(&mut self, _mark: u64) {
+        self.atomic_active = self.atomic_active.saturating_sub(1);
+        if self.atomic_active == 0 {
+            self.journal.clear();
+        }
+    }
+
+    /// [`Host::rollback_atomic`]: undo every entry recorded since `mark`,
+    /// most recent first (so a var written twice restores its
+    /// *original* value, not an intermediate one), then close this scope.
+    fn journal_rollback(&mut self, mark: u64) {
+        while self.journal.len() as u64 > mark {
+            match self.journal.pop().unwrap() {
+                JournalEntry::VarWrite { obj, key, old } => {
+                    if let Some(o) = self.get_mut(obj) {
+                        match old {
+                            Some(v) => {
+                                o.vars.insert(key, v);
+                            }
+                            None => {
+                                o.vars.remove(&key);
+                            }
+                        }
+                    }
+                }
+                JournalEntry::Clone { obj, name } => {
+                    self.remove(obj);
+                    self.names.remove(&name);
+                }
+            }
+        }
+        self.atomic_active = self.atomic_active.saturating_sub(1);
+    }
+
+    /// Record an object-variable write for the currently open atomic
+    /// scope(s), if any (a no-op, no allocation, whenever none is open).
+    fn journal_var_write(&mut self, obj: ObjectId, key: (Rc<str>, Rc<str>), old: Option<Value>) {
+        if self.atomic_active > 0 {
+            self.journal.push(JournalEntry::VarWrite { obj, key, old });
+        }
+    }
+
+    /// Record a `clone_object`, if an atomic scope is open.
+    fn journal_clone(&mut self, obj: ObjectId, name: String) {
+        if self.atomic_active > 0 {
+            self.journal.push(JournalEntry::Clone { obj, name });
+        }
     }
 }
 
@@ -988,7 +1087,11 @@ impl<'a> RegistryHost<'a> {
         // per-call `RegistryHost` construction (mirrors `State::next_clone`).
         self.registry.next_clone += 1;
         let name = format!("{path}#{}", self.registry.next_clone);
-        self.new_object(prog, name)
+        let id = self.new_object(prog, name.clone())?;
+        // spec r5 §5.2.1: a clone is undoable by an enclosing `atomic fn`
+        // scope (a no-op, no allocation, when none is open).
+        self.registry.journal_clone(id, name);
+        Ok(id)
     }
 
     fn ensure_program(&mut self, path: &str) -> R<Rc<CompiledProgram>> {
@@ -1631,13 +1734,27 @@ impl Host for RegistryHost<'_> {
                 o.name
             )));
         }
+        let old = o.vars.get(&key).cloned();
         o.mem_bytes = new_total;
-        o.vars.insert(key, v);
+        o.vars.insert(key.clone(), v);
+        self.registry.journal_var_write(self_id, key, old);
         Ok(())
     }
 
     fn record_cow_copy(&mut self, program: &str) {
         self.registry.cow_metrics.record(program);
+    }
+
+    fn begin_atomic(&mut self) -> u64 {
+        self.registry.journal_begin()
+    }
+
+    fn commit_atomic(&mut self, mark: u64) {
+        self.registry.journal_commit(mark);
+    }
+
+    fn rollback_atomic(&mut self, mark: u64) {
+        self.registry.journal_rollback(mark);
     }
 }
 
@@ -1646,6 +1763,7 @@ mod tests {
     use super::*;
     use crate::bcvm::vm::Exec;
     use loom_compiler::mudlib::{Outcome, Session};
+    use proptest::prelude::*;
 
     #[test]
     fn self_recursive_virtual_call_hits_the_depth_guard_not_the_native_stack() {
@@ -2389,6 +2507,20 @@ pub fn grow(n: int) {
         );
     }
 
+    // -- atomic fn journaling + rollback (spec r5 §5.2.1, OBI-32) --------
+
+    /// A `Registry` with one object whose vars live purely in `vars`
+    /// (no declared program variables needed: `store_global`/`load_global`
+    /// only ever look the key up in that map).
+    fn atomic_test_object() -> (Registry, ObjectId) {
+        let module = compile("/t/obj", &[("/t/obj", "fn create() {}\n")]);
+        let mut registry = Registry::default();
+        let prog = Rc::new(CompiledProgram::new(module, 1, None, Vec::new()));
+        registry.register_program(prog.clone());
+        let obj = make_object(&mut registry, prog);
+        (registry, obj)
+    }
+
     /// A write that stays within quota succeeds and `mem_bytes` tracks it
     /// (no false rejection, and the accounting is actually maintained, not
     /// just checked-and-discarded).
@@ -2556,5 +2688,231 @@ override fn kind() -> string {
             host.call_on(obj_a, "describe", vec![]).unwrap().as_str(),
             Some("A")
         );
+    }
+
+    #[test]
+    fn atomic_fn_rolls_back_a_plain_var_write_on_error() {
+        const WF: &str = r#"
+var n: int = 0
+
+atomic fn bump_then_fail() {
+    n = 1
+    throw "boom"
+}
+
+pub fn get_n() -> int {
+    return n
+}
+"#;
+        let prog = Rc::new(compile_program("/t/obj", &[("/t/obj", WF)], 1, None));
+        let mut registry = Registry::default();
+        registry.register_program(prog.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(prog).expect("instantiate");
+
+        let err = host.call_on(obj, "bump_then_fail", vec![]).unwrap_err();
+        assert!(err.report().contains("boom"), "{}", err.report());
+
+        let n = host.call_on(obj, "get_n", vec![]).unwrap();
+        assert!(n.equals(&Value::Int(0)), "n must be rolled back, got {n:?}");
+    }
+
+    /// r5 amendment: an array/map mutation is an object-variable write, so
+    /// a nested element write on a program variable inside `atomic` is
+    /// journaled and rolled back exactly like a plain `n = 1`.
+    #[test]
+    fn atomic_fn_rolls_back_a_nested_container_write() {
+        const WF: &str = r#"
+var xs: [int] = [1, 2, 3]
+
+atomic fn mutate_then_fail() {
+    xs[0] = 99
+    throw "boom"
+}
+
+pub fn get_xs() -> [int] {
+    return xs
+}
+"#;
+        let prog = Rc::new(compile_program("/t/obj", &[("/t/obj", WF)], 1, None));
+        let mut registry = Registry::default();
+        registry.register_program(prog.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(prog).expect("instantiate");
+
+        host.call_on(obj, "mutate_then_fail", vec![]).unwrap_err();
+
+        let xs = host.call_on(obj, "get_xs", vec![]).unwrap();
+        let want = Value::array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
+        assert!(
+            xs.equals(&want),
+            "xs must be rolled back exactly, got {xs:?}"
+        );
+    }
+
+    #[test]
+    fn atomic_fn_commits_its_writes_on_a_normal_return() {
+        const WF: &str = r#"
+var n: int = 0
+
+atomic fn bump() {
+    n = 1
+}
+
+pub fn get_n() -> int {
+    return n
+}
+"#;
+        let prog = Rc::new(compile_program("/t/obj", &[("/t/obj", WF)], 1, None));
+        let mut registry = Registry::default();
+        registry.register_program(prog.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(prog).expect("instantiate");
+
+        host.call_on(obj, "bump", vec![]).unwrap();
+        let n = host.call_on(obj, "get_n", vec![]).unwrap();
+        assert!(n.equals(&Value::Int(1)));
+    }
+
+    /// An error caught *inside* the atomic function's own body does not
+    /// roll back — the function handled it and returned normally.
+    #[test]
+    fn atomic_fn_does_not_roll_back_an_error_it_catches_itself() {
+        const WF: &str = r#"
+var n: int = 0
+
+atomic fn bump_and_catch() {
+    n = 1
+    try {
+        throw "boom"
+    } catch e {
+    }
+}
+
+pub fn get_n() -> int {
+    return n
+}
+"#;
+        let prog = Rc::new(compile_program("/t/obj", &[("/t/obj", WF)], 1, None));
+        let mut registry = Registry::default();
+        registry.register_program(prog.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(prog).expect("instantiate");
+
+        host.call_on(obj, "bump_and_catch", vec![]).unwrap();
+        let n = host.call_on(obj, "get_n", vec![]).unwrap();
+        assert!(n.equals(&Value::Int(1)), "caught error must not roll back");
+    }
+
+    /// Nested atomic calls telescope: an inner atomic call that commits is
+    /// still undone if the *outer* atomic scope it ran inside later fails.
+    #[test]
+    fn outer_atomic_failure_rolls_back_an_inner_atomic_call_that_already_committed() {
+        const WF: &str = r#"
+var n: int = 0
+
+atomic fn inner() {
+    n = 1
+}
+
+atomic fn outer_then_fail() {
+    inner()
+    throw "boom"
+}
+
+pub fn get_n() -> int {
+    return n
+}
+"#;
+        let prog = Rc::new(compile_program("/t/obj", &[("/t/obj", WF)], 1, None));
+        let mut registry = Registry::default();
+        registry.register_program(prog.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(prog).expect("instantiate");
+
+        host.call_on(obj, "outer_then_fail", vec![]).unwrap_err();
+        let n = host.call_on(obj, "get_n", vec![]).unwrap();
+        assert!(
+            n.equals(&Value::Int(0)),
+            "outer's failure must also undo the inner atomic call's committed write, got {n:?}"
+        );
+    }
+
+    // Property test (spec r5 §5.2.1 AC): an arbitrary sequence of writes
+    // made while an atomic scope is open — including a nested element
+    // write on a program variable (`xs[0] = ...`, exactly the `IndexSet`
+    // + `StoreGlobal` pair codegen emits for `global[i] = v`) — is undone
+    // back to the exact prior state on rollback, no matter what it was.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+        #[test]
+        fn atomic_rollback_restores_exact_prior_state(
+            setup in prop::collection::vec((0usize..3, arb_value()), 0..6),
+            during in prop::collection::vec((0usize..3, arb_value()), 1..12),
+            mutate_xs_element in any::<bool>(),
+        ) {
+            let (mut registry, obj) = atomic_test_object();
+            let mut host = RegistryHost::new(&mut registry, obj);
+            let keys = ["a", "xs", "m"];
+
+            for (i, v) in &setup {
+                host.store_global("/t/obj", keys[*i], v.clone());
+            }
+            let snapshot: Vec<Value> = keys.iter().map(|k| host.load_global("/t/obj", k)).collect();
+
+            let mark = host.begin_atomic();
+            for (i, v) in &during {
+                host.store_global("/t/obj", keys[*i], v.clone());
+            }
+            if mutate_xs_element {
+                // The nested-element-write case the AC calls out by name:
+                // read the container, mutate a copy (COW), write the whole
+                // (new) value back over the global slot.
+                let mut xs = host.load_global("/t/obj", "xs");
+                if let Some(arr) = xs.array_mut()
+                    && !arr.is_empty()
+                {
+                    arr[0] = Value::Int(-1);
+                    host.store_global("/t/obj", "xs", xs);
+                }
+            }
+            host.rollback_atomic(mark);
+
+            for (k, want) in keys.iter().zip(&snapshot) {
+                let got = host.load_global("/t/obj", k);
+                prop_assert!(
+                    want.equals(&got),
+                    "rollback did not restore the exact prior state of `{k}`: want {want:?}, got {got:?}"
+                );
+            }
+        }
+    }
+
+    fn arb_value() -> impl Strategy<Value = Value> {
+        prop_oneof![
+            any::<i64>().prop_map(Value::Int),
+            prop::collection::vec(any::<i64>(), 0..5)
+                .prop_map(|v| Value::array(v.into_iter().map(Value::Int).collect())),
+        ]
     }
 }

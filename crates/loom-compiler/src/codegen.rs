@@ -107,6 +107,7 @@ fn lower_function(f: &hir::Function) -> Result<ir::Function, Unsupported> {
 
     Ok(ir::Function {
         name: f.name.clone(),
+        atomic: f.atomic,
         param_count,
         min_arity,
         ret: f.ret.clone(),
@@ -994,6 +995,7 @@ impl Assembler {
         let name = self.intern(&f.name);
         FunctionCode {
             name,
+            atomic: f.atomic,
             params: f.param_count,
             min_arity: f.min_arity,
             ret: f.ret.clone(),
