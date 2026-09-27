@@ -53,6 +53,19 @@ pub fn process_input(line: string) {
             compile_object("/std/player")
             burn_count += 1
         }
+    } else if verb == "burncompile_try" {
+        // OBI-32 CTO follow-up: tick exhaustion caused by efun cost
+        // (`compile_object` at 500 ticks, not a per-backedge `TickCheck`)
+        // must still be uncatchable — the `catch` body below must never
+        // run, no matter how small the tick budget.
+        try {
+            while true {
+                compile_object("/std/player")
+                burn_count += 1
+            }
+        } catch e {
+            send(self, "CAUGHT (should never happen)\n")
+        }
     } else if verb == "burnlen" {
         while true {
             len(words)
