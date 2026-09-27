@@ -3000,13 +3000,13 @@ pub fn get_n() -> int {
             let keys = ["a", "xs", "m"];
 
             for (i, v) in &setup {
-                host.store_global("/t/obj", keys[*i], v.clone());
+                host.store_global("/t/obj", keys[*i], v.clone()).unwrap();
             }
             let snapshot: Vec<Value> = keys.iter().map(|k| host.load_global("/t/obj", k)).collect();
 
             let mark = host.begin_atomic();
             for (i, v) in &during {
-                host.store_global("/t/obj", keys[*i], v.clone());
+                host.store_global("/t/obj", keys[*i], v.clone()).unwrap();
             }
             if mutate_xs_element {
                 // The nested-element-write case the AC calls out by name:
@@ -3017,7 +3017,7 @@ pub fn get_n() -> int {
                     && !arr.is_empty()
                 {
                     arr[0] = Value::Int(-1);
-                    host.store_global("/t/obj", "xs", xs);
+                    host.store_global("/t/obj", "xs", xs).unwrap();
                 }
             }
             host.rollback_atomic(mark);
