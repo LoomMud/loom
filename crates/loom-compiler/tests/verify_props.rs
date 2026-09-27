@@ -273,6 +273,7 @@ proptest! {
             consts: vec![ConstValue::Int(0)],
             functions: vec![FunctionCode {
                 name: 0,
+                atomic: false,
                 params: params.min(n_regs),
                 min_arity: params.min(n_regs),
                 ret: loom_compiler::Ty::Void,

@@ -53,6 +53,8 @@ pub enum ConstValue {
 #[derive(Clone, Debug)]
 pub struct FunctionCode {
     pub name: StrId,
+    /// `atomic fn` (spec r5 §5.2.1, OBI-32): see `crate::ir::Function::atomic`.
+    pub atomic: bool,
     /// Registers `0..params` are the parameters, in order.
     pub params: u32,
     /// Number of leading parameters that are *required* (no default);
@@ -442,6 +444,7 @@ impl Writer {
     }
     fn put_function(&mut self, f: &FunctionCode) {
         self.put_varu32(f.name);
+        self.put_u8(f.atomic as u8);
         self.put_varu32(f.params);
         self.put_varu32(f.min_arity);
         self.put_ty(&f.ret);
@@ -843,6 +846,7 @@ impl<'a> Reader<'a> {
     }
     fn get_function(&mut self) -> Result<FunctionCode, DecodeError> {
         let name = self.get_varu32()?;
+        let atomic = self.get_u8()? != 0;
         let params = self.get_varu32()?;
         let min_arity = self.get_varu32()?;
         if min_arity > params {
@@ -875,6 +879,7 @@ impl<'a> Reader<'a> {
         }
         Ok(FunctionCode {
             name,
+            atomic,
             params,
             min_arity,
             ret,
@@ -1035,6 +1040,7 @@ mod tests {
             consts: vec![ConstValue::Int(42), ConstValue::Str(0)],
             functions: vec![FunctionCode {
                 name: 0,
+                atomic: false,
                 params: 0,
                 min_arity: 0,
                 ret: Ty::String,
@@ -1061,6 +1067,7 @@ mod tests {
             consts: vec![],
             functions: vec![FunctionCode {
                 name: 0,
+                atomic: false,
                 params: 0,
                 min_arity: 0,
                 ret: Ty::Void,

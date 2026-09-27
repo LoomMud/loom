@@ -104,6 +104,13 @@ pub struct Function {
     pub name: Rc<str>,
     pub vis: Visibility,
     pub is_override: bool,
+    /// `atomic fn` (spec r5 §5.2.1, OBI-32): every call to this function
+    /// journals object-variable writes (including clone/destruct) and
+    /// rolls them back all-or-nothing if the call ends by propagating an
+    /// error out of it (an error caught *inside* the function's own body
+    /// does not roll back — the function handled it and returned
+    /// normally).
+    pub atomic: bool,
     pub params: Vec<Param>,
     /// `Ty::Void` when the function has no `-> T`.
     pub ret: Ty,

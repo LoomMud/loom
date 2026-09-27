@@ -907,6 +907,7 @@ impl Cx<'_> {
             name: f.info.name.clone(),
             vis: f.info.vis,
             is_override: d.mods.is_override,
+            atomic: d.mods.atomic,
             params,
             ret: f.info.ret.clone(),
             locals: std::mem::take(&mut self.locals),
