@@ -1,7 +1,7 @@
 ok
 program /main
   linearization /main
-  struct internal Loadout (schema 01e5319e0d0c2685)
+  struct internal Loadout (schema 40e2bc36821e0973)
     field primary: Stats
     field kind: DamageKind
   var internal current: Stats?
@@ -14,10 +14,10 @@ program /main
 
 program /std/combat
   linearization /std/combat
-  struct pub Stats (schema b4f9477199c03767)
+  struct pub Stats (schema ea71c2cf3c76fded)
     field hp: int
     field name: string
-  enum pub DamageKind (schema 8ec5fb7edfc83287)
+  enum pub DamageKind (schema 641958f9fab17366)
     variant Slash()
     variant Fire(int)
 
