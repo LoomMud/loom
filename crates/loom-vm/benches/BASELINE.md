@@ -35,13 +35,13 @@ each run (`secure/master.wf`, `bench/b.wf`, `builders/{b,c,d}/p.wf`).
 | `cross_object` | 20 000 `call_other`-style calls to `/bench/b` | call_other dispatch, frame setup, arg checks |
 | `monocall` | 500 000 virtual self-calls in a tight loop | call *dispatch* overhead in isolation (OBI-78 inline cache target) |
 | `monocall_other` | 500 000 `CallOther` dispatches in a tight loop | same, cross-object dispatch path |
-| `priv_control` | 10 000 calls to an ungated P0 efun | baseline call cost with no security check, for isolating the check's marginal cost |
-| `priv_check_hot` | 10 000 calls through a single `guard()` privilege check, cache warm | S1 guard-model check cost, cache hit |
-| `priv_check_guard3` | 10 000 calls through 3 stacked `guard()` checks, cache warm | marginal cost per extra stacked check |
-| `priv_check_deep` | 10 000 calls, one extra non-checking frame before the check | isolates frame push/pop cost from the check itself (should ≈ `priv_check_hot`) |
+| `priv_control` | 10 000 calls to `geteuid()`, an ungated P0 efun | baseline call cost with no security check, for isolating the checks' marginal cost |
+| `priv_check_hot` | 10 000 calls to `seteuid("b")`, cache warm | cost of the two cached checks `seteuid` triggers (`valid_efun` + `valid_seteuid`) plus their audit entries, per gated efun call |
+| `priv_check_guard3` | same 10 000-iteration `seteuid` loop, but with three distinct principals stacked (`b` → `c` → `d`, via `relay()` calling into `hot()`) | how cached-check cost scales with principal-stack width, not a count of extra checks |
+| `priv_check_deep` | the `priv_check_hot` loop run at call depth 150 (`dive(150)`) | the guard check reads only the top guard entry and never walks the stack, so this should ≈ `priv_check_hot` regardless of depth |
 | `priv_read_hit` | 1 000 calls through a cached `valid_read` check | cache-hit read-permission cost |
 | `priv_miss` | 1 000 calls, security cache flushed every sample | full miss cost: one `valid_read` re-evaluation per call |
-| `priv_creator_frame` | 10 000 calls exercising the creator-frame push/pop on the privilege stack (OBI-87 `priv_creator_frame`) | creator-frame bookkeeping isolated from ordinary dispatch (compare to `monocall_other`) |
+| `priv_creator_frame` | 10 000 `CallValue`s: `b` makes a trivial closure once, hands it to `d`, which invokes it 10 000 times | creator-frame push/pop cost isolated from ordinary dispatch (compare *per call* to `monocall_other`: same trivial callee, but a plain `CallOther` with one principal instead of a `CallValue` crossing two) |
 
 ## bcvm numbers (current `main`)
 
@@ -66,13 +66,21 @@ OBI-87), `cargo run --release -p loom-vm --example vm_bench 30`, single run:
 | `priv_miss` | 3.466 ms | 3.977 ms | 3.443 ms |
 | `priv_creator_frame` | 4.029 ms | 4.129 ms | 4.018 ms |
 
-Derived: `(priv_check_hot - priv_control) / 10000` ≈ 376 ns per cached
-`guard()` check; `priv_check_deep` tracking `priv_check_hot` confirms that
-cost is the check itself, not the extra frame; `(priv_miss - priv_read_hit) /
-1000` ≈ 583 ns is the marginal cost of a cache miss re-evaluating
-`valid_read`; `priv_creator_frame` sits below `monocall_other`, i.e. the
-creator-frame push/pop does not add call overhead beyond ordinary
-`CallOther` dispatch at this sample size.
+Derived: `(priv_check_hot - priv_control) / 10000` ≈ 376 ns per gated
+`seteuid()` call — that is two cached checks (`valid_efun` +
+`valid_seteuid`) plus their audit entries, not a single check; dividing by
+two checks gives ≈ 188 ns per cached check. `priv_check_deep` tracking
+`priv_check_hot` at call depth 150 confirms the guard check reads only the
+top of stack and does not walk it, so depth is free. `priv_check_guard3`
+(three stacked principals) vs. `priv_check_hot` (one) shows how cost scales
+with principal-stack width rather than per-check count.
+`(priv_miss - priv_read_hit) / 1000` ≈ 583 ns is the marginal cost of a
+cache miss re-evaluating `valid_read`. `priv_creator_frame` and
+`monocall_other` have different call counts (10 000 `CallValue`s vs.
+500 000 `CallOther`s), so compare *per call*: `priv_creator_frame` ≈ 4.029
+ms / 10 000 ≈ 403 ns/call, `monocall_other` ≈ 230.322 ms / 500 000 ≈ 461
+ns/call. The creator-frame push/pop therefore does not add call overhead
+beyond ordinary `CallOther` dispatch at this sample size.
 
 Machine notes: this container's CPU/RAM (12 logical CPUs reported by
 `nproc`), rustc 1.98.1, `release` profile (default codegen settings), single
