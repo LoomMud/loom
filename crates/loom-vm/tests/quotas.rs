@@ -228,6 +228,101 @@ fn tick_share_per_min_defers_a_call_out_but_never_defers_player_input() {
     assert_eq!(host.take(1), "grown 10\n");
 }
 
+#[test]
+fn tick_share_per_min_bumps_the_breach_metric_only_once_per_transition_into_breach() {
+    // OBI-137 S2: `loom_tier_quota_breaches_total` must bump once per
+    // window *transition* into breach, not once per deferred
+    // heartbeat/call_out tick -- several ticks in a row while still over
+    // the share must not each add to the count.
+    let (mut world, mut host) = boot();
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"tick_share_per_min": 1}"#)));
+    connect_appr(&mut world, &mut host, 1);
+
+    world.input(1, "sethbn 0", &mut host);
+    host.take(1);
+    world.input(1, "callout", &mut host);
+    host.take(1);
+    world.tick(&mut host); // the call_out fires; the window is now breached.
+    assert_eq!(
+        world.quota_breach_count(1, "tick_share_per_min"),
+        0,
+        "not breached yet at the moment this one fired"
+    );
+
+    // Several more ticks in a row while still breached: each one's
+    // `tick_share_breached` check finds the uid still over its share
+    // (nothing new was scheduled, so there is nothing to defer either),
+    // but the metric must not grow past the single transition.
+    for _ in 0..5 {
+        world.tick(&mut host);
+    }
+
+    // Now actually schedule and let several ticks find it breached and
+    // defer it, to prove the *defer* path itself does not re-bump either.
+    world.input(1, "callout", &mut host);
+    host.take(1);
+    for _ in 0..5 {
+        world.tick(&mut host); // each one finds it still breached, defers
+    }
+    assert_eq!(
+        world.quota_breach_count(1, "tick_share_per_min"),
+        1,
+        "one bump for the one transition into breach, not one per deferred tick"
+    );
+}
+
+#[test]
+fn max_callouts_obj_counter_frees_up_again_after_remove_call_out() {
+    // OBI-137 S3: `pending_count_for_obj` must reflect a cancelled
+    // call_out immediately, not keep counting it until it would have
+    // become due.
+    let (mut world, mut host) = boot();
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"max_callouts_obj": 1}"#)));
+    connect_appr(&mut world, &mut host, 1);
+
+    world.input(1, "callout", &mut host);
+    assert_eq!(host.take(1), "scheduled\n");
+    world.input(1, "callout", &mut host);
+    assert!(host.take(1).contains("max_callouts_obj"));
+
+    world.input(1, "cancelcallout", &mut host);
+    assert_eq!(host.take(1), "true\n");
+
+    // The slot freed by the cancel must be usable again immediately.
+    world.input(1, "callout", &mut host);
+    assert_eq!(host.take(1), "scheduled\n");
+}
+
+#[test]
+fn max_heartbeats_counter_frees_up_again_after_destruct() {
+    // OBI-137 S3: destructing a still-subscribed object must free its
+    // owner's per-owner heartbeat count immediately, not leave it charged
+    // until some later scan happens to notice the object is gone.
+    //
+    // (Connections 2 and 3 are the fixture's guest/staffer special cases
+    // -- `connect_appr` on connection 4 is this fixture's second
+    // `appr`-owned player, same convention as
+    // `max_heartbeats_row_denies_a_second_apprentice_owned_subscriber`.)
+    let (mut world, mut host) = boot();
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"max_heartbeats": 1}"#)));
+    let ob1 = connect_appr(&mut world, &mut host, 1);
+    world.input(1, "heartbeaton", &mut host);
+    assert_eq!(host.take(1), "on\n");
+
+    world.connect(2, &mut host); // guest
+    host.take(2);
+    world.connect(3, &mut host); // staffer
+    host.take(3);
+    let ob4 = connect_appr(&mut world, &mut host, 4);
+    world.input(4, "heartbeaton", &mut host);
+    assert!(host.take(4).contains("max_heartbeats"));
+
+    world.destruct(ob1, &mut host);
+    world.input(4, "heartbeaton", &mut host);
+    assert_eq!(host.take(4), "on\n");
+    let _ = ob4;
+}
+
 // -- disk_quota_mb on write_file into /builders/<u>/** -----------------------
 
 #[test]
@@ -239,7 +334,7 @@ fn disk_quota_mb_row_denies_a_write_that_would_exceed_the_builders_directory_tot
     world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"disk_quota_mb": 1}"#)));
 
     let chunk = "a".repeat(700_000);
-    world
+    let ok = world
         .call(
             workroom,
             "write_disk",
@@ -247,16 +342,77 @@ fn disk_quota_mb_row_denies_a_write_that_would_exceed_the_builders_directory_tot
             &mut host,
         )
         .expect("700_000 bytes is within the 1 MB quota");
+    assert!(matches!(ok, Value::Bool(true)));
 
-    let e = world
+    // OBI-137 S1: over quota returns `false` and writes an audit entry --
+    // it must not raise.
+    let audit_before = world.audit_log().len();
+    let result = world
         .call(
             workroom,
             "write_disk",
             vec![Value::str("/builders/appr/b.txt"), Value::str(&chunk)],
             &mut host,
         )
-        .unwrap_err();
-    assert!(e.contains("disk_quota_mb"), "{e}");
+        .expect("an over-quota write_file must not raise");
+    assert!(matches!(result, Value::Bool(false)), "{result:?}");
+    let new_entries = &world.audit_log()[audit_before..];
+    assert!(
+        new_entries
+            .iter()
+            .any(|e| e.apply == "quota" && e.efun == "disk_quota_mb" && !e.allowed),
+        "expected a disk_quota_mb audit entry, got {new_entries:?}"
+    );
+    assert!(
+        !std::path::Path::new(&format!("{}/builders/appr/b.txt", world.root().display())).exists(),
+        "a rejected write must not land on disk"
+    );
+}
+
+#[test]
+fn disk_quota_mb_counter_stays_correct_across_overwrite_shrink_and_a_later_write() {
+    let (mut world, mut host) = boot();
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"disk_quota_mb": 1}"#)));
+
+    let big = "a".repeat(900_000);
+    world
+        .call(
+            workroom,
+            "write_disk",
+            vec![Value::str("/builders/appr/a.txt"), Value::str(&big)],
+            &mut host,
+        )
+        .expect("900_000 bytes is within the 1 MB quota");
+
+    // Shrink the same file: the counter must reflect the *new* (smaller)
+    // size, not keep charging the old 900_000 bytes -- so a second write
+    // that would only fit if the shrink was accounted for must succeed.
+    let small = "a".repeat(10_000);
+    world
+        .call(
+            workroom,
+            "write_disk",
+            vec![Value::str("/builders/appr/a.txt"), Value::str(&small)],
+            &mut host,
+        )
+        .expect("overwriting with a smaller file must succeed");
+
+    let bigger = "a".repeat(900_000);
+    let result = world
+        .call(
+            workroom,
+            "write_disk",
+            vec![Value::str("/builders/appr/b.txt"), Value::str(&bigger)],
+            &mut host,
+        )
+        .expect("must not raise");
+    assert!(
+        matches!(result, Value::Bool(true)),
+        "the shrink must have freed enough of the quota for this write to fit: {result:?}"
+    );
 }
 
 // -- move_to confinement (spec ยง7) -------------------------------------------

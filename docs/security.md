@@ -92,9 +92,9 @@ The cache is dropped whole on any of these events:
 
 None of the four can permanently stop the loop except a clean shutdown (CTO review, OBI-123 B1). A `LISTEN` failure at boot, or the listener connection dropping later (a Postgres restart, a network blip), no longer ends `run_roles_manager`: the boot load always runs regardless, the mutation and expiry triggers keep working the whole time `LISTEN` is down, and `LISTEN` itself reconnects on an exponential backoff (`next_listen_backoff`, 1s doubling up to a 30s cap), forcing an immediate reload on every successful (re)connect. `RolesSnapshot::has_grant` also checks `expires_at <= now` itself (B2) as defence in depth -- a stale, never-refreshed snapshot must not fail an expired grant open just because nothing reloaded it away yet -- but that check is a backstop, not a substitute for the loop actually staying alive.
 
-## Per-tier quotas, ownership, and confinement (OBI-121/S2c)
+## Per-tier quotas, ownership, and confinement (OBI-121/S2c, OBI-137)
 
-Normative source: [OBI-36 design note](https://paperclip.home.oberfield.net/OBI/issues/OBI-36#document-design) §3, §4, §7. Implementation: `crates/loom-vm/src/quota.rs` (resolution + the `loom_tier_quota_breaches_total{tier,quota}` counter table), `crates/loom-vm/src/bcvm/registry.rs` (every enforcement point).
+Normative source: [OBI-36 design note](https://paperclip.home.oberfield.net/OBI/issues/OBI-36#document-design) §3, §4, §7. Implementation: `crates/loom-vm/src/quota.rs` (resolution + the `loom_tier_quota_breaches_total{tier,quota}` counter table), `crates/loom-vm/src/bcvm/registry.rs` (every enforcement point), `crates/loom-vm/src/scheduler.rs` (`max_heartbeats`/`max_callouts_*`'s `O(1)` counters), `crates/loom-vm/src/disk_usage.rs` (`disk_quota_mb`'s `O(1)` per-`<u>` byte counter).
 
 ### `owner`, `uid`, and R1
 
@@ -113,14 +113,20 @@ Every quota is resolved from the S2 `RolesSnapshot`'s `tier_policy` row for a ui
 |---|---|---|---|---|
 | `max_ticks_exec` | execution's quota uid | 1,000,000 ticks | `World::exec`'s tick budget | execution errors out (existing tick-exhaustion path); player input still gets the world default even through a T1 object; **also the world default for `root`/`mudlib`/`domain:*`** |
 | `max_mem_exec_mb` | object's `owner` | 16 MB | `store_global` (per-object vars, spec r6) | write denied, audited, `loom_tier_quota_breaches_total{quota="max_mem_exec_mb"}` |
-| `tick_share_per_min` | execution's quota uid | unlimited | a sliding 60 s window checked before a heartbeat/call_out execution starts | the heartbeat/call_out is deferred to a later tick; player input is never deferred |
+| `tick_share_per_min` | execution's quota uid | unlimited | a **sliding** 60-bucket window (`World::TickShareWindow`, one bucket per 10 world ticks -- 100 ms each, so 60 buckets span 60 s of real time when the driver ticks on its normal timer) checked before a heartbeat/call_out execution starts | the heartbeat/call_out is deferred to a later tick, **keeping its original id and FIFO position** (`Scheduler::defer`), not re-scheduled with a fresh id; player input is never deferred; the metric bumps once per **transition** into breach, not once per deferred tick |
 | `max_objects` | object's `owner` | unlimited | `RegistryHost::instantiate`, before the new object is inserted | `load_object`/`clone_object` denied (`"object quota exceeded"`), audited |
-| `max_heartbeats` | object's `owner` | unlimited | `set_heartbeat(true)` | denied, audited (re-subscribing an already-on object never counts twice) |
-| `max_callouts_obj` | calling object's `owner` | unlimited | `call_out`, before scheduling | denied, audited |
-| `max_callouts_uid` | execution's quota uid | unlimited | `call_out`, before scheduling (separately from `max_callouts_obj`, since one uid's several objects can collectively exceed it) | denied, audited |
-| `disk_quota_mb` | the `<u>` in `/builders/<u>/**` | unlimited | `write_file` into that subtree | denied, audited; scoped to `/builders/**` only, keyed on the directory's owner even for a staff/grant write into someone else's tree |
+| `max_heartbeats` | object's `owner` | unlimited | `set_heartbeat(true)`; `Scheduler::heartbeat_count_for_owner` is an `O(1)` counter, kept in lockstep by subscribe/unsubscribe/destruct | denied, audited (re-subscribing an already-on object never counts twice) |
+| `max_callouts_obj` | calling object's `owner` | unlimited | `call_out`, before scheduling; `Scheduler::pending_count_for_obj` is an `O(1)` counter, kept in lockstep by schedule/fire/cancel/destruct | denied, audited |
+| `max_callouts_uid` | execution's quota uid | unlimited | `call_out`, before scheduling (separately from `max_callouts_obj`, since one uid's several objects can collectively exceed it); `Scheduler::pending_count_for_quota_uid` is the same `O(1)` counter discipline | denied, audited |
+| `disk_quota_mb` | the `<u>` in `/builders/<u>/**` | unlimited | `write_file` into that subtree | **returns `false` (never raises)**, audited; scoped to `/builders/**` only, keyed on the directory's owner even for a staff/grant write into someone else's tree |
 
 Every denial (except `max_ticks_exec`'s existing tick-exhaustion error and `tick_share_per_min`'s defer, which are not "violations") bumps `loom_tier_quota_breaches_total{tier,quota}` (`Registry::quota_breaches`/`World::quota_breach_count`) **and** appends an audit entry (`apply: "quota"`, `efun`: the quota's own name), same as every other decision. There is no metrics-export story for `loom-vm` yet (same caveat as `bcvm::registry::CowMetrics`), so the metric is an in-process counter table today, not a Prometheus series.
+
+**OBI-137 fast-follow, three behaviour changes on top of OBI-121:**
+
+- **`disk_quota_mb` never raises.** `write_file` over quota returns `Bool(false)` and writes an audit entry, exactly like any other efun reporting "no" -- Weft code that calls `write_file` and checks its return value (rather than wrapping it in `try`/`catch`) now sees the same denial it always would have for e.g. a bad path. The byte counter behind it (`disk_usage::DiskUsage`) is seeded with **one** recursive walk of `/builders/<u>/**` the first time `<u>` is ever checked, then maintained in `O(1)` on every accepted write from `fileio::file_size_bytes`'s `metadata().len()` (never the old file's contents) -- **no `O(files)` walk per write** any more.
+- **`tick_share_per_min` is a true sliding window**, not OBI-121's fixed 60-second bucket (which could pass up to 2x a uid's share for a burst straddling the bucket's wholesale reset). `loom_tier_quota_breaches_total` now bumps once per window **transition** into breach, not once per deferred heartbeat/call_out tick while still over it. A deferred call_out keeps its original `id` and FIFO position (`Scheduler::defer`) instead of being rescheduled with a fresh, later id -- it still runs before a later call_out that becomes due the same tick it is retried on.
+- **`max_heartbeats`/`max_callouts_obj`/`max_callouts_uid` are `O(1)` counters**, not a scan of every pending call_out or heartbeat target on every check. `Scheduler` maintains a running `HashMap` count for each, updated on subscribe/unsubscribe, schedule/fire/cancel and destruct.
 
 ### `program_flags(path)` and confinement
 

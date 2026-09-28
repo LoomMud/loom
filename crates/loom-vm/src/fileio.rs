@@ -109,6 +109,22 @@ pub fn read_file(root: &Path, path: &str) -> Result<Option<String>, String> {
         .map_err(|e| format!("{path}: not valid UTF-8: {e}"))
 }
 
+/// The size of `path` in bytes, from `metadata().len()` -- never its
+/// contents (OBI-137 S1: the `disk_quota_mb` counter's "old size" input
+/// on an overwrite must not read a file just to size it). `Ok(0)` for a
+/// path that does not exist (a brand new file has no old size to
+/// subtract). Confined the same way `read_file`/`write_file` are.
+pub fn file_size_bytes(root: &Path, path: &str) -> Result<u64, String> {
+    let resolved = resolve(root, path)?;
+    if !resolved.exists() {
+        return Ok(0);
+    }
+    confine_canonical(root, &resolved)?;
+    std::fs::metadata(&resolved)
+        .map(|m| m.len())
+        .map_err(|e| format!("{}: {e}", resolved.display()))
+}
+
 /// Recursive byte total of every regular file under a mudlib-absolute
 /// directory (OBI-121 S2c `disk_quota_mb`, `/builders/<u>/**`). `Ok(0)`
 /// for a directory that does not exist yet (a builder who has never
@@ -116,6 +132,12 @@ pub fn read_file(root: &Path, path: &str) -> Result<Option<String>, String> {
 /// not an error. Confined the same way `read_file`/`write_file` are
 /// (lexical `resolve` + `confine_canonical`), so a symlink cannot be used
 /// to make this walk (or the quota it feeds) see bytes outside `root`.
+///
+/// **OBI-137 S1: called at most once per `<u>`, ever** (`disk_usage::
+/// DiskUsage::seeded_total`'s lazy seed) -- this is the one `O(files)`
+/// walk the design note allows ("seeded lazily by one walk"); every
+/// write/remove/rename after that updates the cached total in `O(1)`
+/// instead of re-walking.
 pub fn dir_size_bytes(root: &Path, dir: &str) -> Result<u64, String> {
     let resolved = resolve(root, dir)?;
     if !resolved.exists() {
@@ -237,6 +259,15 @@ mod tests {
                 std::fs::read_to_string("/etc/passwd.txt").unwrap_or_default() != "pwned"
             }
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_size_bytes_is_zero_for_a_missing_path_and_the_metadata_len_otherwise() {
+        let root = tmp_root("file-size");
+        assert_eq!(file_size_bytes(&root, "/domains/x/nope.wf").unwrap(), 0);
+        write_file(&root, "/domains/x/y.wf", "hello").unwrap();
+        assert_eq!(file_size_bytes(&root, "/domains/x/y.wf").unwrap(), 5);
         let _ = std::fs::remove_dir_all(&root);
     }
 
