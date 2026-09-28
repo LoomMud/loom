@@ -11,6 +11,7 @@
 //! `docs/weft-grammar.md` for the supported grammar.
 
 pub mod bcvm;
+pub mod disk_usage;
 pub mod efuns;
 pub mod fileio;
 pub mod host;

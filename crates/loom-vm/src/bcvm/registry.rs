@@ -1536,6 +1536,9 @@ struct Driver<'a> {
     input_actor: Option<Sym>,
     /// Mudlib root, for the `read_file`/`write_file` VFS.
     root: PathBuf,
+    /// `disk_quota_mb`'s per-`<u>` byte counter (OBI-137 S1), owned by
+    /// `World`; see `crate::disk_usage::DiskUsage`.
+    disk_usage: &'a mut crate::disk_usage::DiskUsage,
 }
 
 /// Approximate current native stack position (mirrors the tree-walker's
@@ -1795,6 +1798,7 @@ impl<'a> RegistryHost<'a> {
         roles_ctx: crate::world::RolesCtx<'a>,
         cut_guard: Option<GuardSet>,
         input_actor: Option<Sym>,
+        disk_usage: &'a mut crate::disk_usage::DiskUsage,
     ) -> Self {
         let base = cut_guard
             .unwrap_or_else(|| GuardSet::empty().with(principal_of(registry, self_object)));
@@ -1822,6 +1826,7 @@ impl<'a> RegistryHost<'a> {
                 roles_ctx,
                 input_actor,
                 root,
+                disk_usage,
             }),
             stack_base: stack_addr(),
             call_cache: HashMap::new(),
@@ -2260,8 +2265,10 @@ impl<'a> RegistryHost<'a> {
         Ok(())
     }
 
-    /// `max_heartbeats` (OBI-121 S2c): checked before `set_heartbeat(true)`
-    /// subscribes `me`, keyed on `me`'s own owner uid.
+    /// `max_heartbeats` (OBI-121 S2c, OBI-137 S3): checked before
+    /// `set_heartbeat(true)` subscribes `me`, keyed on `me`'s own owner
+    /// uid. `Scheduler::heartbeat_count_for_owner` is an `O(1)` `HashMap`
+    /// lookup (OBI-137 S3), not a scan of every heartbeat target.
     fn check_heartbeat_quota(&mut self, me: ObjectId) -> R<()> {
         let Some(driver) = self.driver.as_ref() else {
             return Ok(());
@@ -2279,16 +2286,10 @@ impl<'a> RegistryHost<'a> {
         else {
             return Ok(());
         };
-        let already_on = driver.scheduler.heartbeat_targets().contains(&me);
-        if already_on {
+        if driver.scheduler.is_heartbeat_target(me) {
             return Ok(()); // re-subscribing does not add to the count
         }
-        let current = driver
-            .scheduler
-            .heartbeat_targets()
-            .iter()
-            .filter(|ob| self.registry.get(**ob).is_some_and(|o| o.owner == uid))
-            .count() as u64;
+        let current = driver.scheduler.heartbeat_count_for_owner(uid);
         if current >= max {
             self.registry
                 .quota_breaches
@@ -2331,55 +2332,70 @@ impl<'a> RegistryHost<'a> {
             .record(tier, crate::quota::MAX_MEM_EXEC_MB);
     }
 
-    /// `disk_quota_mb` (OBI-121 S2c): only paths under `/builders/<u>/**`
-    /// are quota-scoped (spec), keyed on `<u>` itself (the directory's
-    /// owner), not the caller -- a grant/staff write into someone else's
-    /// `/builders/<u>` still counts against `<u>`'s own quota. A no-op
-    /// without a driver, for a path outside `/builders/**`, or for an
-    /// always-unlimited (or policy-silent) `<u>`.
-    fn check_disk_quota(&mut self, path: &str, new_bytes: u64) -> R<()> {
+    /// `disk_quota_mb` (OBI-121 S2c, OBI-137 S1): only paths under
+    /// `/builders/<u>/**` are quota-scoped (spec), keyed on `<u>` itself
+    /// (the directory's owner), not the caller -- a grant/staff write
+    /// into someone else's `/builders/<u>` still counts against `<u>`'s
+    /// own quota. A no-op (returns `Ok(true)`) without a driver, for a
+    /// path outside `/builders/**`, or for an always-unlimited (or
+    /// policy-silent) `<u>`.
+    ///
+    /// Returns `Ok(false)` (never `Err`) for an over-quota write, after
+    /// pushing the audit entry and bumping the breach metric itself
+    /// (OBI-137 S1: `write_file` over quota must return `false`, not
+    /// raise) -- the caller (`write_file`'s efun arm) turns that into
+    /// `Ok(Value::Bool(false))`, never an `RtError`.
+    ///
+    /// **No `O(files)` walk here** (OBI-137 S1): the directory total
+    /// comes from `DiskUsage::seeded_total` (one walk, the first time
+    /// `<u>` is ever asked about, cached from then on) and the file's old
+    /// size from `fileio::file_size_bytes` (`metadata().len()`, never its
+    /// contents). On acceptance, the counter is updated here too (the
+    /// caller writes unconditionally right after this returns `true`, on
+    /// the single-threaded world thread, so nothing else can race it in
+    /// between).
+    fn check_disk_quota(&mut self, path: &str, new_bytes: u64) -> R<bool> {
         let Some(driver) = self.driver.as_ref() else {
-            return Ok(());
+            return Ok(true);
         };
         let mut segs = path.trim_start_matches('/').split('/');
         if segs.next() != Some("builders") {
-            return Ok(());
+            return Ok(true);
         }
-        let Some(u) = segs.next().filter(|s| !s.is_empty()) else {
-            return Ok(());
+        let Some(u) = segs.next().filter(|s| !s.is_empty()).map(|s| s.to_string()) else {
+            return Ok(true);
         };
-        if crate::quota::is_unlimited_uid(u) {
-            return Ok(());
+        if crate::quota::is_unlimited_uid(&u) {
+            return Ok(true);
         }
-        let tier = driver.roles.tier(u);
+        let tier = driver.roles.tier(&u);
         let Some(max_mb) =
-            crate::quota::resolve(&driver.roles, u, self.quota_defaults()).disk_quota_mb
+            crate::quota::resolve(&driver.roles, &u, self.quota_defaults()).disk_quota_mb
         else {
-            return Ok(());
+            return Ok(true);
         };
         let root = driver.root.clone();
-        let dir = format!("/builders/{u}");
-        let existing_file_size = crate::fileio::read_file(&root, path)
-            .ok()
-            .flatten()
-            .map(|s| s.len() as u64)
-            .unwrap_or(0);
-        let dir_total = crate::fileio::dir_size_bytes(&root, &dir).unwrap_or(0);
-        let projected = dir_total.saturating_sub(existing_file_size) + new_bytes;
+        let old_bytes = crate::fileio::file_size_bytes(&root, path).unwrap_or(0);
         let max_bytes = max_mb.saturating_mul(crate::quota::MB);
+        let driver = self.driver.as_mut().expect("checked above");
+        let seeded = driver.disk_usage.seeded_total(&root, &u);
+        let projected = seeded.saturating_sub(old_bytes).saturating_add(new_bytes);
         if projected > max_bytes {
             self.registry
                 .quota_breaches
                 .record(tier, crate::quota::DISK_QUOTA_MB);
-            return Err(self.deny_quota(
+            self.audit_quota_denial(
                 crate::quota::DISK_QUOTA_MB,
                 format!(
-                    "disk_quota_mb quota exceeded for `{u}` ({projected} bytes would be in use \
-                 under {dir}, quota is {max_bytes} bytes)"
+                    "disk_quota_mb quota exceeded for `{u}` ({projected} bytes would be in \
+                     use under /builders/{u}, quota is {max_bytes} bytes)"
                 ),
-            ));
+            );
+            return Ok(false);
         }
-        Ok(())
+        let driver = self.driver.as_mut().expect("checked above");
+        driver.disk_usage.note_write(&u, old_bytes, new_bytes);
+        Ok(true)
     }
 
     /// Run apply `name` on `on` from a **cut** (an empty guard stack
@@ -2611,11 +2627,11 @@ impl<'a> RegistryHost<'a> {
     }
 
     /// Audits a quota denial (spec §3/§5: "quota breaches" go to the audit
-    /// sink, same as every other decision, CTO review S4) and returns the
-    /// error to raise. Not routed through `authorize`/`Operation`: a quota
-    /// breach is a driver rule derived from the S2 roles snapshot, not a
-    /// master `valid_*` decision.
-    fn deny_quota(&mut self, quota: &'static str, msg: String) -> RtError {
+    /// sink, same as every other decision, CTO review S4). Not routed
+    /// through `authorize`/`Operation`: a quota breach is a driver rule
+    /// derived from the S2 roles snapshot, not a master `valid_*`
+    /// decision.
+    fn audit_quota_denial(&mut self, quota: &'static str, msg: String) {
         let caller = self.self_object();
         if let Some(d) = self.driver.as_mut() {
             d.security.push(AuditEntry {
@@ -2623,13 +2639,21 @@ impl<'a> RegistryHost<'a> {
                 efun: quota,
                 privilege: Privilege::P0,
                 apply: "quota",
-                arg: msg.clone().into(),
+                arg: msg.into(),
                 guard: GuardSet::empty(),
                 allowed: false,
                 denied_by: None,
                 at_unix_ms: 0, // stamped by `push` itself
             });
         }
+    }
+
+    /// Same audit as [`Self::audit_quota_denial`], but for a quota whose
+    /// enforcement point raises rather than returning a sentinel value
+    /// (every quota except `disk_quota_mb`, OBI-137 S1: `write_file` over
+    /// quota returns `false` instead, see `check_disk_quota`).
+    fn deny_quota(&mut self, quota: &'static str, msg: String) -> RtError {
+        self.audit_quota_denial(quota, msg.clone());
         RtError::new(msg)
     }
 
@@ -2936,11 +2960,16 @@ impl<'a> RegistryHost<'a> {
                 if on {
                     self.check_heartbeat_quota(me)?;
                 }
+                // OBI-137 S3: `set_heart_beat` records `me`'s owner at
+                // subscribe time so it can decrement the right per-owner
+                // count again on unsubscribe/destruct without needing the
+                // registry (which may already be gone by then).
+                let owner = self.registry.get(me).map_or(ROOT, |o| o.owner);
                 self.driver
                     .as_mut()
                     .expect("checked above")
                     .scheduler
-                    .set_heart_beat(me, on);
+                    .set_heart_beat(me, owner, on);
                 Ok(Value::Null)
             }
             "random" => {
@@ -3056,7 +3085,12 @@ impl<'a> RegistryHost<'a> {
                         op: "write_file",
                     },
                 )?;
-                self.check_disk_quota(&p, text.len() as u64)?;
+                if !self.check_disk_quota(&p, text.len() as u64)? {
+                    // OBI-137 S1: over-quota is not an error -- `write_file`
+                    // reports it the same way any other efun reports "no"
+                    // (a `false` return), not a raised `RtError`.
+                    return Ok(Value::Bool(false));
+                }
                 let root = &self.driver.as_ref().expect("checked above").root;
                 crate::fileio::write_file(root, &p, text)
                     .map(Value::Bool)

@@ -9,6 +9,7 @@ persistent var grown: int = 0
 persistent var heartbeat_grow_n: int = 0
 persistent var heartbeat_runs: int = 0
 persistent var heartbeat_grown: int = 0
+persistent var last_callout_id: int = -1
 
 pub fn logon() {
     send(self, "ready\n")
@@ -41,8 +42,10 @@ pub fn process_input(line: string) {
         set_heartbeat(false)
         send(self, "off\n")
     } else if verb == "callout" {
-        call_out("do_work", 1)
+        last_callout_id = call_out("do_work", 1)
         send(self, "scheduled\n")
+    } else if verb == "cancelcallout" {
+        send(self, $"{remove_call_out(last_callout_id)}\n")
     } else if verb == "write" and len(words) == 3 {
         try {
             send(self, $"{write_file(words[1], words[2])}\n")

@@ -358,6 +358,9 @@ pub struct World {
     /// `tick_share_per_min`'s per-uid sliding usage window (OBI-121 S2c):
     /// see `TickShareWindow`.
     tick_share: HashMap<crate::security::Sym, TickShareWindow>,
+    /// `disk_quota_mb`'s per-`<u>` byte counter (OBI-137 S1): see
+    /// `crate::disk_usage::DiskUsage`.
+    disk_usage: crate::disk_usage::DiskUsage,
 }
 
 /// Identifies one [`World::begin_recompile`] call, so its eventual result
@@ -367,30 +370,88 @@ pub struct World {
 pub struct RecompileToken(u64);
 
 /// `tick_share_per_min`'s per-uid sliding-window tick usage (OBI-121 S2c
-/// §3). **Simplification (flagged, not hidden):** a fixed 60-second
-/// bucket that resets wholesale once it's older than 60s, not a true
-/// sliding window (no sub-minute decay) -- simpler to reason about and
-/// enough to bound a uid's ticks-per-minute; a real sliding window is a
-/// straightforward follow-up if the coarser bucket ever proves too bursty
-/// at the minute boundary.
+/// §3, OBI-137 S2). A true 60-slot sliding window (design note: "for
+/// example a 60-slot ring of per-second buckets", superseding OBI-121's
+/// original fixed-bucket simplification, which reset wholesale once a
+/// window turned 60s old and so could pass up to 2x a uid's share across
+/// a burst straddling that reset).
+///
+/// **Clocked on world ticks, not the wall clock** (flagged spec
+/// deviation): each bucket spans [`TICKS_PER_BUCKET`] world ticks (10 --
+/// a world tick is 100 ms, `World::tick`'s own doc comment, so 10 ticks
+/// is one second of *real* time when the driver is ticking on its normal
+/// 100 ms timer) rather than a real `Instant`. This makes the window
+/// entirely deterministic from the world-tick counter
+/// (`Scheduler::tick`) alone, so a test can drive a whole 60-second
+/// window's worth of buckets with plain repeated `World::tick()` calls
+/// instead of a real 60-second sleep -- see
+/// `tick_share_per_min_caps_a_burst_straddling_a_window_boundary` in
+/// `tests/quotas.rs`.
+const TICKS_PER_BUCKET: u64 = 10;
+const BUCKET_COUNT: usize = 60;
+
 struct TickShareWindow {
-    window_start: std::time::Instant,
-    used: u64,
+    /// Ticks used in each bucket, indexed by `(world_tick / TICKS_PER_BUCKET)
+    /// % BUCKET_COUNT`.
+    buckets: [u64; BUCKET_COUNT],
+    /// Which absolute bucket index (`world_tick / TICKS_PER_BUCKET`,
+    /// never wrapped) `buckets[i]` currently holds usage for --
+    /// `u64::MAX` for a slot that has never been written. A slot whose
+    /// `bucket_index` is more than `BUCKET_COUNT` behind the *current*
+    /// bucket index is stale (older than the 60-slot window) and is
+    /// treated as zero without needing to eagerly zero all 60 slots on
+    /// every roll.
+    bucket_index: [u64; BUCKET_COUNT],
+    /// Whether this uid's usage was already at/over its limit as of the
+    /// most recent [`World::tick_share_breached`] check (OBI-137 S2:
+    /// `loom_tier_quota_breaches_total` must bump once per *transition*
+    /// into breach, not once per deferred heartbeat/call_out tick).
+    breached: bool,
 }
 
 impl TickShareWindow {
     fn fresh() -> TickShareWindow {
         TickShareWindow {
-            window_start: std::time::Instant::now(),
-            used: 0,
+            buckets: [0; BUCKET_COUNT],
+            bucket_index: [u64::MAX; BUCKET_COUNT],
+            breached: false,
         }
     }
 
-    fn roll_if_expired(&mut self) {
-        if self.window_start.elapsed() >= std::time::Duration::from_secs(60) {
-            self.window_start = std::time::Instant::now();
-            self.used = 0;
+    fn slot(world_tick: u64) -> (usize, u64) {
+        let bucket_index = world_tick / TICKS_PER_BUCKET;
+        ((bucket_index as usize) % BUCKET_COUNT, bucket_index)
+    }
+
+    /// Charge `ticks` against the bucket `world_tick` falls in, first
+    /// zeroing that slot if it belongs to an earlier bucket (a slot is
+    /// only ever reused once the ring has come all the way back around
+    /// to it, `BUCKET_COUNT` buckets later).
+    fn add(&mut self, world_tick: u64, ticks: u64) {
+        let (slot, bucket_index) = TickShareWindow::slot(world_tick);
+        if self.bucket_index[slot] != bucket_index {
+            self.bucket_index[slot] = bucket_index;
+            self.buckets[slot] = 0;
         }
+        self.buckets[slot] = self.buckets[slot].saturating_add(ticks);
+    }
+
+    /// Total ticks used across the [`BUCKET_COUNT`] buckets ending at
+    /// (and including) whichever bucket `world_tick` falls in -- a true
+    /// sliding sum, not a fixed-bucket total, so a burst that straddles
+    /// what would have been a fixed-bucket reset boundary is still
+    /// capped at the same 1x share as one that does not.
+    fn used(&self, world_tick: u64) -> u64 {
+        let (_, current_bucket) = TickShareWindow::slot(world_tick);
+        let mut total = 0u64;
+        for i in 0..BUCKET_COUNT {
+            if self.bucket_index[i] != u64::MAX
+                && current_bucket.saturating_sub(self.bucket_index[i]) < BUCKET_COUNT as u64
+            {
+                total = total.saturating_add(self.buckets[i]);
+            }
+        }
+        total
     }
 }
 
@@ -427,6 +488,7 @@ impl World {
             roles_results: VecDeque::new(),
             last_call_out_quota_uid: None,
             tick_share: HashMap::new(),
+            disk_usage: crate::disk_usage::DiskUsage::default(),
         };
         let mut null = NullHost;
         let sentinel = ObjectId {
@@ -642,6 +704,7 @@ impl World {
             },
             cut_guard,
             input_actor,
+            &mut self.disk_usage,
         );
         let result = body(&mut rh);
         // OBI-121 S2c `tick_share_per_min`: charge whatever ticks this
@@ -656,10 +719,16 @@ impl World {
         result
     }
 
-    /// `tick_share_per_min` (OBI-121 S2c §3): does `uid`'s sliding-window
-    /// usage already meet or exceed its tier's `tick_share_per_min`? A
-    /// uid with no such row (unlimited, or the row just doesn't mention
-    /// it) is never breached.
+    /// `tick_share_per_min` (OBI-121 S2c §3, OBI-137 S2): does `uid`'s
+    /// sliding-window usage already meet or exceed its tier's
+    /// `tick_share_per_min`? A uid with no such row (unlimited, or the
+    /// row just doesn't mention it) is never breached.
+    ///
+    /// Bumps `loom_tier_quota_breaches_total` exactly once per
+    /// *transition* into breach (OBI-137 S2): a heartbeat/call_out
+    /// deferred on every subsequent tick while still over its share does
+    /// not bump it again, only the first tick that found it breached
+    /// after last being under it.
     fn tick_share_breached(&mut self, uid: crate::security::Sym) -> bool {
         let name = self.registry.syms.name(uid).to_string();
         let defaults =
@@ -668,29 +737,37 @@ impl World {
         else {
             return false;
         };
+        let world_tick = self.scheduler.tick();
         let w = self
             .tick_share
             .entry(uid)
             .or_insert_with(TickShareWindow::fresh);
-        w.roll_if_expired();
-        if w.used >= limit {
-            let tier = self.roles.tier(&name);
-            self.registry
-                .quota_breaches
-                .record(tier, crate::quota::TICK_SHARE_PER_MIN);
-            true
+        let used = w.used(world_tick);
+        let is_breached = used >= limit;
+        if is_breached {
+            if !w.breached {
+                w.breached = true;
+                let tier = self.roles.tier(&name);
+                self.registry
+                    .quota_breaches
+                    .record(tier, crate::quota::TICK_SHARE_PER_MIN);
+            }
         } else {
-            false
+            w.breached = false;
         }
+        is_breached
     }
 
     fn record_tick_share_usage(&mut self, uid: crate::security::Sym, ticks: u64) {
+        if ticks == 0 {
+            return;
+        }
+        let world_tick = self.scheduler.tick();
         let w = self
             .tick_share
             .entry(uid)
             .or_insert_with(TickShareWindow::fresh);
-        w.roll_if_expired();
-        w.used += ticks;
+        w.add(world_tick, ticks);
     }
 
     fn report(host: &mut dyn Host, conn: u64, e: &RtError) {
@@ -878,18 +955,16 @@ impl World {
             if self.registry.get(call.ob).is_none() {
                 continue; // destructed in the same tick it was scheduled for
             }
-            // `tick_share_per_min`: defer a due call_out the same way --
-            // re-queue it one tick out instead of running it now, rather
-            // than dropping it (spec: "deferred", not cancelled).
+            // `tick_share_per_min` (OBI-137 S2): defer a due call_out the
+            // same way -- re-queue it one tick out instead of running it
+            // now, rather than dropping it (spec: "deferred", not
+            // cancelled), keeping its *original* id and FIFO position
+            // (`Scheduler::defer`) rather than scheduling a brand new
+            // pending call with a fresh (higher) id -- a call that was
+            // deferred must still run before a later call_out that
+            // becomes due on the same tick it is retried on.
             if self.tick_share_breached(call.quota_uid) {
-                self.scheduler.call_out(
-                    call.ob,
-                    1,
-                    call.func.clone(),
-                    call.args.clone(),
-                    call.guard.clone(),
-                    call.quota_uid,
-                );
+                self.scheduler.defer(call);
                 continue;
             }
             self.last_call_out_quota_uid = Some(call.quota_uid);
@@ -1313,5 +1388,63 @@ impl World {
 
     pub fn object_count(&self) -> usize {
         self.registry.ids().len()
+    }
+}
+
+#[cfg(test)]
+mod tick_share_window_tests {
+    use super::*;
+
+    // -- OBI-137 S2: a true sliding window, not a fixed bucket ------------
+
+    #[test]
+    fn a_burst_straddling_what_would_be_a_fixed_bucket_reset_is_still_capped() {
+        let mut w = TickShareWindow::fresh();
+        // A fixed 60-second bucket resets wholesale at tick 600 (bucket
+        // 60): charge right up to that boundary, then straddle it.
+        w.add(590, 5); // just before the old fixed-bucket reset point
+        w.add(605, 5); // just after it
+        // A fixed-bucket implementation would show `used(605) == 5` here
+        // (the bucket wholesale-reset at 600, forgetting the tick-590
+        // usage) -- letting a uid burst 2x its share right at the
+        // boundary. The sliding window must still see both charges as
+        // long as they are within 60 buckets (600 ticks) of each other.
+        assert_eq!(
+            w.used(605),
+            10,
+            "the sliding window must still see both bursts"
+        );
+    }
+
+    #[test]
+    fn usage_older_than_the_window_falls_off() {
+        let mut w = TickShareWindow::fresh();
+        w.add(0, 7);
+        assert_eq!(w.used(0), 7);
+        // Still inside the 60-bucket window (599 - 0 < 600 ticks).
+        assert_eq!(w.used(599), 7);
+        // Exactly 600 ticks later (60 buckets on): the tick-0 usage has
+        // rolled all the way off the ring.
+        assert_eq!(w.used(600), 0);
+    }
+
+    #[test]
+    fn usage_accumulates_within_the_same_bucket() {
+        let mut w = TickShareWindow::fresh();
+        w.add(3, 2);
+        w.add(4, 3); // ticks 3 and 4 are in the same 10-tick bucket
+        assert_eq!(w.used(4), 5);
+    }
+
+    #[test]
+    fn a_reused_ring_slot_does_not_see_a_much_older_buckets_leftover_count() {
+        let mut w = TickShareWindow::fresh();
+        w.add(0, 9); // bucket 0
+        w.add(6000, 4); // bucket 600, same ring slot as bucket 0 (600 % 60 == 0)
+        assert_eq!(
+            w.used(6000),
+            4,
+            "a slot's stale usage from 60 buckets ago must not leak into a reused slot"
+        );
     }
 }
