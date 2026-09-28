@@ -16,6 +16,10 @@ fn valid_compile(path: string, ob: object) -> bool {
     return true
 }
 
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}
+
 fn valid_read(path: string, ob: object, op: string) -> bool {
     return true
 }

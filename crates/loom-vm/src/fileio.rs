@@ -109,6 +109,38 @@ pub fn read_file(root: &Path, path: &str) -> Result<Option<String>, String> {
         .map_err(|e| format!("{path}: not valid UTF-8: {e}"))
 }
 
+/// Recursive byte total of every regular file under a mudlib-absolute
+/// directory (OBI-121 S2c `disk_quota_mb`, `/builders/<u>/**`). `Ok(0)`
+/// for a directory that does not exist yet (a builder who has never
+/// written anything): the quota check treats that the same as "empty",
+/// not an error. Confined the same way `read_file`/`write_file` are
+/// (lexical `resolve` + `confine_canonical`), so a symlink cannot be used
+/// to make this walk (or the quota it feeds) see bytes outside `root`.
+pub fn dir_size_bytes(root: &Path, dir: &str) -> Result<u64, String> {
+    let resolved = resolve(root, dir)?;
+    if !resolved.exists() {
+        return Ok(0);
+    }
+    confine_canonical(root, &resolved)?;
+    let mut total = 0u64;
+    let mut stack = vec![resolved];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            let meta = entry
+                .metadata()
+                .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// `write_file()`: only `.wf`/`.txt` suffixes are allowed; parent
 /// directories are created under the root as needed.
 pub fn write_file(root: &Path, path: &str, text: &str) -> Result<bool, String> {

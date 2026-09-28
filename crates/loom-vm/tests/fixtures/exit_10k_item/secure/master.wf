@@ -9,3 +9,7 @@ pub fn connect() -> object {
 fn valid_efun(name: string, class: int, ob: object) -> bool {
     return true
 }
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}

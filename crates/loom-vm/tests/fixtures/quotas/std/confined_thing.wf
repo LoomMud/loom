@@ -1,0 +1,8 @@
+// A `Confined` object (the master's `program_flags` returns 1 for this
+// exact path): rules 1/2's "a Confined object cannot move into ...".
+pub fn create() {
+}
+
+pub fn move_into_obj(dest: object) {
+    move_to(dest)
+}

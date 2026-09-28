@@ -1,0 +1,32 @@
+// Owner `appr` (from the `/builders/appr/**` convention): the driver-
+// level fixture for the object-count/memory/disk/R1 quota tests, called
+// directly by `World::call` (root-acting), which is fine since every one
+// of these quotas is keyed on *this object's own owner* (`max_objects`,
+// `max_mem_exec_mb`) or on whatever `/daemons/thing` R1 confines its
+// clone's owner to -- none of them depend on who is calling.
+var data: [int] = []
+
+pub fn grow(n: int) {
+    // Double the array by self-concatenation (O(log n) concats, each
+    // O(current size)) instead of appending one element at a time, so
+    // this stays O(n log n) rather than O(n^2) -- the point of this fn
+    // is to trip the memory/tick quota quickly, not to hit an exact
+    // size, so an overshoot from doubling past n is fine.
+    var a: [int] = [0]
+    while len(a) < n {
+        a = a + a
+    }
+    data = a
+}
+
+// R1 (OBI-121 S2c spec §7): `/daemons/thing`'s own uid (`mudlib`, the
+// `default_creator` fallback -- no `/builders`/`/domains` prefix) is not
+// in this call's guard set (just `appr`, this object's own principal), so
+// the clone's owner/euid is confined to `appr` instead.
+pub fn spawn_daemon() -> object {
+    return clone_object("/daemons/thing")
+}
+
+pub fn write_disk(p: string, text: string) -> bool {
+    return write_file(p, text)
+}

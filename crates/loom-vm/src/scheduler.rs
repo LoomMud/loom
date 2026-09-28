@@ -142,6 +142,12 @@ impl Scheduler {
         self.heartbeat.clone()
     }
 
+    /// How many objects are currently subscribed to the heartbeat
+    /// (OBI-121 S2c `max_heartbeats`, tests/introspection).
+    pub fn heartbeat_count(&self) -> usize {
+        self.heartbeat.len()
+    }
+
     /// `upgrade_all(path)` efun (OBI-89): queue `ob` for a batched eager
     /// migration by [`Scheduler::drain_eager_upgrades`].
     pub fn enqueue_eager_upgrade(&mut self, ob: ObjectId, path: String) {
@@ -167,6 +173,17 @@ impl Scheduler {
     /// Number of pending (not yet due) `call_out`s, for tests/introspection.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Pending `call_out`s scheduled by `ob` (OBI-121 S2c `max_callouts_obj`).
+    pub fn pending_count_for_obj(&self, ob: ObjectId) -> usize {
+        self.pending.iter().filter(|p| p.ob == ob).count()
+    }
+
+    /// Pending `call_out`s charged to `quota_uid` (OBI-121 S2c
+    /// `max_callouts_uid`).
+    pub fn pending_count_for_quota_uid(&self, uid: Sym) -> usize {
+        self.pending.iter().filter(|p| p.quota_uid == uid).count()
     }
 
     /// Advance one world tick and drain every `call_out` now due, ordered

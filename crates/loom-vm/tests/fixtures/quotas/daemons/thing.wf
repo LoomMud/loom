@@ -1,0 +1,8 @@
+// A `/daemons`-style shared program: no `/builders`/`/domains` prefix, so
+// its own uid is the `default_creator` fallback, `mudlib` -- an
+// always-unlimited uid (OBI-121 S2c `crate::quota::is_unlimited_uid`).
+// R1 confines a clone of this to whichever uid's guard set didn't already
+// contain `mudlib` (`workroom.wf`'s `spawn_daemon`).
+pub fn ids() -> string {
+    return $"{getuid()}/{geteuid()}"
+}

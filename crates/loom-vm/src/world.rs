@@ -324,6 +324,9 @@ pub struct World {
     /// call_out runs; tier quota *enforcement* against this uid is S2
     /// (OBI-36).
     last_call_out_quota_uid: Option<crate::security::Sym>,
+    /// `tick_share_per_min`'s per-uid sliding usage window (OBI-121 S2c):
+    /// see `TickShareWindow`.
+    tick_share: HashMap<crate::security::Sym, TickShareWindow>,
 }
 
 /// Identifies one [`World::begin_recompile`] call, so its eventual result
@@ -331,6 +334,34 @@ pub struct World {
 /// caller that asked for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecompileToken(u64);
+
+/// `tick_share_per_min`'s per-uid sliding-window tick usage (OBI-121 S2c
+/// §3). **Simplification (flagged, not hidden):** a fixed 60-second
+/// bucket that resets wholesale once it's older than 60s, not a true
+/// sliding window (no sub-minute decay) -- simpler to reason about and
+/// enough to bound a uid's ticks-per-minute; a real sliding window is a
+/// straightforward follow-up if the coarser bucket ever proves too bursty
+/// at the minute boundary.
+struct TickShareWindow {
+    window_start: std::time::Instant,
+    used: u64,
+}
+
+impl TickShareWindow {
+    fn fresh() -> TickShareWindow {
+        TickShareWindow {
+            window_start: std::time::Instant::now(),
+            used: 0,
+        }
+    }
+
+    fn roll_if_expired(&mut self) {
+        if self.window_start.elapsed() >= std::time::Duration::from_secs(60) {
+            self.window_start = std::time::Instant::now();
+            self.used = 0;
+        }
+    }
+}
 
 impl World {
     /// Boot a world from `mudlib_root`: compile and load `/secure/master.wf`.
@@ -363,6 +394,7 @@ impl World {
             roles_pending: HashMap::new(),
             roles_results: VecDeque::new(),
             last_call_out_quota_uid: None,
+            tick_share: HashMap::new(),
         };
         let mut null = NullHost;
         let sentinel = ObjectId {
@@ -370,7 +402,7 @@ impl World {
             generation: 0,
         };
         let master = w
-            .exec(&mut null, sentinel, None, None, None, None, |h| {
+            .exec(&mut null, sentinel, None, None, None, None, None, |h| {
                 h.load_object(MASTER_PATH)
             })
             .map_err(|e| BootError::Master(e.report()))?;
@@ -417,7 +449,7 @@ impl World {
             if let Some(o) = self.registry.get(ob) {
                 let conn = o.conn;
                 let this_player = conn.map(|_| ob);
-                let _ = self.exec(host, ob, this_player, conn, None, None, |h| {
+                let _ = self.exec(host, ob, this_player, conn, None, None, None, |h| {
                     h.call_apply(
                         ob,
                         "account_result",
@@ -483,7 +515,7 @@ impl World {
             if let Some(o) = self.registry.get(ob) {
                 let conn = o.conn;
                 let this_player = conn.map(|_| ob);
-                let _ = self.exec(host, ob, this_player, conn, None, None, |h| {
+                let _ = self.exec(host, ob, this_player, conn, None, None, None, |h| {
                     h.call_apply(
                         ob,
                         "roles_result",
@@ -506,6 +538,17 @@ impl World {
     /// connected user, if any — `this_player()`'s answer). `cut_guard`
     /// overrides that derived cut for a scheduled call_out, whose guard
     /// must be exactly its captured set (D-S1.7).
+    ///
+    /// `ticks_quota_uid` (OBI-121 S2c §3/§4): `None` gets the world
+    /// default `max_ticks_exec` (player input, `connect`, `disconnect`,
+    /// the account/roles result drains, and every driver-only
+    /// introspection/tooling call below) -- "the world default ... for
+    /// player input" applies even when the input travelled through a
+    /// tier-owned object (AC: "a player-input execution through a T1
+    /// object still gets the 1M-tick default"). `Some(uid)` resolves
+    /// `uid`'s owner tier's row instead: only `World::tick`'s heartbeat
+    /// (keyed on the object's own euid) and call_out (keyed on its
+    /// captured `quota_uid`) pass this.
     #[allow(clippy::too_many_arguments)]
     fn exec<T>(
         &mut self,
@@ -515,14 +558,22 @@ impl World {
         conn: Option<u64>,
         cut_guard: Option<crate::security::GuardSet>,
         input_actor: Option<crate::security::Sym>,
+        ticks_quota_uid: Option<crate::security::Sym>,
         body: impl FnOnce(&mut RegistryHost<'_>) -> Result<T, RtError>,
     ) -> Result<T, RtError> {
         self.registry.debug_assert_atomic_scope_closed();
+        let max_ticks = match ticks_quota_uid {
+            None => crate::quota::WORLD_DEFAULT_MAX_TICKS_EXEC,
+            Some(uid) => {
+                let name = self.registry.syms.name(uid).to_string();
+                crate::quota::resolve(&self.roles, &name).max_ticks_exec
+            }
+        };
         let mut rh = RegistryHost::with_driver(
             &mut self.registry,
             acting,
             self.limits.vm_limits(),
-            self.limits.max_ticks,
+            max_ticks,
             &mut self.compiler,
             host,
             this_player,
@@ -547,8 +598,50 @@ impl World {
             input_actor,
         );
         let result = body(&mut rh);
+        // OBI-121 S2c `tick_share_per_min`: charge whatever ticks this
+        // execution actually used against its quota uid's sliding window
+        // -- player input (`ticks_quota_uid: None`) never participates,
+        // per spec ("player input is never deferred").
+        if let Some(uid) = ticks_quota_uid {
+            let used = max_ticks.saturating_sub(rh.ticks_left);
+            self.record_tick_share_usage(uid, used);
+        }
         self.registry.debug_assert_atomic_scope_closed();
         result
+    }
+
+    /// `tick_share_per_min` (OBI-121 S2c §3): does `uid`'s sliding-window
+    /// usage already meet or exceed its tier's `tick_share_per_min`? A
+    /// uid with no such row (unlimited, or the row just doesn't mention
+    /// it) is never breached.
+    fn tick_share_breached(&mut self, uid: crate::security::Sym) -> bool {
+        let name = self.registry.syms.name(uid).to_string();
+        let Some(limit) = crate::quota::resolve(&self.roles, &name).tick_share_per_min else {
+            return false;
+        };
+        let w = self
+            .tick_share
+            .entry(uid)
+            .or_insert_with(TickShareWindow::fresh);
+        w.roll_if_expired();
+        if w.used >= limit {
+            let tier = self.roles.tier(&name);
+            self.registry
+                .quota_breaches
+                .record(tier, crate::quota::TICK_SHARE_PER_MIN);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_tick_share_usage(&mut self, uid: crate::security::Sym, ticks: u64) {
+        let w = self
+            .tick_share
+            .entry(uid)
+            .or_insert_with(TickShareWindow::fresh);
+        w.roll_if_expired();
+        w.used += ticks;
     }
 
     fn report(host: &mut dyn Host, conn: u64, e: &RtError) {
@@ -571,16 +664,23 @@ impl World {
             host.close(conn);
             return;
         };
-        let r = self.exec(host, master, None, Some(conn), None, None, |h| {
-            match h.call_apply(master, "connect", Vec::new())? {
+        let r = self.exec(
+            host,
+            master,
+            None,
+            Some(conn),
+            None,
+            None,
+            None,
+            |h| match h.call_apply(master, "connect", Vec::new())? {
                 Some(Value::Object(id)) if h.registry.get(id).is_some() => Ok(id),
                 Some(v) => Err(RtError::new(format!(
                     "{MASTER_PATH}: connect() must return object, got {}",
                     v.type_name()
                 ))),
                 None => Err(RtError::new(format!("{MASTER_PATH} has no connect()"))),
-            }
-        });
+            },
+        );
         let player = match r {
             Ok(p) => p,
             Err(e) => {
@@ -590,9 +690,16 @@ impl World {
             }
         };
         self.registry.bind(conn, player);
-        if let Err(e) = self.exec(host, player, Some(player), Some(conn), None, None, |h| {
-            h.call_apply(player, "logon", Vec::new())
-        }) {
+        if let Err(e) = self.exec(
+            host,
+            player,
+            Some(player),
+            Some(conn),
+            None,
+            None,
+            None,
+            |h| h.call_apply(player, "logon", Vec::new()),
+        ) {
             World::report(host, conn, &e);
         }
     }
@@ -613,15 +720,22 @@ impl World {
             return;
         };
         let actor = self.registry.get(ob).map(|o| o.euid);
-        let r = self.exec(host, ob, Some(ob), Some(conn), None, actor, |h| {
-            match h.call_apply(ob, "process_input", vec![Value::str(line)])? {
+        let r = self.exec(
+            host,
+            ob,
+            Some(ob),
+            Some(conn),
+            None,
+            actor,
+            None,
+            |h| match h.call_apply(ob, "process_input", vec![Value::str(line)])? {
                 Some(_) => Ok(()),
                 None => Err(RtError::new(format!(
                     "{} has no process_input()",
                     h.registry.obj_name(ob)
                 ))),
-            }
-        });
+            },
+        );
         if let Err(e) = r {
             World::report(host, conn, &e);
         }
@@ -636,7 +750,7 @@ impl World {
             o.conn = None;
         }
         // Errors have nowhere to go (the connection is gone).
-        let _ = self.exec(host, ob, Some(ob), None, None, None, |h| {
+        let _ = self.exec(host, ob, Some(ob), None, None, None, None, |h| {
             h.call_apply(ob, "net_dead", Vec::new())
         });
     }
@@ -677,20 +791,67 @@ impl World {
                 if self.registry.get(ob).is_none() {
                     continue; // destructed since it subscribed
                 }
-                let _ = self.exec(host, ob, None, None, None, None, |h| {
-                    h.call_apply(ob, "heartbeat", Vec::new())
-                });
+                // OBI-121 S2c: quotas are keyed on the execution's quota
+                // uid, which for a driver-started run with no roles/tier
+                // snapshot pick is the acting object's own **owner**
+                // (`Host::current_uid`/D-S1.6 -- the same field `call_out`
+                // already captures as `quota_uid`, not the current euid),
+                // so a heartbeat and a call_out from the same object are
+                // billed identically regardless of any `seteuid` in
+                // between.
+                let heartbeat_quota_uid = self
+                    .registry
+                    .get(ob)
+                    .map_or(crate::security::ROOT, |o| o.uid);
+                // `tick_share_per_min` (OBI-121 S2c §3): a heartbeat whose
+                // owner already met its ticks-per-minute share this
+                // window is deferred (skipped this cycle, retried next
+                // interval) rather than run -- never lost, per spec.
+                if self.tick_share_breached(heartbeat_quota_uid) {
+                    continue;
+                }
+                let _ = self.exec(
+                    host,
+                    ob,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(heartbeat_quota_uid),
+                    |h| h.call_apply(ob, "heartbeat", Vec::new()),
+                );
             }
         }
         for call in due {
             if self.registry.get(call.ob).is_none() {
                 continue; // destructed in the same tick it was scheduled for
             }
+            // `tick_share_per_min`: defer a due call_out the same way --
+            // re-queue it one tick out instead of running it now, rather
+            // than dropping it (spec: "deferred", not cancelled).
+            if self.tick_share_breached(call.quota_uid) {
+                self.scheduler.call_out(
+                    call.ob,
+                    1,
+                    call.func.clone(),
+                    call.args.clone(),
+                    call.guard.clone(),
+                    call.quota_uid,
+                );
+                continue;
+            }
             self.last_call_out_quota_uid = Some(call.quota_uid);
             let guard = call.guard.clone();
-            let _ = self.exec(host, call.ob, None, None, Some(guard), None, move |h| {
-                h.call_apply(call.ob, &call.func, call.args)
-            });
+            let _ = self.exec(
+                host,
+                call.ob,
+                None,
+                None,
+                Some(guard),
+                None,
+                Some(call.quota_uid),
+                move |h| h.call_apply(call.ob, &call.func, call.args),
+            );
         }
         let batch = self
             .scheduler
@@ -703,7 +864,7 @@ impl World {
                 continue; // path no longer registered at all
             };
             let master = self.master_or_sentinel();
-            let _ = self.exec(host, master, None, None, None, None, move |h| {
+            let _ = self.exec(host, master, None, None, None, None, None, move |h| {
                 // Someone may have already lazily upgraded `ob` (an
                 // ordinary access) between `upgrade_all` queuing it and
                 // this tick draining it -- `RegistryHost::upgrade` itself
@@ -821,7 +982,7 @@ impl World {
         host: &mut dyn Host,
     ) -> Result<Vec<String>, String> {
         let master = self.master_or_sentinel();
-        self.exec(host, master, None, None, None, None, |h| {
+        self.exec(host, master, None, None, None, None, None, |h| {
             Ok(h.recompile(path))
         })
         .unwrap_or_else(|e| Err(e.report()))
@@ -888,7 +1049,7 @@ impl World {
                     let begin_snapshot = job.begin_snapshot().clone();
                     let master = self.master_or_sentinel();
                     let result = self
-                        .exec(host, master, None, None, None, None, |h| {
+                        .exec(host, master, None, None, None, None, None, |h| {
                             Ok(h.finish_recompile(&root_path, &begin_snapshot, outcome))
                         })
                         .unwrap_or_else(|e| Err(e.report()));
@@ -915,7 +1076,7 @@ impl World {
     /// Load (compile + create) `path` as the driver would for a preload.
     pub fn load_object(&mut self, path: &str, host: &mut dyn Host) -> Result<ObjectId, String> {
         let master = self.master_or_sentinel();
-        self.exec(host, master, None, None, None, None, |h| {
+        self.exec(host, master, None, None, None, None, None, |h| {
             h.load_object(path)
         })
         .map_err(|e| e.report())
@@ -930,7 +1091,7 @@ impl World {
         host: &mut dyn Host,
     ) -> Result<Value, String> {
         let master = self.master_or_sentinel();
-        self.exec(host, master, None, None, None, None, |h| {
+        self.exec(host, master, None, None, None, None, None, |h| {
             h.call_apply(ob, func, args)?
                 .ok_or_else(|| RtError::new(format!("no function `{func}`")))
         })
@@ -988,6 +1149,49 @@ impl World {
     /// there is no exporter wired up yet.
     pub fn cow_copies_total(&self, program: &str) -> u64 {
         self.registry.cow_metrics.get(program)
+    }
+
+    /// `loom_tier_quota_breaches_total{tier,quota}` (OBI-121 S2c): see
+    /// `crate::quota::QuotaBreachMetrics` for where/how this is collected
+    /// and why there is no exporter wired up yet (same reasoning as
+    /// `cow_copies_total`). `quota` is one of the `crate::quota` key
+    /// constants (`max_ticks_exec`, `max_objects`, ...).
+    pub fn quota_breach_count(&self, tier: u32, quota: &str) -> u64 {
+        self.registry.quota_breaches.get(tier, quota)
+    }
+
+    /// `ob`'s owner uid (OBI-121 S2c: immutable, set at creation --
+    /// `BcObject::uid`), resolved to its name.
+    pub fn owner_uid(&self, ob: ObjectId) -> Option<&str> {
+        self.registry
+            .get(ob)
+            .map(|o| self.registry.syms.name(o.uid))
+    }
+
+    /// `ob`'s current euid, resolved to its name (tests/introspection;
+    /// `getuid`/`geteuid` are the Weft-level equivalent).
+    pub fn euid_name(&self, ob: ObjectId) -> Option<&str> {
+        self.registry
+            .get(ob)
+            .map(|o| self.registry.syms.name(o.euid))
+    }
+
+    /// Live object count currently charged to `uid` (OBI-121 S2c
+    /// `max_objects`, tests/introspection).
+    pub fn object_count_for_uid(&mut self, uid: &str) -> u64 {
+        let sym = self.registry.syms.intern(uid);
+        self.registry.object_count_for_uid(sym)
+    }
+
+    /// `program_flags(path)`'s cached result (OBI-121 S2c §7,
+    /// tests/introspection): `"confined"`/`"live"`, matching the master
+    /// apply's own vocabulary rather than exposing `bcvm::registry::
+    /// ProgramFlags` (an implementation detail) in the public API.
+    pub fn program_flags(&self, path: &str) -> &'static str {
+        match self.registry.program_flags(path) {
+            crate::bcvm::registry::ProgramFlags::Confined => "confined",
+            crate::bcvm::registry::ProgramFlags::Live => "live",
+        }
     }
 
     /// Current (deep, transitively-accounted, see `bcvm::heap::cost`)
