@@ -1162,10 +1162,12 @@ impl World {
 
     /// `ob`'s owner uid (OBI-121 S2c: immutable, set at creation --
     /// `BcObject::uid`), resolved to its name.
+    /// `ob`'s owner uid (OBI-121 S2c: immutable, set at creation --
+    /// `BcObject::owner`), resolved to its name.
     pub fn owner_uid(&self, ob: ObjectId) -> Option<&str> {
         self.registry
             .get(ob)
-            .map(|o| self.registry.syms.name(o.uid))
+            .map(|o| self.registry.syms.name(o.owner))
     }
 
     /// `ob`'s current euid, resolved to its name (tests/introspection;
@@ -1187,11 +1189,12 @@ impl World {
     /// tests/introspection): `"confined"`/`"live"`, matching the master
     /// apply's own vocabulary rather than exposing `bcvm::registry::
     /// ProgramFlags` (an implementation detail) in the public API.
+    /// `program_flags(path)`'s cached result (OBI-121 S2c §7,
+    /// tests/introspection): `"confined"`/`"live"`/`"none"`, matching the
+    /// master apply's own vocabulary rather than exposing `bcvm::registry
+    /// ::ProgramFlags` (an implementation detail) in the public API.
     pub fn program_flags(&self, path: &str) -> &'static str {
-        match self.registry.program_flags(path) {
-            crate::bcvm::registry::ProgramFlags::Confined => "confined",
-            crate::bcvm::registry::ProgramFlags::Live => "live",
-        }
+        self.registry.program_flags(path).as_str()
     }
 
     /// Current (deep, transitively-accounted, see `bcvm::heap::cost`)

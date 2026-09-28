@@ -1,0 +1,27 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Mudlib-owned player (OBI-121 S2c, CTO review B3 fixture fix): a real
+// mudlib has exactly one player program, cloned per connection, whose
+// *owner/uid* is always `mudlib` -- what tells one player from another is
+// its *euid*, set post-clone by `/secure/login`'s `seteuid`, not a
+// separate owner per account. This fixture exercises that shape directly:
+// confinement rules 2/3 must key on euid tier, not on owner/uid (`mudlib`
+// is never staff, so keying on owner/uid would make every player, staff
+// included, tier 0).
+pub fn logon() {
+    send(self, "ready\n")
+}
+
+// Called once, right after `connect()` clones this, to assign the
+// account's euid (mirrors `/secure/login`'s post-auth `seteuid`).
+pub fn set_account(e: string) {
+    seteuid(e)
+}
+
+pub fn move_into_obj(dest: object) {
+    move_to(dest)
+}
+
+pub fn net_dead() {
+}

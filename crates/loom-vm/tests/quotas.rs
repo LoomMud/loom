@@ -134,7 +134,13 @@ fn max_objects_row_denies_a_clone_once_the_apprentices_count_is_at_the_limit() {
     let e = world
         .call(workroom, "spawn_daemon", Vec::new(), &mut host)
         .unwrap_err();
-    assert!(e.contains("max_objects"), "{e}");
+    assert!(e.contains("object quota exceeded"), "{e}");
+
+    // CTO review S4: every quota denial is audited, not just counted in
+    // the metric.
+    let last = world.audit_log().last().expect("an audit entry");
+    assert!(!last.allowed);
+    assert_eq!(last.apply, "quota");
 }
 
 // -- max_heartbeats ----------------------------------------------------------
@@ -327,4 +333,72 @@ fn a_tier0_player_cannot_enter_a_confined_room() {
         .call(guest, "move_into_obj", vec![Value::Object(room)], &mut host)
         .unwrap_err();
     assert!(e.contains("tier-0 player cannot enter"), "{e}");
+}
+
+// -- CTO review B4: `program_flags` must be recomputed as part of
+// `install`, not lazily on the next `load_object`/`clone_object` -- else
+// an already-live confined object reads the fail-open default (a
+// confinement bypass) until someone happens to re-load/clone that exact
+// path -----------------------------------------------------------------
+
+#[test]
+fn recompiling_a_confined_program_keeps_its_existing_clone_confined() {
+    let (mut world, mut host) = boot();
+    let thing = world
+        .load_object("/std/confined_thing", &mut host)
+        .expect("load");
+    let room = world
+        .load_object("/std/live_room", &mut host)
+        .expect("load");
+    assert_eq!(world.program_flags("/std/confined_thing"), "confined");
+
+    // Recompile `/std/confined_thing` (a builder editing the file, no
+    // content change needed to reproduce the bug: `Registry::install`
+    // used to just drop the path's cached `program_flags`, so the next
+    // read served the fail-open default until *something* re-triggered
+    // `ensure_program_flags` -- which only `load_object`/`clone_object` do,
+    // and neither runs again in this test after the recompile).
+    world
+        .compile_object("/std/confined_thing", &mut host)
+        .expect("recompile");
+    assert_eq!(
+        world.program_flags("/std/confined_thing"),
+        "confined",
+        "recomputed as part of install, not left at the fail-open default"
+    );
+
+    let e = world
+        .call(thing, "move_into_obj", vec![Value::Object(room)], &mut host)
+        .unwrap_err();
+    assert!(
+        e.contains("live room"),
+        "still confined after the recompile: {e}"
+    );
+}
+
+// -- CTO review B2: "unlimited" (root/mudlib/domain:*) is unlimited
+// *counts*, never unlimited per-execution ticks -- a mudlib heartbeat with
+// an infinite loop must tick-exhaust at the world default, not hang the
+// driver ------------------------------------------------------------------
+
+#[test]
+fn a_mudlib_owned_heartbeat_with_an_infinite_loop_aborts_at_the_world_default() {
+    let (mut world, mut host) = boot();
+    let looper = world
+        .load_object("/daemons/looper", &mut host)
+        .expect("load");
+    assert_eq!(world.owner_uid(looper), Some("mudlib"));
+
+    world.call(looper, "on", Vec::new(), &mut host).expect("on");
+    for _ in 0..25 {
+        world.tick(&mut host);
+    }
+
+    // The infinite loop never lets the heartbeat return normally, but it
+    // must still have run (and tick-exhausted) rather than the driver
+    // hanging forever inside this one `tick`.
+    assert!(matches!(
+        world.var(looper, "heartbeat_runs"),
+        Some(Value::Int(1))
+    ));
 }
