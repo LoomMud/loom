@@ -1455,6 +1455,13 @@ pub struct RegistryHost<'a> {
     /// The object each currently-running (possibly nested) call is
     /// executing as; `self_object()` is always the top.
     self_stack: Vec<ObjectId>,
+    /// The program each nested [`RegistryHost::call_in`] handed its
+    /// interpreter as the base module, innermost last. A closure made by a
+    /// base-module frame belongs to *that* program, which is an ancestor
+    /// when the function is inherited, not to the object's leaf program
+    /// (OBI-37: pinning the leaf made an inherited closure index the wrong
+    /// module's function table).
+    base_code: Vec<Rc<CompiledProgram>>,
     /// Guard stack (OBI-35 D-S1.2): `guards.last()` is the set of distinct
     /// principals on the stack down to the nearest cut. Pushed with every
     /// `self_stack` push, by creator frames and by cuts.
@@ -1763,6 +1770,7 @@ impl<'a> RegistryHost<'a> {
         RegistryHost {
             registry,
             self_stack: vec![self_object],
+            base_code: Vec::new(),
             guards: vec![base],
             evaluating: Vec::new(),
             extra_ticks: 0,
@@ -1809,6 +1817,7 @@ impl<'a> RegistryHost<'a> {
         RegistryHost {
             registry,
             self_stack: vec![self_object],
+            base_code: Vec::new(),
             guards: vec![base],
             evaluating: Vec::new(),
             extra_ticks: 0,
@@ -3662,6 +3671,7 @@ impl<'a> RegistryHost<'a> {
             return Err(e);
         }
         self.push_self(on);
+        self.base_code.push(target.clone());
         let limits = self.limits;
         let mut ticks = self.ticks_left;
         let result = {
@@ -3669,6 +3679,7 @@ impl<'a> RegistryHost<'a> {
             interp.call(&func_name, args)
         };
         self.ticks_left = ticks;
+        self.base_code.pop();
         self.pop_self();
         result
     }
@@ -4217,8 +4228,13 @@ impl Host for RegistryHost<'_> {
         }
     }
 
-    /// See [`Host::current_program`].
+    /// See [`Host::current_program`]: the innermost `call_in`'s base
+    /// program, else (a host driven without `call_in`, e.g. unit tests)
+    /// the running object's own program.
     fn current_program(&self) -> R<Rc<dyn ProgramCode>> {
+        if let Some(p) = self.base_code.last() {
+            return Ok(p.clone() as Rc<dyn ProgramCode>);
+        }
         let id = self.self_object();
         let prog = self
             .registry
