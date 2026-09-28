@@ -61,23 +61,66 @@ the `actor` the driver passes in. See the doc comment on `Persist` in
 
 ### What's next
 
-- **Two-root approval for T4/T5 grants.** Phase 1 has no function that grants
-  tier 4 or 5; `roles_bootstrap_root` is an owner-invoked, out-of-band
-  bootstrap step. A follow-up will add the two-root approval flow from
-  design §5.11.2 ("two-root rule for T4/T5 grants") as a driver-reachable
-  path, once OBI-35's effective-principal plumbing lands.
 - Domain lifecycle (create/archive) and `staff` row removal (full demotion to
   player) are not yet covered by any `security definer` function.
-- **`roles_set_tier` assumes uid == username for new staff.** It binds a new
-  `staff` row via `accounts.username = p_target_uid`, so it only works when
-  the target's account username matches its intended uid. That assumption
-  breaks for a root created by `roles_bootstrap_root` with a uid different
-  from its account's username. A follow-up should, for *existing* staff, look
-  the account up through `staff.account_id` instead of `accounts.username`;
-  for now, new staff must be created with uid == username by convention.
 - `roles_set_member` does not reject changes to membership in an `archived`
   domain; a follow-up should add that check alongside the existing `unknown
   domain` check.
+- The two-root proposal flow (below) covers T4/T5 tier changes only.
+  Domain-lead appointment/removal at T3/T4 is unchanged from R2.
+
+## Migration 0002: two-root proposals, NOTIFY, audit_log (design OBI-36 §1, §5, §6)
+
+[OBI-119](/OBI/issues/OBI-119) (S2a) adds `crates/loom-persist/migrations/0002_roles_s2.sql`
+on top of 0001:
+
+- **Existing-staff account lookup fix (R2 follow-up).** `roles_set_tier` (and
+  the new two-root apply path) now resolve an *existing* staff row's account
+  through `staff.account_id` first, and only fall back to
+  `accounts.username` for a target that has no `staff` row yet. This fixes
+  the assumption noted in the original R2 follow-up: a uid no longer has to
+  match its account's username once it already has a `staff` row (for
+  example a root created by `roles_bootstrap_root` with uid != username).
+- **Two-root rule for T4/T5 (§6/D-S2.6).** `roles_set_tier` still rejects
+  tiers 4 and 5 outright. Two new `SECURITY DEFINER` functions implement the
+  two-root approval flow:
+  - `roles_propose_tier(actor, target_uid, new_tier, reason) -> bigint`:
+    only a T5 root may call this, only to propose granting T4/T5 or to
+    demote an existing T4/T5 account. No self-target. Inserts a row into
+    `role_proposals` (default 24 h expiry) and returns its id.
+  - `roles_approve_proposal(actor, id)`: only a T5 root, distinct from both
+    the proposer and the target, may approve an unexpired, not-yet-applied
+    proposal. It applies the tier and writes `role_changes` with a reason
+    naming both roots and the proposal id.
+  - `role_proposals` is never written directly by `loom_app`, only through
+    these two functions.
+- **`NOTIFY roles_changed`.** `AFTER INSERT OR UPDATE OR DELETE ... FOR EACH
+  STATEMENT` triggers on `staff`, `domains`, `domain_members`, `tier_policy`
+  and `grants` call `pg_notify('roles_changed', <table name>)`. This is one
+  of three refresh triggers for the driver's roles snapshot (design §1); the
+  other two (after any mutation efun, and a timer at the earliest grant
+  expiry) are S2b (loom-vm/loom-cli, OBI-120).
+- **`audit_log`.** An append-only Postgres sink for the driver's in-memory
+  audit ring (design §5). `loom_app` has `INSERT` only -- no `SELECT`,
+  `UPDATE` or `DELETE` -- so a compromised world-runtime login can add
+  entries but never read back, edit or erase them.
+
+### `Persist` API added in 0002
+
+- `load_roles_snapshot() -> RolesRows`: plain data (no `loom-vm` dependency)
+  -- `staff`, `domains`, `domain_members`, `tier_policy`, every currently
+  unexpired grant (`active_grants`), and the earliest of those grants'
+  `expires_at` (`None` if there are no active grants). `loom-vm` builds its
+  own `RolesSnapshot` from these rows (S2b).
+- `listen_roles_changed() -> mpsc::Receiver<String>`: `LISTEN roles_changed`
+  on a dedicated `PgListener`, forwarding each notification's payload (the
+  table name) on the returned channel until it errors or the receiver is
+  dropped.
+- `roles_propose_tier` / `roles_approve_proposal`: thin wrappers over the
+  SQL functions above.
+- `insert_audit_batch(&[AuditRow])`: appends a batch of audit rows in one
+  round trip (a single multi-row `INSERT`), matching the driver's
+  batched-write DB-worker pattern.
 
 ## SQLx offline metadata
 

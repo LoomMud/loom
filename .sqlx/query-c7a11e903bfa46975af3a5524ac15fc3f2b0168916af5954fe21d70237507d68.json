@@ -1,0 +1,74 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tier, max_ticks_exec, max_mem_exec_mb, tick_share_per_min, max_objects,\n                    max_heartbeats, max_callouts_obj, max_callouts_uid, disk_quota_mb,\n                    efun_classes\n             FROM tier_policy ORDER BY tier",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tier",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 1,
+        "name": "max_ticks_exec",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "max_mem_exec_mb",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "tick_share_per_min",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "max_objects",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "max_heartbeats",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "max_callouts_obj",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "max_callouts_uid",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "disk_quota_mb",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "efun_classes",
+        "type_info": "Int2Array"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "c7a11e903bfa46975af3a5524ac15fc3f2b0168916af5954fe21d70237507d68"
+}
