@@ -47,6 +47,10 @@ pub struct AuditRow {
     pub guard_set: Vec<String>,
     pub allowed: bool,
     pub detail: Option<String>,
+    /// Unix milliseconds when the decision was made (`AuditEntry::push`'s
+    /// own timestamp, not whenever a sink eventually writes the row --
+    /// CTO review, OBI-123 N2).
+    pub at_unix_ms: i64,
 }
 
 /// The `account_create`/`account_login` async backend (spec, OBI-85):
@@ -1009,6 +1013,7 @@ impl World {
                 .collect(),
             allowed: e.allowed,
             detail: e.denied_by.map(|s| self.principal_name(s).to_string()),
+            at_unix_ms: e.at_unix_ms,
         }
     }
 

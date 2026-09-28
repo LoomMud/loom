@@ -90,6 +90,8 @@ The cache is dropped whole on any of these events:
 3. **Every completed mutation**: `spawn_world_thread`'s drain loop pulses a small (`capacity 1`, coalescing) channel right after `World::deliver_roles_result` for a `DbEvent::RolesResult`.
 4. **The earliest grant expiry**: `RolesRows::earliest_grant_expiry` arms a `tokio::time::sleep` for exactly that long after each load (an hour if there are no active grants) -- the only trigger that fires with **no row change at all**, since nothing writes to Postgres when a grant's `expires_at` simply passes.
 
+None of the four can permanently stop the loop except a clean shutdown (CTO review, OBI-123 B1). A `LISTEN` failure at boot, or the listener connection dropping later (a Postgres restart, a network blip), no longer ends `run_roles_manager`: the boot load always runs regardless, the mutation and expiry triggers keep working the whole time `LISTEN` is down, and `LISTEN` itself reconnects on an exponential backoff (`next_listen_backoff`, 1s doubling up to a 30s cap), forcing an immediate reload on every successful (re)connect. `RolesSnapshot::has_grant` also checks `expires_at <= now` itself (B2) as defence in depth -- a stale, never-refreshed snapshot must not fail an expired grant open just because nothing reloaded it away yet -- but that check is a backstop, not a substitute for the loop actually staying alive.
+
 ## Per-tier quotas, ownership, and confinement (OBI-121/S2c)
 
 Normative source: [OBI-36 design note](https://paperclip.home.oberfield.net/OBI/issues/OBI-36#document-design) §3, §4, §7. Implementation: `crates/loom-vm/src/quota.rs` (resolution + the `loom_tier_quota_breaches_total{tier,quota}` counter table), `crates/loom-vm/src/bcvm/registry.rs` (every enforcement point).

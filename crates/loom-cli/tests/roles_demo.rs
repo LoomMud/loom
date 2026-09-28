@@ -363,6 +363,13 @@ fn a_roles_changed_notify_swaps_the_snapshot_and_flushes_the_security_cache() {
 /// only the expiry timer (`run_roles_manager`'s `tokio::time::sleep`
 /// branch, armed at `RolesRows::earliest_grant_expiry`) can make this
 /// happen.
+///
+/// (CTO review N4: kept the reconnect-on-`Reply::Closed` retry below even
+/// after B1's `run_roles_manager` reliability fix -- that fix is about
+/// the *server's* reload loop never permanently stopping, not about the
+/// occasional "connection closed" this test's own telnet client observed
+/// against a real, Postgres-backed server under CI load, which is a
+/// separate, still not fully root-caused symptom.)
 #[test]
 fn an_expired_grant_disappears_from_the_snapshot_without_a_restart() {
     let _serialize = serialize_db_tests();
