@@ -279,6 +279,26 @@ fn confined_object_cannot_move_into_a_live_room() {
     assert!(e.contains("live room"), "{e}");
 }
 
+/// A room the master loads from its own `create()` exists before the
+/// driver has a master to ask `program_flags` (warp's zones: every start
+/// room). It must still read as `live` once the master is up, not as a
+/// permanently cached `none` (found by warp's tier smoke test, OBI-36).
+#[test]
+fn a_room_loaded_during_master_boot_still_gets_its_live_flag() {
+    let (mut world, mut host) = boot();
+    let room = world
+        .find_object("/std/boot_live_room")
+        .expect("loaded by the master's create()");
+    let thing = world
+        .load_object("/std/confined_thing", &mut host)
+        .expect("load");
+    let e = world
+        .call(thing, "move_into_obj", vec![Value::Object(room)], &mut host)
+        .unwrap_err();
+    assert!(e.contains("live room"), "{e}");
+    assert_eq!(world.program_flags("/std/boot_live_room"), "live");
+}
+
 #[test]
 fn confined_object_cannot_move_into_a_tier0_players_inventory_but_can_into_a_staff_players() {
     let (mut world, mut host) = boot();

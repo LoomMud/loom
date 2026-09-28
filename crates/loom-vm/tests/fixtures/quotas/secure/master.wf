@@ -18,6 +18,13 @@
 // read as tier 0.
 persistent var connect_count: int = 0
 
+// Loaded while the master itself is still being created (no master yet,
+// so `program_flags` cannot be asked then): see
+// `a_room_loaded_during_master_boot_still_gets_its_live_flag`.
+fn create() {
+    load_object("/std/boot_live_room")
+}
+
 pub fn connect() -> object {
     connect_count += 1
     if connect_count == 2 {
@@ -66,7 +73,7 @@ fn program_flags(path: string) -> int {
     if path == "/std/confined_room" or path == "/std/confined_thing" {
         return 1
     }
-    if path == "/std/live_room" {
+    if path == "/std/live_room" or path == "/std/boot_live_room" {
         return 2
     }
     return 0
