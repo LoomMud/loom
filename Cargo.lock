@@ -1094,6 +1094,7 @@ dependencies = [
  "loom-compiler",
  "loom-syntax",
  "proptest",
+ "serde_json",
 ]
 
 [[package]]

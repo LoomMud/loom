@@ -42,3 +42,15 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `read_file` | `read_file(String) -> Optional(String)` | P0 | 20 |
 | `write_file` | `write_file(String, String) -> Bool` | P1 | 50 |
 | `unguarded` | `unguarded(String, Array(Any)?) -> Any` | P4 | 10 |
+| `roles_tier` | `roles_tier(String) -> Int` | P0 | 2 |
+| `roles_is_member` | `roles_is_member(String, String) -> Bool` | P0 | 2 |
+| `roles_is_lead` | `roles_is_lead(String, String) -> Bool` | P0 | 2 |
+| `roles_has_grant` | `roles_has_grant(String, String, String) -> Bool` | P0 | 3 |
+| `roles_policy` | `roles_policy(Int) -> Map(String, Int)` | P0 | 3 |
+| `roles_domains` | `roles_domains(String) -> Array(String)` | P0 | 3 |
+| `roles_set_tier` | `roles_set_tier(String, Int, String) -> Int` | P3 | 50 |
+| `roles_set_member` | `roles_set_member(String, String, String, String) -> Int` | P3 | 50 |
+| `roles_grant` | `roles_grant(String, String, String, Optional(Int), String) -> Int` | P3 | 50 |
+| `roles_revoke_grant` | `roles_revoke_grant(String, String, String, String) -> Int` | P3 | 50 |
+| `roles_propose_tier` | `roles_propose_tier(String, Int, String) -> Int` | P3 | 50 |
+| `roles_approve` | `roles_approve(Int) -> Int` | P3 | 50 |

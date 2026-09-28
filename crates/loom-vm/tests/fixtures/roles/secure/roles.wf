@@ -1,0 +1,66 @@
+// The mudlib-side facade for the roles snapshot (OBI-36 design note
+// D-S2.1/D-S2.2): every read/mutation efun is secure-only, so this is the
+// only object allowed to call them directly. `/cmds/builder/*.wf` would
+// normally wrap these with a friendly rank check in Weft (design §5); the
+// test fixture skips that layer and calls straight through.
+
+pub fn tier(uid: string) -> int {
+    return roles_tier(uid)
+}
+
+pub fn is_member(uid: string, domain: string) -> bool {
+    return roles_is_member(uid, domain)
+}
+
+pub fn is_lead(uid: string, domain: string) -> bool {
+    return roles_is_lead(uid, domain)
+}
+
+pub fn has_grant(uid: string, kind: string, target: string) -> bool {
+    return roles_has_grant(uid, kind, target)
+}
+
+pub fn policy(tier: int) -> {string: int} {
+    return roles_policy(tier)
+}
+
+pub fn domains(uid: string) -> [string] {
+    return roles_domains(uid)
+}
+
+pub fn set_tier(target: string, tier: int, reason: string) -> int {
+    return roles_set_tier(target, tier, reason)
+}
+
+pub fn set_member(domain: string, target: string, role: string, reason: string) -> int {
+    return roles_set_member(domain, target, role, reason)
+}
+
+pub fn grant(target: string, kind: string, what: string, expires_at: int?, reason: string) -> int {
+    return roles_grant(target, kind, what, expires_at, reason)
+}
+
+pub fn revoke_grant(target: string, kind: string, what: string, reason: string) -> int {
+    return roles_revoke_grant(target, kind, what, reason)
+}
+
+pub fn propose_tier(target: string, tier: int, reason: string) -> int {
+    return roles_propose_tier(target, tier, reason)
+}
+
+pub fn approve(proposal_id: int) -> int {
+    return roles_approve(proposal_id)
+}
+
+// Test-only (OBI-36 actor rule): proves a mutation is refused once the
+// actor's euid is no longer in the guard set, even though `input_actor`
+// is still set -- `unguarded` restarts the guard at this object's own
+// euid (root, since this is /secure), dropping the interactive's euid
+// that `World::input` captured at the cut.
+fn do_set_tier_cut(target: string, tier: string, reason: string) -> any {
+    return roles_set_tier(target, to_int(tier) ?? 0, reason)
+}
+
+pub fn set_tier_after_cut(target: string, tier: int, reason: string) -> int {
+    return unguarded("do_set_tier_cut", [target, $"{tier}", reason]) as int
+}

@@ -1,0 +1,54 @@
+// Minimal player for the OBI-36 S2b roles-efun tests: enough verbs to
+// drive the actor rule (`become`, `settier`, `schedcall`) and the
+// snapshot-swap/cache-flush test (`writefile`), plus `roles_result`.
+persistent var mutation_error: string? = null
+persistent var last_request: int = -1
+
+pub fn logon() {
+    send(self, "ready\n")
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "become" and len(words) == 2 {
+        seteuid(words[1])
+        send(self, "ok\n")
+    } else if verb == "settier" and len(words) == 4 {
+        let tier = to_int(words[2]) ?? 0
+        last_request = load_object("/secure/roles").set_tier(words[1], tier, words[3])
+        send(self, $"req {last_request}\n")
+    } else if verb == "schedcall" {
+        call_out("do_mutate", 1)
+        send(self, "scheduled\n")
+    } else if verb == "cutsettier" {
+        let roles = load_object("/secure/roles")
+        let req = roles.set_tier_after_cut("frodo", 2, "cut")
+        send(self, $"req {req}\n")
+    } else if verb == "writefile" and len(words) == 3 {
+        try {
+            send(self, $"{write_file(words[1], words[2])}\n")
+        } catch e {
+            send(self, $"denied: {e}\n")
+        }
+    } else if verb == "mutation_error" {
+        send(self, $"{mutation_error}\n")
+    } else {
+        send(self, "What?\n")
+    }
+}
+
+fn do_mutate() {
+    try {
+        load_object("/secure/roles").set_tier("frodo", 2, "from a call_out")
+    } catch e {
+        mutation_error = e
+    }
+}
+
+pub fn roles_result(id: int, ok: bool, detail: string) {
+    send(self, $"roles_result {id} {ok} {detail}\n")
+}
+
+pub fn net_dead() {
+}

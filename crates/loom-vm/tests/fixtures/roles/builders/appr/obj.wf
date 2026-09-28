@@ -1,0 +1,6 @@
+// A plain non-secure object (OBI-36 S2b): calls the roles read efun
+// directly (no `/secure/roles` facade) so tests can assert the
+// secure-only driver rule refuses it.
+pub fn call_roles_tier(uid: string) -> int {
+    return roles_tier(uid)
+}

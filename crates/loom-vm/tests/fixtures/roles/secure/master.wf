@@ -1,0 +1,29 @@
+// Test-only master (OBI-36 S2b): permissive except `valid_write`, which
+// is keyed on the roles snapshot's tier for the caller's own euid --
+// enough to exercise "a snapshot swap flushes the security cache, and the
+// next execution sees the new tier" (`RolesSnapshot`/`set_roles_snapshot`)
+// without needing real tier-quota enforcement (that is S2c, OBI-36's
+// per-tier quota child issue).
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return roles_tier(effective_principal()) >= 2
+}
+
+fn valid_seteuid(ob: object, e: string) -> bool {
+    return true
+}
