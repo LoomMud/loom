@@ -20,6 +20,14 @@ use uuid::Uuid;
 /// `LOOM_REQUIRE_DB=1` is set, in which case a missing required DB variable
 /// panics instead of letting the test suite silently skip DB coverage
 /// (D-27.7: CI must fail, not skip).
+///
+/// OBI-151: these tests read `LOOM_TEST_DB_MIGRATE_URL`/
+/// `LOOM_TEST_DATABASE_URL`, never the ambient `LOOM_DB_MIGRATE_URL`/
+/// `DATABASE_URL` -- agent shells export `DATABASE_URL` for Paperclip's
+/// own control-plane Postgres (OBI-150). Point these at a disposable DB
+/// (`scripts/with-disposable-postgres.sh`); `Persist::connect`/
+/// `run_migrations` also hard-fail if the URL still looks like the
+/// control-plane DB.
 fn required_env(name: &str) -> Option<String> {
     match std::env::var(name) {
         Ok(value) => Some(value),
@@ -43,12 +51,12 @@ pub struct Fixture {
 }
 
 pub async fn setup() -> Option<Fixture> {
-    let Some(migrate_url) = required_env("LOOM_DB_MIGRATE_URL") else {
-        eprintln!("skipping: LOOM_DB_MIGRATE_URL not set");
+    let Some(migrate_url) = required_env("LOOM_TEST_DB_MIGRATE_URL") else {
+        eprintln!("skipping: LOOM_TEST_DB_MIGRATE_URL not set");
         return None;
     };
-    let Some(app_url) = required_env("DATABASE_URL") else {
-        eprintln!("skipping: DATABASE_URL not set");
+    let Some(app_url) = required_env("LOOM_TEST_DATABASE_URL") else {
+        eprintln!("skipping: LOOM_TEST_DATABASE_URL not set");
         return None;
     };
 

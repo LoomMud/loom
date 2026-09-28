@@ -261,6 +261,7 @@ impl LoomServer {
             .env("LOOM_TELNET_ADDR", bind)
             .env("LOOM_HTTP_ADDR", format!("127.0.0.1:{http_port}"))
             .env_remove("DATABASE_URL")
+            .env_remove("LOOM_SMOKE_DATABASE_URL")
             .env("RUST_LOG", "")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
