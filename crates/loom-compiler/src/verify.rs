@@ -226,7 +226,7 @@ impl Cx<'_> {
                 for &e in elems {
                     self.expect_assignable(e, elem_ty)?;
                 }
-                self.expect(*dst, &Ty::array(elem_ty.as_ref().clone()))
+                self.expect(*dst, &Ty::array(elem_ty.clone()))
             }
             Op::NewMap {
                 dst,
@@ -238,10 +238,7 @@ impl Cx<'_> {
                     self.expect_assignable(*k, key_ty)?;
                     self.expect_assignable(*v, val_ty)?;
                 }
-                self.expect(
-                    *dst,
-                    &Ty::map(key_ty.as_ref().clone(), val_ty.as_ref().clone()),
-                )
+                self.expect(*dst, &Ty::map(key_ty.clone(), val_ty.clone()))
             }
             Op::Index {
                 dst,
@@ -289,7 +286,7 @@ impl Cx<'_> {
             } => {
                 self.reg(*src)?;
                 let _ = kind;
-                self.expect(*dst, &Ty::array(elem_ty.as_ref().clone()))
+                self.expect(*dst, &Ty::array(elem_ty.clone()))
             }
             Op::ToStr { dst, src } => {
                 self.reg(*src)?;

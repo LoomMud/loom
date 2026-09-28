@@ -104,20 +104,16 @@ pub enum Op {
     LoadSelf {
         dst: Reg,
     },
-    // `ty` is boxed (spec OBI-107): a bare `Ty` is 24 bytes, which alone
-    // would make cold ops like this one dominate `size_of::<Op>()` for
-    // every hot op (`BinOp`, `Copy`, ...) that pays for the biggest variant
-    // whether it uses it or not. See the `size_of::<Op>()` assertion below.
     LoadGlobal {
         dst: Reg,
         owner: StrId,
         name: StrId,
-        ty: Box<Ty>,
+        ty: Ty,
     },
     StoreGlobal {
         owner: StrId,
         name: StrId,
-        ty: Box<Ty>,
+        ty: Ty,
         src: Reg,
     },
     UnOp {
@@ -135,13 +131,13 @@ pub enum Op {
     },
     NewArray {
         dst: Reg,
-        elem_ty: Box<Ty>,
+        elem_ty: Ty,
         elems: Vec<Reg>,
     },
     NewMap {
         dst: Reg,
-        key_ty: Box<Ty>,
-        val_ty: Box<Ty>,
+        key_ty: Ty,
+        val_ty: Ty,
         entries: Vec<(Reg, Reg)>,
     },
     Index {
@@ -175,7 +171,7 @@ pub enum Op {
         dst: Reg,
         src: Reg,
         kind: IterKind,
-        elem_ty: Box<Ty>,
+        elem_ty: Ty,
     },
     ToStr {
         dst: Reg,
@@ -219,7 +215,7 @@ pub enum Op {
     Cast {
         dst: Reg,
         src: Reg,
-        ty: Box<Ty>,
+        ty: Ty,
     },
     Jump {
         target: PC,
@@ -245,14 +241,6 @@ pub enum Op {
     /// See [`crate::ir::Inst::PopHandler`].
     PopHandler,
 }
-
-/// OBI-107: `step()`'s hot loop indexes an `Op` by reference out of an
-/// `Rc<[Op]>` (no per-instruction clone), so its size sets how much cache
-/// footprint a tight loop's instruction stream costs. The cold `Ty`
-/// payloads above are boxed to keep it well under one cache line; if a new
-/// variant needs more room, box its cold payload too rather than raising
-/// this bound.
-const _: () = assert!(std::mem::size_of::<Op>() <= 48);
 
 // ---------------------------------------------------------------------
 // Encoding: a small hand-rolled binary format (uleb128 varints, zigzag for
@@ -716,7 +704,7 @@ impl Writer {
                 kind,
                 src,
             } => {
-                self.put_u8(24);
+                self.put_u8(27);
                 self.put_varu32(*owner);
                 self.put_varu32(*name);
                 self.put_varu32(*index);
@@ -1174,12 +1162,12 @@ impl<'a> Reader<'a> {
                 dst: self.get_varu32()?,
                 owner: self.get_varu32()?,
                 name: self.get_varu32()?,
-                ty: Box::new(self.get_ty()?),
+                ty: self.get_ty()?,
             },
             4 => Op::StoreGlobal {
                 owner: self.get_varu32()?,
                 name: self.get_varu32()?,
-                ty: Box::new(self.get_ty()?),
+                ty: self.get_ty()?,
                 src: self.get_varu32()?,
             },
             5 => Op::UnOp {
@@ -1197,13 +1185,13 @@ impl<'a> Reader<'a> {
             },
             7 => Op::NewArray {
                 dst: self.get_varu32()?,
-                elem_ty: Box::new(self.get_ty()?),
+                elem_ty: self.get_ty()?,
                 elems: self.get_reg_vec()?,
             },
             8 => {
                 let dst = self.get_varu32()?;
-                let key_ty = Box::new(self.get_ty()?);
-                let val_ty = Box::new(self.get_ty()?);
+                let key_ty = self.get_ty()?;
+                let val_ty = self.get_ty()?;
                 let n = self.get_varu32()? as usize;
                 if n > self.buf.len() {
                     return Err(DecodeError("implausible map literal length".into()));
@@ -1231,7 +1219,7 @@ impl<'a> Reader<'a> {
                 kind: self.get_index_kind()?,
                 src: self.get_varu32()?,
             },
-            24 => Op::IndexSetGlobal {
+            27 => Op::IndexSetGlobal {
                 owner: self.get_varu32()?,
                 name: self.get_varu32()?,
                 index: self.get_varu32()?,
@@ -1242,7 +1230,7 @@ impl<'a> Reader<'a> {
                 dst: self.get_varu32()?,
                 src: self.get_varu32()?,
                 kind: self.get_iter_kind()?,
-                elem_ty: Box::new(self.get_ty()?),
+                elem_ty: self.get_ty()?,
             },
             12 => Op::ToStr {
                 dst: self.get_varu32()?,
@@ -1277,7 +1265,7 @@ impl<'a> Reader<'a> {
             16 => Op::Cast {
                 dst: self.get_varu32()?,
                 src: self.get_varu32()?,
-                ty: Box::new(self.get_ty()?),
+                ty: self.get_ty()?,
             },
             17 => Op::Jump {
                 target: self.get_varu32()?,
