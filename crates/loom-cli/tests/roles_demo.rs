@@ -632,7 +632,12 @@ impl LoomServer {
             .expect("cargo binary path for loom-cli");
         let http_port = reserve_local_port();
         let log_path = scratch("roles-demo-log").join("server.log");
-        let log_file = std::fs::File::create(&log_path).expect("create loom serve stderr log file");
+        // `loom_obs::init_tracing`'s `fmt` layer writes to stdout, not
+        // stderr (`tracing_subscriber::fmt`'s default) -- capture both
+        // into the same file so `dump_log` actually sees the driver's
+        // `error!`/`warn!` output, not just an empty file.
+        let log_file = std::fs::File::create(&log_path).expect("create loom serve log file");
+        let log_file_2 = log_file.try_clone().expect("clone log file handle");
 
         let child = Command::new(loom_bin)
             .arg("serve")
@@ -643,8 +648,8 @@ impl LoomServer {
             .env("DATABASE_URL", database_url)
             .env("RUST_LOG", "loom_cli=debug,loom_vm=info,loom_persist=debug")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(log_file)
+            .stdout(log_file)
+            .stderr(log_file_2)
             .spawn()
             .expect("spawn loom serve");
 
@@ -675,18 +680,20 @@ impl LoomServer {
 
 impl Drop for LoomServer {
     fn drop(&mut self) {
-        match self.child.try_wait().ok().flatten() {
-            // Exited on its own (not via our own `kill()` below): almost
-            // certainly a crash, since every test either calls
-            // `assert_alive` (which already dumped the log and panicked)
-            // or runs to completion with the server still up. Dump it here
-            // too so a test that panicked on a *symptom* (a dropped
-            // connection, a timeout) still surfaces the cause.
-            Some(_) => self.dump_log(),
-            None => {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
-            }
+        let status = self.child.try_wait().ok().flatten();
+        // Dump whenever we are unwinding from a panic, regardless of
+        // whether the process had already exited on its own by this
+        // point: a bare "connection closed"/timeout panic on its own does
+        // not say *why*, and waiting for `assert_alive` to be the one
+        // place that dumps misses every panic that happens before a test
+        // ever gets there.
+        if std::thread::panicking() {
+            eprintln!("loom serve process status at drop: {status:?}");
+            self.dump_log();
+        }
+        if status.is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
     }
 }
