@@ -211,7 +211,15 @@ fn parse_gmcp(body: &[u8]) -> Option<GmcpMessage> {
         }
     };
 
-    Some(match package_message {
+    Some(classify_gmcp(package_message, payload))
+}
+
+/// Classifies an already-split `package.message` + JSON payload into a
+/// [`GmcpMessage`]. Shared by the telnet subnegotiation parser above
+/// (`parse_gmcp`) and the WebSocket JSON-envelope path (`ws.rs`), so both
+/// transports agree on which packages get a structured variant.
+pub(crate) fn classify_gmcp(package_message: &str, payload: serde_json::Value) -> GmcpMessage {
+    match package_message {
         "Core.Hello" => {
             let client = payload
                 .get("client")
@@ -232,7 +240,7 @@ fn parse_gmcp(body: &[u8]) -> Option<GmcpMessage> {
             module: other.to_string(),
             payload,
         },
-    })
+    }
 }
 
 fn string_array(value: &serde_json::Value) -> Vec<String> {

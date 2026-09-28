@@ -4,6 +4,7 @@
 //! Telnet/WebSocket networking and sessions (§8.2). Owner: Legolas.
 
 mod telnet;
+mod ws;
 
 use std::collections::HashMap;
 use std::io;
@@ -24,7 +25,7 @@ pub type ConnId = u64;
 /// particular carries a client-controlled JSON parser on the network
 /// edge, so an oversized frame gets dropped (and counted), not buffered
 /// without bound.
-const MAX_SUBNEGOTIATION_BYTES: usize = 8192;
+pub(crate) const MAX_SUBNEGOTIATION_BYTES: usize = 8192;
 
 pub const DEFAULT_TELNET_ADDR: &str = "0.0.0.0:4000";
 
@@ -122,12 +123,45 @@ struct ConnEntry {
     task: JoinHandle<()>,
 }
 
+/// Telnet-only server: no WebSocket connections ever arrive. Kept as a
+/// thin wrapper over [`run_server_with_ws`] so existing callers (and
+/// tests) don't have to thread through an unused channel.
 pub async fn run_server(
+    listener: TcpListener,
+    config: NetConfig,
+    event_tx: mpsc::Sender<NetEvent>,
+    command_rx: mpsc::Receiver<NetCommand>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> io::Result<()> {
+    // Held for the lifetime of the call so the `ws_accept_rx` select arm
+    // never sees a closed channel (which would otherwise short-circuit
+    // `tokio::select!`'s `else` branch); nothing ever sends on it.
+    let (_ws_accept_tx, ws_accept_rx) = mpsc::channel(1);
+    run_server_with_ws(
+        listener,
+        config,
+        event_tx,
+        command_rx,
+        shutdown_rx,
+        ws_accept_rx,
+    )
+    .await
+}
+
+/// Telnet server that also accepts already-upgraded WebSocket connections
+/// pushed in from `loom-http`'s `/ws` route (OBI-39). A WS connection
+/// shares this function's `ConnId` counter, its `conns` registry (so
+/// `NetCommand::Send`/`SendGmcp`/`Close` reach it exactly like a telnet
+/// connection), and therefore the same `output_queue_depth` backpressure:
+/// a slow WS reader is dropped by the same "queue full" path below as a
+/// slow telnet client, not a separate one.
+pub async fn run_server_with_ws(
     listener: TcpListener,
     config: NetConfig,
     event_tx: mpsc::Sender<NetEvent>,
     mut command_rx: mpsc::Receiver<NetCommand>,
     mut shutdown_rx: watch::Receiver<bool>,
+    mut ws_accept_rx: mpsc::Receiver<axum::extract::ws::WebSocket>,
 ) -> io::Result<()> {
     let mut next_conn_id: ConnId = 1;
     let mut conns: HashMap<ConnId, ConnEntry> = HashMap::new();
@@ -141,6 +175,25 @@ pub async fn run_server(
             }
             Some(conn_id) = closed_rx.recv() => {
                 conns.remove(&conn_id);
+            }
+            Some(socket) = ws_accept_rx.recv() => {
+                let conn_id = next_conn_id;
+                next_conn_id += 1;
+
+                debug!(conn_id, "accepted websocket connection");
+                if event_tx.send(NetEvent::Connected(conn_id)).await.is_err() {
+                    break;
+                }
+
+                let (tx, rx) = mpsc::channel(config.output_queue_depth);
+                let conn_event_tx = event_tx.clone();
+                let conn_closed_tx = closed_tx.clone();
+                let conn_config = config.clone();
+                let task = tokio::spawn(async move {
+                    ws::run_ws_connection(conn_id, socket, conn_config, rx, conn_event_tx, conn_closed_tx).await;
+                });
+
+                conns.insert(conn_id, ConnEntry { tx, task });
             }
             Some(cmd) = command_rx.recv() => {
                 match cmd {
@@ -580,8 +633,13 @@ impl TelnetCodec {
     }
 }
 
+/// Shared by the telnet codec (this file) and the WebSocket connection
+/// handler (`ws.rs`): both transports rate-limit input lines through the
+/// same token-bucket algorithm and config fields (`rate_limit_burst`,
+/// `rate_limit_per_second`), so a player can't get a materially different
+/// input rate by switching transport.
 #[derive(Debug)]
-struct TokenBucket {
+pub(crate) struct TokenBucket {
     tokens: f64,
     burst: f64,
     refill_per_second: f64,
@@ -589,7 +647,7 @@ struct TokenBucket {
 }
 
 impl TokenBucket {
-    fn new(burst: u32, refill_per_second: f64) -> Self {
+    pub(crate) fn new(burst: u32, refill_per_second: f64) -> Self {
         let burst = burst as f64;
         Self {
             tokens: burst,
@@ -599,7 +657,7 @@ impl TokenBucket {
         }
     }
 
-    fn try_take(&mut self) -> bool {
+    pub(crate) fn try_take(&mut self) -> bool {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         self.last_refill = now;

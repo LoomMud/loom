@@ -15,7 +15,15 @@ workspace = true
 [dependencies]
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.41"
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+# WebSocket message/frame types only (`axum::extract::ws`); the axum Router
+# itself lives in `loom-http`. Kept here, not re-exported, because the
+# WebSocket connection handler needs the same rate limiter, line cap and
+# output backpressure as the telnet path (`ws.rs` is a sibling of this
+# crate's telnet codec, not a wrapper around it).
+axum = { version = "0.8.4", default-features = false, features = ["ws"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
