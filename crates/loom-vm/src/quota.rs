@@ -6,10 +6,22 @@
 //! Quotas are resolved from the S2 [`crate::roles::RolesSnapshot`]
 //! (`tier_policy`), keyed on a uid: `root`, `mudlib` and `domain:*` are
 //! always unlimited (never staff-owned, never billed), everyone else gets
-//! their [`RolesSnapshot::tier`]'s policy row, falling back to the world
-//! default for `max_ticks_exec`/`max_mem_exec_mb` (the two quotas every
-//! execution/object always has a finite value for) and to "no limit" for
-//! every count-based quota the row does not mention.
+//! their [`RolesSnapshot::tier`]'s policy row, falling back to the
+//! *configured* [`Defaults`] for `max_ticks_exec`/`max_mem_exec_mb` (the
+//! two quotas every execution/object always has a finite value for) and
+//! to "no limit" for every count-based quota the row does not mention.
+//!
+//! **The world default is `Limits::default()`'s own values, passed in by
+//! the caller as [`Defaults`], not a hardcoded constant baked into this
+//! module** (CTO review N5): a world that configures a different
+//! `Limits::max_ticks`/`mem_quota_bytes` (e.g. `loom-vm`'s own
+//! `examples/vm_bench.rs`, which raises the tick budget to benchmark
+//! heavier workloads) must see that reflected in every tier-resolved
+//! quota too, not just the `ticks_quota_uid: None` (player-input) path
+//! `World::exec` already handles directly. [`WORLD_DEFAULT_MAX_TICKS_EXEC`]/
+//! [`WORLD_DEFAULT_MAX_MEM_EXEC_MB`] still exist, but only as the spec's
+//! literal numbers and `Limits::default()`'s own initialisers -- nothing
+//! in this module reads them directly any more.
 //!
 //! `bcvm::registry::RegistryHost` and `World` are the enforcement points:
 //! see `RegistryHost::instantiate` (R1 + `max_objects`), `store_global`
@@ -22,10 +34,11 @@ use std::collections::HashMap;
 
 use crate::roles::RolesSnapshot;
 
-/// World default `max_ticks_exec` (spec: "the world default (1M ticks /
-/// 16 MB) for player input and for non-staff uids").
+/// The spec's literal world-default numbers ("the world default (1M
+/// ticks / 16 MB)"). Only ever read as `Limits::default()`'s own
+/// initialisers -- see the module doc for why [`resolve`]/[`TierQuotas::
+/// unlimited`] do not reference these directly (CTO review N5).
 pub const WORLD_DEFAULT_MAX_TICKS_EXEC: u64 = 1_000_000;
-/// World default `max_mem_exec_mb`.
 pub const WORLD_DEFAULT_MAX_MEM_EXEC_MB: u64 = 16;
 
 pub const MB: u64 = 1024 * 1024;
@@ -40,6 +53,34 @@ pub const MAX_HEARTBEATS: &str = "max_heartbeats";
 pub const MAX_CALLOUTS_OBJ: &str = "max_callouts_obj";
 pub const MAX_CALLOUTS_UID: &str = "max_callouts_uid";
 pub const DISK_QUOTA_MB: &str = "disk_quota_mb";
+
+/// The two always-finite quotas' configured world defaults (CTO review
+/// N5): `Limits::max_ticks` and `Limits::mem_quota_bytes` (converted to
+/// whole MB, rounding down -- a sub-MB configured default is not a shape
+/// this quota model represents; `Limits::default()`'s own 16 MB is exact).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Defaults {
+    pub max_ticks_exec: u64,
+    pub max_mem_exec_mb: u64,
+}
+
+impl Defaults {
+    pub fn from_limits(max_ticks: u64, mem_quota_bytes: u64) -> Defaults {
+        Defaults {
+            max_ticks_exec: max_ticks,
+            max_mem_exec_mb: (mem_quota_bytes / MB).max(1),
+        }
+    }
+}
+
+impl Default for Defaults {
+    fn default() -> Defaults {
+        Defaults {
+            max_ticks_exec: WORLD_DEFAULT_MAX_TICKS_EXEC,
+            max_mem_exec_mb: WORLD_DEFAULT_MAX_MEM_EXEC_MB,
+        }
+    }
+}
 
 /// `root`, `mudlib` and every `domain:*` uid are always unlimited (spec:
 /// "unlimited counts for `root`/`mudlib`/`domain:*`"). A pure string test
@@ -68,19 +109,19 @@ pub struct TierQuotas {
 }
 
 impl TierQuotas {
-    /// **Unlimited counts, but still the world default for the two
-    /// per-execution limits** (spec §3/§4: "`root`, `mudlib`, `domain:*`
-    /// and players: the world default for per-execution limits and
-    /// unlimited counts"). A `u64::MAX` tick/mem budget here would let a
-    /// single mudlib heartbeat or call_out with a `while (1) {}` bug hang
-    /// the whole driver -- a liveness regression the design note does not
-    /// ask for (CTO review, OBI-121 B2). Per-execution limits are *never*
+    /// **Unlimited counts, but still `defaults` for the two per-execution
+    /// limits** (spec §3/§4: "`root`, `mudlib`, `domain:*` and players:
+    /// the world default for per-execution limits and unlimited counts").
+    /// A `u64::MAX` tick/mem budget here would let a single mudlib
+    /// heartbeat or call_out with a `while (1) {}` bug hang the whole
+    /// driver -- a liveness regression the design note does not ask for
+    /// (CTO review, OBI-121 B2). Per-execution limits are *never*
     /// unbounded; only the counts (objects, heartbeats, call_outs, disk)
     /// are.
-    pub fn unlimited() -> TierQuotas {
+    pub fn unlimited(defaults: Defaults) -> TierQuotas {
         TierQuotas {
-            max_ticks_exec: WORLD_DEFAULT_MAX_TICKS_EXEC,
-            max_mem_exec_mb: WORLD_DEFAULT_MAX_MEM_EXEC_MB,
+            max_ticks_exec: defaults.max_ticks_exec,
+            max_mem_exec_mb: defaults.max_mem_exec_mb,
             tick_share_per_min: None,
             max_objects: None,
             max_heartbeats: None,
@@ -99,13 +140,12 @@ impl TierQuotas {
 
 /// Resolve `uid`'s effective quota set from `roles` (spec §3/§4). Always
 /// unlimited for `root`/`mudlib`/`domain:*`; otherwise `roles.tier(uid)`'s
-/// policy row, falling back to the world default for the two
-/// always-finite quotas and to "no limit" for every count-based one the
-/// row omits.
+/// policy row, falling back to `defaults` for the two always-finite
+/// quotas and to "no limit" for every count-based one the row omits.
 #[inline]
-pub fn resolve(roles: &RolesSnapshot, uid: &str) -> TierQuotas {
+pub fn resolve(roles: &RolesSnapshot, uid: &str, defaults: Defaults) -> TierQuotas {
     if is_unlimited_uid(uid) {
-        return TierQuotas::unlimited();
+        return TierQuotas::unlimited(defaults);
     }
     let tier = roles.tier(uid);
     // `policy_row` (a borrow), not `policy` (an owned `HashMap` clone with
@@ -122,8 +162,8 @@ pub fn resolve(roles: &RolesSnapshot, uid: &str) -> TierQuotas {
             .map(|v| v as u64)
     };
     TierQuotas {
-        max_ticks_exec: pos_u64(MAX_TICKS_EXEC).unwrap_or(WORLD_DEFAULT_MAX_TICKS_EXEC),
-        max_mem_exec_mb: pos_u64(MAX_MEM_EXEC_MB).unwrap_or(WORLD_DEFAULT_MAX_MEM_EXEC_MB),
+        max_ticks_exec: pos_u64(MAX_TICKS_EXEC).unwrap_or(defaults.max_ticks_exec),
+        max_mem_exec_mb: pos_u64(MAX_MEM_EXEC_MB).unwrap_or(defaults.max_mem_exec_mb),
         tick_share_per_min: pos_u64(TICK_SHARE_PER_MIN),
         max_objects: pos_u64(MAX_OBJECTS),
         max_heartbeats: pos_u64(MAX_HEARTBEATS),
@@ -170,8 +210,8 @@ mod tests {
     fn unlimited_uids_never_consult_the_snapshot() {
         for uid in ["root", "mudlib", "domain:shire", "domain:"] {
             assert_eq!(
-                resolve(&RolesSnapshot::empty(), uid),
-                TierQuotas::unlimited()
+                resolve(&RolesSnapshot::empty(), uid, Defaults::default()),
+                TierQuotas::unlimited(Defaults::default())
             );
         }
         assert!(!is_unlimited_uid("appr"));
@@ -183,18 +223,36 @@ mod tests {
         // OBI-121 B2: unlimited *counts*, not unlimited ticks/mem -- a
         // mudlib heartbeat with an infinite loop must still abort at the
         // world default rather than hang the driver.
-        let q = TierQuotas::unlimited();
+        let q = TierQuotas::unlimited(Defaults::default());
         assert_eq!(q.max_ticks_exec, WORLD_DEFAULT_MAX_TICKS_EXEC);
         assert_eq!(q.max_mem_exec_mb, WORLD_DEFAULT_MAX_MEM_EXEC_MB);
         assert_eq!(q.max_objects, None);
     }
 
     #[test]
+    fn unlimited_uids_honour_a_non_default_configured_default_too() {
+        // CTO review N5: the *configured* default, not the hardcoded
+        // constant.
+        let d = Defaults::from_limits(500_000, 4 * MB);
+        let q = TierQuotas::unlimited(d);
+        assert_eq!(q.max_ticks_exec, 500_000);
+        assert_eq!(q.max_mem_exec_mb, 4);
+    }
+
+    #[test]
     fn non_staff_uid_gets_the_world_default() {
-        let q = resolve(&RolesSnapshot::empty(), "appr");
+        let q = resolve(&RolesSnapshot::empty(), "appr", Defaults::default());
         assert_eq!(q.max_ticks_exec, WORLD_DEFAULT_MAX_TICKS_EXEC);
         assert_eq!(q.max_mem_exec_mb, WORLD_DEFAULT_MAX_MEM_EXEC_MB);
         assert_eq!(q.max_objects, None);
+    }
+
+    #[test]
+    fn non_staff_uid_honours_a_non_default_configured_default_too() {
+        let d = Defaults::from_limits(500_000, 4 * MB);
+        let q = resolve(&RolesSnapshot::empty(), "appr", d);
+        assert_eq!(q.max_ticks_exec, 500_000);
+        assert_eq!(q.max_mem_exec_mb, 4);
     }
 
     #[test]
@@ -207,7 +265,7 @@ mod tests {
         tp.insert(1u32, row);
         let mut staff = Map::new();
         staff.insert("appr".to_string(), 1u32);
-        let q = resolve(&snap(tp, staff), "appr");
+        let q = resolve(&snap(tp, staff), "appr", Defaults::default());
         assert_eq!(q.max_ticks_exec, 50_000);
         assert_eq!(q.max_mem_exec_mb, 2);
         assert_eq!(q.max_mem_exec_bytes(), 2 * MB);

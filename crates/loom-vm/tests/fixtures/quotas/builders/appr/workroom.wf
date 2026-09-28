@@ -30,3 +30,12 @@ pub fn spawn_daemon() -> object {
 pub fn write_disk(p: string, text: string) -> bool {
     return write_file(p, text)
 }
+
+// CTO review N4 fixture: calls through a mudlib-owned `/std` helper
+// (`spawn_via_helper`) so the test can prove `caller_quota_uid` ranks
+// `appr` (T1) over `mudlib` (an always-unlimited uid, tier 0 in the
+// snapshot but never billable) when picking whose quota the helper's own
+// `clone_object`/`call_out` are charged to.
+pub fn spawn_via_helper(path: string) -> object {
+    return load_object("/std/helper").clone_and_schedule(path)
+}

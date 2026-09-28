@@ -1,0 +1,11 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// An ordinary (unflagged, `program_flags` returns `NONE` for anything not
+// explicitly listed by the fixture master) container, used by the N2 (CTO
+// review) confinement chain test: a confined item must not reach a
+// tier-0 player by being moved into a bag that is itself in that
+// player's inventory, even though the bag is not itself a player.
+pub fn move_into_obj(dest: object) {
+    move_to(dest)
+}

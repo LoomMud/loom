@@ -1,0 +1,10 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Owner `senior` (from the `/builders/senior/**` convention): a program
+// owned by a *different* builder than the apprentice, used by the N4
+// (CTO review) fixture to prove R1 confines a clone made through a
+// mudlib-owned helper to the *calling apprentice*, not to `senior`.
+pub fn ids() -> string {
+    return $"{getuid()}/{geteuid()}"
+}

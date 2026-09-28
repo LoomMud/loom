@@ -313,6 +313,13 @@ pub struct World {
     /// stays valid for the execution it was built for even if a new
     /// snapshot lands the instant after.
     roles: Arc<RolesSnapshot>,
+    /// Bumped by every [`World::set_roles_snapshot`] (OBI-121 S2c N1): a
+    /// monotonic counter, not the snapshot `Arc`'s own pointer -- an
+    /// `Arc`'s address can be reused after it is dropped (ABA), so a
+    /// per-object cache keyed on it (`BcObject::mem_quota_cache`) could
+    /// wrongly serve a stale value after two swaps land back-to-back at
+    /// the same address. A `u64` counter cannot repeat within a boot.
+    roles_generation: u64,
     /// `roles_set_tier`/... (OBI-36 D-S2.2): see `RolesCtx`.
     roles_backend: Box<dyn RolesMutations>,
     roles_next_id: u64,
@@ -389,6 +396,7 @@ impl World {
             account_results: VecDeque::new(),
             security: SecurityState::new(),
             roles: Arc::new(RolesSnapshot::empty()),
+            roles_generation: 0,
             roles_backend: Box::new(NullRolesMutations),
             roles_next_id: 0,
             roles_pending: HashMap::new(),
@@ -472,6 +480,7 @@ impl World {
     /// among loaded grants.
     pub fn set_roles_snapshot(&mut self, snap: Arc<RolesSnapshot>) {
         self.roles = snap;
+        self.roles_generation += 1;
         self.flush_security_cache();
     }
 
@@ -574,7 +583,11 @@ impl World {
             None => self.limits.max_ticks,
             Some(uid) => {
                 let name = self.registry.syms.name(uid).to_string();
-                crate::quota::resolve(&self.roles, &name).max_ticks_exec
+                let defaults = crate::quota::Defaults::from_limits(
+                    self.limits.max_ticks,
+                    self.limits.mem_quota_bytes,
+                );
+                crate::quota::resolve(&self.roles, &name, defaults).max_ticks_exec
             }
         };
         let mut rh = RegistryHost::with_driver(
@@ -596,6 +609,7 @@ impl World {
             },
             &mut self.security,
             self.roles.clone(),
+            self.roles_generation,
             crate::world::RolesCtx {
                 next_id: &mut self.roles_next_id,
                 pending: &mut self.roles_pending,
@@ -624,7 +638,10 @@ impl World {
     /// it) is never breached.
     fn tick_share_breached(&mut self, uid: crate::security::Sym) -> bool {
         let name = self.registry.syms.name(uid).to_string();
-        let Some(limit) = crate::quota::resolve(&self.roles, &name).tick_share_per_min else {
+        let defaults =
+            crate::quota::Defaults::from_limits(self.limits.max_ticks, self.limits.mem_quota_bytes);
+        let Some(limit) = crate::quota::resolve(&self.roles, &name, defaults).tick_share_per_min
+        else {
             return false;
         };
         let w = self
@@ -799,18 +816,21 @@ impl World {
                 if self.registry.get(ob).is_none() {
                     continue; // destructed since it subscribed
                 }
-                // OBI-121 S2c: quotas are keyed on the execution's quota
-                // uid, which for a driver-started run with no roles/tier
-                // snapshot pick is the acting object's own **owner**
-                // (`Host::current_uid`/D-S1.6 -- the same field `call_out`
-                // already captures as `quota_uid`, not the current euid),
-                // so a heartbeat and a call_out from the same object are
+                // OBI-121 S2c (CTO review N3): quotas are keyed on the
+                // execution's quota uid, which for a driver-started run
+                // with no roles/tier snapshot pick is the acting object's
+                // own **owner** (not `uid` -- an R1 clone's `uid` stays
+                // the program's declared uid, but its billing identity is
+                // `owner`; keying this on `uid` would let an R1 clone's
+                // heartbeat usage escape back onto the program uid,
+                // exactly the evasion R1 was meant to close), so a
+                // heartbeat and a call_out from the same object are
                 // billed identically regardless of any `seteuid` in
                 // between.
                 let heartbeat_quota_uid = self
                     .registry
                     .get(ob)
-                    .map_or(crate::security::ROOT, |o| o.uid);
+                    .map_or(crate::security::ROOT, |o| o.owner);
                 // `tick_share_per_min` (OBI-121 S2c §3): a heartbeat whose
                 // owner already met its ticks-per-minute share this
                 // window is deferred (skipped this cycle, retried next

@@ -822,15 +822,17 @@ pub struct BcObject {
     /// `uid`.
     pub owner: Sym,
     /// `mem_quota_bytes_for(owner)`'s result, cached (OBI-121 S2c CTO
-    /// review, V7 bench gate follow-up): keyed on the roles snapshot's own
-    /// `Arc` identity, so it never needs invalidating explicitly -- a
-    /// `World::set_roles_snapshot` swap installs a new `Arc`, whose
-    /// address can never match a stale cache entry. `store_global` is a
-    /// hot loop (a tight global-array index-write is O(1) per write, spec
-    /// r5 §5.2.1/OBI-80); re-resolving the owner's tier/policy row
-    /// through the roles snapshot on every single write was a measured
-    /// regression against the pre-quota baseline.
-    pub mem_quota_cache: std::cell::Cell<Option<(usize, u64)>>,
+    /// review, V7 bench gate follow-up): keyed on `World::roles_generation`
+    /// (a monotonic counter), not the roles snapshot's own `Arc` pointer
+    /// (N1: an `Arc`'s address can be reused after it is dropped -- ABA --
+    /// so a pointer-keyed cache could wrongly serve a stale value after
+    /// two snapshot swaps land back-to-back at the same address; a `u64`
+    /// counter cannot repeat within a boot). `store_global` is a hot loop
+    /// (a tight global-array index-write is O(1) per write, spec r5
+    /// §5.2.1/OBI-80); re-resolving the owner's tier/policy row through
+    /// the roles snapshot on every single write was a measured regression
+    /// against the pre-quota baseline.
+    pub mem_quota_cache: std::cell::Cell<Option<(u64, u64)>>,
 }
 
 impl BcObject {
@@ -1011,7 +1013,8 @@ pub struct Registry {
     /// called at most once per path per compile (`RegistryHost::
     /// ensure_program_flags`, invalidated by `Registry::install` whenever
     /// that path is recompiled). Absent means "never asked yet" -- the
-    /// getter [`Registry::program_flags`] treats that the same as `Live`.
+    /// getter [`Registry::program_flags`] treats that the same as
+    /// [`ProgramFlags::NONE`].
     program_flags_cache: HashMap<String, ProgramFlags>,
     /// Live object count per owner uid (OBI-121 S2c `max_objects`), kept
     /// only for uids [`crate::quota::is_unlimited_uid`] says are not
@@ -1146,8 +1149,9 @@ impl Registry {
     }
 
     /// `program_flags(path)`'s cached result (OBI-121 S2c §7):
-    /// [`ProgramFlags::Live`] if never computed (or the path is not
-    /// registered at all).
+    /// [`ProgramFlags::NONE`] if never computed (or the path is not
+    /// registered at all) -- the fail-open default, not `Live` (CTO
+    /// review B4/N nits).
     pub fn program_flags(&self, path: &str) -> ProgramFlags {
         self.program_flags_cache
             .get(path)
@@ -1174,6 +1178,14 @@ impl Registry {
                 self.program_flags_cache.remove(path);
             }
         }
+    }
+
+    /// Drop every cached `program_flags` result (CTO review nit): used by
+    /// `RegistryHost::install` when `/secure/master` itself is one of the
+    /// recompiled paths, since every entry -- not only the recompiled
+    /// ones -- was computed by calling the *old* master's apply.
+    fn clear_program_flags_cache(&mut self) {
+        self.program_flags_cache.clear();
     }
 
     /// Every live object id (mirrors `crate::object::ObjectTable::ids`),
@@ -1508,6 +1520,11 @@ struct Driver<'a> {
     /// (an `Arc` bump) into every `RegistryHost` so a snapshot swap mid-way
     /// through some other execution never changes what *this* one sees.
     roles: std::sync::Arc<crate::roles::RolesSnapshot>,
+    /// `World::roles_generation` as of this snapshot (OBI-121 S2c N1):
+    /// what `BcObject::mem_quota_cache` keys on instead of `roles`'s own
+    /// `Arc` pointer (which can be reused after a drop -- ABA -- while a
+    /// `u64` counter cannot repeat within a boot).
+    roles_generation: u64,
     /// `roles_set_tier`/... bookkeeping (OBI-36 D-S2.2), owned by `World`;
     /// see `crate::world::RolesCtx`.
     roles_ctx: crate::world::RolesCtx<'a>,
@@ -1774,6 +1791,7 @@ impl<'a> RegistryHost<'a> {
         accounts: crate::world::AccountsCtx<'a>,
         security: &'a mut SecurityState,
         roles: std::sync::Arc<crate::roles::RolesSnapshot>,
+        roles_generation: u64,
         roles_ctx: crate::world::RolesCtx<'a>,
         cut_guard: Option<GuardSet>,
         input_actor: Option<Sym>,
@@ -1800,6 +1818,7 @@ impl<'a> RegistryHost<'a> {
                 accounts,
                 security,
                 roles,
+                roles_generation,
                 roles_ctx,
                 input_actor,
                 root,
@@ -1872,8 +1891,8 @@ impl<'a> RegistryHost<'a> {
     /// at most once per path (until the next recompile of it,
     /// `RegistryHost::install`). A no-op with no master (boot, or the
     /// driver-less unit tests in this module): `Registry::program_flags`
-    /// then defaults every path to `Live`, same as an explicit apply that
-    /// returned anything but `1`.
+    /// then defaults every path to [`ProgramFlags::NONE`], same as an
+    /// explicit apply that returned anything but `1`/`2`.
     /// `program_flags(path)` (OBI-121 S2c §7) fail-open default: with no
     /// master (boot, or the driver-less unit tests in this module),
     /// `Registry::program_flags` defaults every path to `ProgramFlags::
@@ -2008,19 +2027,43 @@ impl<'a> RegistryHost<'a> {
             .expect("guards is never empty while a Host call is in flight")
     }
 
-    /// "The caller's quota uid" (OBI-121 S2c §4, CTO review B1): **the
-    /// lowest-tier principal in the current guard set, ties broken by the
-    /// most recently pushed frame.** This is what R1 (`instantiate`) and
-    /// `call_out`'s `quota_uid` capture must use, not `Host::current_uid`'s
-    /// bare "whichever object is running right now" -- a chain like
-    /// `apprentice_obj.call_other(staff_obj, "clone_it")` must still bill
-    /// the apprentice even though `staff_obj` is the immediate caller when
-    /// `instantiate` runs, because the apprentice's principal is still on
-    /// the (uncut) guard stack.
+    /// `crate::quota::Defaults` for every `quota::resolve` call in this
+    /// file (CTO review N5): all of them (`max_objects`, `max_heartbeats`,
+    /// `max_callouts_obj`/`max_callouts_uid`, `max_mem_exec_mb`,
+    /// `disk_quota_mb`) only ever read a count field or
+    /// `max_mem_exec_bytes()`, never `max_ticks_exec`, so the tick side of
+    /// `Defaults` here is a placeholder, not a real fallback -- the two
+    /// call sites that *do* read `max_ticks_exec` (`World::exec`'s
+    /// tier-resolved tick budget, `World::tick_share_breached`) build
+    /// their own `Defaults` directly from `self.limits.max_ticks`, since
+    /// only `World` (not `RegistryHost`) has that field. The mem side is
+    /// real: `self.limits.mem_quota_bytes`, the same configured default
+    /// `store_global` used before this quota model existed.
+    fn quota_defaults(&self) -> crate::quota::Defaults {
+        crate::quota::Defaults::from_limits(
+            crate::quota::WORLD_DEFAULT_MAX_TICKS_EXEC,
+            self.limits.mem_quota_bytes,
+        )
+    }
+
+    /// "The caller's quota uid" (OBI-121 S2c §4, CTO review B1/N4): **the
+    /// lowest-tier *billable* principal in the current guard set, ties
+    /// broken by the most recently pushed frame.** "Billable" excludes
+    /// every always-unlimited uid (`root`/`mudlib`/`domain:*`,
+    /// `crate::quota::is_unlimited_uid`) from the ranking entirely (N4:
+    /// `RolesSnapshot::tier` returns 0 -- the *lowest* tier -- for any uid
+    /// with no `staff` row, and that includes every unlimited uid, so
+    /// ranking them alongside real tiers let an apprentice's call through
+    /// any `/std`/`/daemons` helper come out as `mudlib`'s quota uid
+    /// instead of the apprentice's own -- exactly the evasion R1/this
+    /// method exist to close). A tier-0 *player* (a real, billed uid whose
+    /// tier just happens to be 0) still correctly outranks an apprentice.
     ///
     /// Falls back to `Host::current_uid` (the self object's own uid) with
-    /// no driver/roles snapshot available (unit tests) or an empty guard
-    /// set (an all-root call chain has no principal to rank).
+    /// no driver/roles snapshot available (unit tests), an empty guard set
+    /// (an all-root call chain has no principal to rank), or when *every*
+    /// principal on the guard is an unlimited uid (nothing billable to
+    /// pick).
     fn caller_quota_uid(&self) -> Sym {
         let guard = self.top_guard();
         if guard.is_empty() {
@@ -2032,6 +2075,9 @@ impl<'a> RegistryHost<'a> {
         let mut best: Option<(u32, Sym)> = None;
         for p in guard.principals() {
             let name = self.registry.syms.name(p.euid);
+            if crate::quota::is_unlimited_uid(name) {
+                continue;
+            }
             let tier = driver.roles.tier(name);
             // `<=` so a later (more recently pushed) frame wins a tie,
             // per spec ("ties to the most recent frame") -- push order
@@ -2134,7 +2180,7 @@ impl<'a> RegistryHost<'a> {
             return Ok(());
         }
         let tier = driver.roles.tier(&name);
-        let q = crate::quota::resolve(&driver.roles, &name);
+        let q = crate::quota::resolve(&driver.roles, &name, self.quota_defaults());
         let Some(max) = q.max_objects else {
             return Ok(());
         };
@@ -2163,7 +2209,9 @@ impl<'a> RegistryHost<'a> {
         let me_name = self.registry.syms.name(me_uid).to_string();
         if !crate::quota::is_unlimited_uid(&me_name) {
             let tier = driver.roles.tier(&me_name);
-            if let Some(max) = crate::quota::resolve(&driver.roles, &me_name).max_callouts_obj {
+            if let Some(max) = crate::quota::resolve(&driver.roles, &me_name, self.quota_defaults())
+                .max_callouts_obj
+            {
                 let current = driver.scheduler.pending_count_for_obj(me) as u64;
                 if current >= max {
                     self.registry
@@ -2180,7 +2228,10 @@ impl<'a> RegistryHost<'a> {
         if !crate::quota::is_unlimited_uid(&uid_name) {
             let driver = self.driver.as_ref().expect("checked above");
             let tier = driver.roles.tier(&uid_name);
-            if let Some(max) = crate::quota::resolve(&driver.roles, &uid_name).max_callouts_uid {
+            if let Some(max) =
+                crate::quota::resolve(&driver.roles, &uid_name, self.quota_defaults())
+                    .max_callouts_uid
+            {
                 let current = driver.scheduler.pending_count_for_quota_uid(quota_uid) as u64;
                 if current >= max {
                     self.registry
@@ -2210,7 +2261,9 @@ impl<'a> RegistryHost<'a> {
             return Ok(());
         }
         let tier = driver.roles.tier(&name);
-        let Some(max) = crate::quota::resolve(&driver.roles, &name).max_heartbeats else {
+        let Some(max) =
+            crate::quota::resolve(&driver.roles, &name, self.quota_defaults()).max_heartbeats
+        else {
             return Ok(());
         };
         let already_on = driver.scheduler.heartbeat_targets().contains(&me);
@@ -2247,7 +2300,7 @@ impl<'a> RegistryHost<'a> {
             return self.limits.mem_quota_bytes;
         };
         let name = self.registry.syms.name(uid);
-        crate::quota::resolve(&driver.roles, name).max_mem_exec_bytes()
+        crate::quota::resolve(&driver.roles, name, self.quota_defaults()).max_mem_exec_bytes()
     }
 
     /// Bump `loom_tier_quota_breaches_total{tier,max_mem_exec_mb}` for a
@@ -2286,7 +2339,9 @@ impl<'a> RegistryHost<'a> {
             return Ok(());
         }
         let tier = driver.roles.tier(u);
-        let Some(max_mb) = crate::quota::resolve(&driver.roles, u).disk_quota_mb else {
+        let Some(max_mb) =
+            crate::quota::resolve(&driver.roles, u, self.quota_defaults()).disk_quota_mb
+        else {
             return Ok(());
         };
         let root = driver.root.clone();
@@ -3717,8 +3772,22 @@ impl<'a> RegistryHost<'a> {
         // existing instance, so recomputing it here closes the gap for
         // all of them at once).
         let paths: Vec<String> = new_set.keys().cloned().collect();
-        for path in &paths {
-            self.registry.set_program_flags(path, None);
+        // If `/secure/master` itself is being recompiled, every cached
+        // `program_flags` entry -- not only the recompiled paths -- came
+        // from calling the *old* master's apply, so drop the whole cache
+        // (CTO review nit) rather than just the paths in `new_set`.
+        let master_recompiled = self
+            .driver
+            .as_ref()
+            .and_then(|d| d.master)
+            .and_then(|m| self.registry.get(m))
+            .is_some_and(|o| new_set.contains_key(o.program.path.as_ref()));
+        if master_recompiled {
+            self.registry.clear_program_flags_cache();
+        } else {
+            for path in &paths {
+                self.registry.set_program_flags(path, None);
+            }
         }
         for path in &paths {
             self.ensure_program_flags(path);
@@ -4012,33 +4081,29 @@ impl Host for RegistryHost<'_> {
             .unwrap_or(Value::Null))
     }
 
-    /// The effective per-object vars quota (bytes) for an object whose
-    /// owner is `uid` (OBI-121 S2c: `max_mem_exec_mb`, "applied as the
-    /// per-object vars limit by the owner's tier"). Without a driver
-    /// (unit tests), falls back to `self.limits.mem_quota_bytes` --
-    /// preserves the pre-OBI-121 test contract of a fixed quota set
-    /// directly on `Limits`.
+    /// The memory quota this write must respect (OBI-121 S2c §3/§4:
+    /// `max_mem_exec_mb`, "applied as the per-object vars limit by the
+    /// owner's tier"), cached on the object (`BcObject::mem_quota_cache`,
+    /// V7 bench gate follow-up: re-resolving the owner's tier/policy row
+    /// through the roles snapshot on every single write was a measured
+    /// regression against the pre-quota baseline on a tight global-array
+    /// index-write loop) and keyed on `World::roles_generation`, not the
+    /// snapshot `Arc`'s own address (N1: an `Arc` can be reused after a
+    /// drop, so a pointer-keyed cache has an ABA problem a monotonic
+    /// counter does not).
     fn store_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
         let self_id = self.self_object();
         let quota = match self.registry.get(self_id) {
             None => self.limits.mem_quota_bytes,
             Some(o) => {
-                // Cached (`BcObject::mem_quota_cache`, V7 bench gate
-                // follow-up): re-resolving the owner's tier/policy row on
-                // every single write was a measured regression against
-                // the pre-quota baseline on a tight global-array
-                // index-write loop.
-                let roles_ptr = self
-                    .driver
-                    .as_ref()
-                    .map(|d| std::sync::Arc::as_ptr(&d.roles) as usize);
-                match (roles_ptr, o.mem_quota_cache.get()) {
-                    (Some(ptr), Some((cached_ptr, cached_bytes))) if ptr == cached_ptr => {
+                let generation = self.driver.as_ref().map(|d| d.roles_generation);
+                match (generation, o.mem_quota_cache.get()) {
+                    (Some(current), Some((cached_gen, cached_bytes))) if current == cached_gen => {
                         cached_bytes
                     }
-                    (Some(ptr), _) => {
+                    (Some(current), _) => {
                         let bytes = self.mem_quota_bytes_for(o.owner);
-                        o.mem_quota_cache.set(Some((ptr, bytes)));
+                        o.mem_quota_cache.set(Some((current, bytes)));
                         bytes
                     }
                     (None, _) => self.limits.mem_quota_bytes,
