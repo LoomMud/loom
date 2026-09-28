@@ -3090,7 +3090,11 @@ impl<'a> RegistryHost<'a> {
                     .as_str()
                     .ok_or_else(|| RtError::new("roles_has_grant(): expected string target"))?;
                 let roles = self.driver.as_ref().expect("checked above").roles.clone();
-                Ok(Value::Bool(roles.has_grant(uid, kind, target)))
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                Ok(Value::Bool(roles.has_grant(uid, kind, target, now)))
             }
             "roles_policy" => {
                 self.require_secure_caller("roles_policy")?;
@@ -3217,6 +3221,7 @@ impl<'a> RegistryHost<'a> {
             guard,
             allowed: secure,
             denied_by: None,
+            at_unix_ms: 0, // stamped by `push` itself
         });
         if !secure {
             return Err(RtError::new(format!(
@@ -3295,6 +3300,7 @@ impl<'a> RegistryHost<'a> {
             guard,
             allowed: actor.is_some(),
             denied_by: None,
+            at_unix_ms: 0, // stamped by `push` itself
         });
         match (secure, actor, path) {
             (true, Some(a), _) => Ok(a),
@@ -3339,10 +3345,17 @@ impl<'a> RegistryHost<'a> {
     /// caller already failed `roles_mutation_gate`'s actor-rule check
     /// before reaching this point, since that also requires player input).
     fn roles_result_recipient(&self) -> ObjectId {
-        self.driver
-            .as_ref()
-            .and_then(|d| d.this_player)
-            .unwrap_or_else(|| self.self_object())
+        let this_player = self.driver.as_ref().and_then(|d| d.this_player);
+        debug_assert!(
+            this_player.is_some(),
+            "roles_result_recipient(): no this_player -- falling back to self_object() means \
+             roles_result will be delivered to whatever object's method is currently \
+             executing, not a connected interactive; every legitimate caller already failed \
+             roles_mutation_gate's actor rule (which requires this_player) before reaching \
+             this point, so reaching here with none at all is a driver bug, not a normal \
+             runtime condition (CTO review, OBI-123 N3)"
+        );
+        this_player.unwrap_or_else(|| self.self_object())
     }
 
     /// The backend's request queue was full or closed (`false` from a

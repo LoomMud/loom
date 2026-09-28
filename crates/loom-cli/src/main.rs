@@ -369,6 +369,7 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         roles_snapshot_rx,
         roles_reload_tx,
         audit_tx,
+        persist.is_some(),
         persist.is_none(),
     )?;
 
@@ -764,6 +765,36 @@ enum RolesReloadTrigger {
     Mutation,
     Expiry,
     LoadFailedRetry,
+    /// The `LISTEN roles_changed` connection was lost (e.g. a Postgres
+    /// restart) and is being reconnected in the background (CTO review,
+    /// OBI-123 B1) -- the mutation and expiry triggers keep working the
+    /// whole time, so this is never a reason to stop refreshing.
+    ListenerLost,
+    /// `LISTEN roles_changed` just reconnected after [`ListenerLost`](Self::ListenerLost).
+    ListenerReconnected,
+}
+
+/// The next backoff delay after a failed `LISTEN roles_changed`
+/// (re)connect attempt: doubles, capped at [`LISTEN_RETRY_MAX`]. A pure
+/// function so the backoff schedule itself is unit-testable without a
+/// Postgres connection at all (CTO review, OBI-123 B1's "add a test").
+const LISTEN_RETRY_MIN: Duration = Duration::from_secs(1);
+const LISTEN_RETRY_MAX: Duration = Duration::from_secs(30);
+
+fn next_listen_backoff(current: Duration) -> Duration {
+    (current * 2).min(LISTEN_RETRY_MAX)
+}
+
+/// [`run_roles_manager`]'s `LISTEN roles_changed` receiver, when it has
+/// one. `None` means the connection is down and being reconnected on a
+/// backoff timer; `recv_listen` never resolves in that state (`pending()`),
+/// so `tokio::select!` simply never picks that branch until it is `Some`
+/// again -- the mutation/expiry branches keep firing normally either way.
+async fn recv_listen(rx: &mut Option<mpsc::Receiver<String>>) -> Option<String> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Owns every refresh trigger for the roles snapshot (design OBI-36 §1,
@@ -775,6 +806,19 @@ enum RolesReloadTrigger {
 /// every successful reload on `snapshot_tx`, a [`watch`] channel so the
 /// world thread only ever sees the latest snapshot, never a backlog of
 /// stale ones.
+///
+/// **Never permanently stops refreshing except on shutdown** (CTO review,
+/// OBI-123 B1): a `LISTEN` failure at boot, or the listener connection
+/// dropping later (e.g. a Postgres restart), no longer ends the loop --
+/// `RolesSnapshot::has_grant`'s own `expires_at` check (B2) is only
+/// defence in depth, not a substitute for actually refreshing, so a
+/// snapshot that never reloads again would otherwise fail open forever on
+/// every *other* kind of change (a demotion, a revoked grant that hasn't
+/// hit its own `expires_at` yet, ...). The boot load always runs, `LISTEN`
+/// reconnects on an exponential backoff
+/// ([`next_listen_backoff`], capped at [`LISTEN_RETRY_MAX`]) while the
+/// mutation and expiry triggers keep working the whole time, and every
+/// successful (re)connect forces an immediate reload.
 async fn run_roles_manager(
     persist: Persist,
     mut reload_rx: mpsc::Receiver<()>,
@@ -782,12 +826,13 @@ async fn run_roles_manager(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut listen_rx = match persist.listen_roles_changed().await {
-        Ok(rx) => rx,
+        Ok(rx) => Some(rx),
         Err(err) => {
-            error!(error = %err, "LISTEN roles_changed failed: the roles snapshot will never refresh after boot");
-            return;
+            warn!(error = %err, "LISTEN roles_changed failed at boot; retrying in the background -- the boot load and the mutation/expiry triggers are unaffected");
+            None
         }
     };
+    let mut listen_backoff = LISTEN_RETRY_MIN;
 
     let mut trigger = RolesReloadTrigger::Boot;
     loop {
@@ -805,17 +850,35 @@ async fn run_roles_manager(
                     .unwrap_or(Duration::from_secs(3600));
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
-                    payload = listen_rx.recv() => {
+                    payload = recv_listen(&mut listen_rx) => {
                         match payload {
                             Some(table) => {
                                 debug!(table = %table, "roles_changed notify");
                                 trigger = RolesReloadTrigger::Notify;
                             }
-                            None => break, // listener task exited
+                            None => {
+                                warn!("roles_changed LISTEN connection lost; reconnecting in the background");
+                                listen_rx = None;
+                                listen_backoff = LISTEN_RETRY_MIN;
+                                trigger = RolesReloadTrigger::ListenerLost;
+                            }
                         }
                     }
                     _ = reload_rx.recv() => trigger = RolesReloadTrigger::Mutation,
                     _ = tokio::time::sleep(sleep_for) => trigger = RolesReloadTrigger::Expiry,
+                    _ = tokio::time::sleep(listen_backoff), if listen_rx.is_none() => {
+                        match persist.listen_roles_changed().await {
+                            Ok(rx) => {
+                                listen_rx = Some(rx);
+                                listen_backoff = LISTEN_RETRY_MIN;
+                                trigger = RolesReloadTrigger::ListenerReconnected;
+                            }
+                            Err(err) => {
+                                warn!(error = %err, backoff = ?listen_backoff, "LISTEN roles_changed reconnect failed; backing off");
+                                listen_backoff = next_listen_backoff(listen_backoff);
+                            }
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -858,8 +921,14 @@ async fn run_audit_sink(
 }
 
 fn to_persist_audit_row(r: loom_vm::AuditRow) -> loom_persist::AuditRow {
+    // CTO review (OBI-123 N2): `at` is the decision's own timestamp
+    // (`AuditEntry::push`'s, stamped on the world thread when the
+    // decision was made), not `now_utc()` here -- this function can run
+    // arbitrarily later than the decision if `run_audit_sink` is behind.
+    let at = OffsetDateTime::from_unix_timestamp_nanos(r.at_unix_ms as i128 * 1_000_000)
+        .unwrap_or_else(|_| OffsetDateTime::now_utc());
     loom_persist::AuditRow {
-        at: OffsetDateTime::now_utc(),
+        at,
         kind: r.kind.to_string(),
         caller: r.caller,
         effective_principal: r.effective_principal,
@@ -883,6 +952,7 @@ fn spawn_world_thread(
     mut roles_snapshot_rx: watch::Receiver<Option<std::sync::Arc<RolesSnapshot>>>,
     roles_reload_tx: mpsc::Sender<()>,
     audit_tx: mpsc::Sender<Vec<loom_vm::AuditRow>>,
+    has_audit_sink: bool,
     load_roles_seed: bool,
 ) -> Result<thread::JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -923,6 +993,13 @@ fn spawn_world_thread(
             }));
             let mut host = NetHost { command_tx };
             let mut audit_cursor: u64 = 0;
+            // CTO review (OBI-123 N1): rate-limit the "batch dropped"
+            // warning below to at most once per interval -- a full/closed
+            // `audit_tx` is expected to fail closed-loop for a while under
+            // sustained backpressure, and logging every single tick's drop
+            // in that case would itself be a (smaller) flood.
+            let mut last_audit_drop_warn: Option<std::time::Instant> = None;
+            const AUDIT_DROP_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
             // OBI-85/OBI-123: drain any `account_create`/`account_login`/
             // `roles_*` result that has come back since the last time we
@@ -978,15 +1055,30 @@ fn spawn_world_thread(
                         tick_pending.store(false, Ordering::Release);
 
                         // OBI-123 D-S2.5: once per world tick, flush any
-                        // audit entries recorded since the last flush. A
-                        // full/closed `audit_tx` (no Postgres, or the sink
-                        // task fell behind) drops this batch silently --
-                        // the audit ring itself still has it, up to its own
-                        // bound.
-                        let (rows, cursor) = world.drain_audit_since(audit_cursor);
-                        audit_cursor = cursor;
-                        if !rows.is_empty() {
-                            let _ = audit_tx.try_send(rows);
+                        // audit entries recorded since the last flush.
+                        // Skipped entirely when there is no sink at all
+                        // (`has_audit_sink` false: no `DATABASE_URL`) --
+                        // nothing would ever drain `audit_tx` anyway (CTO
+                        // review N1). A full/closed `audit_tx` with a real
+                        // sink (the sink task fell behind, or the process
+                        // is shutting down) drops this batch, logged at a
+                        // rate limit -- the audit ring itself still has it,
+                        // up to its own bound.
+                        if has_audit_sink {
+                            let (rows, cursor) = world.drain_audit_since(audit_cursor);
+                            audit_cursor = cursor;
+                            if !rows.is_empty() && audit_tx.try_send(rows).is_err() {
+                                let now = std::time::Instant::now();
+                                if last_audit_drop_warn
+                                    .is_none_or(|t| now.duration_since(t) >= AUDIT_DROP_WARN_INTERVAL)
+                                {
+                                    warn!(
+                                        "audit_log batch dropped: run_audit_sink is full or gone \
+                                         (further drops suppressed for {AUDIT_DROP_WARN_INTERVAL:?})"
+                                    );
+                                    last_audit_drop_warn = Some(now);
+                                }
+                            }
                         }
                     }
                     // NAWS/TTYPE/GMCP hooks into the world (efun-visible
@@ -1254,5 +1346,54 @@ mod tick_timer_tests {
         assert!(event_rx.try_recv().is_err());
 
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod roles_manager_tests {
+    use super::*;
+
+    /// CTO review (OBI-123 B1): the reconnect backoff must actually grow
+    /// (never immediately hammer a down Postgres in a tight loop) and
+    /// must be bounded (never grow unbounded either). A pure function,
+    /// deliberately: the full async reconnect behaviour needs a real
+    /// Postgres connection to exercise end to end (covered by
+    /// `loom-cli/tests/roles_demo.rs`'s Postgres-backed tests for the
+    /// happy path), but the backoff schedule itself does not, and is
+    /// exactly the part most likely to have an off-by-one/unbounded-growth
+    /// bug.
+    #[test]
+    fn listen_backoff_doubles_and_caps_at_the_max() {
+        let mut backoff = LISTEN_RETRY_MIN;
+        assert_eq!(backoff, Duration::from_secs(1));
+        backoff = next_listen_backoff(backoff);
+        assert_eq!(backoff, Duration::from_secs(2));
+        backoff = next_listen_backoff(backoff);
+        assert_eq!(backoff, Duration::from_secs(4));
+        backoff = next_listen_backoff(backoff);
+        assert_eq!(backoff, Duration::from_secs(8));
+        backoff = next_listen_backoff(backoff);
+        assert_eq!(backoff, Duration::from_secs(16));
+        backoff = next_listen_backoff(backoff);
+        assert_eq!(backoff, LISTEN_RETRY_MAX, "32s would exceed the 30s cap");
+        // Stays capped, does not keep growing past it.
+        for _ in 0..5 {
+            backoff = next_listen_backoff(backoff);
+            assert_eq!(backoff, LISTEN_RETRY_MAX);
+        }
+    }
+
+    /// `recv_listen` must never resolve while the receiver is `None` --
+    /// otherwise a `tokio::select!` arm on it would busy-loop instead of
+    /// genuinely waiting for either a real notification or the reconnect
+    /// timer.
+    #[tokio::test(start_paused = true)]
+    async fn recv_listen_never_resolves_with_no_receiver() {
+        let mut rx: Option<mpsc::Receiver<String>> = None;
+        let raced = tokio::select! {
+            _ = recv_listen(&mut rx) => "recv_listen resolved",
+            _ = tokio::time::sleep(Duration::from_secs(3600)) => "timer won",
+        };
+        assert_eq!(raced, "timer won");
     }
 }

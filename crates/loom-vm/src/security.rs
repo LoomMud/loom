@@ -261,6 +261,14 @@ pub struct AuditEntry {
     pub allowed: bool,
     /// The euid the master denied for, if denied by policy.
     pub denied_by: Option<Sym>,
+    /// Unix milliseconds at the moment the decision was made -- stamped by
+    /// [`SecurityState::push`] itself (every construction site leaves this
+    /// `0`; `push` is the one place that actually knows "now", so it is
+    /// the only place trusted to fill it in), never by the eventual sink
+    /// (CTO review, OBI-123 N2: a driver-side `audit_log` row must record
+    /// when the decision happened, not whenever a possibly-delayed sink
+    /// task got around to writing it).
+    pub at_unix_ms: i64,
 }
 
 /// A pending cache fill, returned by a missed [`SecurityState::lookup`].
@@ -351,10 +359,15 @@ impl SecurityState {
             guard: guard.clone(),
             allowed,
             denied_by,
+            at_unix_ms: 0, // stamped by `push` itself
         });
     }
 
-    pub(crate) fn push(&mut self, entry: AuditEntry) {
+    pub(crate) fn push(&mut self, mut entry: AuditEntry) {
+        entry.at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         if !entry.allowed {
             self.denials += 1;
         }

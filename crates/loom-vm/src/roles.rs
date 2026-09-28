@@ -107,10 +107,26 @@ impl RolesSnapshot {
     }
 
     /// `roles_has_grant(uid, kind, target)`.
-    pub fn has_grant(&self, uid: &str, kind: &str, target: &str) -> bool {
-        self.grants
-            .iter()
-            .any(|g| g.uid == uid && g.kind == kind && g.target == target)
+    /// `roles_has_grant(uid, kind, target)`. Ignores an expired grant
+    /// (`expires_at <= now`) rather than trusting the snapshot's own
+    /// freshness: defence in depth for the case the driver's refresh
+    /// loop has stalled (CTO review, OBI-123 B2) -- normally the
+    /// Postgres `active_grants` view (or the seed file, by convention)
+    /// already excludes expired grants before this snapshot is even
+    /// built, but a *stale* snapshot (loaded once, never refreshed since)
+    /// can still hold one whose `expires_at` has since passed in real
+    /// wall-clock time, and a security check must never fail open just
+    /// because a refresh didn't happen. `now` is Unix seconds, taken by
+    /// the caller (`crate::bcvm::registry`'s `roles_has_grant` efun arm)
+    /// so this stays a pure, clock-independent function -- easy to unit
+    /// test at a fixed `now` without needing to race the real clock.
+    pub fn has_grant(&self, uid: &str, kind: &str, target: &str, now: i64) -> bool {
+        self.grants.iter().any(|g| {
+            g.uid == uid
+                && g.kind == kind
+                && g.target == target
+                && g.expires_at.is_none_or(|exp| exp > now)
+        })
     }
 
     /// `roles_policy(tier)`: empty for a tier with no row (never an
@@ -274,7 +290,7 @@ mod tests {
         assert_eq!(s.tier("frodo"), 0);
         assert!(!s.is_member("frodo", "shire"));
         assert!(!s.is_lead("frodo", "shire"));
-        assert!(!s.has_grant("frodo", "efun", "write_file"));
+        assert!(!s.has_grant("frodo", "efun", "write_file", 0));
         assert_eq!(s.policy(0), HashMap::new());
         assert_eq!(s.domains("frodo"), Vec::<String>::new());
     }
@@ -309,10 +325,39 @@ mod tests {
         assert_eq!(s.policy(3).get("max_ticks_exec"), Some(&2_000_000));
         assert_eq!(s.policy(3).get("max_objects"), Some(&500));
         assert!(s.policy(1).is_empty());
-        assert!(s.has_grant("sam", "efun", "write_file"));
-        assert!(s.has_grant("sam", "path", "/domains/shire"));
-        assert!(!s.has_grant("sam", "efun", "read_file"));
-        assert!(!s.has_grant("frodo", "efun", "write_file"));
+        assert!(s.has_grant("sam", "efun", "write_file", 500));
+        assert!(s.has_grant("sam", "path", "/domains/shire", 500));
+        assert!(!s.has_grant("sam", "efun", "read_file", 500));
+        assert!(!s.has_grant("frodo", "efun", "write_file", 500));
+    }
+
+    #[test]
+    fn has_grant_ignores_an_expired_grant_even_if_the_snapshot_was_never_refreshed() {
+        // CTO review (OBI-123 B2): a stale snapshot (loaded once, never
+        // refreshed since) must not fail open just because a grant's
+        // `expires_at` has since passed in real wall-clock time.
+        let s = RolesSnapshot::from_seed_json(
+            r#"{"grants": [{"uid": "sam", "kind": "efun", "target": "write_file", "expires_at": 1000}]}"#,
+        )
+        .expect("parse");
+        assert!(
+            s.has_grant("sam", "efun", "write_file", 999),
+            "not yet expired"
+        );
+        assert!(
+            !s.has_grant("sam", "efun", "write_file", 1000),
+            "expires_at <= now must count as expired"
+        );
+        assert!(!s.has_grant("sam", "efun", "write_file", 1001), "expired");
+    }
+
+    #[test]
+    fn has_grant_with_no_expiry_never_expires() {
+        let s = RolesSnapshot::from_seed_json(
+            r#"{"grants": [{"uid": "sam", "kind": "efun", "target": "write_file", "expires_at": null}]}"#,
+        )
+        .expect("parse");
+        assert!(s.has_grant("sam", "efun", "write_file", i64::MAX));
     }
 
     #[test]
