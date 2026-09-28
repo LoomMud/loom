@@ -28,7 +28,7 @@ Every execution the driver starts is a cut. That covers heartbeats, call_outs, `
 | `upgrade_all(path)` (P1) | `valid_efun`, then `valid_upgrade(path, ob)`, checked after `valid_efun`, mirroring `compile_object` |
 | `bind_connection(ob)` (P3) | `valid_efun`, then `valid_bind(caller, ob)` (and the caller must be the master) |
 | `seteuid(e)` (P3) | `valid_efun`, then `valid_seteuid(ob, e)` |
-| `destruct(ob)` (P2) | `valid_efun("destruct", 2, ob)` -- **skipped entirely when `ob == self()`** (OBI-149, a driver rule: see the `destruct(self())` section below) |
+| `destruct(ob)` (P2) | `valid_efun("destruct", 2, caller)` -- **skipped entirely when `ob == self()`** (OBI-149, a driver rule: see the `destruct(self())` section below) |
 
 - **Inside an apply,** `effective_principal()` returns the euid under evaluation. The driver calls the apply once for each euid in the guard set.
 - **Fail closed.** The operation is denied if there is no master, if the master lacks the apply, or if the apply throws, returns a non-bool or runs out of ticks. A master must define at least `valid_efun` before any non-root code can use a P1+ efun.
@@ -112,7 +112,7 @@ Normative source: [OBI-36 design note](https://paperclip.home.oberfield.net/OBI/
 `destruct(ob)` (P2) needs `valid_efun` to destruct an arbitrary object, but `remove()` -> `destruct(self())` is the ordinary way an object cleans itself up (kills, corpses, `dest`) and runs with players on the stack — a P2 gate here would force every master to allow `destruct` unconditionally just so objects can destruct themselves, which also lets any tier-1 caller destruct anything else it can merely reference.
 
 - `destruct(ob)` where `ob == self()` skips `valid_efun` entirely — a driver rule, exactly like `unguarded`'s, not master policy. Always allowed, and always audited (`apply: "destruct-self"`, `Privilege::P0`).
-- `destruct(ob)` for any other object is unchanged: `Privilege::P2`, gated by `valid_efun("destruct", 2, ob)` for every euid in the guard set, same as any other P2 efun.
+- `destruct(ob)` for any other object is unchanged: `Privilege::P2`, gated by `valid_efun("destruct", 2, caller)` for every euid in the guard set, same as any other P2 efun.
 - Once this lands, a master no longer needs to allow `destruct` unconditionally in its `valid_efun` (e.g. warp's `/secure/master.account_efuns()`) purely so `remove()` keeps working — that grant can be narrowed to whichever principals should actually be able to destruct objects other than themselves.
 
 ### Quotas
