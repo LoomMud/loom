@@ -17,10 +17,27 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
+
+/// Every test here spawns a real `loom serve` subprocess and hits the
+/// same shared Postgres instance (through its own connection pool *and*
+/// through the owner pool this file seeds/asserts with). Running them
+/// concurrently (the default `cargo test` behaviour) stacks up to four
+/// subprocesses, each with their own DB worker, `LISTEN` connection, and
+/// world-tick timer, competing for CPU and DB connections on the same
+/// runner -- exactly the kind of contention that turns a generous-looking
+/// timeout into a flaky one. Serializing them trades a few extra seconds
+/// of wall time for determinism.
+fn serialize_db_tests() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn unique_uid(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4()).replace('-', "")
@@ -188,6 +205,7 @@ async fn insert_expiring_grant(owner: &PgPool, uid: &str, granted_by: &str, seco
 /// string as the actor instead of the interactive's euid.
 #[test]
 fn mutation_from_secure_roles_reaches_sql_with_the_interactives_euid_as_actor() {
+    let _serialize = serialize_db_tests();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let Some(fx) = rt.block_on(setup()) else {
         eprintln!("skipping: no database configured");
@@ -271,6 +289,7 @@ fn mutation_from_secure_roles_reaches_sql_with_the_interactives_euid_as_actor() 
 /// server restart.
 #[test]
 fn a_roles_changed_notify_swaps_the_snapshot_and_flushes_the_security_cache() {
+    let _serialize = serialize_db_tests();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let Some(fx) = rt.block_on(setup()) else {
         eprintln!("skipping: no database configured");
@@ -346,6 +365,7 @@ fn a_roles_changed_notify_swaps_the_snapshot_and_flushes_the_security_cache() {
 /// happen.
 #[test]
 fn an_expired_grant_disappears_from_the_snapshot_without_a_restart() {
+    let _serialize = serialize_db_tests();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let Some(fx) = rt.block_on(setup()) else {
         eprintln!("skipping: no database configured");
@@ -416,6 +436,7 @@ fn an_expired_grant_disappears_from_the_snapshot_without_a_restart() {
 /// mutation gate covered by the actor-rule test above.
 #[test]
 fn audit_log_has_a_row_for_a_denied_p2_plus_check() {
+    let _serialize = serialize_db_tests();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let Some(fx) = rt.block_on(setup()) else {
         eprintln!("skipping: no database configured");
@@ -601,6 +622,7 @@ fn reserve_local_port() -> u16 {
 
 struct LoomServer {
     child: Child,
+    log_path: PathBuf,
 }
 
 impl LoomServer {
@@ -609,6 +631,8 @@ impl LoomServer {
             .or_else(|_| std::env::var("CARGO_BIN_EXE_loom_cli"))
             .expect("cargo binary path for loom-cli");
         let http_port = reserve_local_port();
+        let log_path = scratch("roles-demo-log").join("server.log");
+        let log_file = std::fs::File::create(&log_path).expect("create loom serve stderr log file");
 
         let child = Command::new(loom_bin)
             .arg("serve")
@@ -617,28 +641,52 @@ impl LoomServer {
             .env("LOOM_TELNET_ADDR", bind)
             .env("LOOM_HTTP_ADDR", format!("127.0.0.1:{http_port}"))
             .env("DATABASE_URL", database_url)
-            .env("RUST_LOG", "")
+            .env("RUST_LOG", "loom_cli=debug,loom_vm=info,loom_persist=debug")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(log_file)
             .spawn()
             .expect("spawn loom serve");
 
-        Self { child }
+        Self { child, log_path }
     }
 
     fn assert_alive(&mut self) {
         if let Some(status) = self.child.try_wait().expect("poll server process") {
+            self.dump_log();
             panic!("loom server exited early with status {status}");
+        }
+    }
+
+    /// Print the server's captured stderr (RUST_LOG output) so a CI
+    /// failure that never got as far as `assert_alive` -- a dropped
+    /// connection, a timeout waiting for a reply -- still shows *why* the
+    /// subprocess went away, instead of just "connection closed".
+    fn dump_log(&self) {
+        match std::fs::read_to_string(&self.log_path) {
+            Ok(text) => eprintln!(
+                "---- loom serve stderr ({}) ----\n{text}",
+                self.log_path.display()
+            ),
+            Err(err) => eprintln!("(could not read {}: {err})", self.log_path.display()),
         }
     }
 }
 
 impl Drop for LoomServer {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        match self.child.try_wait().ok().flatten() {
+            // Exited on its own (not via our own `kill()` below): almost
+            // certainly a crash, since every test either calls
+            // `assert_alive` (which already dumped the log and panicked)
+            // or runs to completion with the server still up. Dump it here
+            // too so a test that panicked on a *symptom* (a dropped
+            // connection, a timeout) still surfaces the cause.
+            Some(_) => self.dump_log(),
+            None => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
         }
     }
 }
