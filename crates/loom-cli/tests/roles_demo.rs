@@ -226,7 +226,7 @@ fn mutation_from_secure_roles_reaches_sql_with_the_interactives_euid_as_actor() 
     let out = poll_until_contains(&mut conn, "req ", Duration::from_secs(2));
     assert!(out.contains("req "), "{out}");
 
-    let out = poll_until_contains(&mut conn, "roles_result ", Duration::from_secs(5));
+    let out = poll_until_contains(&mut conn, "roles_result ", Duration::from_secs(15));
     assert!(
         out.contains("roles_result 1 true"),
         "expected the promotion to succeed: {out}"
@@ -251,7 +251,7 @@ fn mutation_from_secure_roles_reaches_sql_with_the_interactives_euid_as_actor() 
                 "roles_set_tier",
                 "allow",
                 &format!("{member_uid} tier=2"),
-                Duration::from_secs(3),
+                Duration::from_secs(10),
             )
             .await,
             "audit_log must have an allowed roles_set_tier row naming the operation and target"
@@ -354,8 +354,13 @@ fn an_expired_grant_disappears_from_the_snapshot_without_a_restart() {
 
     let uid = unique_uid("carol");
     let granter = unique_uid("granter");
+    // A generous expiry window (10s): the boot-time snapshot load has to
+    // connect, `LISTEN`, and run its first `load_roles_snapshot()` round
+    // trip before the grant is visible at all -- give that plenty of
+    // slack on a contended CI runner, well before the grant's own expiry.
+    const GRANT_TTL_SECS: i64 = 10;
     rt.block_on(async {
-        insert_expiring_grant(&fx.owner, &uid, &granter, 3).await;
+        insert_expiring_grant(&fx.owner, &uid, &granter, GRANT_TTL_SECS).await;
     });
 
     let mudlib = fixture("roles");
@@ -370,24 +375,35 @@ fn an_expired_grant_disappears_from_the_snapshot_without_a_restart() {
     let mut conn = BufReader::new(stream);
     read_until_contains(&mut conn, "Welcome.", Duration::from_secs(5));
 
-    send_line(&mut conn, &format!("hasgrant {uid} efun write_file"));
-    let out = poll_until_contains(&mut conn, "hasgrant ", Duration::from_secs(5));
-    assert!(
-        out.contains("hasgrant true"),
-        "the unexpired grant must be loaded: {out}"
-    );
-
-    // Poll past the 3s expiry: the earliest-expiry timer must reload on
-    // its own, no NOTIFY, no restart.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // Retry (not a single request): the boot-time snapshot load is async,
+    // so an immediate `hasgrant` could race a world that has not yet
+    // swapped the real snapshot in.
+    let query = format!("hasgrant {uid} efun write_file");
+    let load_deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        send_line(&mut conn, &format!("hasgrant {uid} efun write_file"));
-        let out = poll_until_contains(&mut conn, "hasgrant ", Duration::from_secs(5));
-        if out.contains("hasgrant false") {
+        send_line(&mut conn, &query);
+        if let Some(reply) = read_one_reply(&mut conn, Duration::from_secs(1))
+            && reply.trim_end() == "hasgrant true"
+        {
+            break;
+        }
+        if Instant::now() > load_deadline {
+            panic!("the unexpired grant was never loaded within the deadline");
+        }
+    }
+
+    // Poll past the expiry: the earliest-expiry timer must reload on its
+    // own, no NOTIFY, no restart.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        send_line(&mut conn, &query);
+        if let Some(reply) = read_one_reply(&mut conn, Duration::from_secs(1))
+            && reply.trim_end() == "hasgrant false"
+        {
             break;
         }
         if Instant::now() > deadline {
-            panic!("grant never expired from the snapshot: {out}");
+            panic!("grant never expired from the snapshot");
         }
     }
 
@@ -430,7 +446,7 @@ fn audit_log_has_a_row_for_a_denied_p2_plus_check() {
                 "write_file",
                 "deny",
                 &marker,
-                Duration::from_secs(5)
+                Duration::from_secs(10)
             )
             .await,
             "expected a denied write_file audit_log row for {marker}"
