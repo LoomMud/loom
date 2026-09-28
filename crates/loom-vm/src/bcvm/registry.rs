@@ -5236,6 +5236,55 @@ pub fn set_it() {{
             .expect("comfortably under a 1_000_000 byte quota");
     }
 
+    /// OBI-80 CTO re-review (function values, OBI-87/79 landed since this
+    /// was first written): a closure capturing a large local array is the
+    /// same one-level-of-nesting bypass as a plain array — storing the
+    /// closure in a global must count the captured array's bytes, not just
+    /// the closure value's own 16-byte slot.
+    #[test]
+    fn deep_accounting_rejects_a_closure_capturing_a_large_local_array() {
+        let zeros = (0..200).map(|_| "0").collect::<Vec<_>>().join(",");
+        let wf = format!(
+            r#"
+var data: any = null
+
+pub fn set_it() {{
+    let big: [int] = [{zeros}]
+    data = fn() -> int {{
+        return big[0]
+    }}
+}}
+"#
+        );
+        let prog = Rc::new(compile_program(
+            "/obj/thing",
+            &[("/obj/thing", &wf)],
+            1,
+            None,
+        ));
+        let mut registry = Registry::default();
+        registry.register_program(prog.clone());
+        let placeholder = ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        };
+        let mut host = RegistryHost::new(&mut registry, placeholder);
+        let obj = host.instantiate(prog).expect("instantiate");
+        // Same 200-int nested payload as the array test above; a closure
+        // that only charged its own slot (the OBI-78 bypass, or leaving
+        // `HeapObj::Fn` at a flat 0 the way this cost() briefly did) would
+        // never trip this quota.
+        host.limits.mem_quota_bytes = 1000;
+        let err = host
+            .call_on(obj, "set_it", vec![])
+            .expect_err("a closure's captured array must push the object over a 1000-byte quota");
+        assert!(
+            err.report().contains("memory quota exceeded"),
+            "{}",
+            err.report()
+        );
+    }
+
     /// OBI-80 acceptance criterion: writing the same (shared) substructure
     /// into two different objects' globals charges both in full (no
     /// dedup/single-owner attribution), and releasing it from one holder
