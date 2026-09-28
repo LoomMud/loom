@@ -57,6 +57,10 @@ pub enum PersistError {
     PasswordHash(String),
     #[error("invalid argon2 parameters")]
     ArgonParams,
+    /// OBI-151: `assert_not_control_plane_db` rejected a connection string
+    /// that looks like Paperclip's control-plane DB.
+    #[error("{0}")]
+    ControlPlaneDbRejected(String),
 }
 
 #[derive(Debug, Clone)]
@@ -323,6 +327,86 @@ impl std::fmt::Debug for Password {
     }
 }
 
+/// Reject connection strings that look like they point at Paperclip's
+/// control-plane Postgres instead of a disposable/dedicated one (OBI-151).
+///
+/// Agent shells export `DATABASE_URL` for Paperclip's own control-plane DB
+/// (see OBI-150); nothing in loom/warp may ever open a connection to it.
+/// This is a defense-in-depth belt, not the primary guardrail -- the
+/// primary guardrail is that test/dev entrypoints must not read the
+/// ambient `DATABASE_URL` at all (see `LOOM_TEST_DATABASE_URL`,
+/// `LOOM_TEST_DB_MIGRATE_URL`, `LOOM_SMOKE_DATABASE_URL` and
+/// `scripts/with-disposable-postgres.sh`). This check only catches the
+/// two concrete shapes the control-plane DSN is known to take; it is not a
+/// general allow-list and must not be treated as one.
+pub fn assert_not_control_plane_db(url: &str) -> std::result::Result<(), String> {
+    // Deliberately not pulling in a URL-parsing crate for this: a crude
+    // split is enough to pull the host:port and database name out of a
+    // `postgres://user:pass@host:port/dbname?query` DSN.
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let after_at = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
+    let mut path_split = after_at.splitn(2, '/');
+    let host_port = path_split.next().unwrap_or("");
+    let db_name = path_split
+        .next()
+        .unwrap_or("")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+
+    if host_port.eq_ignore_ascii_case("postgres:5432") {
+        return Err(format!(
+            "refusing to connect to {host_port:?}: this looks like Paperclip's \
+             control-plane Postgres host, not a disposable/dedicated loom DB \
+             (OBI-151/OBI-150). Use scripts/with-disposable-postgres.sh, or point \
+             LOOM_TEST_DATABASE_URL/LOOM_TEST_DB_MIGRATE_URL/LOOM_SMOKE_DATABASE_URL \
+             at a DB you own instead."
+        ));
+    }
+    if db_name.eq_ignore_ascii_case("paperclip") {
+        return Err(format!(
+            "refusing to connect to database {db_name:?}: this looks like Paperclip's \
+             control-plane database, not a disposable/dedicated loom DB \
+             (OBI-151/OBI-150). Use scripts/with-disposable-postgres.sh, or point \
+             LOOM_TEST_DATABASE_URL/LOOM_TEST_DB_MIGRATE_URL/LOOM_SMOKE_DATABASE_URL \
+             at a DB you own instead."
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod control_plane_guard_tests {
+    use super::assert_not_control_plane_db;
+
+    #[test]
+    fn rejects_control_plane_host() {
+        let err =
+            assert_not_control_plane_db("postgres://paperclip:secret@postgres:5432/paperclip")
+                .unwrap_err();
+        assert!(err.contains("postgres:5432"));
+    }
+
+    #[test]
+    fn rejects_control_plane_db_name_on_other_host() {
+        let err =
+            assert_not_control_plane_db("postgres://x:y@localhost:55432/paperclip").unwrap_err();
+        assert!(err.contains("paperclip"));
+    }
+
+    #[test]
+    fn allows_disposable_db() {
+        assert_not_control_plane_db("postgres://loom_app:pw@127.0.0.1:55432/loom").unwrap();
+    }
+
+    #[test]
+    fn allows_query_string_and_no_path() {
+        assert_not_control_plane_db("postgres://loom_app:pw@127.0.0.1:55432/loom?sslmode=disable")
+            .unwrap();
+        assert_not_control_plane_db("postgres://loom_app:pw@127.0.0.1:55432").unwrap();
+    }
+}
+
 /// Run schema migrations against `migrate_database_url`.
 ///
 /// This must authenticate as `loom_owner` (see `LOOM_DB_MIGRATE_URL`), the
@@ -332,6 +416,8 @@ impl std::fmt::Debug for Password {
 /// used to run migrations (D-27.4 finding: "ownership makes the REVOKEs
 /// moot").
 pub async fn run_migrations(migrate_database_url: &str) -> Result<()> {
+    assert_not_control_plane_db(migrate_database_url)
+        .map_err(PersistError::ControlPlaneDbRejected)?;
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(migrate_database_url)
@@ -346,6 +432,7 @@ impl Persist {
     /// `loom_app`, which owns nothing and cannot write the role tables
     /// directly (D-27.4).
     pub async fn connect(database_url: &str, max_connections: u32) -> Result<Self> {
+        assert_not_control_plane_db(database_url).map_err(PersistError::ControlPlaneDbRejected)?;
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(database_url)

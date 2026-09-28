@@ -28,8 +28,18 @@ jobs:
       # Postgres service's superuser. loom_owner owns every table/function
       # and runs migrations (LOOM_DB_MIGRATE_URL); loom_app is the
       # world-runtime login under test and is not an owner (DATABASE_URL).
+      #
+      # OBI-151: the `loom-cli`/`loom-persist` integration tests read
+      # LOOM_TEST_DB_MIGRATE_URL/LOOM_TEST_DATABASE_URL, not the ambient
+      # LOOM_DB_MIGRATE_URL/DATABASE_URL names (those are reserved for the
+      # real `loom migrate`/`loom serve` entrypoints and, on an agent's own
+      # shell, DATABASE_URL is Paperclip's control-plane DB -- OBI-150).
+      # CI's Postgres service is neither ambient nor shared, so it is safe
+      # to point both sets of variables at the same service container.
       LOOM_DB_MIGRATE_URL: postgres://loom_owner:loom_owner_ci_only@localhost:5432/loom
       DATABASE_URL: postgres://loom_app:loom_app_ci_only@localhost:5432/loom
+      LOOM_TEST_DB_MIGRATE_URL: postgres://loom_owner:loom_owner_ci_only@localhost:5432/loom
+      LOOM_TEST_DATABASE_URL: postgres://loom_app:loom_app_ci_only@localhost:5432/loom
       # D-27.7: fail (not skip) DB-backed tests when the DB env isn't set.
       LOOM_REQUIRE_DB: "1"
       # Compile-time sqlx query! checks use the committed .sqlx cache; the
