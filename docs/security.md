@@ -28,6 +28,7 @@ Every execution the driver starts is a cut. That covers heartbeats, call_outs, `
 | `upgrade_all(path)` (P1) | `valid_efun`, then `valid_upgrade(path, ob)`, checked after `valid_efun`, mirroring `compile_object` |
 | `bind_connection(ob)` (P3) | `valid_efun`, then `valid_bind(caller, ob)` (and the caller must be the master) |
 | `seteuid(e)` (P3) | `valid_efun`, then `valid_seteuid(ob, e)` |
+| `destruct(ob)` (P2) | `valid_efun("destruct", 2, ob)` -- **skipped entirely when `ob == self()`** (OBI-149, a driver rule: see the `destruct(self())` section below) |
 
 - **Inside an apply,** `effective_principal()` returns the euid under evaluation. The driver calls the apply once for each euid in the guard set.
 - **Fail closed.** The operation is denied if there is no master, if the master lacks the apply, or if the apply throws, returns a non-bool or runs out of ticks. A master must define at least `valid_efun` before any non-root code can use a P1+ efun.
@@ -104,6 +105,15 @@ Normative source: [OBI-36 design note](https://paperclip.home.oberfield.net/OBI/
   - Example (the design note's own "known consequence"): `domain:start` cloning a `domain:forest` NPC gets a clone owned by, and euid, `domain:start` — a domain lead cannot escape their own domain's object-count budget by spawning another domain's NPCs.
   - Example (this task's AC): a T1 workroom object (owner `appr`) calling `clone_object("/daemons/thing")` (declared uid `mudlib`, not in the caller's guard set) gets a clone owned by, and euid, `appr` — and that clone's `max_objects` count is charged to `appr`.
   - **`load_object` does not apply R1** (flagged deviation from a fully literal reading, open for CTO re-review): it returns the same object for a given path to every future caller, so it never multiplies billed objects (not the clone-spam quota evasion R1 targets), and applying R1 there would let whichever caller happens to `load_object` a path first silently steal that path's owner/euid assignment forever — a regression against the pre-existing rule (`security.rs`) that a shared daemon object's own uid/euid do not depend on who first resolved it.
+- **D-S2.4 amendment (OBI-149): billing owner vs. starting euid.** Every player command runs through a `/cmds/**`-style object, which is itself always owned (and starts euid'd) `mudlib` — so `mudlib` is already in the guard set by the time the command's target code runs. R1's own test ("the guard does not already contain the program's own uid") therefore never fires for any `root`/`mudlib`/`domain:*`-owned program cloned from inside a command: the clone would come out owned by that always-unlimited uid, and `max_objects`/`max_heartbeats`/`max_callouts_obj` become evadable just by routing the same `clone_object` through a command instead of calling the object directly. The fix splits **billing owner** from **starting euid**: `euid` is exactly what R1 above already decided (unchanged); **`owner`** additionally gets redirected to the caller's quota uid whenever `creator_file(path)` is one of the always-unlimited uids (`root`/`mudlib`/`domain:*`) *and* the caller's quota uid resolves to a real, billable staff principal (tier ≥ 1 in the roles snapshot) — a tier-0 player (no `staff` row at all) is not billable and leaves `owner` alone. A known, accepted consequence: a builder's `reset zone` bills every NPC it spawns to that builder until each one dies.
+
+### `destruct(self())` is a P0 driver rule
+
+`destruct(ob)` (P2) needs `valid_efun` to destruct an arbitrary object, but `remove()` -> `destruct(self())` is the ordinary way an object cleans itself up (kills, corpses, `dest`) and runs with players on the stack — a P2 gate here would force every master to allow `destruct` unconditionally just so objects can destruct themselves, which also lets any tier-1 caller destruct anything else it can merely reference.
+
+- `destruct(ob)` where `ob == self()` skips `valid_efun` entirely — a driver rule, exactly like `unguarded`'s, not master policy. Always allowed, and always audited (`apply: "destruct-self"`, `Privilege::P0`).
+- `destruct(ob)` for any other object is unchanged: `Privilege::P2`, gated by `valid_efun("destruct", 2, ob)` for every euid in the guard set, same as any other P2 efun.
+- Once this lands, a master no longer needs to allow `destruct` unconditionally in its `valid_efun` (e.g. warp's `/secure/master.account_efuns()`) purely so `remove()` keeps working — that grant can be narrowed to whichever principals should actually be able to destruct objects other than themselves.
 
 ### Quotas
 

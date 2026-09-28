@@ -1,0 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// A `/cmds/**`-style command object (OBI-149): no `/builders`/`/domains`
+// prefix, so `default_creator` gives it `mudlib`, an always-unlimited
+// uid -- exactly like every real player command handler. Every player
+// command runs through an object like this one, which pushes `mudlib`
+// onto the guard set *before* the target's own code (`workroom`'s own
+// `appr` principal) ever runs.
+pub fn run(target: object) -> object {
+    return target.spawn_daemon()
+}

@@ -2673,11 +2673,17 @@ impl<'a> RegistryHost<'a> {
         // `unguarded` is P4-sensitive but gated by a driver rule (caller's
         // program under /secure), not by `valid_efun`: every caller it
         // exists for has lower-privileged frames below it (D-S1.5).
+        // `destruct` is exempted too (OBI-149): whether it needs
+        // `valid_efun` at all depends on its *argument* (`self()` is a
+        // P0 driver rule, anything else is still P2 -- see the
+        // `"destruct"` match arm below), which this generic pre-check
+        // cannot see before `args` is parsed.
         if let Some(p) = crate::efuns::privilege(name)
             && p.gated()
             && !matches!(
                 name,
                 "unguarded"
+                    | "destruct"
                     | "roles_set_tier"
                     | "roles_set_member"
                     | "roles_grant"
@@ -3010,6 +3016,42 @@ impl<'a> RegistryHost<'a> {
             })),
             "destruct" => {
                 let id = self.want_obj_or_dead(name, &a0)?;
+                let me = self.self_object();
+                if id == me {
+                    // P0 driver rule (OBI-149), not master policy:
+                    // `destruct(self())` is always allowed. `remove()` ->
+                    // `destruct(self())` runs with players on the stack
+                    // (kills, corpses, `dest`), so the generic P2
+                    // `valid_efun` gate -- which cannot see the argument
+                    // -- would otherwise force every master to allow
+                    // `destruct` unconditionally just so objects can
+                    // clean up after themselves (warp's
+                    // `account_efuns()` did exactly that). Destructing
+                    // *another* object is still P2 below. Always
+                    // audited, like `unguarded`.
+                    let guard = self.top_guard().clone();
+                    let d = self.driver.as_mut().expect("checked above");
+                    d.security.push(AuditEntry {
+                        caller: me,
+                        efun: "destruct",
+                        privilege: Privilege::P0,
+                        apply: "destruct-self",
+                        arg: "".into(),
+                        guard,
+                        allowed: true,
+                        denied_by: None,
+                        at_unix_ms: 0, // stamped by `push` itself
+                    });
+                } else {
+                    self.authorize(
+                        name,
+                        Privilege::P2,
+                        Operation::Efun {
+                            name: "destruct",
+                            class: Privilege::P2,
+                        },
+                    )?;
+                }
                 let driver = self.driver.as_mut().expect("checked above");
                 let conn = self.registry.destruct(id, driver.scheduler);
                 if let Some(c) = conn {
@@ -3661,11 +3703,41 @@ impl<'a> RegistryHost<'a> {
         // which loads `/builders/arch/daemon` from `appr`'s stack and
         // still requires it owned/euid'd `arch`). `clone_object` always
         // passes `true`.
-        let owner = if apply_r1 && !guard.is_empty() && !guard.has_euid(prog_uid) {
+        let mut owner = if apply_r1 && !guard.is_empty() && !guard.has_euid(prog_uid) {
             self.caller_quota_uid()
         } else {
             prog_uid
         };
+        // D-S2.4 amendment (OBI-149): the R1 test above skips the
+        // redirect whenever the guard already contains `prog_uid` --
+        // which every `/cmds/**` command frame does for any always-
+        // unlimited program (`root`/`mudlib`/`domain:*`), since command
+        // objects are themselves mudlib-owned and so push `mudlib` onto
+        // the guard before the apprentice's own code ever runs. Without
+        // this, an apprentice cloning `/std/item` (or any other
+        // mudlib/root/domain-owned program) from inside a command
+        // handler gets the clone billed to `mudlib`, which is never
+        // billed at all -- `max_objects`/`max_heartbeats`/
+        // `max_callouts_obj` become unenforceable simply by routing the
+        // same call through a command instead of calling the builder's
+        // own object directly. Bill it to the lowest-tier *billable*
+        // staff principal on the stack instead, same ranking
+        // `caller_quota_uid` already uses -- but only when that
+        // principal is tier >= 1 (a real staff row): a bare tier-0
+        // player has no policy row and must stay unaffected (spec:
+        // "Players (tier 0, no policy row) are unaffected"). `euid`
+        // itself is untouched -- R1 above already decided it and this
+        // amendment only ever narrows *billing*, never confinement.
+        if apply_r1
+            && crate::quota::is_unlimited_uid(self.registry.syms.name(prog_uid))
+            && let Some(driver) = self.driver.as_ref()
+        {
+            let candidate = self.caller_quota_uid();
+            let name = self.registry.syms.name(candidate);
+            if !crate::quota::is_unlimited_uid(name) && driver.roles.tier(name) >= 1 {
+                owner = candidate;
+            }
+        }
         self.check_max_objects(owner)?;
         let mut obj = BcObject::new(prog.clone());
         obj.uid = prog_uid;
