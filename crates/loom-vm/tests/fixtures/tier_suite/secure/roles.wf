@@ -1,0 +1,22 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: the read half of Warp's /secure/roles facade (a50a002).
+// The only door to the driver's roles snapshot; the roles_* efuns refuse
+// any caller not compiled from /secure/**.
+
+pub fn tier(uid: string) -> int {
+    return roles_tier(uid)
+}
+
+pub fn member(uid: string, domain: string) -> bool {
+    return roles_is_member(uid, domain)
+}
+
+pub fn lead(uid: string, domain: string) -> bool {
+    return roles_is_lead(uid, domain)
+}
+
+pub fn has_grant(uid: string, kind: string, target: string) -> bool {
+    return roles_has_grant(uid, kind, target)
+}

@@ -182,6 +182,100 @@ async fn second_root_applies_proposal_and_role_changes_names_both_roots() {
     );
 }
 
+/// E1.3 (OBI-37), two-root rule: a single root cannot bypass the proposal
+/// flow through `roles_set_tier` -- not to grant T4 or T5, and not to
+/// demote an existing arch. Positive control: the same root sets a player
+/// to T3 directly.
+#[tokio::test]
+async fn a_single_root_cannot_move_anyone_into_or_out_of_t4_t5_directly() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let root_uid = unique_uid("root-direct");
+    let root_account = seed_account(&fx.owner, &root_uid).await;
+    seed_staff(&fx.owner, &root_uid, root_account, 5).await;
+
+    let player_uid = unique_uid("player-direct");
+    seed_account(&fx.owner, &player_uid).await;
+
+    let arch_uid = unique_uid("arch-direct");
+    let arch_account = seed_account(&fx.owner, &arch_uid).await;
+    seed_staff(&fx.owner, &arch_uid, arch_account, 4).await;
+
+    for tier in [4, 5] {
+        let r = fx
+            .app
+            .roles_set_tier(&root_uid, &player_uid, tier, "direct grant")
+            .await;
+        assert!(
+            r.is_err(),
+            "roles_set_tier must refuse a direct T{tier} grant"
+        );
+    }
+    assert_eq!(staff_tier(&fx.owner, &player_uid).await, None);
+
+    let r = fx
+        .app
+        .roles_set_tier(&root_uid, &arch_uid, 3, "direct demotion")
+        .await;
+    assert!(r.is_err(), "roles_set_tier must refuse demoting an arch");
+    assert_eq!(staff_tier(&fx.owner, &arch_uid).await, Some(4));
+
+    fx.app
+        .roles_set_tier(&root_uid, &player_uid, 3, "direct T3 grant")
+        .await
+        .expect("a root may set T1-T3 directly");
+    assert_eq!(staff_tier(&fx.owner, &player_uid).await, Some(3));
+}
+
+/// E1.3 (OBI-37), two-root rule: an arch (T4) can neither propose nor
+/// approve a T4/T5 change. Positive control: a root's proposal, approved
+/// by a second root, applies.
+#[tokio::test]
+async fn only_roots_may_propose_or_approve_a_two_root_change() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let arch_uid = unique_uid("arch-proposer");
+    let arch_account = seed_account(&fx.owner, &arch_uid).await;
+    seed_staff(&fx.owner, &arch_uid, arch_account, 4).await;
+
+    let root_a = unique_uid("root-a2");
+    let root_a_account = seed_account(&fx.owner, &root_a).await;
+    seed_staff(&fx.owner, &root_a, root_a_account, 5).await;
+
+    let root_b = unique_uid("root-b2");
+    let root_b_account = seed_account(&fx.owner, &root_b).await;
+    seed_staff(&fx.owner, &root_b, root_b_account, 5).await;
+
+    let target_uid = unique_uid("arch-candidate-2");
+    seed_account(&fx.owner, &target_uid).await;
+
+    let r = fx
+        .app
+        .roles_propose_tier(&arch_uid, &target_uid, 4, "arch proposes")
+        .await;
+    assert!(r.is_err(), "an arch must not be able to propose");
+
+    let proposal_id = fx
+        .app
+        .roles_propose_tier(&root_a, &target_uid, 4, "promote to arch")
+        .await
+        .expect("a root may propose");
+
+    let r = fx.app.roles_approve_proposal(&arch_uid, proposal_id).await;
+    assert!(r.is_err(), "an arch must not be able to approve");
+    assert_eq!(staff_tier(&fx.owner, &target_uid).await, None);
+
+    fx.app
+        .roles_approve_proposal(&root_b, proposal_id)
+        .await
+        .expect("a second, distinct root approves");
+    assert_eq!(staff_tier(&fx.owner, &target_uid).await, Some(4));
+}
+
 /// `loom_app` cannot write the new tables directly -- only through the
 /// `roles_*` security-definer functions -- except `INSERT` on `audit_log`.
 #[tokio::test]

@@ -1,0 +1,19 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: a /secure helper that cuts the stack with unguarded().
+// The suite only calls it as the driver (root) and through inheritance; a
+// real /secure helper must check its actor before unguarded (the SECURITY
+// DEFINER pattern, docs/security.md).
+
+pub fn cut_write(p: string) -> bool {
+    return unguarded("do_write", [p]) as bool
+}
+
+fn do_write(p: string) -> any {
+    return write_file(p, "cut")
+}
+
+pub fn read_tier(uid: string) -> int {
+    return roles_tier(uid)
+}

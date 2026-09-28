@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: builder's workroom (uid `builder`). All behaviour is inherited
+// from /std/workbench; the tier decides what it may do.
+
+inherit /std/workbench
