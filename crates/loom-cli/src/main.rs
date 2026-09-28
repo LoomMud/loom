@@ -90,6 +90,7 @@ async fn run() -> Result<(), String> {
             }
             probe(&url)
         }
+        "migrate" => migrate().await,
         other => Err(format!("unknown command: {other}")),
     }
 }
@@ -181,6 +182,26 @@ fn probe(url: &str) -> Result<(), String> {
         }
         other => Err(format!("probe: unsupported scheme: {other}")),
     }
+}
+
+/// `loom migrate`: run `loom-persist`'s embedded `sqlx` migrations against
+/// `LOOM_DB_MIGRATE_URL`, which must authenticate as `loom_owner` -- the
+/// login that owns every table and `security definer` function (D-27.4,
+/// `loom-persist`'s module docs). Never touches `DATABASE_URL`
+/// (`loom_app`, the world-runtime login): that login has no DDL rights and
+/// this command doesn't need it. Intended to run once, to completion,
+/// before `loom serve` is started against the same database (OBI-130: the
+/// staging Compose stack runs this as a separate one-shot step, the same
+/// way `mudlib-sync` gates `loom` on `service_completed_successfully`).
+async fn migrate() -> Result<(), String> {
+    let url = std::env::var("LOOM_DB_MIGRATE_URL").map_err(|_| {
+        "LOOM_DB_MIGRATE_URL is not set (must authenticate as loom_owner)".to_string()
+    })?;
+    loom_persist::run_migrations(&url)
+        .await
+        .map_err(|err| format!("migration failed: {err}"))?;
+    info!("migrations applied");
+    Ok(())
 }
 
 /// `loom disasm <mudlib-root> <program-path>`: compile one program (and its
