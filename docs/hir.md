@@ -115,7 +115,7 @@ previously described:
 - **Never persisted (r5 rule 4, OBI-53):** the checker rejects a
   `persistent` variable whose type is or contains `fn(...)` — directly, in
   an array/map, or (once structs are checked) in a struct field — with
-  `W0287`. A function value pins a code version and a principal that may
+  `W0294`. A function value pins a code version and a principal that may
   not survive a reboot.
 
 A function value is therefore a capability: its runtime representation and
