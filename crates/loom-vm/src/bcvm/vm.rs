@@ -988,11 +988,11 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 // through a Weft `try`/`catch`, a full unwind out of the
                 // call chain, or a tick/budget abort alike.
                 let (owner_s, name_s) = (
-                    self.str_of(owner).to_string(),
-                    self.str_of(name).to_string(),
+                    self.str_of(*owner).to_string(),
+                    self.str_of(*name).to_string(),
                 );
-                let key = reg!(index);
-                let val = reg!(src);
+                let key = reg!(*index);
+                let val = reg!(*src);
                 let mut container = self.host.take_global(&owner_s, &name_s)?;
                 let shared = container.is_shared();
                 // A map insert of a genuinely new key is the one way this
@@ -1014,7 +1014,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     self.host.restore_global(&owner_s, &name_s, container)?;
                     return Err(e);
                 }
-                match Self::index_set(kind, &mut container, key, val) {
+                match Self::index_set(*kind, &mut container, key, val) {
                     Ok(()) => {
                         self.host.commit_global(&owner_s, &name_s, container)?;
                         if shared {
@@ -1860,7 +1860,7 @@ mod tests {
             Op::LoadConst { dst: 3, idx: 1 }, // value 99
             Op::NewArray {
                 dst: 0,
-                elem_ty: Box::new(Ty::Int),
+                elem_ty: Ty::Int,
                 elems: vec![2],
             }, // arr = [0]
             Op::Copy { dst: 1, src: 0 },      // alias = arr (shares the buffer)
