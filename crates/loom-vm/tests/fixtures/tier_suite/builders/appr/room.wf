@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: a room in appr's workroom (program_flags CONFINED).
+
+pub fn create() {
+}

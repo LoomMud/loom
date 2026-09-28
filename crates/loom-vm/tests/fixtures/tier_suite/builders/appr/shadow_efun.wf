@@ -1,0 +1,9 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite, LPC-style shadow(): Weft has no such efun, so this
+// program must not compile.
+
+pub fn attach() {
+    shadow(load_object("/builders/arch/tool"))
+}

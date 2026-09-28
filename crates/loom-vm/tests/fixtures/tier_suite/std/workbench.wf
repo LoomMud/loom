@@ -1,0 +1,179 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: the reviewed toolkit every workroom inherits. Inherited
+// code runs as the *inheriting* object's uid/euid, so the same function is
+// the attack when /builders/appr/workroom runs it and the positive control
+// when /builders/builder or /builders/arch's workroom runs it.
+
+var pending: string = ""
+persistent var spun: int = 0
+persistent var fired: int = 0
+var hoard: [int] = []
+
+// ---- files ---------------------------------------------------------------
+
+pub fn write(p: string) -> bool {
+    return write_file(p, "x")
+}
+
+pub fn write_text(p: string, t: string) -> bool {
+    return write_file(p, t)
+}
+
+pub fn read(p: string) -> string? {
+    return read_file(p)
+}
+
+pub fn compile(p: string) -> string? {
+    return compile_object(p)
+}
+
+pub fn upgrade(p: string) -> int {
+    return upgrade_all(p)
+}
+
+pub fn load(p: string) -> object {
+    return load_object(p)
+}
+
+// ---- identity and privileged efuns -----------------------------------------
+
+pub fn raise(e: string) {
+    seteuid(e)
+}
+
+pub fn ids() -> string {
+    return $"{getuid()}/{geteuid()}"
+}
+
+pub fn kill(p: string) {
+    destruct(load_object(p))
+}
+
+pub fn kill_self() {
+    destruct(self())
+}
+
+pub fn cut(p: string) -> any {
+    return unguarded("write", [p])
+}
+
+pub fn roles_direct(uid: string) -> int {
+    return roles_tier(uid)
+}
+
+pub fn roles_facade(uid: string) -> int {
+    return load_object("/secure/roles").tier(uid)
+}
+
+pub fn propose_direct(target: string) -> int {
+    return roles_propose_tier(target, 4, "self-service")
+}
+
+// ---- higher-tier objects ---------------------------------------------------
+
+fn arch() -> object {
+    return load_object("/builders/arch/tool")
+}
+
+pub fn ask_arch_write(p: string) -> bool {
+    return arch().write_for(p)
+}
+
+pub fn relay_to_arch(p: string) -> bool {
+    return load_object("/std/relay").relay_write(arch(), p)
+}
+
+pub fn write_for(p: string) -> bool {
+    return write_file(p, "bench")
+}
+
+pub fn make_writer(p: string) -> fn() -> bool {
+    return fn() -> bool {
+        return write_file(p, "closure")
+    }
+}
+
+pub fn invoke(f: fn() -> bool) -> bool {
+    return f()
+}
+
+pub fn give_arch_closure(p: string) {
+    arch().store(make_writer(p))
+}
+
+pub fn ask_arch_schedule(p: string) {
+    arch().schedule_write(p)
+}
+
+pub fn schedule_write(p: string) {
+    pending = p
+    call_out("finish_write", 1)
+}
+
+fn finish_write() {
+    write_file(pending, "call_out")
+}
+
+// ---- quotas ----------------------------------------------------------------
+
+pub fn spawn() -> object {
+    return clone_object("/std/thing")
+}
+
+pub fn spawn_via_arch() -> object {
+    return arch().clone_for()
+}
+
+pub fn ticker() -> object {
+    let t = clone_object("/std/ticker")
+    t.on()
+    return t
+}
+
+pub fn sched() -> int {
+    return call_out("noop", 100)
+}
+
+pub fn sched_via_arch() -> int {
+    return arch().sched_noop()
+}
+
+fn noop() {
+    fired += 1
+}
+
+pub fn sched_spin(n: int) {
+    call_out("spin", 1)
+    spun = -n
+}
+
+fn spin() {
+    let n = 0 - spun
+    var i = 0
+    while i < n {
+        i += 1
+    }
+    spun = n
+}
+
+pub fn grow(n: int) {
+    var a: [int] = [0]
+    while len(a) < n {
+        a = a + a
+    }
+    hoard = a
+}
+
+pub fn bytes(n: int) -> string {
+    var s = "x"
+    while len(s) < n {
+        s = s + s
+    }
+    return s
+}
+
+pub fn move_into(what: object, dest: object) {
+    what.move_into(dest)
+}

@@ -1,0 +1,326 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite (OBI-37) reference master.
+//
+// Everything from "Security policy" down is the §5.11 policy of Warp's
+// /secure/master.wf at warp a50a002, copied verbatim so the driver's tier
+// enforcement is tested against the policy a real mudlib ships, not a
+// test-only allow-list. Deliberate deltas from a50a002 (keep this list
+// current when re-syncing):
+//   - account_efuns() is ["disconnect"]: `destruct` is gone, as OBI-154
+//     asks of Warp (destruct(self()) is a P0 driver rule since OBI-149).
+// Everything above the policy is test scaffolding: no zones, no login.
+
+// The account the next connection's /std/player takes on (the stand-in
+// for /secure/login's post-auth handoff). Set from the Rust test only.
+var next_account: string = "guest"
+
+pub fn set_next_account(a: string) {
+    next_account = a
+}
+
+fn connect() -> object {
+    let p = clone_object("/std/player")
+    p.assume_account_euid(next_account)
+    return p
+}
+
+// ---- Security policy (spec r5 §5.11, OBI-36 design note D-S2.5) ----------
+//
+// The driver asks each apply once for every euid in the guard set (every
+// distinct euid on the stack; root never counts) and allows the operation
+// only if all of them say yes. Inside an apply, effective_principal() is
+// the euid being asked about. Results are cached per (apply, euid,
+// argument), so they depend only on those and the roles snapshot, never on
+// `ob`. Anything that throws or returns a non-bool is a denial.
+//
+// Principals:
+//   mudlib      /std, /cmds, /daemons, /secure-called code: reviewed and
+//               trusted, so it allows what the humans on the same stack
+//               are allowed. It never writes /secure or /std live.
+//   domain:<d>  area code (rooms, NPCs): P0-P2, reads, no writes/compiles.
+//   <account>   a player (tier 0) or staff member (tier 1-5), looked up in
+//               the roles snapshot through /secure/roles' read efuns.
+
+// Path classes (§5.11.1). Returns [class, argument].
+//   /secure/**                     secure
+//   /std, /cmds, /daemons, /include protected
+//   /domains/<d>/wip/**             domain_wip(d)
+//   /domains/<d>/**  (the rest)     domain_live(d)  [spec: /domains/<d>/live/**;
+//                                   Warp's areas predate the live/ split]
+//   /builders/<u>/**                workroom(u)
+//   /doc/**                         doc
+//   /data/**                        data
+//   anything else                   other (arch and root only)
+pub fn classify(path: string) -> [string] {
+    let parts = split(path, "/")
+    if len(parts) < 2 or parts[0] != "" or ".." in parts {
+        return ["other", ""]
+    }
+    let top = parts[1]
+    if top == "secure" {
+        return ["secure", ""]
+    }
+    if top == "std" or top == "cmds" or top == "daemons" or top == "include" {
+        return ["protected", ""]
+    }
+    if top == "domains" and len(parts) >= 3 and parts[2] != "" {
+        if len(parts) >= 4 and parts[3] == "wip" {
+            return ["domain_wip", parts[2]]
+        }
+        return ["domain_live", parts[2]]
+    }
+    if top == "builders" and len(parts) >= 3 and parts[2] != "" {
+        return ["workroom", parts[2]]
+    }
+    if top == "doc" {
+        return ["doc", ""]
+    }
+    if top == "data" {
+        return ["data", ""]
+    }
+    return ["other", ""]
+}
+
+fn roles() -> object {
+    return load_object("/secure/roles")
+}
+
+pub fn is_domain_uid(who: string) -> bool {
+    return split(who, ":")[0] == "domain" and len(split(who, ":")) == 2
+}
+
+// A path grant (§5.11.2 "grants") covers the path and everything below it.
+fn path_granted(who: string, path: string) -> bool {
+    let r = roles()
+    let parts = split(path, "/")
+    var prefix = ""
+    var i = 1
+    while i < len(parts) {
+        prefix += "/" + parts[i]
+        if r.has_grant(who, "path", prefix) as bool {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+// Highest efun privilege class for a tier (§5.11.2 "Efun privilege
+// classes"; the seed's tier_policy.efun_classes, which the snapshot does
+// not carry yet).
+pub fn max_class(tier: int) -> int {
+    if tier >= 5 {
+        return 4
+    }
+    if tier == 4 {
+        return 3
+    }
+    if tier == 3 {
+        return 2
+    }
+    if tier >= 1 {
+        return 1
+    }
+    return 0
+}
+
+// P2 efuns the ordinary game needs with any account on the stack: `quit`
+// disconnects, and remove() destructs NPCs a player kills and corpses.
+pub fn account_efuns() -> [string] {
+    return ["disconnect"]
+}
+
+pub fn can_efun(who: string, name: string, class: int) -> bool {
+    if class <= 0 or who == "root" {
+        return true
+    }
+    if who == "mudlib" {
+        return class <= 3
+    }
+    if is_domain_uid(who) {
+        return class <= 2
+    }
+    if name in account_efuns() {
+        return true
+    }
+    if class <= max_class(roles().tier(who) as int) {
+        return true
+    }
+    return roles().has_grant(who, "efun", name) as bool
+}
+
+pub fn can_read(who: string, path: string) -> bool {
+    if who == "root" or who == "mudlib" {
+        return true
+    }
+    let c = classify(path)
+    if is_domain_uid(who) {
+        return c[0] != "secure" and c[0] != "data"
+    }
+    let r = roles()
+    let t = r.tier(who) as int
+    if t >= 4 {
+        return true
+    }
+    let cls = c[0]
+    var ok = false
+    if cls == "doc" {
+        ok = true
+    } else if cls == "protected" {
+        ok = t >= 1
+    } else if cls == "workroom" {
+        ok = t >= 1 and (c[1] == who or t >= 3)
+    } else if cls == "domain_live" or cls == "domain_wip" {
+        ok = t >= 2 or (t >= 1 and (r.member(who, c[1]) as bool))
+    }
+    return ok or path_granted(who, path)
+}
+
+// Live writes (§5.11.2 "Write, live"). /secure and protected code change
+// only through Git review, never live, for everyone but root.
+pub fn can_write(who: string, path: string) -> bool {
+    if who == "root" {
+        return true
+    }
+    let c = classify(path)
+    let cls = c[0]
+    if who == "mudlib" {
+        return cls == "workroom" or cls == "domain_live" or cls == "domain_wip" or cls == "doc"
+    }
+    if is_domain_uid(who) {
+        return false
+    }
+    let r = roles()
+    let t = r.tier(who) as int
+    var ok = false
+    if t >= 1 {
+        if cls == "workroom" {
+            ok = c[1] == who
+        } else if cls == "domain_wip" {
+            ok = (t >= 2 and (r.member(who, c[1]) as bool)) or (r.lead(who, c[1]) as bool) or t >= 4
+        } else if cls == "domain_live" {
+            ok = (r.lead(who, c[1]) as bool) or t >= 4
+        } else if cls == "doc" {
+            ok = t >= 3
+        }
+    }
+    return ok or path_granted(who, path)
+}
+
+// Compiling reloads what is on disk (reviewed code) into the running game.
+// T1 only in its own workroom; domains for their members; protected code
+// for arches; /secure for roots.
+pub fn can_compile(who: string, path: string) -> bool {
+    if who == "root" or who == "mudlib" {
+        return true
+    }
+    if is_domain_uid(who) {
+        return false
+    }
+    let c = classify(path)
+    let cls = c[0]
+    let r = roles()
+    let t = r.tier(who) as int
+    var ok = false
+    if t == 1 {
+        ok = cls == "workroom" and c[1] == who
+    } else if t >= 2 {
+        if cls == "secure" {
+            ok = t >= 5
+        } else if cls == "workroom" {
+            ok = c[1] == who or t >= 3
+        } else if cls == "domain_live" or cls == "domain_wip" {
+            ok = (r.member(who, c[1]) as bool) or t >= 4
+        } else {
+            ok = t >= 4
+        }
+    }
+    return ok or path_granted(who, path)
+}
+
+// upgrade_all (P1): like compile, but a domain lead only for its own
+// domains (§5.11.2) and members never.
+pub fn can_upgrade(who: string, path: string) -> bool {
+    if who == "root" or who == "mudlib" {
+        return true
+    }
+    if is_domain_uid(who) {
+        return false
+    }
+    let c = classify(path)
+    let r = roles()
+    let t = r.tier(who) as int
+    if c[0] == "domain_live" or c[0] == "domain_wip" {
+        return (t >= 3 and (r.lead(who, c[1]) as bool)) or t >= 4
+    }
+    if c[0] == "workroom" {
+        return t >= 1 and c[1] == who
+    }
+    return can_compile(who, path)
+}
+
+// An account uid as created by /secure/login: 3-16 letters a-z.
+pub fn is_account_name(n: string) -> bool {
+    if len(n) < 3 or len(n) > 16 {
+        return false
+    }
+    let letters = "abcdefghijklmnopqrstuvwxyz"
+    var i = 0
+    while i < len(n) {
+        if not (n[i] in letters) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return can_efun(effective_principal(), name, class)
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return can_read(effective_principal(), path)
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return can_write(effective_principal(), path)
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return can_compile(effective_principal(), path)
+}
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return can_upgrade(effective_principal(), path)
+}
+
+// Only /std/player.assume_account_euid, reached from login_complete with
+// root and mudlib alone on the stack, moves an euid, and only onto an
+// account name. Anyone else on the stack (any account, any domain) denies.
+fn valid_seteuid(ob: object, e: string) -> bool {
+    return effective_principal() == "mudlib" and is_account_name(e)
+}
+
+// bind_connection is the master's alone and runs with root only on the
+// stack, which the driver allows without asking. Deny everyone else.
+fn valid_bind(ob: object, target: object) -> bool {
+    return false
+}
+
+// Apply (cached per program): confinement bits for move_to.
+//   1 CONFINED  workroom or domain wip: never enters a live room, never
+//               reaches a player's inventory, players never enter it.
+//   2 LIVE      domain live content.
+fn program_flags(path: string) -> int {
+    let cls = classify(path)[0]
+    if cls == "workroom" or cls == "domain_wip" {
+        return 1
+    }
+    if cls == "domain_live" {
+        return 2
+    }
+    return 0
+}

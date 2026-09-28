@@ -1,0 +1,9 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: a trusted mudlib object (uid `mudlib`) in the middle of
+// a call_other chain.
+
+pub fn relay_write(target: object, p: string) -> bool {
+    return target.write_for(p)
+}

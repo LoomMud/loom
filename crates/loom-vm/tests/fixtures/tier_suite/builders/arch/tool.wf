@@ -1,0 +1,65 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: a T4 (arch) daemon that lower tiers call into. Every
+// entry point does something only an arch may do on its own.
+
+var stored: any = null
+var pending: string = ""
+var last_error: string = ""
+
+pub fn create() {
+    set_heartbeat(true)
+}
+
+pub fn write_for(p: string) -> bool {
+    return write_file(p, "arch")
+}
+
+pub fn make_writer(p: string) -> fn() -> bool {
+    return fn() -> bool {
+        return write_file(p, "arch-closure")
+    }
+}
+
+pub fn invoke(f: fn() -> bool) -> bool {
+    return f()
+}
+
+// Runs whatever closure it was handed on its next heartbeat. A denial is
+// caught so the heartbeat stays subscribed.
+pub fn store(f: fn() -> bool) {
+    stored = f
+}
+
+pub fn heartbeat() {
+    if stored != null {
+        let f = stored
+        stored = null
+        try {
+            f()
+        } catch e {
+            last_error = e
+        }
+    }
+}
+
+pub fn schedule_write(p: string) {
+    pending = p
+    call_out("finish_write", 1)
+}
+
+fn finish_write() {
+    write_file(pending, "arch-call_out")
+}
+
+pub fn clone_for() -> object {
+    return clone_object("/std/thing")
+}
+
+pub fn sched_noop() -> int {
+    return call_out("noop", 100)
+}
+
+fn noop() {
+}

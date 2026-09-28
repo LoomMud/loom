@@ -1,0 +1,11 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: a plain clonable mudlib item (uid `mudlib`).
+
+pub fn create() {
+}
+
+pub fn move_into(dest: object) {
+    move_to(dest)
+}
