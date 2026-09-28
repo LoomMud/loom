@@ -402,3 +402,161 @@ fn a_mudlib_owned_heartbeat_with_an_infinite_loop_aborts_at_the_world_default() 
         Some(Value::Int(1))
     ));
 }
+
+// -- CTO re-review N1: `mem_quota_cache` must key on a generation
+// counter, not the roles snapshot `Arc`'s own address (an ABA problem in
+// principle -- a dropped `Arc`'s address can be reused) -----------------
+
+#[test]
+fn mem_quota_cache_is_invalidated_by_every_roles_snapshot_swap_not_just_the_first() {
+    let (mut world, mut host) = boot();
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+
+    // World default (16 MB): a few thousand ints is fine.
+    world
+        .call(workroom, "grow", vec![Value::Int(2_000)], &mut host)
+        .expect("within the world default");
+
+    // Swap #1: a tight 1 MB row -- must reject immediately (not serve a
+    // cached "unlimited" answer from before any snapshot was set).
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"max_mem_exec_mb": 1}"#)));
+    world
+        .call(workroom, "grow", vec![Value::Int(500_000)], &mut host)
+        .unwrap_err();
+
+    // Swap #2: back to a generous row -- must accept again (not keep
+    // serving swap #1's cached rejection-causing quota).
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"max_mem_exec_mb": 64}"#)));
+    world
+        .call(workroom, "grow", vec![Value::Int(500_000)], &mut host)
+        .expect("swap #2's more generous quota must actually take effect");
+}
+
+// -- CTO re-review N2: confinement rule 2 must walk dest's entire
+// environment chain, not only dest itself -------------------------------
+
+#[test]
+fn confined_object_cannot_reach_a_tier0_player_through_a_container_in_their_inventory() {
+    let (mut world, mut host) = boot();
+    world.set_roles_snapshot(Arc::new(
+        RolesSnapshot::from_seed_json(r#"{"staff": {"staffer": 3}}"#).unwrap(),
+    ));
+    connect_appr(&mut world, &mut host, 1);
+    world.connect(2, &mut host); // guest, T0
+    host.take(2);
+    let guest = world.connection_object(2).expect("bound");
+    world.connect(3, &mut host); // staffer, T3
+    host.take(3);
+    let staffer = world.connection_object(3).expect("bound");
+
+    let thing = world
+        .load_object("/std/confined_thing", &mut host)
+        .expect("load");
+    let bag = world.load_object("/std/bag", &mut host).expect("load");
+
+    // The bag itself is unflagged (not a player, not confined/live), so
+    // placing it in either inventory is unrestricted.
+    world
+        .call(bag, "move_into_obj", vec![Value::Object(guest)], &mut host)
+        .expect("an ordinary container may enter any inventory");
+
+    let e = world
+        .call(thing, "move_into_obj", vec![Value::Object(bag)], &mut host)
+        .unwrap_err();
+    assert!(
+        e.contains("tier-0 player"),
+        "a confined item must not reach a tier-0 player through a container \
+         in their inventory: {e}"
+    );
+
+    // Move the (still empty -- the write above failed) bag into the
+    // staff player's inventory instead, and the same move must now
+    // succeed.
+    world
+        .call(
+            bag,
+            "move_into_obj",
+            vec![Value::Object(staffer)],
+            &mut host,
+        )
+        .expect("moving the bag itself is unrestricted");
+    world
+        .call(thing, "move_into_obj", vec![Value::Object(bag)], &mut host)
+        .expect("a staff player's container is not confined");
+}
+
+// -- CTO re-review N3: a heartbeat on an R1 clone is billed to the
+// clone's owner, not to the program's own (always-unlimited) uid --------
+
+#[test]
+fn an_r1_clones_heartbeat_is_billed_to_the_apprentices_max_heartbeats_quota() {
+    let (mut world, mut host) = boot();
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"max_heartbeats": 1}"#)));
+
+    let clone1 = world
+        .call(workroom, "spawn_daemon", Vec::new(), &mut host)
+        .expect("spawn_daemon");
+    let Value::Object(clone1) = clone1 else {
+        panic!("expected an object");
+    };
+    world
+        .call(clone1, "subscribe", Vec::new(), &mut host)
+        .expect("the apprentice's first heartbeat subscriber is within the limit");
+
+    let clone2 = world
+        .call(workroom, "spawn_daemon", Vec::new(), &mut host)
+        .expect("spawn_daemon");
+    let Value::Object(clone2) = clone2 else {
+        panic!("expected an object");
+    };
+    let e = world
+        .call(clone2, "subscribe", Vec::new(), &mut host)
+        .unwrap_err();
+    assert!(
+        e.contains("max_heartbeats"),
+        "the clone's heartbeat must be billed to `appr` (owner), not to \
+         `/daemons/thing`'s own (always-unlimited) uid: {e}"
+    );
+}
+
+// -- CTO re-review N4: `caller_quota_uid` must skip always-unlimited
+// principals when ranking the guard set by tier --------------------------
+
+#[test]
+fn a_call_through_a_mudlib_helper_still_bills_the_calling_apprentice() {
+    let (mut world, mut host) = boot();
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+
+    let clone = world
+        .call(
+            workroom,
+            "spawn_via_helper",
+            vec![Value::str("/builders/senior/thing")],
+            &mut host,
+        )
+        .expect("spawn_via_helper");
+    let Value::Object(clone_id) = clone else {
+        panic!("expected an object, got {clone:?}");
+    };
+    assert_eq!(
+        world.owner_uid(clone_id),
+        Some("appr"),
+        "the guard set is {{appr(T1), mudlib(T0-but-unbillable)}}: the \
+         lowest *billable* tier is appr's, not mudlib's"
+    );
+
+    world.tick(&mut host); // the scheduled call_out (delay 1) fires here.
+    assert_eq!(
+        world.last_call_out_quota_uid(),
+        Some("appr"),
+        "the helper's own call_out must be billed to the caller, not to \
+         its own (always-unlimited) uid"
+    );
+}

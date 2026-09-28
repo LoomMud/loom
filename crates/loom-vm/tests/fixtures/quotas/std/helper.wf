@@ -1,0 +1,16 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// A mudlib-owned helper (CTO review N4 fixture): the caller-quota-uid
+// ranking bug meant a call through any `/std` helper like this one would
+// have its clone_object/call_out billed to `mudlib` (an always-unlimited
+// uid, so never actually billed anywhere) instead of the apprentice that
+// called in. `owner`/`quota_uid` here must both come out as the caller's.
+pub fn clone_and_schedule(path: string) -> object {
+    let ob = clone_object(path)
+    call_out("noop", 1)
+    return ob
+}
+
+fn noop() {
+}

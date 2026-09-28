@@ -6,3 +6,14 @@
 pub fn ids() -> string {
     return $"{getuid()}/{geteuid()}"
 }
+
+// CTO review N3: a heartbeat subscribed on an R1 clone of this program
+// must be billed to the clone's `owner` (the apprentice that spawned it),
+// not to this program's own `uid` (`mudlib`, always-unlimited -- if it
+// were billed there, `max_heartbeats` could never actually apply).
+pub fn subscribe() {
+    set_heartbeat(true)
+}
+
+pub fn heartbeat() {
+}
