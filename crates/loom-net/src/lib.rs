@@ -266,9 +266,17 @@ async fn run_connection(
                             }
                         }
                         ConnControl::SendGmcp(package_message, payload) => {
-                            let bytes = encode_gmcp(&package_message, &payload);
-                            if writer.write_all(&bytes).await.is_err() {
-                                break;
+                            if codec.gmcp_enabled() {
+                                let bytes = encode_gmcp(&package_message, &payload);
+                                if writer.write_all(&bytes).await.is_err() {
+                                    break;
+                                }
+                            } else {
+                                debug!(
+                                    conn_id,
+                                    package_message,
+                                    "dropping SendGmcp: GMCP was never negotiated on this connection"
+                                );
                             }
                         }
                         ConnControl::Close => {
@@ -398,6 +406,13 @@ impl TelnetCodec {
         self.options.start()
     }
 
+    /// Whether GMCP has actually been negotiated (`us == Yes`): gates
+    /// `ConnControl::SendGmcp` so a caller can't push a GMCP frame onto a
+    /// connection that never agreed to speak it.
+    fn gmcp_enabled(&self) -> bool {
+        self.options.is_enabled_us(telnet::OPT_GMCP)
+    }
+
     fn feed(&mut self, chunk: &[u8]) -> CodecOutcome {
         let mut lines = Vec::new();
         let mut responses = Vec::new();
@@ -438,7 +453,7 @@ impl TelnetCodec {
                     let response = if is_known_option(*byte) {
                         self.options.handle_verb(verb, *byte)
                     } else {
-                        refusal_for(verb, *byte)
+                        refusal_for(verb, *byte).unwrap_or_default()
                     };
                     if !response.is_empty() {
                         responses.push(response);
@@ -468,6 +483,14 @@ impl TelnetCodec {
                                 total = self.oversize_subnegotiations,
                                 "dropped oversized telnet subnegotiation (> {MAX_SUBNEGOTIATION_BYTES} bytes)"
                             );
+                            // A flood of oversized junk frames is exactly
+                            // the kind of client-controlled-parser cost
+                            // the rate limit exists for (CTO review,
+                            // OBI-26): charge a token here too, not just
+                            // on successfully-parsed frames below.
+                            if !self.bucket.try_take() {
+                                return CodecOutcome::Disconnect;
+                            }
                         } else {
                             let is_gmcp = self.sub_buf.first() == Some(&telnet::OPT_GMCP);
                             let (response, event) =
@@ -601,13 +624,20 @@ fn is_known_option(option: u8) -> bool {
     )
 }
 
-fn refusal_for(verb: u8, option: u8) -> Vec<u8> {
-    let refusal = if verb == DO || verb == DONT {
-        WONT
-    } else {
-        DONT
-    };
-    vec![IAC, refusal, option]
+fn refusal_for(verb: u8, option: u8) -> Option<Vec<u8>> {
+    // RFC 854/1143: never acknowledge a state you are already in. For an
+    // option we've never heard of, we are implicitly always in `No`/`No`
+    // (never asked to do it, never offered to do it), so a peer telling us
+    // `WONT`/`DONT` is telling us something we already believe -- replying
+    // would let a peer that also "correctly" answers refusals ping-pong
+    // forever. Only `WILL`/`DO` (the peer asking us to change state) gets
+    // an answer.
+    match verb {
+        WILL => Some(vec![IAC, DONT, option]),
+        DO => Some(vec![IAC, WONT, option]),
+        WONT | DONT => None,
+        _ => unreachable!("caller only dispatches DO/DONT/WILL/WONT"),
+    }
 }
 
 #[cfg(test)]
@@ -757,6 +787,91 @@ mod tests {
             panic!("unexpected disconnect");
         };
         assert_eq!(responses, vec![vec![IAC, WONT, telnet::OPT_MCCP2]]);
+    }
+
+    #[test]
+    fn unknown_option_refusals_are_never_acknowledged() {
+        // RFC 854/1143: never acknowledge a state you're already in. For an
+        // unknown option we're implicitly always No/No, so WONT/DONT (the
+        // peer telling us something we already believe) must get silence,
+        // not another refusal -- otherwise a peer that also "correctly"
+        // answers refusals ping-pongs forever (CTO review, OBI-26).
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        let out = codec.feed(&[IAC, WONT, 99]);
+        let CodecOutcome::Ok { responses, .. } = out else {
+            panic!("unexpected disconnect");
+        };
+        assert!(
+            responses.is_empty(),
+            "WONT for an unknown option must get silence"
+        );
+
+        let out = codec.feed(&[IAC, DONT, 99]);
+        let CodecOutcome::Ok { responses, .. } = out else {
+            panic!("unexpected disconnect");
+        };
+        assert!(
+            responses.is_empty(),
+            "DONT for an unknown option must get silence"
+        );
+
+        // WILL/DO for an unknown option still get an answer (that's how
+        // the peer learns we won't do it).
+        let out = codec.feed(&[IAC, WILL, 99]);
+        let CodecOutcome::Ok { responses, .. } = out else {
+            panic!("unexpected disconnect");
+        };
+        assert_eq!(responses, vec![vec![IAC, DONT, 99]]);
+
+        let out = codec.feed(&[IAC, DO, 99]);
+        let CodecOutcome::Ok { responses, .. } = out else {
+            panic!("unexpected disconnect");
+        };
+        assert_eq!(responses, vec![vec![IAC, WONT, 99]]);
+    }
+
+    #[test]
+    fn disabling_a_known_option_from_yes_is_acknowledged() {
+        // RFC 1143: a Yes -> No transition (the peer disabling something
+        // that was negotiated on) must be acknowledged, or a Q-method peer
+        // is stuck in WANTNO forever waiting for our answer (CTO review,
+        // OBI-26).
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        let _ = codec.start(); // sends `DO NAWS`; him[NAWS] = WantYes
+
+        // Client agrees: him[NAWS] -> Yes (no reply needed, we already asked).
+        let out = codec.feed(&[IAC, WILL, telnet::OPT_NAWS]);
+        let CodecOutcome::Ok { responses, .. } = out else {
+            panic!("unexpected disconnect");
+        };
+        assert!(responses.is_empty());
+
+        // Client disables it: Yes -> No must be acked with exactly one DONT.
+        let out = codec.feed(&[IAC, WONT, telnet::OPT_NAWS]);
+        let CodecOutcome::Ok { responses, .. } = out else {
+            panic!("unexpected disconnect");
+        };
+        assert_eq!(responses, vec![vec![IAC, DONT, telnet::OPT_NAWS]]);
+
+        // A second WONT (already No) must get silence, not another DONT.
+        let out = codec.feed(&[IAC, WONT, telnet::OPT_NAWS]);
+        let CodecOutcome::Ok { responses, .. } = out else {
+            panic!("unexpected disconnect");
+        };
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn send_gmcp_is_dropped_until_gmcp_is_negotiated() {
+        // Condition 3 (CTO review, OBI-26): `NetCommand::SendGmcp` must be
+        // gated on having actually negotiated GMCP, not just written
+        // unconditionally to the wire.
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        let _ = codec.start(); // sends `WILL GMCP`; us[GMCP] = WantYes
+        assert!(!codec.gmcp_enabled());
+
+        let _ = codec.feed(&[IAC, DO, telnet::OPT_GMCP]); // client agrees
+        assert!(codec.gmcp_enabled());
     }
 
     #[test]
@@ -1181,6 +1296,92 @@ mod tests {
         b"{\"a\":1}",
         b"line",
     ];
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_gmcp_over_the_wire_is_gated_on_negotiation() {
+        // Condition 3 (CTO review, OBI-26), end to end: a `SendGmcp`
+        // issued before the client has agreed to `DO GMCP` must produce no
+        // bytes on the wire at all; one issued after negotiation completes
+        // must produce the encoded frame.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server = tokio::spawn(run_server(listener, config, event_tx, cmd_rx, shutdown_rx));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        drain_preamble(&mut client).await;
+
+        let conn = loop {
+            match event_rx.recv().await.expect("event channel closed") {
+                NetEvent::Connected(id) => break id,
+                _ => continue,
+            }
+        };
+
+        // Before negotiation: SendGmcp must be dropped, not written.
+        cmd_tx
+            .send(NetCommand::SendGmcp(
+                conn,
+                "Char.Foo".to_string(),
+                serde_json::json!({"x": 1}),
+            ))
+            .await
+            .unwrap();
+
+        // Prove "no bytes" by racing the drop against something that *does*
+        // produce bytes: send a line and read its echo-free response
+        // ourselves isn't available here (no echo task), so instead confirm
+        // no data arrives within a short window, then complete negotiation
+        // and confirm the second SendGmcp *does* arrive.
+        client.write_all(b"unrelated line\r\n").await.unwrap(); // keeps the connection alive; not read by anything in this test
+        let mut probe = [0_u8; 1];
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            client.read(&mut probe),
+        )
+        .await
+        .is_err();
+        assert!(
+            timed_out,
+            "SendGmcp before negotiation must not put any bytes on the wire"
+        );
+
+        // Complete GMCP negotiation: client agrees to DO GMCP.
+        client
+            .write_all(&[IAC, DO, telnet::OPT_GMCP])
+            .await
+            .unwrap();
+        // Give the server a moment to process the negotiation frame.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        cmd_tx
+            .send(NetCommand::SendGmcp(
+                conn,
+                "Char.Foo".to_string(),
+                serde_json::json!({"x": 1}),
+            ))
+            .await
+            .unwrap();
+
+        let expected = encode_gmcp("Char.Foo", &serde_json::json!({"x": 1}));
+        let mut buf = vec![0_u8; expected.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_exact(&mut buf),
+        )
+        .await
+        .expect("timed out waiting for the post-negotiation GMCP frame")
+        .unwrap();
+        assert_eq!(buf, expected);
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn echo_integration_server_round_trip() {
