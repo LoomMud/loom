@@ -10,4 +10,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo deny check licenses bans sources advisories
 scripts/check-dco.sh
+if [ -d web-client ]; then
+  (cd web-client && npm install --include=dev && npm run build && npm test && npm run check-licenses)
+fi
 echo "ci-local: all gates green"
