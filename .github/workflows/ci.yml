@@ -131,6 +131,25 @@ jobs:
           workspaces: crates/loom-compiler/fuzz
       - run: cargo install cargo-fuzz --locked
       - run: FUZZ_SECONDS=45 scripts/fuzz-smoke.sh bytecode
+  web-client:
+    # Minimal TS web client (OBI-39): build + unit tests, and an npm
+    # dependency licence gate mirroring `deny.toml`'s OSI allow-list (the
+    # client ships zero production dependencies today; `--production`
+    # scopes the gate to whatever actually ends up in the browser bundle,
+    # not this repo's own build tooling).
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
+    defaults:
+      run:
+        working-directory: web-client
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "22"
+      - run: npm install --include=dev
+      - run: npm run build
+      - run: npm test
+      - run: npm run check-licenses
   loadtest-smoke:
     # R4 load-bot smoke (OBI-40): 20 simulated players, 60s, against a real
     # `loom serve` on this checkout's fixture mudlib driven by Warp's
