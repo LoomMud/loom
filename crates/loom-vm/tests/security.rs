@@ -98,6 +98,14 @@ pub fn cut(p: string) {
 pub fn read_it(p: string) -> string? {
     return read_file(p)
 }
+
+pub fn kill_self() {
+    destruct(self())
+}
+
+pub fn kill_arch() {
+    destruct(load_object("/builders/arch/daemon"))
+}
 "#;
 
 const ROLES: &str = r#"
@@ -320,4 +328,42 @@ fn file_paths_cannot_escape_the_mudlib() {
         .call(APPR_OB, "read_it", &["/builders/appr/missing.txt"])
         .unwrap();
     assert!(matches!(v, Value::Null));
+}
+
+// OBI-149: `destruct(self())` is a P0 driver rule, not master policy --
+// `remove()` -> `destruct(self())` must keep working even for a uid
+// whose own `valid_efun` denies every P2+ efun (as `appr`'s does here),
+// exactly the constraint that otherwise forces a master to allow
+// `destruct` unconditionally just so objects can clean themselves up.
+// Destructing a *different* object is still gated at P2.
+#[test]
+fn destruct_self_is_p0_but_destructing_another_object_stays_p2() {
+    let mut m = Mud::new("sec-destruct");
+    m.ob(ARCH_OB); // make sure the daemon exists before appr tries it
+
+    // appr's valid_efun only allows class <= 1; destruct is class 2, so
+    // destructing *another* object is refused exactly as any other P2
+    // efun would be.
+    let e = m.call(APPR_OB, "kill_arch", &[]).unwrap_err();
+    assert!(e.contains("permission denied"), "{e}");
+    assert!(
+        m.world.find_object(ARCH_OB).is_some(),
+        "denied destruct must not have removed the daemon"
+    );
+
+    // destruct(self()) skips valid_efun entirely (a driver rule, not
+    // master policy) -- it succeeds even though appr's own valid_efun
+    // would have denied class 2.
+    m.call(APPR_OB, "kill_self", &[])
+        .expect("destruct(self()) is always allowed");
+    assert!(
+        m.world.find_object(APPR_OB).is_none(),
+        "appr's object must actually be gone"
+    );
+
+    // Always audited, and audited as the P0 driver rule, not as a P2
+    // `valid_efun` decision.
+    let last = m.world.audit_log().last().expect("an audit entry");
+    assert_eq!(last.apply, "destruct-self");
+    assert!(last.allowed);
 }
