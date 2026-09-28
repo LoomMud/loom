@@ -36,7 +36,7 @@ use loom_compiler::bytecode::{
 
 use std::rc::Rc;
 
-use crate::bcvm::heap::{self, FnBody, FunctionValue, MAP_ENTRY_BYTES, MapData, Value};
+use crate::bcvm::heap::{self, FnBody, FunctionValue, MapData, Value};
 use crate::object::ObjectId;
 use crate::security::GuardSet;
 
@@ -255,9 +255,10 @@ pub trait Host {
         self.store_global(owner, name, v)
     }
     /// Would committing `added_bytes` more onto the global `take_global`
-    /// just emptied (a map insert of a genuinely new key, the one way an
-    /// `IndexSetGlobal` write can grow a container, spec r5 OBI-108) push
-    /// this object's memory quota over — checked *before* the mutation
+    /// just emptied (an array element replace, a map key replace, or a
+    /// brand new map key -- with deep accounting, OBI-80, every one of
+    /// those can grow the container, spec r5 OBI-108) push this object's
+    /// memory quota over -- checked *before* the mutation
     /// that would need it, so a rejected write never has to be undone,
     /// only never applied. `Ok(())` by default (used by hosts that do not
     /// enforce a per-object quota at all).
@@ -1012,24 +1013,28 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 // write. `take_global` must not touch that total itself —
                 // `reserve_global_growth` right below needs it to still
                 // include this container's own bytes (the pre-take total),
-                // or a map insert bypasses the quota entirely.
-                let old_bytes = heap::shallow_bytes(&container);
+                // or an element write bypasses the quota entirely.
+                let old_bytes = heap::cost(&container);
                 let shared = container.is_shared();
-                // A map insert of a genuinely new key is the one way this
-                // write can grow the container (an array's length never
-                // changes); `shallow_bytes` counts a map by `entries.len()`
-                // alone, so the exact growth is known *before* mutating,
-                // the same way the array bounds check already happens
-                // before its own mutation — a rejected write is simply
-                // never applied, nothing to undo.
-                let grows = matches!(
-                    kind,
-                    IndexKind::Map | IndexKind::MapPresent | IndexKind::Dyn
-                ) && container.as_map().is_some_and(|m| m.get(&key).is_none());
-                if grows
-                    && let Err(e) =
-                        self.host
-                            .reserve_global_growth(&owner_s, &name_s, MAP_ENTRY_BYTES)
+                // CTO re-review (OBI-108, after OBI-80 deep accounting
+                // landed): with *deep* cost, not just OBI-78's shallow
+                // slot count, an array element **replace** can grow the
+                // container too (`g[0] = big_local_array`), and so can a
+                // map key **replace** (`m["k"] = big`), not only a brand
+                // new map key — the exact case #18 (OBI-80) closed for
+                // whole-var writes would otherwise reopen here.
+                // `index_growth` computes the exact `cost(new) -
+                // cost(old)` this specific write is about to apply to
+                // `container`'s cached `deep_bytes` (0 for anything
+                // `index_set` below is instead going to reject: an
+                // out-of-range index or a bad key type never mutates, so
+                // there is nothing to reserve for it) — reserved *before*
+                // mutating, the same way the array bounds check already
+                // happens before its own mutation, so a rejected write is
+                // simply never applied, nothing to undo.
+                let growth = Self::index_growth(*kind, &container, &key, &val);
+                if growth > 0
+                    && let Err(e) = self.host.reserve_global_growth(&owner_s, &name_s, growth)
                 {
                     self.host
                         .restore_global(&owner_s, &name_s, old_bytes, container)?;
@@ -1591,6 +1596,59 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 "cannot assign into {} (need array or map)",
                 place.type_name()
             ))),
+        }
+    }
+
+    /// The exact `heap::cost` delta an `Op::IndexSetGlobal` write is about
+    /// to apply to `place`'s (a taken-out global container's) cached deep
+    /// byte total, computed *before* mutating (CTO re-review, OBI-108,
+    /// after OBI-80 deep accounting landed): with deep accounting an array
+    /// element **replace** can grow the container (`g[0] = big_array`),
+    /// not just a map's brand new key, and a map key **replace** can grow
+    /// it too (the new value may cost more than the one it overwrites) --
+    /// both need the same before-mutation quota reservation an out-of-
+    /// range index or a fresh map key already got. Mirrors exactly what
+    /// `ArrayData::set`/`MapData::insert` (see `heap.rs`) will actually do
+    /// to `deep_bytes`, so the reservation this drives is exact, never an
+    /// approximation -- and always `0` (nothing to reserve) for anything
+    /// `Self::index_set` is instead about to reject without mutating
+    /// (out-of-range index, wrong key type, not an array/map): there is no
+    /// growth to charge for a write that never happens.
+    fn index_growth(kind: IndexKind, place: &Value, key: &Value, val: &Value) -> u64 {
+        let new_cost = heap::cost(val);
+        match kind {
+            IndexKind::Array | IndexKind::Dyn if place.as_array().is_some() => {
+                let Value::Int(i) = key else {
+                    return 0;
+                };
+                let Some(items) = place.as_array() else {
+                    return 0;
+                };
+                let Some(old) = usize::try_from(*i).ok().and_then(|i| items.get(i)) else {
+                    return 0;
+                };
+                new_cost.saturating_sub(heap::cost(old))
+            }
+            IndexKind::Map | IndexKind::MapPresent | IndexKind::Dyn if place.as_map().is_some() => {
+                if !key.is_valid_key() {
+                    return 0;
+                }
+                let Some(m) = place.as_map() else {
+                    return 0;
+                };
+                match m.get(key) {
+                    // Key already present: a replace, same growth an
+                    // array element replace gets -- the delta between the
+                    // new and old value's own cost.
+                    Some(old) => new_cost.saturating_sub(heap::cost(old)),
+                    // A genuinely new key: `MapData::insert` adds the full
+                    // cost of *both* the key and the value (see `heap.rs`
+                    // `MapData::insert`'s new-key branch), not just the
+                    // value.
+                    None => new_cost.saturating_add(heap::cost(key)),
+                }
+            }
+            _ => 0,
         }
     }
 

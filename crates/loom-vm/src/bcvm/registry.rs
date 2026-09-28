@@ -3453,21 +3453,22 @@ impl Host for RegistryHost<'_> {
         Ok(old)
     }
 
-    /// See `bcvm::vm::Host::commit_global`. No quota re-check: an array's
-    /// `shallow_bytes` never changes (`Op::IndexSet` cannot change its
-    /// length) and a map growth was already reserved, before the mutation,
-    /// by `reserve_global_growth` — this is just the actual write-back.
-    /// `old_bytes` is `shallow_bytes` of the value as `take_global` handed
-    /// it out; since `take_global` left `mem_bytes` counting it, this is
-    /// the one place that subtracts it back out before adding the
-    /// (possibly larger, for a map growth) new size — a single atomic
-    /// correction rather than the subtract-in-`take`/add-in-`commit` split
-    /// that let `reserve_global_growth` see a stale total (CTO review of
-    /// PR #47).
+    /// See `bcvm::vm::Host::commit_global`. `old_bytes` is `heap::cost`
+    /// of the value as `take_global` handed it out; since `take_global`
+    /// left `mem_bytes` counting it, this is the one place that subtracts
+    /// it back out before adding the new (possibly larger -- an array
+    /// element replace or a map key insert/replace can each grow the
+    /// container under deep accounting, CTO re-review of PR #47 after
+    /// OBI-80 landed) size -- a single atomic correction rather than the
+    /// subtract-in-`take`/add-in-`commit` split that let
+    /// `reserve_global_growth` see a stale total (CTO review of PR #47).
+    /// No quota re-check here: any growth was already reserved, before the
+    /// mutation, by `reserve_global_growth` (see `bcvm::vm::Interpreter::
+    /// index_growth`) -- this is just the actual write-back.
     fn commit_global(&mut self, owner: &str, name: &str, old_bytes: u64, v: Value) -> R<()> {
         let self_id = self.self_object();
         let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
-        let new_bytes = heap::shallow_bytes(&v);
+        let new_bytes = heap::cost(&v);
         let Some(o) = self.registry.get_mut(self_id) else {
             return Err(RtError::new("self was destructed"));
         };
@@ -3480,7 +3481,7 @@ impl Host for RegistryHost<'_> {
     /// before this take, it fits now) and no new journal entry
     /// (`take_global` already recorded the one undo point for this
     /// write). `v` is exactly the value `take_global` handed out, so
-    /// `shallow_bytes(&v) == old_bytes` and this is always a net-zero
+    /// `heap::cost(&v) == old_bytes` and this is always a net-zero
     /// correction to `mem_bytes` — same formula as `commit_global`, for
     /// symmetry and so a future caller that (mistakenly) restores a
     /// different value still gets a consistent total rather than a
@@ -3488,7 +3489,7 @@ impl Host for RegistryHost<'_> {
     fn restore_global(&mut self, owner: &str, name: &str, old_bytes: u64, v: Value) -> R<()> {
         let self_id = self.self_object();
         let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
-        let new_bytes = heap::shallow_bytes(&v);
+        let new_bytes = heap::cost(&v);
         let Some(o) = self.registry.get_mut(self_id) else {
             return Err(RtError::new("self was destructed"));
         };
@@ -3500,9 +3501,14 @@ impl Host for RegistryHost<'_> {
     /// See `bcvm::vm::Host::reserve_global_growth`. Checked against
     /// `o.mem_bytes` while it is still the *pre-take* total (CTO review of
     /// PR #47, OBI-108: `take_global` no longer subtracts this container's
-    /// own bytes before this check runs, which is what let a map grow past
-    /// quota for free — the check was comparing against a total that had
-    /// already forgotten the very container being grown).
+    /// own bytes before this check runs, which is what let a write grow
+    /// past quota for free — the check was comparing against a total that
+    /// had already forgotten the very container being grown). `added_bytes`
+    /// is the exact `heap::cost` delta the caller's `index_growth` computed
+    /// for this specific element write (array replace, map replace, or a
+    /// brand new map key), not a fixed per-kind estimate — deep accounting
+    /// (OBI-80) makes every one of those able to grow the container, not
+    /// just a new map key the way OBI-78's shallow accounting did.
     fn reserve_global_growth(&mut self, _owner: &str, name: &str, added_bytes: u64) -> R<()> {
         let self_id = self.self_object();
         let quota = self.limits.mem_quota_bytes;
@@ -4721,6 +4727,54 @@ pub fn grow(n: int) {
         );
     }
 
+    /// CTO re-review of PR #47 (OBI-108, after OBI-80 deep accounting
+    /// landed): `IndexSetGlobal` must reserve the deep cost delta for an
+    /// *array* element replace too, not only a new/replaced map key --
+    /// `g[0] = big_local_array` is exactly the OBI-78 nested-container
+    /// bypass (`deep_accounting_rejects_a_large_local_container_nested_in_a_global_write`
+    /// above closes it for a whole-var `data = [big]` write; this is the
+    /// same nesting, through an indexed element write instead).
+    #[test]
+    fn cto_index_set_global_array_element_growth_respects_quota() {
+        let zeros = (0..200).map(|_| "0").collect::<Vec<_>>().join(",");
+        let wf = format!(
+            r#"
+var g: [any] = [0]
+
+pub fn set_it() {{
+    g = [0]
+    let big: [int] = [{zeros}]
+    g[0] = big
+}}
+"#
+        );
+        let module = compile("/obj/thing", &[("/obj/thing", &wf)]);
+        let mut registry = Registry::default();
+        let prog = Rc::new(CompiledProgram::new(module, 1, None, Vec::new()));
+        registry.register_program(prog.clone());
+        let obj = make_object(&mut registry, prog);
+        let mut host = RegistryHost::new(&mut registry, obj);
+        // `g` starts at cost 32 (its own slot + one `Int(0)` element, 16
+        // bytes each); 200 ints nested into `g[0]` cost 200 * 16 = 3200
+        // bytes deep. A quota that only charged the replaced element's old
+        // 16-byte slot (the bypass this test guards against) would never
+        // trip a 1000-byte quota here.
+        host.limits.mem_quota_bytes = 1000;
+        let err = host
+            .call_on(obj, "set_it", vec![])
+            .expect_err("a large element replace must push the object over a 1000-byte quota");
+        assert!(
+            err.report().contains("memory quota exceeded"),
+            "{}",
+            err.report()
+        );
+        let mem = host.registry.get(obj).unwrap().mem_bytes;
+        assert!(
+            mem <= 1000,
+            "a rejected growth must never actually apply: mem_bytes={mem}, quota=1000"
+        );
+    }
+
     // -- atomic fn journaling + rollback (spec r5 §5.2.1, OBI-32) --------
 
     /// A `Registry` with one object whose vars live purely in `vars`
@@ -5485,15 +5539,22 @@ pub fn clear() {
     /// timing-ratio bound can't distinguish O(n) from a mild O(n²)
     /// regression -- the review's own O(n²) re-walk only showed about 16x
     /// on a 4x input, comfortably under the old, loose `< 20` ratio bound).
-    /// Each `data[i] = x` write does exactly four `cost()` calls: two in
-    /// `ArrayData::set` (the old element, the new one) and two in
-    /// `store_global`'s own quota bookkeeping (the whole array's old cost,
-    /// its new cost -- both O(1) reads of the array's own cached
-    /// `deep_bytes`, not a walk of its elements). O(1) per write, so n
-    /// writes make exactly `4n` calls, deterministically. An O(n) re-walk
-    /// per write (the regression this guards against) would make `O(n)`
-    /// calls *per write*, i.e. `O(n²)` total: caught exactly, no timing
-    /// noise, no threshold to tune.
+    /// Each `data[i] = x` write -- one `Op::IndexSetGlobal` (OBI-108) --
+    /// makes exactly six `cost()` calls, all O(1) reads of a cached total,
+    /// never a walk of the array's elements: one for `take_global`'s
+    /// pre-mutation total (`old_bytes`), two for `index_growth`'s exact
+    /// pre-mutation reservation (the old element's cost, the new value's
+    /// cost -- CTO re-review after OBI-80 landed: an array element
+    /// *replace* can grow the container under deep accounting, not only a
+    /// map's new key, so this has to be reserved *before* mutating, same
+    /// as the array bounds check), two more in `ArrayData::set` itself
+    /// (the same old/new costs, recomputed rather than threaded through --
+    /// see the note below), and one in `commit_global`'s bookkeeping (the
+    /// whole array's new cost, an O(1) read of its cached `deep_bytes`).
+    /// O(1) per write, so n writes make exactly `6n` calls,
+    /// deterministically. An O(n) re-walk per write (the regression this
+    /// guards against) would make `O(n)` calls *per write*, i.e. `O(n²)`
+    /// total: caught exactly, no timing noise, no threshold to tune.
     #[test]
     fn filling_a_global_array_by_index_makes_on_not_on_squared_cost_calls() {
         fn cost_calls_to_fill(n: usize) -> u64 {
@@ -5535,13 +5596,13 @@ pub fn fill() {{
         let large = cost_calls_to_fill(8_000); // 4x the elements
         assert_eq!(
             small,
-            4 * 2_000,
-            "O(1) per write: exactly 4 cost() calls per element"
+            6 * 2_000,
+            "O(1) per write: exactly 6 cost() calls per element"
         );
         assert_eq!(
             large,
-            4 * 8_000,
-            "O(1) per write: exactly 4 cost() calls per element"
+            6 * 8_000,
+            "O(1) per write: exactly 6 cost() calls per element"
         );
     }
 }
