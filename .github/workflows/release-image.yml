@@ -51,6 +51,26 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      # The ARC scale set's minimal `actions-runner` image ships the docker CLI
+      # without the buildx plugin (OBI-140), so `docker buildx ...` falls
+      # through to plain `docker` usage. Install a pinned, checksum-verified
+      # plugin when absent; no-op on GitHub-hosted runners.
+      - name: Ensure docker buildx plugin
+        run: |
+          set -euo pipefail
+          if docker buildx version >/dev/null 2>&1; then
+            docker buildx version
+            exit 0
+          fi
+          BUILDX_VERSION=v0.37.1
+          BUILDX_SHA256=9447199cdb435f25880548343c128a4b6650e8891ee598905d8d29d39a8e359b
+          plugins="${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins"
+          mkdir -p "$plugins"
+          curl -sSfL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-amd64" -o "$plugins/docker-buildx"
+          echo "${BUILDX_SHA256}  $plugins/docker-buildx" | sha256sum -c -
+          chmod +x "$plugins/docker-buildx"
+          docker buildx version
+
       - name: Set up buildx
         run: |
           set -euo pipefail
