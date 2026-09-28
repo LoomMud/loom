@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT uid as \"uid!\", kind as \"kind!\", target as \"target!\",\n                    granted_by as \"granted_by!\", expires_at as \"expires_at!\"\n             FROM active_grants ORDER BY uid, kind, target",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "uid!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "kind!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "target!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "granted_by!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "expires_at!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "2bcef1504abe01703ca9d2dbd8109b0092e7a20e711144db7d6354083beaed48"
+}

@@ -31,7 +31,8 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
 use serde_json::Value;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::QueryBuilder;
+use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use thiserror::Error;
@@ -96,6 +97,83 @@ impl GrantKind {
             GrantKind::Path => "path",
         }
     }
+}
+
+/// Plain-data rows loaded by [`Persist::load_roles_snapshot`]. Deliberately
+/// has no `loom-vm` dependency: `loom-vm` builds its own `RolesSnapshot`
+/// from these rows (OBI-120/S2b).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaffRow {
+    pub uid: String,
+    pub account_id: Uuid,
+    pub tier: i16,
+    pub totp_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainRow {
+    pub name: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainMemberRow {
+    pub domain: String,
+    pub uid: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TierPolicyRow {
+    pub tier: i16,
+    pub max_ticks_exec: Option<i32>,
+    pub max_mem_exec_mb: Option<i32>,
+    pub tick_share_per_min: Option<i64>,
+    pub max_objects: Option<i32>,
+    pub max_heartbeats: Option<i32>,
+    pub max_callouts_obj: Option<i32>,
+    pub max_callouts_uid: Option<i32>,
+    pub disk_quota_mb: Option<i32>,
+    pub efun_classes: Vec<i16>,
+}
+
+/// A row from the `active_grants` view (already excludes expired grants).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrantRow {
+    pub uid: String,
+    pub kind: String,
+    pub target: String,
+    pub granted_by: String,
+    pub expires_at: OffsetDateTime,
+}
+
+/// The full roles snapshot (design §1/D-S2.1): staff, domains, domain
+/// membership, tier policy, and every currently-unexpired grant, plus the
+/// earliest grant expiry so the driver can arm a refresh timer for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RolesRows {
+    pub staff: Vec<StaffRow>,
+    pub domains: Vec<DomainRow>,
+    pub domain_members: Vec<DomainMemberRow>,
+    pub tier_policy: Vec<TierPolicyRow>,
+    pub active_grants: Vec<GrantRow>,
+    pub earliest_grant_expiry: Option<OffsetDateTime>,
+}
+
+/// One row for [`Persist::insert_audit_batch`] (design §5/D-S2.5): the
+/// Postgres sink for the driver's in-memory audit ring.
+#[derive(Debug, Clone)]
+pub struct AuditRow {
+    pub at: OffsetDateTime,
+    pub kind: String,
+    pub caller: Option<String>,
+    pub effective_principal: Option<String>,
+    pub apply: Option<String>,
+    pub class: Option<i16>,
+    pub argument: Option<String>,
+    pub guard_set: Vec<String>,
+    pub verdict: String,
+    pub detail: Option<String>,
 }
 
 #[derive(Debug)]
@@ -452,6 +530,155 @@ impl Persist {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| (r.kind, r.target)).collect())
+    }
+
+    /// Load the full roles snapshot (design §1/D-S2.1): plain data, no
+    /// `loom-vm` dependency. Called by the DB worker, never the world
+    /// thread; the driver swaps the resulting snapshot in with
+    /// `World::set_roles_snapshot` (OBI-120/S2b).
+    pub async fn load_roles_snapshot(&self) -> Result<RolesRows> {
+        let staff = sqlx::query_as!(
+            StaffRow,
+            "SELECT uid, account_id, tier, totp_required FROM staff ORDER BY uid"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let domains = sqlx::query_as!(DomainRow, "SELECT name, state FROM domains ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+
+        let domain_members = sqlx::query_as!(
+            DomainMemberRow,
+            "SELECT domain, uid, role FROM domain_members ORDER BY domain, uid"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let tier_policy = sqlx::query_as!(
+            TierPolicyRow,
+            "SELECT tier, max_ticks_exec, max_mem_exec_mb, tick_share_per_min, max_objects,
+                    max_heartbeats, max_callouts_obj, max_callouts_uid, disk_quota_mb,
+                    efun_classes
+             FROM tier_policy ORDER BY tier"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let active_grants = sqlx::query_as!(
+            GrantRow,
+            "SELECT uid as \"uid!\", kind as \"kind!\", target as \"target!\",
+                    granted_by as \"granted_by!\", expires_at as \"expires_at!\"
+             FROM active_grants ORDER BY uid, kind, target"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let earliest_grant_expiry = active_grants.iter().map(|g| g.expires_at).min();
+
+        Ok(RolesRows {
+            staff,
+            domains,
+            domain_members,
+            tier_policy,
+            active_grants,
+            earliest_grant_expiry,
+        })
+    }
+
+    /// `LISTEN roles_changed` (migration 0002's `NOTIFY` triggers on
+    /// `staff`, `domains`, `domain_members`, `tier_policy` and `grants`).
+    /// Spawns a task that forwards each notification's payload (the
+    /// table name that changed) on the returned channel; the driver's DB
+    /// worker drains it and triggers a fresh [`Persist::load_roles_snapshot`]
+    /// plus `World::set_roles_snapshot`. The task exits when the receiver
+    /// is dropped or the listener errors.
+    pub async fn listen_roles_changed(&self) -> Result<mpsc::Receiver<String>> {
+        let mut listener = PgListener::connect_with(&self.pool).await?;
+        listener.listen("roles_changed").await?;
+
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            loop {
+                match listener.recv().await {
+                    Ok(notification) => {
+                        if tx.send(notification.payload().to_string()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        warn!("roles_changed listener error: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(rx)
+    }
+
+    /// Propose a T4/T5 tier change via `roles_propose_tier` (two-root rule,
+    /// design §6/D-S2.6). `actor` MUST be the driver's effective principal
+    /// (see module docs) and must be a T5 root. Returns the new proposal's
+    /// id; a *different* T5 root must call [`Persist::roles_approve_proposal`]
+    /// before it takes effect.
+    pub async fn roles_propose_tier(
+        &self,
+        actor: &str,
+        target_uid: &str,
+        new_tier: i16,
+        reason: &str,
+    ) -> Result<i64> {
+        let id = sqlx::query_scalar!(
+            "SELECT roles_propose_tier($1, $2, $3, $4) as \"id!\"",
+            actor,
+            target_uid,
+            new_tier,
+            reason,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Approve a pending two-root proposal via `roles_approve_proposal`.
+    /// `actor` MUST be the driver's effective principal (see module docs),
+    /// a T5 root distinct from both the proposer and the target, and the
+    /// proposal must be unexpired and not already applied.
+    pub async fn roles_approve_proposal(&self, actor: &str, proposal_id: i64) -> Result<()> {
+        sqlx::query!("SELECT roles_approve_proposal($1, $2)", actor, proposal_id,)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Append a batch of audit entries to `audit_log` in one round trip
+    /// (design §5/D-S2.5). `loom_app` may only `INSERT` here; the sink is
+    /// append-only, matching the driver's in-memory ring semantics.
+    pub async fn insert_audit_batch(&self, rows: &[AuditRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+            "INSERT INTO audit_log (at, kind, caller, effective_principal, apply, class, \
+             argument, guard_set, verdict, detail) ",
+        );
+        builder.push_values(rows, |mut row_builder, row| {
+            row_builder
+                .push_bind(row.at)
+                .push_bind(&row.kind)
+                .push_bind(&row.caller)
+                .push_bind(&row.effective_principal)
+                .push_bind(&row.apply)
+                .push_bind(row.class)
+                .push_bind(&row.argument)
+                .push_bind(&row.guard_set)
+                .push_bind(&row.verdict)
+                .push_bind(&row.detail);
+        });
+        builder.build().execute(&self.pool).await?;
+        Ok(())
     }
 }
 
