@@ -1,0 +1,4 @@
+// A `Live` room loaded by the fixture master's own `create()`, i.e.
+// before the driver has a master to ask `program_flags` (boot).
+pub fn create() {
+}

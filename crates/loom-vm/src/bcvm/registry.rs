@@ -1904,14 +1904,27 @@ impl<'a> RegistryHost<'a> {
         if self.registry.has_program_flags(path) {
             return;
         }
-        let flags = match self.master() {
-            None => ProgramFlags::NONE,
-            Some(m) => {
-                let r = self.run_cut(m, "program_flags", vec![Value::str(path)], None);
-                ProgramFlags::from_master(r.ok().flatten())
-            }
+        // No master yet (boot: everything `/secure/master`'s own
+        // `create()` loads, e.g. its zones' rooms) -- leave the path
+        // uncached, so the first confinement check after boot asks the
+        // real master (`Self::program_flags_of`). Caching `NONE` here
+        // made every boot-loaded room permanently unflagged, i.e. a
+        // `CONFINED` object could be dropped into a live start room.
+        let Some(m) = self.master() else {
+            return;
         };
+        let r = self.run_cut(m, "program_flags", vec![Value::str(path)], None);
+        let flags = ProgramFlags::from_master(r.ok().flatten());
         self.registry.set_program_flags(path, Some(flags));
+    }
+
+    /// `path`'s confinement flags, computing them first if they were
+    /// never cached (a program loaded before the master existed).
+    fn program_flags_of(&mut self, path: &str) -> ProgramFlags {
+        if !self.registry.has_program_flags(path) {
+            self.ensure_program_flags(path);
+        }
+        self.registry.program_flags(path)
     }
 
     fn ensure_program(&mut self, path: &str) -> R<Rc<CompiledProgram>> {
@@ -2540,10 +2553,12 @@ impl<'a> RegistryHost<'a> {
         let Some(dest_ob) = self.registry.get(dest) else {
             return Ok(());
         };
-        let me_flags = self.registry.program_flags(&me_ob.program.path);
-        let dest_flags = self.registry.program_flags(&dest_ob.program.path);
+        let me_prog = me_ob.program.clone();
+        let dest_prog = dest_ob.program.clone();
         let me_euid = self.registry.syms.name(me_ob.euid).to_string();
         let me_is_interactive_tier0 = me_ob.conn.is_some() && self.euid_tier(&me_euid) == 0;
+        let me_flags = self.program_flags_of(&me_prog.path);
+        let dest_flags = self.program_flags_of(&dest_prog.path);
 
         if me_flags.is_confined() {
             if dest_chain_has_tier0_interactive {
