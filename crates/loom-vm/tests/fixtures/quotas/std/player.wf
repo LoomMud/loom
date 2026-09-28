@@ -23,5 +23,14 @@ pub fn move_into_obj(dest: object) {
     move_to(dest)
 }
 
+// OBI-153: lets a test push this player (a tier-0 principal, since
+// `guest` has no `staff` row at all) onto the guard *below* a `/cmds/**`
+// command frame -- exactly the shape of a real player typing a command
+// -- so the command's own target code sees a guard containing both the
+// tier-0 player and whichever staff principal is actually acting.
+pub fn do_cmd(cmd: object, target: object) -> object {
+    return cmd.run(target)
+}
+
 pub fn net_dead() {
 }

@@ -785,3 +785,73 @@ fn a_clone_from_a_mudlib_command_frame_is_still_billed_to_the_apprentice() {
         .unwrap_err();
     assert!(e.contains("object quota exceeded"), "{e}");
 }
+
+// -- OBI-153: the billing-owner amendment must skip a tier-0 principal
+// even when it ranks as "lowest tier" in the whole guard -- it must
+// pick the lowest-tier principal *with tier >= 1* instead, or a tier-0
+// player sitting next to the apprentice on the stack (e.g. the
+// apprentice's own alt walking into the apprentice's room) launders the
+// clone back onto `mudlib` and defeats the D-S2.4 amendment entirely.
+// -------------------------------------------------------------------------
+
+#[test]
+fn a_tier0_player_next_to_the_apprentice_does_not_launder_the_clone_back_to_mudlib() {
+    let (mut world, mut host) = boot();
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+    // The workroom object and the dummy connect(1) apprentice-player
+    // clone below (needed only to advance `connect_count` so the next
+    // connect becomes `guest`) already count 2 against `appr`.
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"max_objects": 3}"#)));
+    // master's `connect_count` so the *next* connect (2) becomes `guest`
+    // (T0) -- `/std/player`'s own account is picked by call order, not
+    // by the connection id passed to `World::connect`.
+    world.connect(1, &mut host);
+    host.take(1);
+    world.connect(2, &mut host); // guest, T0 (no staff row at all)
+    host.take(2);
+    let guest = world.connection_object(2).expect("bound");
+    let cmd = world
+        .load_object("/cmds/goto", &mut host)
+        .expect("load cmd");
+
+    // Guard, innermost last: {guest (T0 player), cmd (mudlib), workroom
+    // (appr, T1)} -- `guest.do_cmd` pushes the tier-0 player onto the
+    // guard *below* the mudlib command frame, exactly like a real player
+    // typing a command whose target code then clones something. Plain
+    // `caller_quota_uid` ranking (lowest tier in the whole guard, ties to
+    // the most recent frame) would pick `guest` here (T0, and pushed
+    // before `workroom`) -- this is the exact evasion this amendment
+    // closes.
+    let clone = world
+        .call(
+            guest,
+            "do_cmd",
+            vec![Value::Object(cmd), Value::Object(workroom)],
+            &mut host,
+        )
+        .expect("first clone is within the limit (workroom + connect(1)'s appr player + this = 3)");
+    let Value::Object(clone_id) = clone else {
+        panic!("expected an object, got {clone:?}");
+    };
+    assert_eq!(
+        world.owner_uid(clone_id),
+        Some("appr"),
+        "billed to the T1 apprentice, not laundered onto the tier-0 \
+         player's guard slot or back onto mudlib"
+    );
+
+    // A second clone the same way is refused -- `max_objects` actually
+    // applies to `appr`, not evadable by routing the same call through
+    // the apprentice's own alt (a tier-0 principal) every time.
+    let e = world
+        .call(
+            guest,
+            "do_cmd",
+            vec![Value::Object(cmd), Value::Object(workroom)],
+            &mut host,
+        )
+        .unwrap_err();
+    assert!(e.contains("object quota exceeded"), "{e}");
+}
