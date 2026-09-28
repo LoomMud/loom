@@ -3104,8 +3104,9 @@ impl<'a> RegistryHost<'a> {
                 if e.is_empty() {
                     return Err(RtError::new("seteuid(): empty euid"));
                 }
-                self.authorize(name, Privilege::P3, Operation::SetEuid { euid: &e })?;
                 let me = self.self_object();
+                self.check_reserved_euid(me, &e)?;
+                self.authorize(name, Privilege::P3, Operation::SetEuid { euid: &e })?;
                 let new = self.registry.syms.intern(&e);
                 let uid = match self.registry.get_mut(me) {
                     Some(o) => {
@@ -3358,6 +3359,41 @@ impl<'a> RegistryHost<'a> {
         let r = self.call_in(me, &target, idx, argv);
         self.guards.pop();
         r
+    }
+
+    /// D-S3.1 (OBI-37), a driver rule rather than master policy, like
+    /// `unguarded`: only `/secure` code (uid root) may `seteuid` onto a
+    /// reserved principal (`root`, `mudlib`, `domain:*`, see
+    /// [`security::is_reserved_principal`]). Not even an object's own
+    /// reserved uid: a mudlib body that took an account's euid must not
+    /// be able to take `mudlib` back, which is exactly what logging in as
+    /// an account named `mudlib` would do. This closes the path where the
+    /// master's "is this an account name" check passes for a player who
+    /// registered as `root` or `mudlib`. Audited when refused.
+    fn check_reserved_euid(&mut self, me: ObjectId, e: &str) -> R<()> {
+        if !security::is_reserved_principal(e) {
+            return Ok(());
+        }
+        if self.registry.get(me).map(|o| o.uid) == Some(security::ROOT) {
+            return Ok(());
+        }
+        let guard = self.top_guard().clone();
+        if let Some(d) = self.driver.as_mut() {
+            d.security.push(AuditEntry {
+                caller: me,
+                efun: "seteuid",
+                privilege: Privilege::P3,
+                apply: "reserved-euid",
+                arg: e.into(),
+                guard,
+                allowed: false,
+                denied_by: None,
+                at_unix_ms: 0, // stamped by `push` itself
+            });
+        }
+        Err(RtError::new(format!(
+            "seteuid(): `{e}` is a reserved driver principal"
+        )))
     }
 
     /// Driver rule shared by every `roles_*` **read** efun (OBI-36
