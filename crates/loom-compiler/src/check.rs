@@ -221,7 +221,7 @@ pub fn check_program(
         // whose type is or contains `fn(...)`.
         if d.mods.persistent && ty.contains_fn() {
             cx.err_hint(
-                "W0287",
+                "W0294",
                 d.name.span,
                 format!(
                     "a `persistent` variable's type cannot be or contain a function type (`{ty}`)"
@@ -2037,7 +2037,7 @@ impl Cx<'_> {
                     let b = self.expr(base, None);
                     let _b = self.value(b);
                     self.err_hint(
-                        "W0286",
+                        "W0293",
                         target.span,
                         "cannot write into an element of this expression",
                         "index into a variable, not the result of an expression",
