@@ -391,12 +391,24 @@ impl SecurityState {
     }
 }
 
+/// The driver's own principal names (D-S3.1, OBI-37): `root`, `mudlib`
+/// and anything with a `:` in it (`domain:<d>`). No account and no
+/// workroom may take one, because the driver and the master treat these
+/// names as trusted: a player registered as `root` whose body was
+/// `seteuid`'d to its account name would *be* the driver's root.
+pub fn is_reserved_principal(name: &str) -> bool {
+    name == "root" || name == "mudlib" || name.contains(':')
+}
+
 /// Built-in `creator_file` fallback (D-S1.1) for a mudlib whose master has
-/// no `creator_file` apply.
+/// no `creator_file` apply. A workroom named after a reserved principal
+/// (`/builders/root`, `/builders/mudlib`) gets `builders:<u>`, a
+/// principal no account can be (D-S3.1).
 pub fn default_creator(path: &str) -> String {
     let mut segs = path.trim_start_matches('/').split('/');
     match (segs.next(), segs.next()) {
         (Some("secure"), _) => "root".to_string(),
+        (Some("builders"), Some(u)) if is_reserved_principal(u) => format!("builders:{u}"),
         (Some("builders"), Some(u)) if !u.is_empty() => u.to_string(),
         (Some("domains"), Some(d)) if !d.is_empty() => format!("domain:{d}"),
         _ => "mudlib".to_string(),
@@ -467,6 +479,18 @@ mod tests {
         assert_eq!(default_creator("/builders/frodo/x"), "frodo");
         assert_eq!(default_creator("/domains/shire/live/inn"), "domain:shire");
         assert_eq!(default_creator("/std/room"), "mudlib");
+        assert_eq!(default_creator("/builders/root/x"), "builders:root");
+        assert_eq!(default_creator("/builders/mudlib/x"), "builders:mudlib");
+    }
+
+    #[test]
+    fn reserved_principals() {
+        for r in ["root", "mudlib", "domain:shire", "builders:root"] {
+            assert!(is_reserved_principal(r), "{r}");
+        }
+        for a in ["frodo", "rooted", "mud"] {
+            assert!(!is_reserved_principal(a), "{a}");
+        }
     }
 
     #[test]
