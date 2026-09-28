@@ -24,6 +24,14 @@ Applied from the first commit (spec v2 §4.4):
   an `SPDX-License-Identifier` tag with value `AGPL-3.0-only`. `reuse lint` gates CI.
 - **No secrets, credentials or unlicensed third-party assets.** `gitleaks` gates CI.
 - **`unsafe` is denied workspace-wide.** Any exception is local to `loom-vm`, justified in a comment, and CTO-reviewed.
+- **Never point a local Postgres-backed test or `loom serve` run at the
+  ambient `DATABASE_URL`** (OBI-151). Agent shells export `DATABASE_URL` for
+  Paperclip's own control-plane Postgres (OBI-150); loom/warp's DB-backed
+  integration tests read `LOOM_TEST_DATABASE_URL`/`LOOM_TEST_DB_MIGRATE_URL`
+  instead (never `DATABASE_URL`/`LOOM_DB_MIGRATE_URL`), and `unset
+  DATABASE_URL` before running anything DB-backed locally. Use
+  `scripts/with-disposable-postgres.sh -- <command>` to get a throwaway,
+  per-run Postgres instance instead -- see `docs/persistence.md#local-db-testing-obi-151`.
 - Run `scripts/ci-local.sh` before pushing; it runs the same gates as CI.
 - Commits made by Paperclip agents end with `Co-Authored-By: Paperclip <noreply@paperclip.ing>`.
 

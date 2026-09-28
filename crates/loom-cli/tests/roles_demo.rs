@@ -9,8 +9,18 @@
 //! two-login harness as `loom-persist`'s own integration tests (D-27.4).
 //!
 //! Skips (like every DB-backed test in this workspace, D-27.7) unless
-//! `LOOM_DB_MIGRATE_URL`/`DATABASE_URL` are set, or fails outright if
-//! `LOOM_REQUIRE_DB=1` (CI never silently skips DB coverage).
+//! `LOOM_TEST_DB_MIGRATE_URL`/`LOOM_TEST_DATABASE_URL` are set, or fails
+//! outright if `LOOM_REQUIRE_DB=1` (CI never silently skips DB coverage).
+//!
+//! OBI-151: these are deliberately *not* `LOOM_DB_MIGRATE_URL`/
+//! `DATABASE_URL` -- agent shells export `DATABASE_URL` pointing at
+//! Paperclip's own control-plane Postgres (OBI-150), so this harness must
+//! never read that variable. Point `LOOM_TEST_DB_MIGRATE_URL`/
+//! `LOOM_TEST_DATABASE_URL` at a disposable/dedicated Postgres instead --
+//! `scripts/with-disposable-postgres.sh` provisions and tears one down for
+//! exactly this purpose. `Persist::connect`/`run_migrations` also
+//! hard-fail (OBI-151's belt-and-suspenders check) if the URL still looks
+//! like the control-plane DB.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -62,13 +72,15 @@ struct Fixture {
     owner: PgPool,
     /// `loom_app` DSN, handed to the spawned `loom serve` subprocess as
     /// `DATABASE_URL` -- the same login `loom-cli`'s DB worker uses in
-    /// production.
+    /// production. Sourced from `LOOM_TEST_DATABASE_URL`, not the ambient
+    /// `DATABASE_URL` (OBI-151): this value only ever reaches the child
+    /// process's own environment, explicitly, never inherited.
     app_url: String,
 }
 
 async fn setup() -> Option<Fixture> {
-    let migrate_url = required_env("LOOM_DB_MIGRATE_URL")?;
-    let app_url = required_env("DATABASE_URL")?;
+    let migrate_url = required_env("LOOM_TEST_DB_MIGRATE_URL")?;
+    let app_url = required_env("LOOM_TEST_DATABASE_URL")?;
 
     loom_persist::run_migrations(&migrate_url)
         .await

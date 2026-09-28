@@ -316,7 +316,8 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         Some(p) => loom_persist::spawn_db_worker(p.clone(), DB_QUEUE_DEPTH),
         None => {
             warn!(
-                "DATABASE_URL is not set: accounts and roles mutations are NOT persisted \
+                "neither LOOM_SMOKE_DATABASE_URL nor DATABASE_URL is set: accounts and roles \
+                 mutations are NOT persisted \
                  (in-memory dev backend); everything here is lost on restart, and every \
                  roles_* mutation efun answers `unavailable`"
             );
@@ -505,18 +506,32 @@ async fn run_world_tick_timer(
 /// spec §3.3), so it is booted *on* the world thread; boot errors are
 /// reported back before we start accepting connections.
 /// Connect to Postgres for the account/roles/audit backends (spec OBI-85,
-/// design OBI-36 D-S2.1/D-S2.2/D-S2.5), if `DATABASE_URL` is set. `None`
-/// means the in-memory dev backend (`loom-persist::spawn_dev_account_worker`)
-/// is used instead: nothing here survives a restart, roles mutations always
-/// answer `"unavailable"`, and there is no `audit_log` sink -- what CI (sans
-/// the Postgres service) and a bare `cargo run` use.
+/// design OBI-36 D-S2.1/D-S2.2/D-S2.5). `None` means the in-memory dev
+/// backend (`loom-persist::spawn_dev_account_worker`) is used instead:
+/// nothing here survives a restart, roles mutations always answer
+/// `"unavailable"`, and there is no `audit_log` sink -- what CI (sans the
+/// Postgres service) and a bare `cargo run` use.
+///
+/// OBI-151: local/interactive smoke runs (an agent's shell running `loom
+/// serve` directly, not through a real deployment) must opt in explicitly
+/// via `LOOM_SMOKE_DATABASE_URL` -- never via the ambient `DATABASE_URL`
+/// that agent shells export for Paperclip's own control-plane DB (OBI-150).
+/// `DATABASE_URL` is still honoured as a fallback because that is the real
+/// production/staging wiring (the container's own env, not an ambient
+/// leak), but [`loom_persist::assert_not_control_plane_db`] (called inside
+/// `Persist::connect`) hard-fails either way if the resolved URL still
+/// looks like the control-plane DB.
 async fn connect_persist() -> Result<Option<Persist>, String> {
-    match std::env::var("DATABASE_URL") {
-        Ok(url) => Persist::connect(&url, 5)
+    let url = match std::env::var("LOOM_SMOKE_DATABASE_URL") {
+        Ok(url) => Some(url),
+        Err(_) => std::env::var("DATABASE_URL").ok(),
+    };
+    match url {
+        Some(url) => Persist::connect(&url, 5)
             .await
             .map(Some)
-            .map_err(|err| format!("failed to connect DATABASE_URL: {err}")),
-        Err(_) => Ok(None),
+            .map_err(|err| format!("failed to connect to Postgres: {err}")),
+        None => Ok(None),
     }
 }
 

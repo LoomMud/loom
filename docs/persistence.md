@@ -26,6 +26,70 @@ logins, both of which must already exist before `run_migrations` is called:
 CI creates both logins in a setup step (see `.github/workflows/ci.yml`).
 Staging provisions them from `/etc/loom/secrets.env` ([OBI-42](/OBI/issues/OBI-42)).
 
+## Local DB testing (OBI-151)
+
+**Never run a Postgres-backed loom/warp test, or `loom serve`, against the
+ambient `DATABASE_URL` in an agent shell.** Agent shells export
+`DATABASE_URL` pointing at Paperclip's own control-plane Postgres
+([OBI-150](/OBI/issues/OBI-150)) -- a real smoke run once wrote accounts
+into it. That variable must never be treated as "the DB to test against";
+treat it the same as any other secret you didn't provision yourself.
+
+Rules, enforced both by naming and by a hard runtime check:
+
+- `loom-cli`'s and `loom-persist`'s DB-backed integration tests
+  (`roles_demo`, `accounts_demo`, `persist_integration`,
+  `roles_s2_integration`) read `LOOM_TEST_DATABASE_URL` and
+  `LOOM_TEST_DB_MIGRATE_URL` -- never the ambient `DATABASE_URL`/
+  `LOOM_DB_MIGRATE_URL`. They skip (or, with `LOOM_REQUIRE_DB=1`, fail) if
+  those aren't set; they never fall back to `DATABASE_URL`.
+- A local, interactive smoke run of `loom serve` (not through the real
+  staging deployment) should export `LOOM_SMOKE_DATABASE_URL` instead of
+  `DATABASE_URL`. `connect_persist()` in `loom-cli` prefers
+  `LOOM_SMOKE_DATABASE_URL` and only falls back to `DATABASE_URL` for the
+  real production/staging wiring (a container's own env, set once by
+  Compose/Flux -- not an ambient shell leak).
+- Either way, [`loom_persist::assert_not_control_plane_db`] is called
+  inside `Persist::connect`/`run_migrations` and hard-fails (returns
+  `Err`, does not silently proceed) if the resolved URL's host is
+  `postgres:5432` or its database name is `paperclip` -- the two shapes
+  Paperclip's control-plane DSN is known to take. This is defense in
+  depth, not the primary guardrail: the primary guardrail is simply never
+  reading `DATABASE_URL` from a test/dev entrypoint in the first place.
+
+**Practical rule of thumb: `unset DATABASE_URL` in your shell before doing
+any loom/warp DB-backed work, and use the disposable-DB helper below
+instead of exporting your own DSN.**
+
+### `scripts/with-disposable-postgres.sh`
+
+Boots a throwaway Postgres instance this run owns -- `initdb`/`pg_ctl` on a
+random `127.0.0.1` port, data directory under
+`$PAPERCLIP_RUN_SCRATCH_DIR` (or `$TMPDIR`) -- bootstraps the same
+`loom_owner`/`loom_app` two-login shape CI's Postgres service creates,
+exports `LOOM_TEST_DATABASE_URL`/`LOOM_TEST_DB_MIGRATE_URL`/
+`LOOM_SMOKE_DATABASE_URL` for the command it wraps, runs that command, and
+always tears the instance down afterwards (success, failure, or signal),
+deleting its data directory. It never reads or forwards the ambient
+`DATABASE_URL`.
+
+```sh
+# DB-backed integration tests
+scripts/with-disposable-postgres.sh -- \
+  cargo test -p loom-cli --test roles_demo -- --test-threads=1
+scripts/with-disposable-postgres.sh -- cargo test -p loom-persist
+
+# an interactive loom serve smoke run
+scripts/with-disposable-postgres.sh -- cargo run -p loom-cli -- serve --mudlib mudlib
+```
+
+It needs a real Postgres server binary already available -- in order,
+it tries `$LOOM_DISPOSABLE_PG_DIR`, `initdb`/`pg_ctl`/`postgres` on `PATH`,
+then a vendored `@embedded-postgres/linux-<arch>` npm package already
+present under a local pnpm store (no network fetch at run time). If none
+of those exist on your machine, it fails with the exact fix needed; see
+`scripts/disposable-postgres-lib.sh` for the search order.
+
 ## Roles schema (design §5.11.3)
 
 Implements the tier model directly: `staff`, `domains`, `domain_members`,
@@ -126,7 +190,7 @@ on top of 0001:
 
 `crates/loom-cli/src/main.rs` is the only caller of every API above (`loom-persist` itself never touches `loom-vm`):
 
-- **Snapshot loader**: `connect_persist()` connects `Persist` from `DATABASE_URL` if set. `run_roles_manager`, a dedicated `tokio::spawn`ed task, owns every refresh trigger design §1 lists (boot, `LISTEN roles_changed`, a pulse after every completed mutation, and a timer at the earliest grant expiry) in one loop, converts `RolesRows` to a `loom_vm::RolesSnapshot` (`build_roles_snapshot`) and publishes it on a `watch` channel. The world thread (which cannot itself be async: `World` is `!Send`) polls that channel once per event and calls `World::set_roles_snapshot`. With no `DATABASE_URL`, `spawn_world_thread` instead loads `LOOM_ROLES_SEED` synchronously at boot (`loom_vm::roles::load_seed_from_env`); a malformed seed is a boot failure.
+- **Snapshot loader**: `connect_persist()` connects `Persist` from `LOOM_SMOKE_DATABASE_URL`/`DATABASE_URL` if either is set (see "Local DB testing" above). `run_roles_manager`, a dedicated `tokio::spawn`ed task, owns every refresh trigger design §1 lists (boot, `LISTEN roles_changed`, a pulse after every completed mutation, and a timer at the earliest grant expiry) in one loop, converts `RolesRows` to a `loom_vm::RolesSnapshot` (`build_roles_snapshot`) and publishes it on a `watch` channel. The world thread (which cannot itself be async: `World` is `!Send`) polls that channel once per event and calls `World::set_roles_snapshot`. With neither set, `spawn_world_thread` instead loads `LOOM_ROLES_SEED` synchronously at boot (`loom_vm::roles::load_seed_from_env`); a malformed seed is a boot failure.
 - **Mutation dispatch**: `ChannelRolesMutations` (a `loom_vm::RolesMutations` impl) turns each `roles_*` efun call into a `DbRequest::Roles*` sent to the same DB worker (`loom_persist::spawn_db_worker`/`spawn_dev_account_worker`) that already serves `account_create`/`account_login`; `try_send` never blocks the world thread and reports `false` (queue full/closed) exactly like `ChannelAccountAuth`. Answers come back as `DbEvent::RolesResult`, delivered to `World::deliver_roles_result` by the same drain loop that already handles `DbEvent::AccountResult`, which also pulses `run_roles_manager`'s reload channel.
 - **`audit_log` sink**: once per world tick, the world thread calls `World::drain_audit_since` and hands the new rows to `run_audit_sink` (another dedicated task), which appends them via `insert_audit_batch`. No `DATABASE_URL` means no sink task at all -- the rows are computed but never sent anywhere.
 
