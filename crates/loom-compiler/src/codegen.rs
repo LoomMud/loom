@@ -1207,12 +1207,12 @@ impl Assembler {
                 dst: *dst,
                 owner: self.intern(&global.owner),
                 name: self.intern(&global.name),
-                ty: Box::new(ty.clone()),
+                ty: ty.clone(),
             },
             Inst::StoreGlobal { global, ty, src } => Op::StoreGlobal {
                 owner: self.intern(&global.owner),
                 name: self.intern(&global.name),
-                ty: Box::new(ty.clone()),
+                ty: ty.clone(),
                 src: *src,
             },
             Inst::UnOp { dst, op, kind, src } => Op::UnOp {
@@ -1240,7 +1240,7 @@ impl Assembler {
                 elems,
             } => Op::NewArray {
                 dst: *dst,
-                elem_ty: Box::new(elem_ty.clone()),
+                elem_ty: elem_ty.clone(),
                 elems: elems.clone(),
             },
             Inst::NewMap {
@@ -1250,8 +1250,8 @@ impl Assembler {
                 entries,
             } => Op::NewMap {
                 dst: *dst,
-                key_ty: Box::new(key_ty.clone()),
-                val_ty: Box::new(val_ty.clone()),
+                key_ty: key_ty.clone(),
+                val_ty: val_ty.clone(),
                 entries: entries.clone(),
             },
             Inst::Index {
@@ -1297,7 +1297,7 @@ impl Assembler {
                 dst: *dst,
                 src: *src,
                 kind: *kind,
-                elem_ty: Box::new(elem_ty.clone()),
+                elem_ty: elem_ty.clone(),
             },
             Inst::ToStr { dst, src } => Op::ToStr {
                 dst: *dst,
@@ -1335,7 +1335,7 @@ impl Assembler {
             Inst::Cast { dst, src, ty } => Op::Cast {
                 dst: *dst,
                 src: *src,
-                ty: Box::new(ty.clone()),
+                ty: ty.clone(),
             },
             Inst::TickCheck => Op::TickCheck,
             Inst::PushHandler {
