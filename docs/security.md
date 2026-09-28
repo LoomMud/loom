@@ -28,7 +28,7 @@ Every execution the driver starts is a cut. That covers heartbeats, call_outs, `
 | `upgrade_all(path)` (P1) | `valid_efun`, then `valid_upgrade(path, ob)`, checked after `valid_efun`, mirroring `compile_object` |
 | `bind_connection(ob)` (P3) | `valid_efun`, then `valid_bind(caller, ob)` (and the caller must be the master) |
 | `seteuid(e)` (P3) | `valid_efun`, then `valid_seteuid(ob, e)` |
-| `destruct(ob)` (P2) | `valid_efun("destruct", 2, ob)` -- **skipped entirely when `ob == self()`** (OBI-149, a driver rule: see the `destruct(self())` section below) |
+| `destruct(ob)` (P2) | `valid_efun("destruct", 2, caller)` -- **skipped entirely when `ob == self()`** (OBI-149, a driver rule: see the `destruct(self())` section below) |
 
 - **Inside an apply,** `effective_principal()` returns the euid under evaluation. The driver calls the apply once for each euid in the guard set.
 - **Fail closed.** The operation is denied if there is no master, if the master lacks the apply, or if the apply throws, returns a non-bool or runs out of ticks. A master must define at least `valid_efun` before any non-root code can use a P1+ efun.
@@ -112,7 +112,7 @@ Normative source: [OBI-36 design note](https://paperclip.home.oberfield.net/OBI/
 `destruct(ob)` (P2) needs `valid_efun` to destruct an arbitrary object, but `remove()` -> `destruct(self())` is the ordinary way an object cleans itself up (kills, corpses, `dest`) and runs with players on the stack — a P2 gate here would force every master to allow `destruct` unconditionally just so objects can destruct themselves, which also lets any tier-1 caller destruct anything else it can merely reference.
 
 - `destruct(ob)` where `ob == self()` skips `valid_efun` entirely — a driver rule, exactly like `unguarded`'s, not master policy. Always allowed, and always audited (`apply: "destruct-self"`, `Privilege::P0`).
-- `destruct(ob)` for any other object is unchanged: `Privilege::P2`, gated by `valid_efun("destruct", 2, ob)` for every euid in the guard set, same as any other P2 efun.
+- `destruct(ob)` for any other object is unchanged: `Privilege::P2`, gated by `valid_efun("destruct", 2, caller)` for every euid in the guard set, same as any other P2 efun.
 - Once this lands, a master no longer needs to allow `destruct` unconditionally in its `valid_efun` (e.g. warp's `/secure/master.account_efuns()`) purely so `remove()` keeps working — that grant can be narrowed to whichever principals should actually be able to destruct objects other than themselves.
 
 ### Quotas
@@ -153,6 +153,32 @@ Every denial (except `max_ticks_exec`'s existing tick-exhaustion error and `tick
 ### `valid_upgrade(path)`
 
 A cached master apply, same shape and caching contract as `valid_compile`. `upgrade_all` calls `authorize` with `Operation::Upgrade`, which runs `valid_efun` first (P1) and `valid_upgrade(path, ob)` second — exactly `compile_object`'s order — before doing any of the upgrade's own program-replacement work.
+
+## Reserved principals (D-S3.1, OBI-37)
+
+`root`, `mudlib` and any name containing `:` (`domain:<d>`) are the driver's own principals (`security::is_reserved_principal`). Two driver rules keep them out of reach. Neither is master policy:
+
+- **`seteuid` onto a reserved principal is refused unless the caller is `/secure` code.** The refusal comes before `valid_seteuid` runs and is audited as `apply: "reserved-euid"`. It also applies to an object's own reserved uid. Without this rule, a player who registered the account `root` would pass a master's "is this an account name" check, and the login `seteuid` would give the player's body the driver's root.
+- **A workroom named after a reserved principal is not that principal.** When there is no `creator_file`, `/builders/root/**` and `/builders/mudlib/**` get the uid `builders:root` and `builders:mudlib`. No account can have those names, so that code runs as a tier-0 nobody. The master's `creator_file` still cannot return `root`.
+
+A mudlib should also refuse these names at account creation. That is defence in depth: the driver rule is what actually holds.
+
+## E1.3 tier suite (OBI-37)
+
+`crates/loom-vm/tests/tier_suite.rs` proves exit criterion E1.3 against `tests/fixtures/tier_suite`. The fixture's master is Warp's shipped §5.11 policy at warp `a50a002`; its header lists the deliberate deltas. Every denial in the suite has a positive control. The DB-backed two-root tests run with `LOOM_REQUIRE_DB=1` in CI's `rust` job, so a missing database fails them instead of skipping them.
+
+| E1.3 case | Tests |
+|---|---|
+| T1 writes only in its own workroom | `apprentice_writes_inside_its_own_workroom`, `apprentice_cannot_write_anywhere_outside_its_workroom`, `higher_tiers_write_where_the_apprentice_cannot`; reads: `apprentice_reads_code_and_docs_but_not_secure_data_or_other_workrooms`; compile/upgrade: `apprentice_compiles_and_upgrades_only_its_own_workroom` |
+| Identity and P2+ efuns | `apprentice_cannot_seteuid_but_login_hands_a_body_its_account`, `apprentice_cannot_destruct_other_objects_but_can_destruct_itself`, `apprentice_cannot_use_driver_only_secure_powers_but_their_facade_answers`, `a_body_cannot_take_a_reserved_principal_as_its_account`, `a_workroom_named_after_a_reserved_principal_is_not_that_principal` |
+| call_other chains | `call_other_into_an_arch_daemon_does_not_lend_its_rights`, `a_call_other_chain_is_denied_by_any_lower_tier_frame_in_it` |
+| Closures and heartbeats | `an_arch_closure_invoked_by_the_apprentice_is_denied`, `an_apprentice_closure_run_by_an_arch_heartbeat_keeps_apprentice_rights`, `a_closure_made_by_inherited_code_runs_its_own_body` |
+| call_out | `a_call_out_keeps_the_guard_it_was_scheduled_under` |
+| Inherit tricks | `inheriting_an_arch_daemon_gives_its_code_not_its_rights`, `inheriting_secure_code_does_not_unlock_unguarded_or_the_roles_efuns`, `overriding_a_hook_in_inherited_mudlib_code_runs_it_as_the_apprentice` |
+| Shadowing | `shadowing_efun_and_apply_names_changes_nothing_the_driver_checks`, `lpc_style_shadow_does_not_exist`, `a_secure_path_inside_a_workroom_is_just_apprentice_code` |
+| Every T1 quota | `max_objects_holds_even_when_the_clone_is_made_by_an_arch_daemon`, `max_heartbeats_holds`, `max_callouts_obj_holds`, `max_callouts_uid_holds_even_through_an_arch_daemon`, `max_ticks_exec_holds`, `max_mem_exec_mb_holds`, `disk_quota_mb_holds`, `tick_share_per_min_holds` |
+| Confinement | `a_workroom_item_cannot_enter_live_domain_content` (tier-0 inventory and room rules: `tests/quotas.rs`) |
+| Two-root rule | `loom-persist/tests/roles_s2_integration.rs`: `a_single_root_cannot_move_anyone_into_or_out_of_t4_t5_directly`, `only_roots_may_propose_or_approve_a_two_root_change`, `single_root_cannot_apply_its_own_proposal`, `proposal_target_cannot_approve`, `expired_proposal_is_rejected`, `second_root_applies_proposal_and_role_changes_names_both_roots`. Driver side, where the actor is always the interactive's own euid: `tests/roles.rs` |
 
 ## Audit
 

@@ -1,0 +1,15 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: a clonable heartbeat subscriber (uid `mudlib`; R1 bills
+// a clone to whoever made it).
+
+persistent var beats: int = 0
+
+pub fn on() {
+    set_heartbeat(true)
+}
+
+pub fn heartbeat() {
+    beats += 1
+}

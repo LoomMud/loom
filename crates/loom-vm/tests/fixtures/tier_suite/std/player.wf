@@ -1,0 +1,29 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: the mudlib player body (uid `mudlib`). Like Warp's
+// /std/player it runs as its account once login hands it over.
+
+pub fn assume_account_euid(a: string) {
+    seteuid(a)
+}
+
+pub fn logon() {
+    send(self(), $"hello {geteuid()}\n")
+}
+
+pub fn process_input(line: string) {
+    let w = split(trim(line), " ")
+    if w[0] == "write" and len(w) == 2 {
+        try {
+            send(self(), $"{write_file(w[1], "x")}\n")
+        } catch e {
+            send(self(), $"denied: {e}\n")
+        }
+    } else {
+        send(self(), "What?\n")
+    }
+}
+
+pub fn net_dead() {
+}

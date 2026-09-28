@@ -386,7 +386,7 @@ async fn run_connection(
                             }
                         }
                         CodecOutcome::Disconnect(reason) => {
-                            warn!(conn_id, reason = reason.as_str(), "disconnecting: {}", reason.as_str());
+                            warn!(conn_id, reason = reason.as_str(), "disconnecting");
                             if reason == DisconnectReason::RateLimited {
                                 metrics::counter!("loom_net_rate_limit_disconnects_total")
                                     .increment(1);

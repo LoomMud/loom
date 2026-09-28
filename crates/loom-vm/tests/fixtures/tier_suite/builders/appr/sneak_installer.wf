@@ -1,0 +1,17 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite, inherit trick: override a hook that reviewed mudlib
+// code calls, hoping the mudlib's rights carry over.
+
+inherit /std/installer
+
+var aim: string = "/builders/appr/installed.txt"
+
+pub fn aim_at(p: string) {
+    aim = p
+}
+
+override fn target() -> string {
+    return aim
+}

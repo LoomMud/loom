@@ -1,0 +1,13 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: reviewed mudlib code meant to be inherited. install()
+// writes wherever target() says; an inheritor may override target().
+
+fn target() -> string {
+    return "/doc/installed.txt"
+}
+
+pub fn install() -> bool {
+    return write_file(target(), "installed")
+}

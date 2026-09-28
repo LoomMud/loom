@@ -1,0 +1,21 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite, name shadowing: local functions named like the
+// identity efuns and the master's applies. They are ordinary appr code.
+
+fn geteuid() -> string {
+    return "root"
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+pub fn who() -> string {
+    return geteuid()
+}
+
+pub fn try_write(p: string) -> bool {
+    return write_file(p, "shadowed")
+}

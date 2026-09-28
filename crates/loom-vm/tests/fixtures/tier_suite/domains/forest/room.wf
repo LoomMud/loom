@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite: live domain content (program_flags LIVE).
+
+pub fn create() {
+}

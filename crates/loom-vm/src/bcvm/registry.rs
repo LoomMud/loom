@@ -1485,6 +1485,13 @@ pub struct RegistryHost<'a> {
     /// The object each currently-running (possibly nested) call is
     /// executing as; `self_object()` is always the top.
     self_stack: Vec<ObjectId>,
+    /// The program each nested [`RegistryHost::call_in`] handed its
+    /// interpreter as the base module, innermost last. A closure made by a
+    /// base-module frame belongs to *that* program, which is an ancestor
+    /// when the function is inherited, not to the object's leaf program
+    /// (OBI-37: pinning the leaf made an inherited closure index the wrong
+    /// module's function table).
+    base_code: Vec<Rc<CompiledProgram>>,
     /// Guard stack (OBI-35 D-S1.2): `guards.last()` is the set of distinct
     /// principals on the stack down to the nearest cut. Pushed with every
     /// `self_stack` push, by creator frames and by cuts.
@@ -1793,6 +1800,7 @@ impl<'a> RegistryHost<'a> {
         RegistryHost {
             registry,
             self_stack: vec![self_object],
+            base_code: Vec::new(),
             guards: vec![base],
             evaluating: Vec::new(),
             extra_ticks: 0,
@@ -1839,6 +1847,7 @@ impl<'a> RegistryHost<'a> {
         RegistryHost {
             registry,
             self_stack: vec![self_object],
+            base_code: Vec::new(),
             guards: vec![base],
             evaluating: Vec::new(),
             extra_ticks: 0,
@@ -2116,13 +2125,26 @@ impl<'a> RegistryHost<'a> {
     /// principal on the guard is an unlimited uid (nothing billable to
     /// pick).
     fn caller_quota_uid(&self) -> Sym {
+        self.lowest_tier_guard_principal(0)
+            .unwrap_or_else(|| self.current_uid())
+    }
+
+    /// The shared ranking `caller_quota_uid` uses, parameterised by a
+    /// minimum tier (D-S2.4 amendment, OBI-153): the lowest-tier
+    /// *billable* principal in the current guard set with `tier >=
+    /// min_tier`, ties broken by the most recently pushed frame. Always
+    /// excludes every always-unlimited uid from the ranking, same as
+    /// `caller_quota_uid` (see its doc comment for why: an unlimited uid
+    /// has no real tier and must never be picked as a billing owner).
+    /// Returns `None` with an empty guard, no driver/roles snapshot, or
+    /// no principal meeting `min_tier` -- callers decide their own
+    /// fallback.
+    fn lowest_tier_guard_principal(&self, min_tier: u32) -> Option<Sym> {
         let guard = self.top_guard();
         if guard.is_empty() {
-            return self.current_uid();
+            return None;
         }
-        let Some(driver) = self.driver.as_ref() else {
-            return self.current_uid();
-        };
+        let driver = self.driver.as_ref()?;
         let mut best: Option<(u32, Sym)> = None;
         for p in guard.principals() {
             let name = self.registry.syms.name(p.euid);
@@ -2130,6 +2152,9 @@ impl<'a> RegistryHost<'a> {
                 continue;
             }
             let tier = driver.roles.tier(name);
+            if tier < min_tier {
+                continue;
+            }
             // `<=` so a later (more recently pushed) frame wins a tie,
             // per spec ("ties to the most recent frame") -- push order
             // means later entries in `principals()` were pushed later.
@@ -2137,7 +2162,7 @@ impl<'a> RegistryHost<'a> {
                 best = Some((tier, p.euid));
             }
         }
-        best.map_or_else(|| self.current_uid(), |(_, euid)| euid)
+        best.map(|(_, euid)| euid)
     }
 
     /// Push a frame running as `obj`: `self_stack` and the guard stack
@@ -3109,8 +3134,9 @@ impl<'a> RegistryHost<'a> {
                 if e.is_empty() {
                     return Err(RtError::new("seteuid(): empty euid"));
                 }
-                self.authorize(name, Privilege::P3, Operation::SetEuid { euid: &e })?;
                 let me = self.self_object();
+                self.check_reserved_euid(me, &e)?;
+                self.authorize(name, Privilege::P3, Operation::SetEuid { euid: &e })?;
                 let new = self.registry.syms.intern(&e);
                 let uid = match self.registry.get_mut(me) {
                     Some(o) => {
@@ -3363,6 +3389,41 @@ impl<'a> RegistryHost<'a> {
         let r = self.call_in(me, &target, idx, argv);
         self.guards.pop();
         r
+    }
+
+    /// D-S3.1 (OBI-37), a driver rule rather than master policy, like
+    /// `unguarded`: only `/secure` code (uid root) may `seteuid` onto a
+    /// reserved principal (`root`, `mudlib`, `domain:*`, see
+    /// [`security::is_reserved_principal`]). Not even an object's own
+    /// reserved uid: a mudlib body that took an account's euid must not
+    /// be able to take `mudlib` back, which is exactly what logging in as
+    /// an account named `mudlib` would do. This closes the path where the
+    /// master's "is this an account name" check passes for a player who
+    /// registered as `root` or `mudlib`. Audited when refused.
+    fn check_reserved_euid(&mut self, me: ObjectId, e: &str) -> R<()> {
+        if !security::is_reserved_principal(e) {
+            return Ok(());
+        }
+        if self.registry.get(me).map(|o| o.uid) == Some(security::ROOT) {
+            return Ok(());
+        }
+        let guard = self.top_guard().clone();
+        if let Some(d) = self.driver.as_mut() {
+            d.security.push(AuditEntry {
+                caller: me,
+                efun: "seteuid",
+                privilege: Privilege::P3,
+                apply: "reserved-euid",
+                arg: e.into(),
+                guard,
+                allowed: false,
+                denied_by: None,
+                at_unix_ms: 0, // stamped by `push` itself
+            });
+        }
+        Err(RtError::new(format!(
+            "seteuid(): `{e}` is a reserved driver principal"
+        )))
     }
 
     /// Driver rule shared by every `roles_*` **read** efun (OBI-36
@@ -3676,6 +3737,7 @@ impl<'a> RegistryHost<'a> {
             return Err(e);
         }
         self.push_self(on);
+        self.base_code.push(target.clone());
         let limits = self.limits;
         let mut ticks = self.ticks_left;
         let result = {
@@ -3683,6 +3745,7 @@ impl<'a> RegistryHost<'a> {
             interp.call(&func_name, args)
         };
         self.ticks_left = ticks;
+        self.base_code.pop();
         self.pop_self();
         result
     }
@@ -3738,35 +3801,42 @@ impl<'a> RegistryHost<'a> {
         } else {
             prog_uid
         };
-        // D-S2.4 amendment (OBI-149): the R1 test above skips the
-        // redirect whenever the guard already contains `prog_uid` --
-        // which every `/cmds/**` command frame does for any always-
-        // unlimited program (`root`/`mudlib`/`domain:*`), since command
-        // objects are themselves mudlib-owned and so push `mudlib` onto
-        // the guard before the apprentice's own code ever runs. Without
-        // this, an apprentice cloning `/std/item` (or any other
-        // mudlib/root/domain-owned program) from inside a command
+        // D-S2.4 amendment (OBI-149, refined OBI-153): the R1 test
+        // above skips the redirect whenever the guard already contains
+        // `prog_uid` -- which every `/cmds/**` command frame does for
+        // any always-unlimited program (`root`/`mudlib`/`domain:*`),
+        // since command objects are themselves mudlib-owned and so push
+        // `mudlib` onto the guard before the apprentice's own code ever
+        // runs. Without this, an apprentice cloning `/std/item` (or any
+        // other mudlib/root/domain-owned program) from inside a command
         // handler gets the clone billed to `mudlib`, which is never
         // billed at all -- `max_objects`/`max_heartbeats`/
         // `max_callouts_obj` become unenforceable simply by routing the
         // same call through a command instead of calling the builder's
         // own object directly. Bill it to the lowest-tier *billable*
-        // staff principal on the stack instead, same ranking
-        // `caller_quota_uid` already uses -- but only when that
-        // principal is tier >= 1 (a real staff row): a bare tier-0
-        // player has no policy row and must stay unaffected (spec:
-        // "Players (tier 0, no policy row) are unaffected"). `euid`
-        // itself is untouched -- R1 above already decided it and this
-        // amendment only ever narrows *billing*, never confinement.
+        // staff principal on the stack instead -- but unlike plain
+        // `caller_quota_uid`, only ranking principals with `tier >= 1`
+        // (OBI-153 fix: plain `caller_quota_uid` picks the lowest tier in
+        // the *whole* guard, which can be a tier-0 player principal
+        // sitting next to the apprentice on the stack -- e.g. the
+        // apprentice's own alt walks into the apprentice's room and the
+        // room's `create()` clones something; the tier-0 alt would then
+        // outrank the T1 apprentice as "lowest tier" and the clone would
+        // stay billed to `mudlib`, letting the apprentice repeat the
+        // clone through the alt to evade `max_objects`/`max_heartbeats`/
+        // `max_callouts_obj` indefinitely). If no guard principal is
+        // tier >= 1 (only unlimited uids and/or bare tier-0 players are
+        // present), this amendment does not fire and `owner` keeps R1's
+        // answer from above (today's rule) -- a bare tier-0 player has
+        // no policy row and must stay unaffected (spec: "Players (tier
+        // 0, no policy row) are unaffected"). `euid` itself is untouched
+        // -- R1 above already decided it and this amendment only ever
+        // narrows *billing*, never confinement.
         if apply_r1
             && crate::quota::is_unlimited_uid(self.registry.syms.name(prog_uid))
-            && let Some(driver) = self.driver.as_ref()
+            && let Some(candidate) = self.lowest_tier_guard_principal(1)
         {
-            let candidate = self.caller_quota_uid();
-            let name = self.registry.syms.name(candidate);
-            if !crate::quota::is_unlimited_uid(name) && driver.roles.tier(name) >= 1 {
-                owner = candidate;
-            }
+            owner = candidate;
         }
         self.check_max_objects(owner)?;
         let mut obj = BcObject::new(prog.clone());
@@ -4224,8 +4294,13 @@ impl Host for RegistryHost<'_> {
         }
     }
 
-    /// See [`Host::current_program`].
+    /// See [`Host::current_program`]: the innermost `call_in`'s base
+    /// program, else (a host driven without `call_in`, e.g. unit tests)
+    /// the running object's own program.
     fn current_program(&self) -> R<Rc<dyn ProgramCode>> {
+        if let Some(p) = self.base_code.last() {
+            return Ok(p.clone() as Rc<dyn ProgramCode>);
+        }
         let id = self.self_object();
         let prog = self
             .registry

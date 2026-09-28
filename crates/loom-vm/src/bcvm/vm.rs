@@ -362,8 +362,11 @@ pub trait Host {
     /// from the interpreter's own frame stack because the *outermost*
     /// frame of a driver-started call (`RegistryHost::call_in`) only ever
     /// borrows a `&Module`, never the owning `Rc` — the host is the one
-    /// thing that always still has it. The default errs: correct for a
-    /// host that never lets Weft code construct a closure.
+    /// thing that always still has it. Only asked for a base-module frame,
+    /// so it must return the program whose module the interpreter was
+    /// built with (for an inherited function, that ancestor, not the
+    /// object's own program). The default errs: correct for a host that
+    /// never lets Weft code construct a closure.
     fn current_program(&self) -> R<Rc<dyn ProgramCode>> {
         Err(RtError::new("closures are not supported by this host"))
     }
@@ -1297,7 +1300,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 captures,
             } => {
                 let captured: Vec<Value> = captures.iter().map(|r| reg!(*r)).collect();
-                let code = self.host.current_program()?;
+                // The program whose function table `func` indexes: the
+                // running frame's own code, or the host's base program for
+                // a base-module frame. Never simply the creator object's
+                // program, which is wrong for inherited code (OBI-37).
+                let code = match self.stack.last().and_then(|f| f.code.clone()) {
+                    Some(c) => c,
+                    None => self.host.current_program()?,
+                };
                 let program_version = code.version();
                 let creator = self.host.self_object();
                 let guard = self.host.current_guard();

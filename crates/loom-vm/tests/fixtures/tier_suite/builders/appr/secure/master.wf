@@ -1,0 +1,22 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite, path shadowing: a "/secure/master" inside appr's
+// workroom. Its uid comes from where it lives (/builders/appr), so it is
+// just appr code.
+
+pub fn cut_write(p: string) -> any {
+    return unguarded("do_write", [p])
+}
+
+fn do_write(p: string) -> any {
+    return write_file(p, "shadow")
+}
+
+pub fn read_tier(uid: string) -> int {
+    return roles_tier(uid)
+}
+
+pub fn ids() -> string {
+    return $"{getuid()}/{geteuid()}"
+}

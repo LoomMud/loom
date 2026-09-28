@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// E1.3 tier suite, inherit trick: inherit /secure code to borrow its
+// driver-only powers (unguarded, the roles_* read efuns).
+
+inherit /secure/cutter
