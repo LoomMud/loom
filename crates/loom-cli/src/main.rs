@@ -35,7 +35,7 @@ const WORLD_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    init_tracing();
+    let _tracing_guard = loom_obs::init_tracing("loom-cli");
 
     if let Err(err) = run().await {
         error!(error = %err, "loom command failed");
@@ -195,8 +195,17 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
 
     info!(bind = %actual_addr, http_bind = %http_actual_addr, mudlib = %mudlib_root.display(), "loom server started");
 
+    // Startup (mudlib compiled, DB backend spawned, both listeners bound)
+    // is finished by this point -- everything above returned `Ok` via
+    // `?`. Flip readiness now so `/readyz` reports 200 as soon as the
+    // HTTP server starts accepting connections, not before.
+    let readiness = loom_obs::Readiness::new();
+    readiness.set_ready();
+    let metrics = loom_obs::PrometheusMetrics::install()
+        .expect("metrics recorder installed exactly once per process");
+
     let (ws_accept_tx, ws_accept_rx) = mpsc::channel(WS_ACCEPT_QUEUE_DEPTH);
-    let http_state = loom_http::HttpState::new(ws_accept_tx);
+    let http_state = loom_http::HttpState::new(ws_accept_tx, readiness, metrics);
     let mut http_server = tokio::spawn(async move {
         axum::serve(http_listener, loom_http::app(http_state))
             .await
@@ -489,24 +498,6 @@ impl Host for NetHost {
 
     fn close(&mut self, conn: u64) {
         let _ = self.command_tx.blocking_send(NetCommand::Close(conn));
-    }
-}
-
-fn init_tracing() {
-    let env_filter = tracing_subscriber::EnvFilter::from_default_env();
-    let use_json = std::env::var("LOOM_LOG_FORMAT")
-        .map(|v| v.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
-
-    if use_json {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(env_filter)
-            .with_current_span(true)
-            .with_span_list(true)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 }
 
