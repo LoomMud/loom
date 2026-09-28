@@ -1,0 +1,45 @@
+// Minimal player for the OBI-123 loom-cli roles wiring tests: enough verbs
+// to drive the actor rule end to end through `process_input` against real
+// Postgres (`become`, `settier`), read the loaded snapshot (`tier`,
+// `hasgrant`), and observe the security-cache flush (`writefile`).
+persistent var last_request: int = -1
+
+pub fn logon() {
+    send(self, "Welcome.\n")
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "become" and len(words) == 2 {
+        seteuid(words[1])
+        send(self, "ok\n")
+    } else if verb == "settier" and len(words) == 4 {
+        let tier = to_int(words[2]) ?? 0
+        last_request = load_object("/secure/roles").set_tier(words[1], tier, words[3])
+        send(self, $"req {last_request}\n")
+    } else if verb == "tier" and len(words) == 2 {
+        let roles = load_object("/secure/roles")
+        send(self, $"tier {roles.tier(words[1])}\n")
+    } else if verb == "hasgrant" and len(words) == 4 {
+        let roles = load_object("/secure/roles")
+        send(self, $"hasgrant {roles.has_grant(words[1], words[2], words[3])}\n")
+    } else if verb == "writefile" and len(words) == 3 {
+        try {
+            send(self, $"{write_file(words[1], words[2])}\n")
+        } catch e {
+            send(self, $"denied: {e}\n")
+        }
+    } else if verb == "look" {
+        send(self, "ok\n")
+    } else {
+        send(self, "What?\n")
+    }
+}
+
+pub fn roles_result(id: int, ok: bool, detail: string) {
+    send(self, $"roles_result {id} {ok} {detail}\n")
+}
+
+pub fn net_dead() {
+}

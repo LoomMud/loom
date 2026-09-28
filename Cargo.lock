@@ -995,9 +995,12 @@ dependencies = [
  "loom-persist",
  "loom-vm",
  "serde_json",
+ "sqlx",
+ "time",
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -293,6 +293,32 @@ fn mutation_actor_is_the_interactives_euid_from_input_never_a_weft_string() {
         actor, target,
         "the actor must never be laundered from a Weft-supplied string argument"
     );
+
+    // OBI-123 CTO review: the roles-mutation audit entry must record the
+    // operation and target, not be empty.
+    let entry = world
+        .audit_log()
+        .iter()
+        .rev()
+        .find(|e| e.apply == "roles_actor")
+        .expect("roles_actor gate must be audited");
+    assert_eq!(&*entry.arg, "roles_set_tier root tier=5");
+    assert!(entry.allowed);
+
+    let (rows, cursor) = world.drain_audit_since(0);
+    assert!(cursor > 0);
+    let row = rows
+        .iter()
+        .rev()
+        .find(|r| r.apply == "roles_actor")
+        .expect("drain_audit_since must include the roles mutation gate");
+    assert_eq!(row.argument, "roles_set_tier root tier=5");
+    assert!(row.allowed);
+    assert_eq!(row.effective_principal.as_deref(), Some("t3lead"));
+    // Draining again from the returned cursor must not repeat any row.
+    let (rows2, cursor2) = world.drain_audit_since(cursor);
+    assert!(rows2.is_empty());
+    assert_eq!(cursor2, cursor);
 }
 
 #[test]

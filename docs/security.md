@@ -56,7 +56,7 @@ Normative source: [OBI-36 design note](https://paperclip.home.oberfield.net/OBI/
 
 - The driver holds the tier model (`staff`, `domain_members`, `tier_policy`, `active_grants`) in an immutable `Arc<RolesSnapshot>`, owned by `World`. `World::set_roles_snapshot(snap)` swaps it in **between executions** and calls `flush_security_cache`, so the very next execution both sees the new tier and never serves a `valid_*` decision cached against the old one.
 - `/secure/roles.wf` is the snapshot's only mudlib facade. It keeps no Weft-side copy of anything: every question (`tier`, `member`, `lead`, `has_grant`, `policy`, `domains`) is answered by calling a read efun.
-- **Dev/CI without Postgres:** set `LOOM_ROLES_SEED` to a JSON file's path and call `loom_vm::roles::load_seed_from_env()` (or build a `RolesSnapshot::from_seed_json` directly) at boot, then `World::set_roles_snapshot`. See `crate::roles` for the seed format. `loom-cli`'s DB-worker loader (OBI-119/S2a) is the Postgres-backed alternative; this crate has no dependency on which one a given boot uses.
+- **Dev/CI without Postgres:** set `LOOM_ROLES_SEED` to a JSON file's path and call `loom_vm::roles::load_seed_from_env()` (or build a `RolesSnapshot::from_seed_json` directly) at boot, then `World::set_roles_snapshot`. See `crate::roles` for the seed format. **`loom-cli`'s DB-worker loader is OBI-123**: `spawn_world_thread` calls `load_seed_from_env()` synchronously at boot only when `DATABASE_URL` is unset (a set-but-malformed seed is a boot failure, never a silent empty snapshot); with Postgres, `run_roles_manager` (a dedicated async task) loads `Persist::load_roles_snapshot`, converts it with `build_roles_snapshot`, and publishes it on a `watch` channel the world thread polls every event loop iteration.
 
 ### Read efuns: secure-only, not master policy
 
@@ -80,6 +80,15 @@ The cache is dropped whole on any of these events:
 - a recompile of anything under `/secure`;
 - `World::flush_security_cache` (a roles snapshot swap, or a grant expiry);
 - the cache reaching 8,192 entries.
+
+### The roles snapshot's three (four) refresh triggers, wired by loom-cli (OBI-123)
+
+`run_roles_manager` in `crates/loom-cli/src/main.rs` owns every trigger design OBI-36 §1 lists, in one loop, reloading (`Persist::load_roles_snapshot` -> `build_roles_snapshot` -> `watch::Sender::send`) whenever any of them fires:
+
+1. **Boot**: the loop's first iteration.
+2. **`LISTEN roles_changed`** (`Persist::listen_roles_changed`, migration 0002's `NOTIFY` triggers on `staff`/`domains`/`domain_members`/`tier_policy`/`grants`).
+3. **Every completed mutation**: `spawn_world_thread`'s drain loop pulses a small (`capacity 1`, coalescing) channel right after `World::deliver_roles_result` for a `DbEvent::RolesResult`.
+4. **The earliest grant expiry**: `RolesRows::earliest_grant_expiry` arms a `tokio::time::sleep` for exactly that long after each load (an hour if there are no active grants) -- the only trigger that fires with **no row change at all**, since nothing writes to Postgres when a grant's `expires_at` simply passes.
 
 ## Per-tier quotas, ownership, and confinement (OBI-121/S2c)
 
@@ -128,4 +137,4 @@ A cached master apply, same shape and caching contract as `valid_compile`. `upgr
 
 ## Audit
 
-Every decision, allowed or denied, is appended to a bounded in-memory ring. Each entry records: caller, efun, class, apply, argument, guard set, verdict, and which euid denied. `World::audit_log()` returns the ring. The Postgres `audit_log` sink is S2 ([OBI-36](https://paperclip.home.oberfield.net/OBI/issues/OBI-36)).
+Every decision, allowed or denied, is appended to a bounded in-memory ring. Each entry records: caller, efun, class, apply, argument, guard set, verdict, and which euid denied. `World::audit_log()` returns the ring; `World::drain_audit_since(cursor)` (OBI-123) additionally resolves every field to an owned `AuditRow` (caller/effective-principal/guard-set as names, not `Sym`s) for a driver-side sink, and returns the new cursor to pass in next time -- a fallen-behind sink gets the oldest still-retained entries rather than an error. The Postgres `audit_log` sink (`crates/loom-cli/src/main.rs`'s `run_audit_sink`) is wired by OBI-123: once per world tick, the world thread computes the new rows and hands them, already-owned, to a dedicated async task that appends them in one `INSERT` (`Persist::insert_audit_batch`); a batch is dropped (with a `warn!`) on a transient DB failure rather than retried or blocking the world thread.

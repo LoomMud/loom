@@ -112,6 +112,9 @@ async fn async_worker_returns_event_while_world_ticks_continue() {
                     DbEvent::AccountResult { .. } => {
                         panic!("unexpected AccountResult from a Sleep request");
                     }
+                    DbEvent::RolesResult { .. } => {
+                        panic!("unexpected RolesResult from a Sleep request");
+                    }
                 }
             }
             _ = tokio::time::sleep(Duration::from_secs(2)) => {

@@ -3273,7 +3273,13 @@ impl<'a> RegistryHost<'a> {
     /// deny a legitimate promotion). The SQL function re-checks rank
     /// independently (`docs/persistence.md`); this gate is the driver's
     /// half.
-    fn roles_mutation_gate(&mut self, efun: &'static str) -> R<Sym> {
+    ///
+    /// `target` is the operation-specific description recorded in the
+    /// audit entry's `arg` (`"<efun> <target>"`, e.g.
+    /// `"roles_set_tier frodo->4"`) so a denied or allowed mutation is
+    /// legible in `audit_log` without joining back to the correlation id
+    /// (CTO review, OBI-123: previously always empty).
+    fn roles_mutation_gate(&mut self, efun: &'static str, target: &str) -> R<Sym> {
         let me = self.self_object();
         let path = self.registry.get(me).map(|o| o.program.path.clone());
         let secure = path.as_deref().is_some_and(|p| p.starts_with("/secure/"));
@@ -3285,7 +3291,7 @@ impl<'a> RegistryHost<'a> {
             efun,
             privilege: Privilege::P3,
             apply: "roles_actor",
-            arg: Box::from(""),
+            arg: format!("{efun} {target}").into_boxed_str(),
             guard,
             allowed: actor.is_some(),
             denied_by: None,
@@ -3340,10 +3346,10 @@ impl<'a> RegistryHost<'a> {
     }
 
     fn roles_set_tier(&mut self, target: &Value, tier: &Value, reason: &Value) -> R<Value> {
-        let actor = self.roles_mutation_gate("roles_set_tier")?;
         let target = Self::want_str(target, "roles_set_tier(): expected string target")?;
         let tier = Self::want_int(tier, "roles_set_tier(): expected int tier")?;
         let reason = Self::want_str(reason, "roles_set_tier(): expected string reason")?;
+        let actor = self.roles_mutation_gate("roles_set_tier", &format!("{target} tier={tier}"))?;
         let caller = self.self_object();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
@@ -3365,11 +3371,14 @@ impl<'a> RegistryHost<'a> {
         role: &Value,
         reason: &Value,
     ) -> R<Value> {
-        let actor = self.roles_mutation_gate("roles_set_member")?;
         let domain = Self::want_str(domain, "roles_set_member(): expected string domain")?;
         let target = Self::want_str(target, "roles_set_member(): expected string target")?;
         let role = Self::want_str(role, "roles_set_member(): expected string role")?;
         let reason = Self::want_str(reason, "roles_set_member(): expected string reason")?;
+        let actor = self.roles_mutation_gate(
+            "roles_set_member",
+            &format!("{target} domain={domain} role={role}"),
+        )?;
         let caller = self.self_object();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
@@ -3392,7 +3401,6 @@ impl<'a> RegistryHost<'a> {
         expires_at: &Value,
         reason: &Value,
     ) -> R<Value> {
-        let actor = self.roles_mutation_gate("roles_grant")?;
         let target = Self::want_str(target, "roles_grant(): expected string target")?;
         let kind = Self::want_str(kind, "roles_grant(): expected string kind")?;
         let what = Self::want_str(what, "roles_grant(): expected string what")?;
@@ -3402,6 +3410,7 @@ impl<'a> RegistryHost<'a> {
             _ => return Err(RtError::new("roles_grant(): expected int? expires_at")),
         };
         let reason = Self::want_str(reason, "roles_grant(): expected string reason")?;
+        let actor = self.roles_mutation_gate("roles_grant", &format!("{target} {kind}:{what}"))?;
         let caller = self.self_object();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
@@ -3423,11 +3432,12 @@ impl<'a> RegistryHost<'a> {
         what: &Value,
         reason: &Value,
     ) -> R<Value> {
-        let actor = self.roles_mutation_gate("roles_revoke_grant")?;
         let target = Self::want_str(target, "roles_revoke_grant(): expected string target")?;
         let kind = Self::want_str(kind, "roles_revoke_grant(): expected string kind")?;
         let what = Self::want_str(what, "roles_revoke_grant(): expected string what")?;
         let reason = Self::want_str(reason, "roles_revoke_grant(): expected string reason")?;
+        let actor =
+            self.roles_mutation_gate("roles_revoke_grant", &format!("{target} {kind}:{what}"))?;
         let caller = self.self_object();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
@@ -3443,10 +3453,11 @@ impl<'a> RegistryHost<'a> {
     }
 
     fn roles_propose_tier(&mut self, target: &Value, tier: &Value, reason: &Value) -> R<Value> {
-        let actor = self.roles_mutation_gate("roles_propose_tier")?;
         let target = Self::want_str(target, "roles_propose_tier(): expected string target")?;
         let tier = Self::want_int(tier, "roles_propose_tier(): expected int tier")?;
         let reason = Self::want_str(reason, "roles_propose_tier(): expected string reason")?;
+        let actor =
+            self.roles_mutation_gate("roles_propose_tier", &format!("{target} tier={tier}"))?;
         let caller = self.self_object();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
@@ -3462,8 +3473,9 @@ impl<'a> RegistryHost<'a> {
     }
 
     fn roles_approve(&mut self, proposal_id: &Value) -> R<Value> {
-        let actor = self.roles_mutation_gate("roles_approve")?;
         let proposal_id = Self::want_int(proposal_id, "roles_approve(): expected int proposal_id")?;
+        let actor =
+            self.roles_mutation_gate("roles_approve", &format!("proposal={proposal_id}"))?;
         let caller = self.self_object();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);

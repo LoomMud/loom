@@ -10,21 +10,31 @@ use std::thread;
 use std::time::Duration;
 
 use loom_net::{GmcpMessage, NetCommand, NetConfig, NetEvent};
-use loom_persist::{DbEvent, DbRequest, Password};
-use loom_vm::{AccountAuth, Host, World};
+use loom_persist::{DbEvent, DbRequest, Password, Persist};
+use loom_vm::{AccountAuth, Host, RolesMutations, RolesSnapshot, World};
+use time::OffsetDateTime;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const COMMAND_CHANNEL_CAPACITY: usize = 1024;
-/// Bound on in-flight `account_create`/`account_login` requests (spec's
-/// bounded-queue engineering lens): past this many outstanding DB/dev-
-/// backend requests, [`ChannelAccountAuth`]'s `try_send` starts failing
-/// (never blocking the world thread; see its doc), and
-/// `World::issue_account_request` immediately queues an `"unavailable"`
-/// `account_result` instead of leaving the request pending forever.
-const ACCOUNT_QUEUE_DEPTH: usize = 256;
+/// Bound on in-flight `account_create`/`account_login`/`roles_*` mutation
+/// requests (spec's bounded-queue engineering lens): past this many
+/// outstanding DB/dev-backend requests, [`ChannelAccountAuth`]/
+/// [`ChannelRolesMutations`]'s `try_send` starts failing (never blocking
+/// the world thread; see their docs), and `World::issue_account_request`/
+/// the `roles_*` mutation efuns immediately queue an `"unavailable"`
+/// result instead of leaving the request pending forever.
+const DB_QUEUE_DEPTH: usize = 256;
+/// Bound on audit rows in flight between the world thread and
+/// [`run_audit_sink`] (OBI-36 D-S2.5/OBI-123): the world thread's
+/// `try_send` drops a batch (with a warning) rather than ever blocking on
+/// a slow/stalled Postgres connection -- the in-memory ring is still the
+/// source of truth and the batch is only a handful of ticks' worth of
+/// entries (see `World::drain_audit_since`'s doc for what a fallen-behind
+/// sink loses instead: the ring's own bound, not this queue's).
+const AUDIT_QUEUE_DEPTH: usize = 64;
 
 /// World tick granularity (spec r5 N2): `World::tick` (heartbeats,
 /// `call_out`s) is driven once per this interval by `serve()`'s timer
@@ -301,15 +311,65 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let tick_pending = Arc::new(AtomicBool::new(false));
 
-    let (account_req_tx, account_event_rx) = spawn_account_backend().await?;
+    let persist = connect_persist().await?;
+    let (db_req_tx, db_event_rx) = match &persist {
+        Some(p) => loom_persist::spawn_db_worker(p.clone(), DB_QUEUE_DEPTH),
+        None => {
+            warn!(
+                "DATABASE_URL is not set: accounts and roles mutations are NOT persisted \
+                 (in-memory dev backend); everything here is lost on restart, and every \
+                 roles_* mutation efun answers `unavailable`"
+            );
+            loom_persist::spawn_dev_account_worker(DB_QUEUE_DEPTH)
+        }
+    };
+
+    // OBI-123: the roles snapshot's three refresh triggers (design OBI-36
+    // §1 -- boot, `LISTEN roles_changed`, and the earliest grant expiry)
+    // plus a fourth (every completed mutation, OBI-120's own AC) all funnel
+    // through one task, `run_roles_manager`, which reloads whenever any of
+    // them fires and publishes the result on `roles_snapshot_rx` for the
+    // world thread to swap in. `roles_reload_tx` is the world thread's
+    // side of the fourth trigger (a pulse after every `roles_result`).
+    // Neither channel does anything if `persist` is `None`: without
+    // Postgres there is no roles schema to load, and `LOOM_ROLES_SEED` (the
+    // dev/CI path) is loaded once, synchronously, inside
+    // `spawn_world_thread` instead.
+    let (roles_snapshot_tx, roles_snapshot_rx) = watch::channel(None);
+    let (roles_reload_tx, roles_reload_rx) = mpsc::channel::<()>(1);
+    if let Some(p) = persist.clone() {
+        tokio::spawn(run_roles_manager(
+            p,
+            roles_reload_rx,
+            roles_snapshot_tx,
+            shutdown_rx.clone(),
+        ));
+    }
+
+    // OBI-123: batch-write the in-memory audit ring (P2+ decisions,
+    // denials, `unguarded`, role mutations, and eventually S2c's quota
+    // breaches) to the Postgres `audit_log` sink. The world thread computes
+    // the rows (it alone can see `World`'s audit state) and hands them,
+    // already-owned, to this task once per world tick; a `None` `persist`
+    // means there is nowhere to write them, so nothing is spawned and the
+    // world thread's `try_send`s are simply never drained (harmless: nothing
+    // reads `audit_rx` back, and the channel is bounded).
+    let (audit_tx, audit_rx) = mpsc::channel(AUDIT_QUEUE_DEPTH);
+    if let Some(p) = persist.clone() {
+        tokio::spawn(run_audit_sink(p, audit_rx, shutdown_rx.clone()));
+    }
 
     let world_handle = spawn_world_thread(
         mudlib_root.clone(),
         event_rx,
         command_tx.clone(),
-        account_req_tx,
-        account_event_rx,
+        db_req_tx,
+        db_event_rx,
         tick_pending.clone(),
+        roles_snapshot_rx,
+        roles_reload_tx,
+        audit_tx,
+        persist.is_none(),
     )?;
 
     info!(bind = %actual_addr, http_bind = %http_actual_addr, mudlib = %mudlib_root.display(), "loom server started");
@@ -443,39 +503,31 @@ async fn run_world_tick_timer(
 /// Spawn the world thread. The `World` is not `Send` (single-threaded heap,
 /// spec §3.3), so it is booted *on* the world thread; boot errors are
 /// reported back before we start accepting connections.
-/// Wire up the `account_create`/`account_login` backend (spec, OBI-85):
-/// Postgres via `loom-persist`'s R2 DB worker if `DATABASE_URL` is set,
-/// else the in-memory dev backend (same Argon2 hashing, nothing survives
-/// a restart) -- what CI and the R4 load bot use.
-async fn spawn_account_backend()
--> Result<(mpsc::Sender<DbRequest>, mpsc::Receiver<DbEvent>), String> {
+/// Connect to Postgres for the account/roles/audit backends (spec OBI-85,
+/// design OBI-36 D-S2.1/D-S2.2/D-S2.5), if `DATABASE_URL` is set. `None`
+/// means the in-memory dev backend (`loom-persist::spawn_dev_account_worker`)
+/// is used instead: nothing here survives a restart, roles mutations always
+/// answer `"unavailable"`, and there is no `audit_log` sink -- what CI (sans
+/// the Postgres service) and a bare `cargo run` use.
+async fn connect_persist() -> Result<Option<Persist>, String> {
     match std::env::var("DATABASE_URL") {
-        Ok(url) => {
-            let persist = loom_persist::Persist::connect(&url, 5)
-                .await
-                .map_err(|err| format!("failed to connect DATABASE_URL: {err}"))?;
-            Ok(loom_persist::spawn_db_worker(persist, ACCOUNT_QUEUE_DEPTH))
-        }
-        Err(_) => {
-            warn!(
-                "DATABASE_URL is not set: accounts are NOT persisted (in-memory dev backend); \
-                 every account is lost on restart"
-            );
-            Ok(loom_persist::spawn_dev_account_worker(ACCOUNT_QUEUE_DEPTH))
-        }
+        Ok(url) => Persist::connect(&url, 5)
+            .await
+            .map(Some)
+            .map_err(|err| format!("failed to connect DATABASE_URL: {err}")),
+        Err(_) => Ok(None),
     }
 }
 
-/// [`AccountAuth`] wired to whichever `DbRequest` sender
-/// [`spawn_account_backend`] chose: `create_account`/`login` never block
-/// the world thread (a `try_send` on a bounded channel, `Err` if it is
-/// full or the worker task is gone -- the caller then queues an
-/// `"unavailable"` result locally instead of leaving the request pending
-/// forever, spec/CTO review OBI-85), and the eventual
-/// [`DbEvent::AccountResult`] comes back through the `DbEvent` receiver
-/// the world thread drains every loop iteration (see `spawn_world_thread`;
-/// once `NetEvent::Tick`, OBI-82, lands, `World::tick` already drains it
-/// too -- see `World::tick`'s doc comment).
+/// [`AccountAuth`] wired to whichever `DbRequest` sender [`connect_persist`]'s
+/// caller chose: `create_account`/`login` never block the world thread (a
+/// `try_send` on a bounded channel, `Err` if it is full or the worker task
+/// is gone -- the caller then queues an `"unavailable"` result locally
+/// instead of leaving the request pending forever, spec/CTO review OBI-85),
+/// and the eventual [`DbEvent::AccountResult`] comes back through the
+/// `DbEvent` receiver the world thread drains every loop iteration (see
+/// `spawn_world_thread`; once `NetEvent::Tick`, OBI-82, lands, `World::tick`
+/// already drains it too -- see `World::tick`'s doc comment).
 struct ChannelAccountAuth {
     request_tx: mpsc::Sender<DbRequest>,
 }
@@ -502,53 +554,413 @@ impl AccountAuth for ChannelAccountAuth {
     }
 }
 
+/// [`RolesMutations`] wired to the same `DbRequest` sender as
+/// [`ChannelAccountAuth`] (OBI-123): every method issues its request with a
+/// `try_send` and reports `false` (never blocking, never leaving the
+/// request pending forever, same rule as `ChannelAccountAuth`) if the
+/// channel is full or the worker task is gone. Answers come back as
+/// [`DbEvent::RolesResult`], delivered to `World::deliver_roles_result` by
+/// `spawn_world_thread`'s drain loop, which also pulses `reload_tx` so
+/// [`run_roles_manager`] reloads the snapshot right after (design OBI-36
+/// §1: "after every roles mutation completes").
+struct ChannelRolesMutations {
+    request_tx: mpsc::Sender<DbRequest>,
+}
+
+impl RolesMutations for ChannelRolesMutations {
+    fn set_tier(
+        &mut self,
+        request_id: u64,
+        actor: &str,
+        target: &str,
+        tier: i64,
+        reason: &str,
+    ) -> bool {
+        self.request_tx
+            .try_send(DbRequest::RolesSetTier {
+                correlation_id: request_id,
+                actor: actor.to_string(),
+                target: target.to_string(),
+                tier,
+                reason: reason.to_string(),
+            })
+            .is_ok()
+    }
+
+    fn set_member(
+        &mut self,
+        request_id: u64,
+        actor: &str,
+        domain: &str,
+        target: &str,
+        role: &str,
+        reason: &str,
+    ) -> bool {
+        self.request_tx
+            .try_send(DbRequest::RolesSetMember {
+                correlation_id: request_id,
+                actor: actor.to_string(),
+                domain: domain.to_string(),
+                target: target.to_string(),
+                role: role.to_string(),
+                reason: reason.to_string(),
+            })
+            .is_ok()
+    }
+
+    fn grant(
+        &mut self,
+        request_id: u64,
+        actor: &str,
+        target: &str,
+        kind: &str,
+        what: &str,
+        expires_at: Option<i64>,
+        reason: &str,
+    ) -> bool {
+        self.request_tx
+            .try_send(DbRequest::RolesGrant {
+                correlation_id: request_id,
+                actor: actor.to_string(),
+                target: target.to_string(),
+                kind: kind.to_string(),
+                what: what.to_string(),
+                expires_at,
+                reason: reason.to_string(),
+            })
+            .is_ok()
+    }
+
+    fn revoke_grant(
+        &mut self,
+        request_id: u64,
+        actor: &str,
+        target: &str,
+        kind: &str,
+        what: &str,
+        reason: &str,
+    ) -> bool {
+        self.request_tx
+            .try_send(DbRequest::RolesRevokeGrant {
+                correlation_id: request_id,
+                actor: actor.to_string(),
+                target: target.to_string(),
+                kind: kind.to_string(),
+                what: what.to_string(),
+                reason: reason.to_string(),
+            })
+            .is_ok()
+    }
+
+    fn propose_tier(
+        &mut self,
+        request_id: u64,
+        actor: &str,
+        target: &str,
+        tier: i64,
+        reason: &str,
+    ) -> bool {
+        self.request_tx
+            .try_send(DbRequest::RolesProposeTier {
+                correlation_id: request_id,
+                actor: actor.to_string(),
+                target: target.to_string(),
+                tier,
+                reason: reason.to_string(),
+            })
+            .is_ok()
+    }
+
+    fn approve(&mut self, request_id: u64, actor: &str, proposal_id: i64) -> bool {
+        self.request_tx
+            .try_send(DbRequest::RolesApprove {
+                correlation_id: request_id,
+                actor: actor.to_string(),
+                proposal_id,
+            })
+            .is_ok()
+    }
+}
+
+/// Build a [`RolesSnapshot`] from `loom-persist`'s plain-data rows
+/// (`Persist::load_roles_snapshot`, OBI-119/S2a): the DB-worker loader half
+/// of design OBI-36 §1/D-S2.1. `tier_policy`'s `efun_classes` column is not
+/// mapped into the per-tier policy map -- it is a list, not a scalar, and
+/// has no reader yet (S2c, OBI-121, is the first consumer of any of
+/// `tier_policy`'s columns for enforcement; this loader only has to satisfy
+/// today's `roles_policy()`/`policy_row()` readers, which are all scalar).
+fn build_roles_snapshot(rows: loom_persist::RolesRows) -> RolesSnapshot {
+    let staff = rows
+        .staff
+        .into_iter()
+        .map(|r| (r.uid, r.tier.max(0) as u32))
+        .collect();
+
+    let mut domain_members: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, loom_vm::DomainRole>,
+    > = std::collections::HashMap::new();
+    for r in rows.domain_members {
+        let role = match r.role.as_str() {
+            "lead" => loom_vm::DomainRole::Lead,
+            "member" => loom_vm::DomainRole::Member,
+            other => {
+                warn!(domain = %r.domain, uid = %r.uid, role = other, "unrecognised domain_members.role; skipping");
+                continue;
+            }
+        };
+        domain_members
+            .entry(r.domain)
+            .or_default()
+            .insert(r.uid, role);
+    }
+
+    let tier_policy = rows
+        .tier_policy
+        .into_iter()
+        .map(|r| {
+            let mut cols = std::collections::HashMap::new();
+            let mut set = |name: &str, v: Option<i32>| {
+                if let Some(v) = v {
+                    cols.insert(name.to_string(), v as i64);
+                }
+            };
+            set("max_ticks_exec", r.max_ticks_exec);
+            set("max_mem_exec_mb", r.max_mem_exec_mb);
+            set("max_objects", r.max_objects);
+            set("max_heartbeats", r.max_heartbeats);
+            set("max_callouts_obj", r.max_callouts_obj);
+            set("max_callouts_uid", r.max_callouts_uid);
+            set("disk_quota_mb", r.disk_quota_mb);
+            if let Some(v) = r.tick_share_per_min {
+                cols.insert("tick_share_per_min".to_string(), v);
+            }
+            (r.tier.max(0) as u32, cols)
+        })
+        .collect();
+
+    let grants = rows
+        .active_grants
+        .into_iter()
+        .map(|g| loom_vm::Grant {
+            uid: g.uid,
+            kind: g.kind,
+            target: g.target,
+            expires_at: Some(g.expires_at.unix_timestamp()),
+        })
+        .collect();
+
+    RolesSnapshot::new(staff, domain_members, tier_policy, grants)
+}
+
+/// Reload trigger for [`run_roles_manager`]'s loop: which of the three
+/// design-note refresh sources (plus the fourth, a completed mutation)
+/// woke it up. Used only for `debug!` logging; the loop always reloads
+/// regardless of which one fired.
+#[derive(Debug, Clone, Copy)]
+enum RolesReloadTrigger {
+    Boot,
+    Notify,
+    Mutation,
+    Expiry,
+    LoadFailedRetry,
+}
+
+/// Owns every refresh trigger for the roles snapshot (design OBI-36 §1,
+/// wired by OBI-123): boot (the first loop iteration), `LISTEN
+/// roles_changed` (`listen_roles_changed`), a pulse on `reload_rx` after
+/// every completed `roles_*` mutation (the fourth trigger, from
+/// `spawn_world_thread`'s drain loop), and a timer at the earliest
+/// `expires_at` among the grants in the snapshot just loaded. Publishes
+/// every successful reload on `snapshot_tx`, a [`watch`] channel so the
+/// world thread only ever sees the latest snapshot, never a backlog of
+/// stale ones.
+async fn run_roles_manager(
+    persist: Persist,
+    mut reload_rx: mpsc::Receiver<()>,
+    snapshot_tx: watch::Sender<Option<std::sync::Arc<RolesSnapshot>>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut listen_rx = match persist.listen_roles_changed().await {
+        Ok(rx) => rx,
+        Err(err) => {
+            error!(error = %err, "LISTEN roles_changed failed: the roles snapshot will never refresh after boot");
+            return;
+        }
+    };
+
+    let mut trigger = RolesReloadTrigger::Boot;
+    loop {
+        match persist.load_roles_snapshot().await {
+            Ok(rows) => {
+                debug!(?trigger, "roles snapshot reloaded");
+                let earliest = rows.earliest_grant_expiry;
+                let snap = build_roles_snapshot(rows);
+                if snapshot_tx.send(Some(std::sync::Arc::new(snap))).is_err() {
+                    return; // world thread is gone
+                }
+                let sleep_for = earliest
+                    .map(|t| t - OffsetDateTime::now_utc())
+                    .map(|d| Duration::from_secs_f64(d.as_seconds_f64().max(0.0)))
+                    .unwrap_or(Duration::from_secs(3600));
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    payload = listen_rx.recv() => {
+                        match payload {
+                            Some(table) => {
+                                debug!(table = %table, "roles_changed notify");
+                                trigger = RolesReloadTrigger::Notify;
+                            }
+                            None => break, // listener task exited
+                        }
+                    }
+                    _ = reload_rx.recv() => trigger = RolesReloadTrigger::Mutation,
+                    _ = tokio::time::sleep(sleep_for) => trigger = RolesReloadTrigger::Expiry,
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "load_roles_snapshot failed; retrying in 5s");
+                trigger = RolesReloadTrigger::LoadFailedRetry;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Batch-write the in-memory audit ring to the `audit_log` Postgres sink
+/// (design OBI-36 §5/D-S2.5, wired by OBI-123): drains whatever
+/// `spawn_world_thread` hands it (already-owned rows, computed on the world
+/// thread from `World::drain_audit_since`) and appends each batch in one
+/// round trip (`Persist::insert_audit_batch`). A failed batch is logged and
+/// dropped -- the audit ring itself is still the source of truth and keeps
+/// its own bounded history, so losing one batch to a transient DB error is
+/// preferable to blocking the world thread or retrying forever.
+async fn run_audit_sink(
+    persist: Persist,
+    mut audit_rx: mpsc::Receiver<Vec<loom_vm::AuditRow>>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            batch = audit_rx.recv() => {
+                let Some(batch) = batch else { break };
+                let rows: Vec<loom_persist::AuditRow> = batch.into_iter().map(to_persist_audit_row).collect();
+                if let Err(err) = persist.insert_audit_batch(&rows).await {
+                    warn!(error = %err, dropped = rows.len(), "audit_log insert failed; batch dropped");
+                }
+            }
+        }
+    }
+}
+
+fn to_persist_audit_row(r: loom_vm::AuditRow) -> loom_persist::AuditRow {
+    loom_persist::AuditRow {
+        at: OffsetDateTime::now_utc(),
+        kind: r.kind.to_string(),
+        caller: r.caller,
+        effective_principal: r.effective_principal,
+        apply: Some(r.apply.to_string()),
+        class: Some(r.class),
+        argument: Some(r.argument),
+        guard_set: r.guard_set,
+        verdict: if r.allowed { "allow" } else { "deny" }.to_string(),
+        detail: r.detail,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_world_thread(
     mudlib_root: PathBuf,
     mut event_rx: mpsc::Receiver<NetEvent>,
     command_tx: mpsc::Sender<NetCommand>,
-    account_req_tx: mpsc::Sender<DbRequest>,
-    mut account_event_rx: mpsc::Receiver<DbEvent>,
+    db_req_tx: mpsc::Sender<DbRequest>,
+    mut db_event_rx: mpsc::Receiver<DbEvent>,
     tick_pending: Arc<AtomicBool>,
+    mut roles_snapshot_rx: watch::Receiver<Option<std::sync::Arc<RolesSnapshot>>>,
+    roles_reload_tx: mpsc::Sender<()>,
+    audit_tx: mpsc::Sender<Vec<loom_vm::AuditRow>>,
+    load_roles_seed: bool,
 ) -> Result<thread::JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let handle = thread::Builder::new()
         .name("loom-world".to_string())
         .spawn(move || {
             let mut world = match World::boot(&mudlib_root) {
-                Ok(world) => {
-                    let _ = ready_tx.send(Ok(()));
-                    world
-                }
+                Ok(world) => world,
                 Err(err) => {
                     let _ = ready_tx.send(Err(format!("world boot failed: {err}")));
                     return;
                 }
             };
+            // OBI-123: without Postgres (`persist` was `None`), `LOOM_ROLES_SEED`
+            // is the dev/CI path (`crate::roles::load_seed_from_env`'s doc): a
+            // set-but-malformed seed is a boot failure, never a silent empty
+            // snapshot. With Postgres, the real snapshot arrives asynchronously
+            // through `roles_snapshot_rx` shortly after boot (`run_roles_manager`'s
+            // first load) -- until then, `World::boot`'s tier-0-for-everyone
+            // default is in effect, same as every other `World::boot` caller
+            // before OBI-36.
+            if load_roles_seed {
+                match loom_vm::roles::load_seed_from_env() {
+                    None => {}
+                    Some(Ok(seed)) => world.set_roles_snapshot(std::sync::Arc::new(seed)),
+                    Some(Err(err)) => {
+                        let _ = ready_tx.send(Err(format!("LOOM_ROLES_SEED: {err}")));
+                        return;
+                    }
+                }
+            }
+            let _ = ready_tx.send(Ok(()));
             world.set_account_auth(Box::new(ChannelAccountAuth {
-                request_tx: account_req_tx,
+                request_tx: db_req_tx.clone(),
+            }));
+            world.set_roles_backend(Box::new(ChannelRolesMutations {
+                request_tx: db_req_tx,
             }));
             let mut host = NetHost { command_tx };
+            let mut audit_cursor: u64 = 0;
 
-            // OBI-85: drain any `account_create`/`account_login` result
-            // that has come back since the last time we looked, on every
-            // loop iteration -- once `NetEvent::Tick` (OBI-82) lands, an
-            // idle server will also flush this on every tick, since
-            // `World::tick` calls `World::drain_account_results` itself.
-            let mut drain_account_events = |world: &mut World, host: &mut NetHost| {
-                while let Ok(event) = account_event_rx.try_recv() {
-                    if let DbEvent::AccountResult {
-                        correlation_id,
-                        ok,
-                        detail,
-                    } = event
-                    {
-                        world.deliver_account_result(correlation_id, ok, &detail);
+            // OBI-85/OBI-123: drain any `account_create`/`account_login`/
+            // `roles_*` result that has come back since the last time we
+            // looked, on every loop iteration -- once `NetEvent::Tick`
+            // (OBI-82) lands, an idle server will also flush this on every
+            // tick, since `World::tick` calls `World::drain_account_results`/
+            // `World::drain_roles_results` itself.
+            let mut drain_db_events = |world: &mut World, host: &mut NetHost| {
+                while let Ok(event) = db_event_rx.try_recv() {
+                    match event {
+                        DbEvent::AccountResult {
+                            correlation_id,
+                            ok,
+                            detail,
+                        } => {
+                            world.deliver_account_result(correlation_id, ok, &detail);
+                        }
+                        DbEvent::RolesResult {
+                            correlation_id,
+                            ok,
+                            detail,
+                        } => {
+                            world.deliver_roles_result(correlation_id, ok, &detail);
+                            // Design OBI-36 §1's fourth refresh trigger: reload
+                            // right after a completed mutation. `try_send`:
+                            // a reload already pending (channel full) covers
+                            // this one too, and `run_roles_manager` may not
+                            // even be running (no Postgres) -- either way
+                            // this must never block the world thread.
+                            let _ = roles_reload_tx.try_send(());
+                        }
+                        // `DbEvent::SleepDone`/`QueryFailed` are R2's own
+                        // diagnostics, not surfaced to the world.
+                        DbEvent::SleepDone { .. } | DbEvent::QueryFailed { .. } => {}
                     }
-                    // `DbEvent::SleepDone`/`QueryFailed` are R2's own
-                    // diagnostics, not surfaced to the world; nothing else
-                    // uses this worker yet.
                 }
                 world.drain_account_results(host);
+                world.drain_roles_results(host);
             };
 
             while let Some(event) = event_rx.blocking_recv() {
@@ -564,6 +976,18 @@ fn spawn_world_thread(
                         // this is the coalescing boundary, not just a
                         // "received" acknowledgement.
                         tick_pending.store(false, Ordering::Release);
+
+                        // OBI-123 D-S2.5: once per world tick, flush any
+                        // audit entries recorded since the last flush. A
+                        // full/closed `audit_tx` (no Postgres, or the sink
+                        // task fell behind) drops this batch silently --
+                        // the audit ring itself still has it, up to its own
+                        // bound.
+                        let (rows, cursor) = world.drain_audit_since(audit_cursor);
+                        audit_cursor = cursor;
+                        if !rows.is_empty() {
+                            let _ = audit_tx.try_send(rows);
+                        }
                     }
                     // NAWS/TTYPE/GMCP hooks into the world (efun-visible
                     // state, `Char.*` driving game logic) are OBI-26
@@ -594,7 +1018,16 @@ fn spawn_world_thread(
                         debug!(conn, module, "GMCP message");
                     }
                 }
-                drain_account_events(&mut world, &mut host);
+                // OBI-123: the roles snapshot's own swap-in point -- checked
+                // every loop iteration (cheap: `watch::Receiver::has_changed`
+                // never awaits), so a reload from `run_roles_manager` takes
+                // effect on the very next event, not just on a tick.
+                if roles_snapshot_rx.has_changed().unwrap_or(false)
+                    && let Some(snap) = roles_snapshot_rx.borrow_and_update().clone()
+                {
+                    world.set_roles_snapshot(snap);
+                }
+                drain_db_events(&mut world, &mut host);
             }
         })
         .map_err(|err| format!("failed to spawn world thread: {err}"))?;
