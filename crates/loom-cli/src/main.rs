@@ -169,6 +169,14 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         .local_addr()
         .map_err(|err| format!("failed to read local addr: {err}"))?;
 
+    let http_bind_addr = http_addr_from_env();
+    let http_listener = TcpListener::bind(&http_bind_addr)
+        .await
+        .map_err(|err| format!("failed to bind {http_bind_addr}: {err}"))?;
+    let http_actual_addr = http_listener
+        .local_addr()
+        .map_err(|err| format!("failed to read HTTP local addr: {err}"))?;
+
     let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -185,9 +193,17 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         tick_pending.clone(),
     )?;
 
-    info!(bind = %actual_addr, mudlib = %mudlib_root.display(), "loom server started");
+    info!(bind = %actual_addr, http_bind = %http_actual_addr, mudlib = %mudlib_root.display(), "loom server started");
 
-    let mut server = tokio::spawn(loom_net::run_server(
+    let (ws_accept_tx, ws_accept_rx) = mpsc::channel(WS_ACCEPT_QUEUE_DEPTH);
+    let http_state = loom_http::HttpState::new(ws_accept_tx);
+    let mut http_server = tokio::spawn(async move {
+        axum::serve(http_listener, loom_http::app(http_state))
+            .await
+            .map_err(|err| format!("HTTP server failed: {err}"))
+    });
+
+    let mut server = tokio::spawn(loom_net::run_server_with_ws(
         listener,
         NetConfig {
             mssp_fields: vec![
@@ -200,6 +216,7 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         event_tx.clone(),
         command_rx,
         shutdown_rx.clone(),
+        ws_accept_rx,
     ));
     let mut ticker = tokio::spawn(run_world_tick_timer(
         event_tx,
@@ -214,6 +231,10 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
                 .map_err(|err| format!("network server task failed: {err}"))?
                 .map_err(|err| format!("network server failed: {err}"))?;
         }
+        result = &mut http_server => {
+            result
+                .map_err(|err| format!("HTTP server task failed: {err}"))??;
+        }
         _ = shutdown_signal() => {
             info!("shutdown signal received");
             let _ = shutdown_tx.send(true);
@@ -227,6 +248,8 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
             .map_err(|err| format!("network server task failed: {err}"))?
             .map_err(|err| format!("network server failed: {err}"))?;
     }
+    http_server.abort();
+    let _ = (&mut http_server).await;
     if !ticker.is_finished() {
         let _ = (&mut ticker).await;
     }
@@ -237,6 +260,18 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         .map_err(|_| "world thread panicked".to_string())?;
 
     Ok(())
+}
+
+pub const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:4001";
+
+/// Bound on in-flight accepted-but-not-yet-registered WebSocket upgrades
+/// between `loom-http`'s `/ws` route and `run_server_with_ws`'s accept
+/// loop (spec's bounded-queue engineering lens: nothing here is
+/// unbounded).
+const WS_ACCEPT_QUEUE_DEPTH: usize = 64;
+
+fn http_addr_from_env() -> String {
+    std::env::var("LOOM_HTTP_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string())
 }
 
 /// The `serve()` world-tick timer (spec r5 N2, OBI-82): every `interval`

@@ -210,12 +210,14 @@ impl LoomServer {
         let loom_bin = std::env::var("CARGO_BIN_EXE_loom-cli")
             .or_else(|_| std::env::var("CARGO_BIN_EXE_loom_cli"))
             .expect("cargo binary path for loom-cli");
+        let http_port = reserve_local_port();
 
         let child = Command::new(loom_bin)
             .arg("serve")
             .arg("--mudlib")
             .arg(mudlib)
             .env("LOOM_TELNET_ADDR", bind)
+            .env("LOOM_HTTP_ADDR", format!("127.0.0.1:{http_port}"))
             .env("RUST_LOG", "")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
