@@ -2589,6 +2589,7 @@ impl<'a> RegistryHost<'a> {
                 guard: GuardSet::empty(),
                 allowed: false,
                 denied_by: None,
+                at_unix_ms: 0, // stamped by `push` itself
             });
         }
         RtError::new(msg)
@@ -2611,6 +2612,7 @@ impl<'a> RegistryHost<'a> {
                 guard: GuardSet::empty(),
                 allowed: false,
                 denied_by: None,
+                at_unix_ms: 0, // stamped by `push` itself
             });
         }
         RtError::new(msg)
