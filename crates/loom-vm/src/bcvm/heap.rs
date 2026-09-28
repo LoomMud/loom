@@ -713,16 +713,6 @@ pub fn cost_calls() -> u64 {
     COST_CALLS.with(|c| c.get())
 }
 
-/// The exact [`shallow_bytes`] delta a *new* map key adds (spec r5
-/// §5.2.1, OBI-108): `shallow_bytes` counts a map by `entries.len()`
-/// alone, so inserting one more entry is this, always, with no need to
-/// build the mutated map first just to measure it — which lets an
-/// in-place `IndexSetGlobal` quota-check a map growth *before* mutating
-/// (mirroring how an array bounds check already happens before its own
-/// mutation), so a rejected write never has to be undone, only never
-/// applied.
-pub const MAP_ENTRY_BYTES: u64 = 2 * std::mem::size_of::<Value>() as u64;
-
 /// Render a value for interpolation / display. `name` resolves object
 /// names.
 pub fn display(v: &Value, name: &dyn Fn(ObjectId) -> String) -> String {
