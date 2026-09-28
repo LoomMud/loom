@@ -123,6 +123,27 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     ("read_file", 1, 1, Privilege::P0, 20),
     ("write_file", 2, 2, Privilege::P1, 50),
     ("unguarded", 1, 2, Privilege::P4, 10),
+    // OBI-36 (S2b), design note D-S2.2: the roles snapshot's read efuns.
+    // Secure-only (a driver rule, exactly like `unguarded`'s D-S1.5, not
+    // master policy): P0, no `valid_efun`/stack check, cheap (1-5 ticks).
+    ("roles_tier", 1, 1, Privilege::P0, 2),
+    ("roles_is_member", 2, 2, Privilege::P0, 2),
+    ("roles_is_lead", 2, 2, Privilege::P0, 2),
+    ("roles_has_grant", 3, 3, Privilege::P0, 3),
+    ("roles_policy", 1, 1, Privilege::P0, 3),
+    ("roles_domains", 1, 1, Privilege::P0, 3),
+    // D-S2.2: async mutation efuns, like `account_create`/`account_login`
+    // (OBI-85) -- return a correlation id, deliver the result later
+    // through `roles_result(id, ok, detail)`. Class P3, but *exempt* from
+    // `valid_efun` (gated instead by the secure-only rule, the actor rule
+    // and the SQL re-check; see `RegistryHost::roles_mutation_gate`),
+    // again like `unguarded`.
+    ("roles_set_tier", 3, 3, Privilege::P3, 50),
+    ("roles_set_member", 4, 4, Privilege::P3, 50),
+    ("roles_grant", 5, 5, Privilege::P3, 50),
+    ("roles_revoke_grant", 4, 4, Privilege::P3, 50),
+    ("roles_propose_tier", 3, 3, Privilege::P3, 50),
+    ("roles_approve", 1, 1, Privilege::P3, 50),
 ];
 
 /// `(min args, max args)` of efun `name`, if it exists.

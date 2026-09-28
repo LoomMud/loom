@@ -1342,6 +1342,19 @@ struct Driver<'a> {
     accounts: crate::world::AccountsCtx<'a>,
     /// Decision cache, policy epoch and audit (OBI-35), owned by `World`.
     security: &'a mut SecurityState,
+    /// The S2 roles snapshot (OBI-36 D-S2.1), owned by `World`; cloned
+    /// (an `Arc` bump) into every `RegistryHost` so a snapshot swap mid-way
+    /// through some other execution never changes what *this* one sees.
+    roles: std::sync::Arc<crate::roles::RolesSnapshot>,
+    /// `roles_set_tier`/... bookkeeping (OBI-36 D-S2.2), owned by `World`;
+    /// see `crate::world::RolesCtx`.
+    roles_ctx: crate::world::RolesCtx<'a>,
+    /// The euid of the interactive whose input started this execution
+    /// (D-S2.2's actor rule), fixed at the input cut by `World::input` and
+    /// never re-read; `None` for every other entry point (`connect`,
+    /// `disconnect`, a heartbeat, a call_out, a `roles_result`/
+    /// `account_result` drain, a driver-started apply/introspection call).
+    input_actor: Option<Sym>,
     /// Mudlib root, for the `read_file`/`write_file` VFS.
     root: PathBuf,
 }
@@ -1598,7 +1611,10 @@ impl<'a> RegistryHost<'a> {
         scheduler: &'a mut crate::scheduler::Scheduler,
         accounts: crate::world::AccountsCtx<'a>,
         security: &'a mut SecurityState,
+        roles: std::sync::Arc<crate::roles::RolesSnapshot>,
+        roles_ctx: crate::world::RolesCtx<'a>,
         cut_guard: Option<GuardSet>,
+        input_actor: Option<Sym>,
     ) -> Self {
         let base = cut_guard
             .unwrap_or_else(|| GuardSet::empty().with(principal_of(registry, self_object)));
@@ -1621,6 +1637,9 @@ impl<'a> RegistryHost<'a> {
                 scheduler,
                 accounts,
                 security,
+                roles,
+                roles_ctx,
+                input_actor,
                 root,
             }),
             stack_base: stack_addr(),
@@ -2009,7 +2028,16 @@ impl<'a> RegistryHost<'a> {
         // exists for has lower-privileged frames below it (D-S1.5).
         if let Some(p) = crate::efuns::privilege(name)
             && p.gated()
-            && name != "unguarded"
+            && !matches!(
+                name,
+                "unguarded"
+                    | "roles_set_tier"
+                    | "roles_set_member"
+                    | "roles_grant"
+                    | "roles_revoke_grant"
+                    | "roles_propose_tier"
+                    | "roles_approve"
+            )
         {
             let sname = crate::efuns::static_name(name).unwrap_or("?");
             self.authorize(
@@ -2023,6 +2051,9 @@ impl<'a> RegistryHost<'a> {
         }
         let a0 = args.first().cloned().unwrap_or(Value::Null);
         let a1 = args.get(1).cloned().unwrap_or(Value::Null);
+        let a2 = args.get(2).cloned().unwrap_or(Value::Null);
+        let a3 = args.get(3).cloned().unwrap_or(Value::Null);
+        let a4 = args.get(4).cloned().unwrap_or(Value::Null);
         match name {
             "self" => Ok(Value::Object(self.self_object())),
             "this_player" => Ok(self
@@ -2388,6 +2419,87 @@ impl<'a> RegistryHost<'a> {
             "account_create" => self.issue_account_request(true, &a0, &a1),
             "account_login" => self.issue_account_request(false, &a0, &a1),
             "unguarded" => self.unguarded(a0, a1),
+            "roles_tier" => {
+                self.require_secure_caller("roles_tier")?;
+                let uid = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("roles_tier(): expected string uid"))?;
+                let roles = self.driver.as_ref().expect("checked above").roles.clone();
+                Ok(Value::Int(roles.tier(uid) as i64))
+            }
+            "roles_is_member" => {
+                self.require_secure_caller("roles_is_member")?;
+                let uid = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("roles_is_member(): expected string uid"))?;
+                let domain = a1
+                    .as_str()
+                    .ok_or_else(|| RtError::new("roles_is_member(): expected string domain"))?;
+                let roles = self.driver.as_ref().expect("checked above").roles.clone();
+                Ok(Value::Bool(roles.is_member(uid, domain)))
+            }
+            "roles_is_lead" => {
+                self.require_secure_caller("roles_is_lead")?;
+                let uid = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("roles_is_lead(): expected string uid"))?;
+                let domain = a1
+                    .as_str()
+                    .ok_or_else(|| RtError::new("roles_is_lead(): expected string domain"))?;
+                let roles = self.driver.as_ref().expect("checked above").roles.clone();
+                Ok(Value::Bool(roles.is_lead(uid, domain)))
+            }
+            "roles_has_grant" => {
+                self.require_secure_caller("roles_has_grant")?;
+                let uid = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("roles_has_grant(): expected string uid"))?;
+                let kind = a1
+                    .as_str()
+                    .ok_or_else(|| RtError::new("roles_has_grant(): expected string kind"))?;
+                let target = a2
+                    .as_str()
+                    .ok_or_else(|| RtError::new("roles_has_grant(): expected string target"))?;
+                let roles = self.driver.as_ref().expect("checked above").roles.clone();
+                Ok(Value::Bool(roles.has_grant(uid, kind, target)))
+            }
+            "roles_policy" => {
+                self.require_secure_caller("roles_policy")?;
+                let tier = match a0 {
+                    Value::Int(n) if n >= 0 => n as u32,
+                    _ => {
+                        return Err(RtError::new(
+                            "roles_policy(): expected non-negative int tier",
+                        ));
+                    }
+                };
+                let roles = self.driver.as_ref().expect("checked above").roles.clone();
+                let mut m = heap::MapData::default();
+                for (k, v) in roles.policy(tier) {
+                    m.insert(Value::str(&k), Value::Int(v));
+                }
+                Ok(Value::map(m))
+            }
+            "roles_domains" => {
+                self.require_secure_caller("roles_domains")?;
+                let uid = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("roles_domains(): expected string uid"))?;
+                let roles = self.driver.as_ref().expect("checked above").roles.clone();
+                Ok(Value::array(
+                    roles
+                        .domains(uid)
+                        .into_iter()
+                        .map(|d| Value::str(&d))
+                        .collect(),
+                ))
+            }
+            "roles_set_tier" => self.roles_set_tier(&a0, &a1, &a2),
+            "roles_set_member" => self.roles_set_member(&a0, &a1, &a2, &a3),
+            "roles_grant" => self.roles_grant(&a0, &a1, &a2, &a3, &a4),
+            "roles_revoke_grant" => self.roles_revoke_grant(&a0, &a1, &a2, &a3),
+            "roles_propose_tier" => self.roles_propose_tier(&a0, &a1, &a2),
+            "roles_approve" => self.roles_approve(&a0),
             _ => Err(RtError::new(format!(
                 "internal: efun `{name}` not implemented"
             ))),
@@ -2491,6 +2603,247 @@ impl<'a> RegistryHost<'a> {
         let r = self.call_in(me, &target, idx, argv);
         self.guards.pop();
         r
+    }
+
+    /// Driver rule shared by every `roles_*` **read** efun (OBI-36
+    /// D-S2.2, same shape as `unguarded`'s D-S1.5): only code compiled
+    /// from `/secure/**` may call it. Not master policy, no `valid_efun`
+    /// check -- this is why the table classes them `Privilege::P0`.
+    /// Checked against the *immediate* caller's own leaf program, not
+    /// "somewhere on the stack".
+    fn require_secure_caller(&self, efun: &'static str) -> R<()> {
+        let me = self.self_object();
+        match self.registry.get(me).map(|o| o.program.path.clone()) {
+            Some(p) if p.starts_with("/secure/") => Ok(()),
+            Some(p) => Err(RtError::new(format!(
+                "{efun}(): only code under /secure may call this ({p} may not)"
+            ))),
+            None => Err(RtError::new(format!("{efun}(): object was destructed"))),
+        }
+    }
+
+    /// The actor-rule euid (D-S2.2), if the execution was started by
+    /// player input (`Driver::input_actor`, set once by `World::input`)
+    /// *and* that euid is still in the current guard set. `None` refuses
+    /// the call: a call_out/heartbeat/`roles_result`/`account_result`
+    /// drain never has an `input_actor` at all, and an interactive that
+    /// has since `seteuid`'d away (or whose frame dropped off the guard
+    /// set some other way) no longer satisfies the rule either. Never a
+    /// string read from Weft -- resolved purely from the registry state
+    /// `World::input` captured at the cut.
+    fn roles_actor(&self) -> Option<Sym> {
+        let actor = self.driver.as_ref()?.input_actor?;
+        self.top_guard().has_euid(actor).then_some(actor)
+    }
+
+    /// Driver rule shared by every `roles_*` **mutation** efun (D-S2.2):
+    /// the immediate caller must be `/secure/**` *and* the actor rule must
+    /// resolve. Always audited, allowed or denied, independent of
+    /// `valid_efun` (`driver_efun` exempts these efuns from it: a T3
+    /// lead's own tier does not include P3, so that check would wrongly
+    /// deny a legitimate promotion). The SQL function re-checks rank
+    /// independently (`docs/persistence.md`); this gate is the driver's
+    /// half.
+    fn roles_mutation_gate(&mut self, efun: &'static str) -> R<Sym> {
+        let me = self.self_object();
+        let path = self.registry.get(me).map(|o| o.program.path.clone());
+        let secure = path.as_deref().is_some_and(|p| p.starts_with("/secure/"));
+        let actor = if secure { self.roles_actor() } else { None };
+        let guard = self.top_guard().clone();
+        let d = self.driver.as_mut().expect("roles mutation needs a driver");
+        d.security.push(AuditEntry {
+            caller: me,
+            efun,
+            privilege: Privilege::P3,
+            apply: "roles_actor",
+            arg: Box::from(""),
+            guard,
+            allowed: actor.is_some(),
+            denied_by: None,
+        });
+        match (secure, actor, path) {
+            (true, Some(a), _) => Ok(a),
+            (false, _, Some(p)) => Err(RtError::new(format!(
+                "{efun}(): only code under /secure may call this ({p} may not)"
+            ))),
+            (false, _, None) => Err(RtError::new(format!("{efun}(): object was destructed"))),
+            (true, None, _) => Err(RtError::new(format!(
+                "{efun}(): refused -- not called from an execution started by player \
+                 input, or the actor's euid has left the guard set"
+            ))),
+        }
+    }
+
+    /// A new correlation id for a `roles_*` mutation request: bumps
+    /// `World`'s counter and records `caller` as pending (mirrors
+    /// `issue_account_request`'s bookkeeping).
+    fn roles_next_request(&mut self, caller: ObjectId) -> u64 {
+        let d = self.driver.as_mut().expect("driver");
+        *d.roles_ctx.next_id += 1;
+        let id = *d.roles_ctx.next_id;
+        d.roles_ctx.pending.insert(id, caller);
+        id
+    }
+
+    /// The backend's request queue was full or closed (`false` from a
+    /// [`crate::world::RolesMutations`] method): never leave the request
+    /// pending forever (same rule as `issue_account_request`, OBI-85 CTO
+    /// review).
+    fn roles_request_unavailable(&mut self, id: u64, caller: ObjectId) {
+        let d = self.driver.as_mut().expect("driver");
+        d.roles_ctx.pending.remove(&id);
+        d.roles_ctx
+            .results
+            .push_back((id, caller, false, "unavailable".to_string()));
+    }
+
+    fn want_str(v: &Value, msg: &'static str) -> R<String> {
+        v.as_str()
+            .map(str::to_string)
+            .ok_or_else(|| RtError::new(msg))
+    }
+
+    fn want_int(v: &Value, msg: &'static str) -> R<i64> {
+        match v {
+            Value::Int(n) => Ok(*n),
+            _ => Err(RtError::new(msg)),
+        }
+    }
+
+    fn roles_set_tier(&mut self, target: &Value, tier: &Value, reason: &Value) -> R<Value> {
+        let actor = self.roles_mutation_gate("roles_set_tier")?;
+        let target = Self::want_str(target, "roles_set_tier(): expected string target")?;
+        let tier = Self::want_int(tier, "roles_set_tier(): expected int tier")?;
+        let reason = Self::want_str(reason, "roles_set_tier(): expected string reason")?;
+        let caller = self.self_object();
+        let actor_name = self.registry.syms.name(actor).to_string();
+        let id = self.roles_next_request(caller);
+        let d = self.driver.as_mut().expect("driver");
+        let issued = d
+            .roles_ctx
+            .backend
+            .set_tier(id, &actor_name, &target, tier, &reason);
+        if !issued {
+            self.roles_request_unavailable(id, caller);
+        }
+        Ok(Value::Int(id as i64))
+    }
+
+    fn roles_set_member(
+        &mut self,
+        domain: &Value,
+        target: &Value,
+        role: &Value,
+        reason: &Value,
+    ) -> R<Value> {
+        let actor = self.roles_mutation_gate("roles_set_member")?;
+        let domain = Self::want_str(domain, "roles_set_member(): expected string domain")?;
+        let target = Self::want_str(target, "roles_set_member(): expected string target")?;
+        let role = Self::want_str(role, "roles_set_member(): expected string role")?;
+        let reason = Self::want_str(reason, "roles_set_member(): expected string reason")?;
+        let caller = self.self_object();
+        let actor_name = self.registry.syms.name(actor).to_string();
+        let id = self.roles_next_request(caller);
+        let d = self.driver.as_mut().expect("driver");
+        let issued =
+            d.roles_ctx
+                .backend
+                .set_member(id, &actor_name, &domain, &target, &role, &reason);
+        if !issued {
+            self.roles_request_unavailable(id, caller);
+        }
+        Ok(Value::Int(id as i64))
+    }
+
+    fn roles_grant(
+        &mut self,
+        target: &Value,
+        kind: &Value,
+        what: &Value,
+        expires_at: &Value,
+        reason: &Value,
+    ) -> R<Value> {
+        let actor = self.roles_mutation_gate("roles_grant")?;
+        let target = Self::want_str(target, "roles_grant(): expected string target")?;
+        let kind = Self::want_str(kind, "roles_grant(): expected string kind")?;
+        let what = Self::want_str(what, "roles_grant(): expected string what")?;
+        let expires_at = match expires_at {
+            Value::Null => None,
+            Value::Int(n) => Some(*n),
+            _ => return Err(RtError::new("roles_grant(): expected int? expires_at")),
+        };
+        let reason = Self::want_str(reason, "roles_grant(): expected string reason")?;
+        let caller = self.self_object();
+        let actor_name = self.registry.syms.name(actor).to_string();
+        let id = self.roles_next_request(caller);
+        let d = self.driver.as_mut().expect("driver");
+        let issued =
+            d.roles_ctx
+                .backend
+                .grant(id, &actor_name, &target, &kind, &what, expires_at, &reason);
+        if !issued {
+            self.roles_request_unavailable(id, caller);
+        }
+        Ok(Value::Int(id as i64))
+    }
+
+    fn roles_revoke_grant(
+        &mut self,
+        target: &Value,
+        kind: &Value,
+        what: &Value,
+        reason: &Value,
+    ) -> R<Value> {
+        let actor = self.roles_mutation_gate("roles_revoke_grant")?;
+        let target = Self::want_str(target, "roles_revoke_grant(): expected string target")?;
+        let kind = Self::want_str(kind, "roles_revoke_grant(): expected string kind")?;
+        let what = Self::want_str(what, "roles_revoke_grant(): expected string what")?;
+        let reason = Self::want_str(reason, "roles_revoke_grant(): expected string reason")?;
+        let caller = self.self_object();
+        let actor_name = self.registry.syms.name(actor).to_string();
+        let id = self.roles_next_request(caller);
+        let d = self.driver.as_mut().expect("driver");
+        let issued =
+            d.roles_ctx
+                .backend
+                .revoke_grant(id, &actor_name, &target, &kind, &what, &reason);
+        if !issued {
+            self.roles_request_unavailable(id, caller);
+        }
+        Ok(Value::Int(id as i64))
+    }
+
+    fn roles_propose_tier(&mut self, target: &Value, tier: &Value, reason: &Value) -> R<Value> {
+        let actor = self.roles_mutation_gate("roles_propose_tier")?;
+        let target = Self::want_str(target, "roles_propose_tier(): expected string target")?;
+        let tier = Self::want_int(tier, "roles_propose_tier(): expected int tier")?;
+        let reason = Self::want_str(reason, "roles_propose_tier(): expected string reason")?;
+        let caller = self.self_object();
+        let actor_name = self.registry.syms.name(actor).to_string();
+        let id = self.roles_next_request(caller);
+        let d = self.driver.as_mut().expect("driver");
+        let issued = d
+            .roles_ctx
+            .backend
+            .propose_tier(id, &actor_name, &target, tier, &reason);
+        if !issued {
+            self.roles_request_unavailable(id, caller);
+        }
+        Ok(Value::Int(id as i64))
+    }
+
+    fn roles_approve(&mut self, proposal_id: &Value) -> R<Value> {
+        let actor = self.roles_mutation_gate("roles_approve")?;
+        let proposal_id = Self::want_int(proposal_id, "roles_approve(): expected int proposal_id")?;
+        let caller = self.self_object();
+        let actor_name = self.registry.syms.name(actor).to_string();
+        let id = self.roles_next_request(caller);
+        let d = self.driver.as_mut().expect("driver");
+        let issued = d.roles_ctx.backend.approve(id, &actor_name, proposal_id);
+        if !issued {
+            self.roles_request_unavailable(id, caller);
+        }
+        Ok(Value::Int(id as i64))
     }
 
     /// Run `name` declared in exactly `target` as `on` in a *fresh*

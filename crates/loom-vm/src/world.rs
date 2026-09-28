@@ -21,8 +21,10 @@ use crate::bcvm::registry::{Compiler, Registry, RegistryHost};
 use crate::bcvm::vm::{Limits as VmLimits, RtError};
 use crate::host::{Host, NullHost};
 use crate::object::ObjectId;
+use crate::roles::RolesSnapshot;
 use crate::scheduler::Scheduler;
 use crate::security::{AuditEntry, SecurityState};
+use std::sync::Arc;
 
 /// Path of the master object.
 pub const MASTER_PATH: &str = "/secure/master";
@@ -56,6 +58,146 @@ impl AccountAuth for NullAccountAuth {
     fn login(&mut self, _request_id: u64, _name: &str, _password: &str) -> bool {
         true
     }
+}
+
+/// The `roles_set_tier`/`roles_set_member`/`roles_grant`/`roles_revoke_grant`/
+/// `roles_propose_tier`/`roles_approve` async mutation backend (OBI-36
+/// design note D-S2.2). `World` calls this to *issue* a mutation (never
+/// blocking, and never touching Postgres itself -- that is `loom-cli`'s
+/// wiring over `loom-persist`'s `SECURITY DEFINER` functions, S2a). The
+/// answer comes back out-of-band and is handed to
+/// [`World::deliver_roles_result`] using the same `request_id`, exactly
+/// like [`AccountAuth`].
+///
+/// Every method's `actor` is the driver-computed actor-rule euid name
+/// (the euid of the interactive whose input started the execution, taken
+/// from the registry, never a string read from Weft -- see
+/// `bcvm::registry::RegistryHost::roles_mutation_gate`), resolved to a
+/// plain `&str` only here, at the boundary to this trait.
+pub trait RolesMutations {
+    fn set_tier(
+        &mut self,
+        request_id: u64,
+        actor: &str,
+        target: &str,
+        tier: i64,
+        reason: &str,
+    ) -> bool;
+    #[allow(clippy::too_many_arguments)]
+    fn set_member(
+        &mut self,
+        request_id: u64,
+        actor: &str,
+        domain: &str,
+        target: &str,
+        role: &str,
+        reason: &str,
+    ) -> bool;
+    #[allow(clippy::too_many_arguments)]
+    fn grant(
+        &mut self,
+        request_id: u64,
+        actor: &str,
+        target: &str,
+        kind: &str,
+        what: &str,
+        expires_at: Option<i64>,
+        reason: &str,
+    ) -> bool;
+    #[allow(clippy::too_many_arguments)]
+    fn revoke_grant(
+        &mut self,
+        request_id: u64,
+        actor: &str,
+        target: &str,
+        kind: &str,
+        what: &str,
+        reason: &str,
+    ) -> bool;
+    fn propose_tier(
+        &mut self,
+        request_id: u64,
+        actor: &str,
+        target: &str,
+        tier: i64,
+        reason: &str,
+    ) -> bool;
+    fn approve(&mut self, request_id: u64, actor: &str, proposal_id: i64) -> bool;
+}
+
+/// Default [`RolesMutations`]: never answers (see the trait's doc; same
+/// rationale as [`NullAccountAuth`]).
+pub struct NullRolesMutations;
+
+impl RolesMutations for NullRolesMutations {
+    fn set_tier(
+        &mut self,
+        _id: u64,
+        _actor: &str,
+        _target: &str,
+        _tier: i64,
+        _reason: &str,
+    ) -> bool {
+        true
+    }
+    fn set_member(
+        &mut self,
+        _id: u64,
+        _actor: &str,
+        _domain: &str,
+        _target: &str,
+        _role: &str,
+        _reason: &str,
+    ) -> bool {
+        true
+    }
+    fn grant(
+        &mut self,
+        _id: u64,
+        _actor: &str,
+        _target: &str,
+        _kind: &str,
+        _what: &str,
+        _expires_at: Option<i64>,
+        _reason: &str,
+    ) -> bool {
+        true
+    }
+    fn revoke_grant(
+        &mut self,
+        _id: u64,
+        _actor: &str,
+        _target: &str,
+        _kind: &str,
+        _what: &str,
+        _reason: &str,
+    ) -> bool {
+        true
+    }
+    fn propose_tier(
+        &mut self,
+        _id: u64,
+        _actor: &str,
+        _target: &str,
+        _tier: i64,
+        _reason: &str,
+    ) -> bool {
+        true
+    }
+    fn approve(&mut self, _id: u64, _actor: &str, _proposal_id: i64) -> bool {
+        true
+    }
+}
+
+/// `roles_*` mutation efun bookkeeping (OBI-36 D-S2.2), borrowed by
+/// `RegistryHost`'s `Driver` for the lifetime of one call -- the same
+/// shape as `AccountsCtx`, one request-id counter/pending map/result
+/// queue pair per async efun family.
+pub struct RolesCtx<'a> {
+    pub next_id: &'a mut u64,
+    pub pending: &'a mut HashMap<u64, ObjectId>,
+    pub results: &'a mut VecDeque<(u64, ObjectId, bool, String)>,
+    pub backend: &'a mut dyn RolesMutations,
 }
 
 /// `account_create`/`account_login` bookkeeping (OBI-85), borrowed by
@@ -164,6 +306,18 @@ pub struct World {
     /// Stack-based privilege check state (OBI-35): decision cache, policy
     /// epoch, audit ring buffer.
     security: SecurityState,
+    /// The S2 roles snapshot (OBI-36 D-S2.1): `RolesSnapshot::empty()`
+    /// (tier 0 for everyone, no domains, no policy, no grants) until
+    /// `set_roles_snapshot` is first called. `Arc` so a swap is a
+    /// pointer write and every in-flight `RegistryHost`'s borrowed copy
+    /// stays valid for the execution it was built for even if a new
+    /// snapshot lands the instant after.
+    roles: Arc<RolesSnapshot>,
+    /// `roles_set_tier`/... (OBI-36 D-S2.2): see `RolesCtx`.
+    roles_backend: Box<dyn RolesMutations>,
+    roles_next_id: u64,
+    roles_pending: HashMap<u64, ObjectId>,
+    roles_results: VecDeque<(u64, ObjectId, bool, String)>,
     /// The `quota_uid` (OBI-35 D-S1.6) of the most recently executed
     /// call_out, for tests/introspection asserting AC 3 ("its execution
     /// reports quota uid = the apprentice's"). `None` until the first
@@ -203,6 +357,11 @@ impl World {
             account_pending: HashMap::new(),
             account_results: VecDeque::new(),
             security: SecurityState::new(),
+            roles: Arc::new(RolesSnapshot::empty()),
+            roles_backend: Box::new(NullRolesMutations),
+            roles_next_id: 0,
+            roles_pending: HashMap::new(),
+            roles_results: VecDeque::new(),
             last_call_out_quota_uid: None,
         };
         let mut null = NullHost;
@@ -211,7 +370,7 @@ impl World {
             generation: 0,
         };
         let master = w
-            .exec(&mut null, sentinel, None, None, None, |h| {
+            .exec(&mut null, sentinel, None, None, None, None, |h| {
                 h.load_object(MASTER_PATH)
             })
             .map_err(|e| BootError::Master(e.report()))?;
@@ -258,10 +417,76 @@ impl World {
             if let Some(o) = self.registry.get(ob) {
                 let conn = o.conn;
                 let this_player = conn.map(|_| ob);
-                let _ = self.exec(host, ob, this_player, conn, None, |h| {
+                let _ = self.exec(host, ob, this_player, conn, None, None, |h| {
                     h.call_apply(
                         ob,
                         "account_result",
+                        vec![Value::Int(id as i64), Value::Bool(ok), Value::str(&detail)],
+                    )
+                });
+            }
+        }
+    }
+
+    /// Install the S2 roles snapshot (OBI-36 D-S2.1): swaps it in between
+    /// executions (a pointer write) and flushes the security decision
+    /// cache ([`Self::flush_security_cache`]), so the *next* execution
+    /// after this call sees both the new roles and no stale cached
+    /// `valid_*` decision from before the swap. The driver
+    /// (`loom-cli`, S2a wiring) calls this at boot (the DB-worker loader,
+    /// or the `LOOM_ROLES_SEED` dev/CI path -- see `crate::roles`), on
+    /// every `LISTEN roles_changed` notification, after every roles
+    /// mutation completes, and on a timer at the earliest `expires_at`
+    /// among loaded grants.
+    pub fn set_roles_snapshot(&mut self, snap: Arc<RolesSnapshot>) {
+        self.roles = snap;
+        self.flush_security_cache();
+    }
+
+    /// The roles snapshot currently in effect (tests/introspection, and
+    /// `loom-cli`'s expiry timer, which needs to read the loaded grants'
+    /// `expires_at`s to schedule its next reload).
+    pub fn roles_snapshot(&self) -> &Arc<RolesSnapshot> {
+        &self.roles
+    }
+
+    /// Install the real `roles_set_tier`/... backend (OBI-36 D-S2.2); until
+    /// this is called, every roles mutation request is issued but never
+    /// answered ([`NullRolesMutations`]).
+    pub fn set_roles_backend(&mut self, backend: Box<dyn RolesMutations>) {
+        self.roles_backend = backend;
+    }
+
+    /// Deliver an out-of-band `roles_*` mutation result (OBI-36 D-S2.2):
+    /// the driver calls this after `loom-persist`'s `SECURITY DEFINER`
+    /// function returns (S2a). A no-op if `request_id` is unknown (already
+    /// delivered, or never issued). Queued rather than delivered
+    /// immediately, exactly like [`Self::deliver_account_result`], so
+    /// `roles_result` always runs on a later top-level entry.
+    pub fn deliver_roles_result(&mut self, request_id: u64, ok: bool, detail: &str) {
+        if let Some(ob) = self.roles_pending.remove(&request_id) {
+            self.roles_results
+                .push_back((request_id, ob, ok, detail.to_string()));
+        }
+    }
+
+    /// Run every `roles_result` apply queued by
+    /// [`Self::deliver_roles_result`] or by a gate failure inside the
+    /// mutation efun itself (secure-only/actor-rule refusal, or a backend
+    /// whose request queue is briefly full). See
+    /// [`Self::drain_account_results`] for the connection-context and
+    /// destructed-issuer semantics, which are the same here (`/secure/roles`
+    /// is the usual issuer, and is never destructed in practice, but the
+    /// rule is uniform).
+    pub fn drain_roles_results(&mut self, host: &mut dyn Host) {
+        while let Some((id, ob, ok, detail)) = self.roles_results.pop_front() {
+            if let Some(o) = self.registry.get(ob) {
+                let conn = o.conn;
+                let this_player = conn.map(|_| ob);
+                let _ = self.exec(host, ob, this_player, conn, None, None, |h| {
+                    h.call_apply(
+                        ob,
+                        "roles_result",
                         vec![Value::Int(id as i64), Value::Bool(ok), Value::str(&detail)],
                     )
                 });
@@ -289,6 +514,7 @@ impl World {
         this_player: Option<ObjectId>,
         conn: Option<u64>,
         cut_guard: Option<crate::security::GuardSet>,
+        input_actor: Option<crate::security::Sym>,
         body: impl FnOnce(&mut RegistryHost<'_>) -> Result<T, RtError>,
     ) -> Result<T, RtError> {
         self.registry.debug_assert_atomic_scope_closed();
@@ -310,7 +536,15 @@ impl World {
                 auth: self.account_auth.as_mut(),
             },
             &mut self.security,
+            self.roles.clone(),
+            crate::world::RolesCtx {
+                next_id: &mut self.roles_next_id,
+                pending: &mut self.roles_pending,
+                results: &mut self.roles_results,
+                backend: self.roles_backend.as_mut(),
+            },
             cut_guard,
+            input_actor,
         );
         let result = body(&mut rh);
         self.registry.debug_assert_atomic_scope_closed();
@@ -337,7 +571,7 @@ impl World {
             host.close(conn);
             return;
         };
-        let r = self.exec(host, master, None, Some(conn), None, |h| {
+        let r = self.exec(host, master, None, Some(conn), None, None, |h| {
             match h.call_apply(master, "connect", Vec::new())? {
                 Some(Value::Object(id)) if h.registry.get(id).is_some() => Ok(id),
                 Some(v) => Err(RtError::new(format!(
@@ -356,7 +590,7 @@ impl World {
             }
         };
         self.registry.bind(conn, player);
-        if let Err(e) = self.exec(host, player, Some(player), Some(conn), None, |h| {
+        if let Err(e) = self.exec(host, player, Some(player), Some(conn), None, None, |h| {
             h.call_apply(player, "logon", Vec::new())
         }) {
             World::report(host, conn, &e);
@@ -364,11 +598,22 @@ impl World {
     }
 
     /// A line of input: `process_input(line)` on the bound object.
+    ///
+    /// **OBI-36 D-S2.2 actor rule.** This is the *input cut*: the
+    /// interactive's own euid, read from the registry right now (never
+    /// re-read once the execution is running), becomes `input_actor` for
+    /// the whole call -- available to `roles_*` mutation efuns however
+    /// deep the call chain goes (e.g. `process_input` -> `/secure/roles`
+    /// -> the efun). Every other entry point (`connect`, `disconnect`,
+    /// `tick`'s heartbeats/call_outs, `drain_account_results`,
+    /// `drain_roles_results`) passes `None`, so a mutation efun called
+    /// from any of those is refused, per spec.
     pub fn input(&mut self, conn: u64, line: &str, host: &mut dyn Host) {
         let Some(&ob) = self.registry.conns.get(&conn) else {
             return;
         };
-        let r = self.exec(host, ob, Some(ob), Some(conn), None, |h| {
+        let actor = self.registry.get(ob).map(|o| o.euid);
+        let r = self.exec(host, ob, Some(ob), Some(conn), None, actor, |h| {
             match h.call_apply(ob, "process_input", vec![Value::str(line)])? {
                 Some(_) => Ok(()),
                 None => Err(RtError::new(format!(
@@ -391,7 +636,7 @@ impl World {
             o.conn = None;
         }
         // Errors have nowhere to go (the connection is gone).
-        let _ = self.exec(host, ob, Some(ob), None, None, |h| {
+        let _ = self.exec(host, ob, Some(ob), None, None, None, |h| {
             h.call_apply(ob, "net_dead", Vec::new())
         });
     }
@@ -432,7 +677,7 @@ impl World {
                 if self.registry.get(ob).is_none() {
                     continue; // destructed since it subscribed
                 }
-                let _ = self.exec(host, ob, None, None, None, |h| {
+                let _ = self.exec(host, ob, None, None, None, None, |h| {
                     h.call_apply(ob, "heartbeat", Vec::new())
                 });
             }
@@ -443,7 +688,7 @@ impl World {
             }
             self.last_call_out_quota_uid = Some(call.quota_uid);
             let guard = call.guard.clone();
-            let _ = self.exec(host, call.ob, None, None, Some(guard), move |h| {
+            let _ = self.exec(host, call.ob, None, None, Some(guard), None, move |h| {
                 h.call_apply(call.ob, &call.func, call.args)
             });
         }
@@ -458,7 +703,7 @@ impl World {
                 continue; // path no longer registered at all
             };
             let master = self.master_or_sentinel();
-            let _ = self.exec(host, master, None, None, None, move |h| {
+            let _ = self.exec(host, master, None, None, None, None, move |h| {
                 // Someone may have already lazily upgraded `ob` (an
                 // ordinary access) between `upgrade_all` queuing it and
                 // this tick draining it -- `RegistryHost::upgrade` itself
@@ -482,6 +727,9 @@ impl World {
         // since the last tick, so login latency is bounded even on an
         // otherwise idle world.
         self.drain_account_results(host);
+        // OBI-36: same reasoning for roles_result -- bounded latency even
+        // on an otherwise idle world.
+        self.drain_roles_results(host);
     }
 
     /// The current world tick (`Scheduler::advance`'s counter; advanced by
@@ -573,14 +821,16 @@ impl World {
         host: &mut dyn Host,
     ) -> Result<Vec<String>, String> {
         let master = self.master_or_sentinel();
-        self.exec(host, master, None, None, None, |h| Ok(h.recompile(path)))
-            .unwrap_or_else(|e| Err(e.report()))
-            .map(|warnings| {
-                warnings
-                    .into_iter()
-                    .map(|w| format!("object {:?} on {}: {}", w.object, w.program, w.message))
-                    .collect()
-            })
+        self.exec(host, master, None, None, None, None, |h| {
+            Ok(h.recompile(path))
+        })
+        .unwrap_or_else(|e| Err(e.report()))
+        .map(|warnings| {
+            warnings
+                .into_iter()
+                .map(|w| format!("object {:?} on {}: {}", w.object, w.program, w.message))
+                .collect()
+        })
     }
 
     /// `compile_object`/`update` (spec §7.2), off the world thread
@@ -638,7 +888,7 @@ impl World {
                     let begin_snapshot = job.begin_snapshot().clone();
                     let master = self.master_or_sentinel();
                     let result = self
-                        .exec(host, master, None, None, None, |h| {
+                        .exec(host, master, None, None, None, None, |h| {
                             Ok(h.finish_recompile(&root_path, &begin_snapshot, outcome))
                         })
                         .unwrap_or_else(|e| Err(e.report()));
@@ -665,8 +915,10 @@ impl World {
     /// Load (compile + create) `path` as the driver would for a preload.
     pub fn load_object(&mut self, path: &str, host: &mut dyn Host) -> Result<ObjectId, String> {
         let master = self.master_or_sentinel();
-        self.exec(host, master, None, None, None, |h| h.load_object(path))
-            .map_err(|e| e.report())
+        self.exec(host, master, None, None, None, None, |h| {
+            h.load_object(path)
+        })
+        .map_err(|e| e.report())
     }
 
     /// Call a function on an object as the driver (visibility not enforced).
@@ -678,7 +930,7 @@ impl World {
         host: &mut dyn Host,
     ) -> Result<Value, String> {
         let master = self.master_or_sentinel();
-        self.exec(host, master, None, None, None, |h| {
+        self.exec(host, master, None, None, None, None, |h| {
             h.call_apply(ob, func, args)?
                 .ok_or_else(|| RtError::new(format!("no function `{func}`")))
         })
