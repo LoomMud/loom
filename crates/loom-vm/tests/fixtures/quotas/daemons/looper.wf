@@ -1,0 +1,19 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// A `/daemons`-style shared program (owner `mudlib`, the `default_creator`
+// fallback -- an always-unlimited uid, `crate::quota::is_unlimited_uid`).
+// OBI-121 B2 (CTO review): "unlimited" must still mean the world default
+// per-execution tick budget, not literally unbounded -- a buggy mudlib
+// heartbeat with an infinite loop must tick-exhaust, not hang the driver.
+persistent var heartbeat_runs: int = 0
+
+pub fn on() {
+    set_heartbeat(true)
+}
+
+pub fn heartbeat() {
+    heartbeat_runs += 1
+    while true {
+    }
+}

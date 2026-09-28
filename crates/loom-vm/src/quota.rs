@@ -67,10 +67,19 @@ pub struct TierQuotas {
 }
 
 impl TierQuotas {
+    /// **Unlimited counts, but still the world default for the two
+    /// per-execution limits** (spec §3/§4: "`root`, `mudlib`, `domain:*`
+    /// and players: the world default for per-execution limits and
+    /// unlimited counts"). A `u64::MAX` tick/mem budget here would let a
+    /// single mudlib heartbeat or call_out with a `while (1) {}` bug hang
+    /// the whole driver -- a liveness regression the design note does not
+    /// ask for (CTO review, OBI-121 B2). Per-execution limits are *never*
+    /// unbounded; only the counts (objects, heartbeats, call_outs, disk)
+    /// are.
     pub fn unlimited() -> TierQuotas {
         TierQuotas {
-            max_ticks_exec: u64::MAX,
-            max_mem_exec_mb: u64::MAX,
+            max_ticks_exec: WORLD_DEFAULT_MAX_TICKS_EXEC,
+            max_mem_exec_mb: WORLD_DEFAULT_MAX_MEM_EXEC_MB,
             tick_share_per_min: None,
             max_objects: None,
             max_heartbeats: None,
@@ -155,6 +164,17 @@ mod tests {
         }
         assert!(!is_unlimited_uid("appr"));
         assert!(!is_unlimited_uid("domain")); // no colon: not a domain uid
+    }
+
+    #[test]
+    fn unlimited_uids_still_get_the_world_default_per_execution_budget() {
+        // OBI-121 B2: unlimited *counts*, not unlimited ticks/mem -- a
+        // mudlib heartbeat with an infinite loop must still abort at the
+        // world default rather than hang the driver.
+        let q = TierQuotas::unlimited();
+        assert_eq!(q.max_ticks_exec, WORLD_DEFAULT_MAX_TICKS_EXEC);
+        assert_eq!(q.max_mem_exec_mb, WORLD_DEFAULT_MAX_MEM_EXEC_MB);
+        assert_eq!(q.max_objects, None);
     }
 
     #[test]

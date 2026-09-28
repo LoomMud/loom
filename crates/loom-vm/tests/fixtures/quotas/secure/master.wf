@@ -2,24 +2,33 @@
 // this fixture is quota/confinement enforcement, not privilege gating,
 // which is already covered by security.rs/roles.rs) except
 // `program_flags`, which is keyed on path so `move_to`'s confinement
-// tests can name a `Confined` program.
+// tests can name a `Confined`/`Live` program.
 //
-// `connect()` hands out three different owners by connection order, so
-// the confinement tests (which need a genuinely tier-0-owned player and
-// a genuinely staff-owned one, not just a `seteuid`d one -- `owner` is
-// immutable) can just `World::connect` more than once in the same test:
-// connection 1 gets the T1 apprentice (every other test in this fixture
-// only ever connects once), connection 2 a tier-0 guest, connection 3 a
-// staff member.
+// `connect()` hands out three different accounts by connection order, so
+// the confinement tests (which need a genuinely tier-0 player and a
+// genuinely staff one) can just `World::connect` more than once in the
+// same test: connection 1 gets the T1 apprentice (owner `appr`, its own
+// `/builders/appr/player`; every other test in this fixture only ever
+// connects once), connections 2 and 3 both clone the single mudlib-owned
+// `/std/player` (owner `mudlib`, an always-unlimited/never-staff uid --
+// CTO review B3) and then `seteuid` it to `guest` (T0, no staff row at
+// all) and `staffer` (T3) respectively, exactly like a real login flow's
+// post-auth `seteuid`. Confinement rules 2/3 must therefore key on euid,
+// not on owner/uid, or every player here (including the staff one) would
+// read as tier 0.
 persistent var connect_count: int = 0
 
 pub fn connect() -> object {
     connect_count += 1
     if connect_count == 2 {
-        return clone_object("/builders/guest/player")
+        let ob = clone_object("/std/player")
+        ob.set_account("guest")
+        return ob
     }
     if connect_count == 3 {
-        return clone_object("/builders/staffer/player")
+        let ob = clone_object("/std/player")
+        ob.set_account("staffer")
+        return ob
     }
     return clone_object("/builders/appr/player")
 }
@@ -48,10 +57,17 @@ fn valid_seteuid(ob: object, e: string) -> bool {
     return true
 }
 
-// `CONFINED` (1) for the two paths this fixture's confinement tests use, `LIVE` (2) otherwise.
+// `CONFINED` (1) for the two paths this fixture's confinement tests use,
+// `LIVE` (2) for the one path standing in for an ordinary room, `NONE`
+// (0) for everything else (players included -- a player's inventory is
+// not itself a "live room", and B4's fail-open default for an unflagged
+// path is `NONE`, not `LIVE`).
 fn program_flags(path: string) -> int {
     if path == "/std/confined_room" or path == "/std/confined_thing" {
         return 1
     }
-    return 2
+    if path == "/std/live_room" {
+        return 2
+    }
+    return 0
 }

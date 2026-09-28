@@ -802,24 +802,25 @@ pub struct BcObject {
     /// dispatch never re-does the program-registry lookup per call once no
     /// recompile is in flight, only the one `u64` compare.
     pub checked_generation: u64,
-    /// Owner (spec §5.7, OBI-35 D-S1.1): from the master's
-    /// `creator_file(path)` at load/clone, never changes. **R1 (OBI-121
-    /// S2c):** a load/clone from a guard set that does not contain
-    /// `creator_file(path)`'s uid gets this set to the caller's own
-    /// quota uid instead (see `RegistryHost::instantiate`) -- the spec's
-    /// "owner", reusing this field rather than adding a redundant one
-    /// (flagged in the OBI-121 task note).
+    /// The object's `uid` (spec §5.7, OBI-35 D-S1.1): from the master's
+    /// `creator_file(path)` at load/clone. **Immutable for the rest of
+    /// the object's life, including across R1** (CTO review, OBI-121 B1:
+    /// the spec explicitly keeps `uid` as `creator_file(p)` always, so it
+    /// stays the single source of truth for "which program declared
+    /// this"). Quotas are keyed on [`BcObject::owner`], not this field.
     pub uid: Sym,
-    /// Effective uid for rights: starts equal to `uid`, changed only by a
-    /// master-validated `seteuid`.
+    /// Effective uid for rights: starts equal to [`BcObject::owner`],
+    /// changed only by a master-validated `seteuid`.
     pub euid: Sym,
-    /// Has this object ever had a connection bound to it (`World::connect`
-    /// / `bind_connection`)? Set once, never cleared -- OBI-121 S2c's
-    /// confinement rules 2/3 need to tell a player object from a room
-    /// even after it disconnects, and the driver has no other notion of
-    /// "this object is a player" (spec §7, deliberately not modelled as a
-    /// separate object kind: flagged as a simplification, not hidden).
-    pub ever_bound: bool,
+    /// Owner (OBI-121 S2c §4): every owner-keyed quota (`max_objects`,
+    /// `max_heartbeats`, `max_callouts_obj`, `max_mem_exec_mb`) is keyed
+    /// on this field, not `uid`. Immutable once set at creation. **R1:**
+    /// a load/clone whose current guard set does not already contain
+    /// `creator_file(path)`'s (i.e. `uid`'s) own euid gets `owner` (and
+    /// starting `euid`) set to the caller's own quota uid instead of
+    /// `uid` (see `RegistryHost::instantiate`) -- otherwise equal to
+    /// `uid`.
+    pub owner: Sym,
 }
 
 impl BcObject {
@@ -839,7 +840,7 @@ impl BcObject {
             checked_generation: 0,
             uid: ROOT,
             euid: ROOT,
-            ever_bound: false,
+            owner: ROOT,
         }
     }
 
@@ -858,25 +859,51 @@ struct Slot {
     obj: Option<BcObject>,
 }
 
-/// `program_flags(path)`'s two values (OBI-121 S2c §7): `LIVE` is the
-/// default absent a master apply (compatibility with a mudlib that has
-/// not defined `program_flags` at all -- flagged as a deliberate
-/// fail-open default, since this is a data classification, not a
-/// privilege decision: nothing is granted or denied by defaulting to
-/// `Live`, only `move_to`'s confinement rules stay inactive for that
-/// program until the master opts it into `Confined`).
+/// `program_flags(path)`'s bitset value (OBI-121 S2c §7, CTO review B4):
+/// `CONFINED = 1`, `LIVE = 2`, and **`0` (neither) is a real, distinct
+/// state** -- most programs (`/std`, `/secure`, ordinary containers, the
+/// void, ...) are neither confined nor live, and `move_to`'s confinement
+/// rules simply stay inactive for them. This is *not* the same as
+/// `LIVE`: rule 1 ("a confined object cannot move into a live room")
+/// must not fire against an unflagged environment, only an explicitly
+/// `LIVE` one. Absent a master apply (or an apply that errors), the
+/// value is `0`, not `LIVE` -- a fail-*open* default in the sense that
+/// nothing is granted or denied by it (this is a data classification,
+/// not a privilege decision), but it must not silently promote every
+/// unflagged program to `LIVE`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ProgramFlags {
-    Confined,
-    #[default]
-    Live,
-}
+pub struct ProgramFlags(u8);
 
 impl ProgramFlags {
+    pub const NONE: ProgramFlags = ProgramFlags(0);
+    pub const CONFINED: ProgramFlags = ProgramFlags(1);
+    pub const LIVE: ProgramFlags = ProgramFlags(2);
+
     fn from_master(v: Option<Value>) -> ProgramFlags {
         match v {
-            Some(Value::Int(1)) => ProgramFlags::Confined,
-            _ => ProgramFlags::Live,
+            Some(Value::Int(n)) if n >= 0 => ProgramFlags((n as u64 & 0b11) as u8),
+            _ => ProgramFlags::NONE,
+        }
+    }
+
+    pub fn is_confined(self) -> bool {
+        self.0 & Self::CONFINED.0 != 0
+    }
+
+    pub fn is_live(self) -> bool {
+        self.0 & Self::LIVE.0 != 0
+    }
+
+    /// `program_flags`'s own vocabulary for `World::program_flags`
+    /// (tests/introspection), which predates the bitset and only ever
+    /// asked about one flag at a time.
+    pub fn as_str(self) -> &'static str {
+        if self.is_confined() {
+            "confined"
+        } else if self.is_live() {
+            "live"
+        } else {
+            "none"
         }
     }
 }
@@ -1036,7 +1063,7 @@ impl Registry {
     }
 
     pub fn insert(&mut self, obj: BcObject) -> ObjectId {
-        let uid = obj.uid;
+        let owner = obj.owner;
         let id = if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             slot.generation = slot.generation.wrapping_add(1);
@@ -1056,7 +1083,7 @@ impl Registry {
                 generation: 0,
             }
         };
-        self.bump_object_count(uid, 1);
+        self.bump_object_count(owner, 1);
         id
     }
 
@@ -1083,7 +1110,7 @@ impl Registry {
         }
         let obj = slot.obj.take()?;
         self.free.push(id.index);
-        self.bump_object_count(obj.uid, -1);
+        self.bump_object_count(obj.owner, -1);
         Some(obj)
     }
 
@@ -1181,9 +1208,7 @@ impl Registry {
     }
 
     /// Bind connection `conn` to object `id` (unbinding both sides'
-    /// previous partners), mirrors `crate::world::State::bind`. Also marks
-    /// `id` as `ever_bound` (OBI-121 S2c confinement rules 2/3), which
-    /// never clears again even once the connection later goes away.
+    /// previous partners), mirrors `crate::world::State::bind`.
     pub fn bind(&mut self, conn: u64, id: ObjectId) {
         if let Some(prev) = self.conns.insert(conn, id)
             && prev != id
@@ -1200,7 +1225,6 @@ impl Registry {
         }
         if let Some(o) = self.get_mut(id) {
             o.conn = Some(conn);
-            o.ever_bound = true;
         }
         self.next_bind_seq += 1;
         self.bind_seq.insert(conn, self.next_bind_seq);
@@ -1804,7 +1828,17 @@ impl<'a> RegistryHost<'a> {
         }
         let prog = self.ensure_program(&path)?;
         self.ensure_program_flags(&path);
-        self.new_object(prog, path)
+        // R1 does not apply here (OBI-121 S2c §7, flagged for CTO
+        // re-review): `load_object` returns the *same* singleton for
+        // `path` to every caller forever after (the early return just
+        // above) -- it never multiplies billed objects, so it is not the
+        // clone-spam quota-evasion R1 targets, and applying R1 anyway
+        // would let whichever caller *happens* to `load_object` a given
+        // path first silently steal that path's owner/euid assignment
+        // (a real regression: `security.rs`'s `a_lower_privileged_caller_
+        // denies_a_higher_privileged_callee` loads `/builders/arch/daemon`
+        // from `appr`'s stack and still expects it owned/euid'd `arch`).
+        self.new_object(prog, path, false)
     }
 
     /// `clone_object`: a new clone `path#N`.
@@ -1816,7 +1850,7 @@ impl<'a> RegistryHost<'a> {
         // per-call `RegistryHost` construction (mirrors `State::next_clone`).
         self.registry.next_clone += 1;
         let name = format!("{path}#{}", self.registry.next_clone);
-        let id = self.new_object(prog, name.clone())?;
+        let id = self.new_object(prog, name.clone(), true)?;
         // spec r5 §5.2.1: a clone is undoable by an enclosing `atomic fn`
         // scope (a no-op, no allocation, when none is open).
         self.registry.journal_clone(id, name);
@@ -1829,12 +1863,19 @@ impl<'a> RegistryHost<'a> {
     /// driver-less unit tests in this module): `Registry::program_flags`
     /// then defaults every path to `Live`, same as an explicit apply that
     /// returned anything but `1`.
+    /// `program_flags(path)` (OBI-121 S2c §7) fail-open default: with no
+    /// master (boot, or the driver-less unit tests in this module),
+    /// `Registry::program_flags` defaults every path to `ProgramFlags::
+    /// NONE` -- not `LIVE` (CTO review B4: defaulting to `LIVE` would
+    /// make an unflagged `/std`/`/secure` environment silently start
+    /// refusing every confined object, which is not what "fail open" on a
+    /// missing data-classification apply should mean).
     fn ensure_program_flags(&mut self, path: &str) {
         if self.registry.has_program_flags(path) {
             return;
         }
         let flags = match self.master() {
-            None => ProgramFlags::Live,
+            None => ProgramFlags::NONE,
             Some(m) => {
                 let r = self.run_cut(m, "program_flags", vec![Value::str(path)], None);
                 ProgramFlags::from_master(r.ok().flatten())
@@ -1857,8 +1898,13 @@ impl<'a> RegistryHost<'a> {
     /// Create an object, run variable initialisers (via [`Self::instantiate`])
     /// then `create()`. On error the half-built object is removed (mirrors
     /// `crate::world::Exec::new_object`).
-    fn new_object(&mut self, prog: Rc<CompiledProgram>, name: String) -> R<ObjectId> {
-        let id = self.instantiate(prog)?;
+    fn new_object(
+        &mut self,
+        prog: Rc<CompiledProgram>,
+        name: String,
+        apply_r1: bool,
+    ) -> R<ObjectId> {
+        let id = self.instantiate(prog, apply_r1)?;
         if let Some(o) = self.registry.get_mut(id) {
             o.name = name.clone();
         }
@@ -1949,6 +1995,41 @@ impl<'a> RegistryHost<'a> {
         self.guards
             .last()
             .expect("guards is never empty while a Host call is in flight")
+    }
+
+    /// "The caller's quota uid" (OBI-121 S2c §4, CTO review B1): **the
+    /// lowest-tier principal in the current guard set, ties broken by the
+    /// most recently pushed frame.** This is what R1 (`instantiate`) and
+    /// `call_out`'s `quota_uid` capture must use, not `Host::current_uid`'s
+    /// bare "whichever object is running right now" -- a chain like
+    /// `apprentice_obj.call_other(staff_obj, "clone_it")` must still bill
+    /// the apprentice even though `staff_obj` is the immediate caller when
+    /// `instantiate` runs, because the apprentice's principal is still on
+    /// the (uncut) guard stack.
+    ///
+    /// Falls back to `Host::current_uid` (the self object's own uid) with
+    /// no driver/roles snapshot available (unit tests) or an empty guard
+    /// set (an all-root call chain has no principal to rank).
+    fn caller_quota_uid(&self) -> Sym {
+        let guard = self.top_guard();
+        if guard.is_empty() {
+            return self.current_uid();
+        }
+        let Some(driver) = self.driver.as_ref() else {
+            return self.current_uid();
+        };
+        let mut best: Option<(u32, Sym)> = None;
+        for p in guard.principals() {
+            let name = self.registry.syms.name(p.euid);
+            let tier = driver.roles.tier(name);
+            // `<=` so a later (more recently pushed) frame wins a tie,
+            // per spec ("ties to the most recent frame") -- push order
+            // means later entries in `principals()` were pushed later.
+            if best.is_none_or(|(bt, _)| tier <= bt) {
+                best = Some((tier, p.euid));
+            }
+        }
+        best.map_or_else(|| self.current_uid(), |(_, euid)| euid)
     }
 
     /// Push a frame running as `obj`: `self_stack` and the guard stack
@@ -2050,9 +2131,10 @@ impl<'a> RegistryHost<'a> {
             self.registry
                 .quota_breaches
                 .record(tier, crate::quota::MAX_OBJECTS);
-            return Err(RtError::new(format!(
-                "max_objects quota exceeded for `{name}` (limit {max})"
-            )));
+            return Err(self.deny_quota(
+                crate::quota::MAX_OBJECTS,
+                format!("object quota exceeded for `{name}` (limit {max})"),
+            ));
         }
         Ok(())
     }
@@ -2066,7 +2148,7 @@ impl<'a> RegistryHost<'a> {
         let Some(driver) = self.driver.as_ref() else {
             return Ok(());
         };
-        let me_uid = self.registry.get(me).map_or(quota_uid, |o| o.uid);
+        let me_uid = self.registry.get(me).map_or(quota_uid, |o| o.owner);
         let me_name = self.registry.syms.name(me_uid).to_string();
         if !crate::quota::is_unlimited_uid(&me_name) {
             let tier = driver.roles.tier(&me_name);
@@ -2076,9 +2158,10 @@ impl<'a> RegistryHost<'a> {
                     self.registry
                         .quota_breaches
                         .record(tier, crate::quota::MAX_CALLOUTS_OBJ);
-                    return Err(RtError::new(format!(
-                        "max_callouts_obj quota exceeded for `{me_name}` (limit {max})"
-                    )));
+                    return Err(self.deny_quota(
+                        crate::quota::MAX_CALLOUTS_OBJ,
+                        format!("max_callouts_obj quota exceeded for `{me_name}` (limit {max})"),
+                    ));
                 }
             }
         }
@@ -2092,9 +2175,10 @@ impl<'a> RegistryHost<'a> {
                     self.registry
                         .quota_breaches
                         .record(tier, crate::quota::MAX_CALLOUTS_UID);
-                    return Err(RtError::new(format!(
-                        "max_callouts_uid quota exceeded for `{uid_name}` (limit {max})"
-                    )));
+                    return Err(self.deny_quota(
+                        crate::quota::MAX_CALLOUTS_UID,
+                        format!("max_callouts_uid quota exceeded for `{uid_name}` (limit {max})"),
+                    ));
                 }
             }
         }
@@ -2107,7 +2191,7 @@ impl<'a> RegistryHost<'a> {
         let Some(driver) = self.driver.as_ref() else {
             return Ok(());
         };
-        let Some(uid) = self.registry.get(me).map(|o| o.uid) else {
+        let Some(uid) = self.registry.get(me).map(|o| o.owner) else {
             return Ok(());
         };
         let name = self.registry.syms.name(uid).to_string();
@@ -2126,15 +2210,16 @@ impl<'a> RegistryHost<'a> {
             .scheduler
             .heartbeat_targets()
             .iter()
-            .filter(|ob| self.registry.get(**ob).is_some_and(|o| o.uid == uid))
+            .filter(|ob| self.registry.get(**ob).is_some_and(|o| o.owner == uid))
             .count() as u64;
         if current >= max {
             self.registry
                 .quota_breaches
                 .record(tier, crate::quota::MAX_HEARTBEATS);
-            return Err(RtError::new(format!(
-                "max_heartbeats quota exceeded for `{name}` (limit {max})"
-            )));
+            return Err(self.deny_quota(
+                crate::quota::MAX_HEARTBEATS,
+                format!("max_heartbeats quota exceeded for `{name}` (limit {max})"),
+            ));
         }
         Ok(())
     }
@@ -2154,9 +2239,9 @@ impl<'a> RegistryHost<'a> {
     }
 
     /// Bump `loom_tier_quota_breaches_total{tier,max_mem_exec_mb}` for a
-    /// `store_global` denial (a no-op without a driver, or for an
-    /// always-unlimited uid, whose `max_mem_exec_bytes()` is `u64::MAX`
-    /// and so can never actually be exceeded).
+    /// `store_global` denial (a no-op without a driver, or when `uid` is
+    /// `None` -- `self` was already destructed by the time the write was
+    /// attempted, so there is nothing to bill).
     fn record_mem_quota_breach(&mut self, uid: Option<Sym>) {
         let (Some(driver), Some(uid)) = (self.driver.as_ref(), uid) else {
             return;
@@ -2206,10 +2291,13 @@ impl<'a> RegistryHost<'a> {
             self.registry
                 .quota_breaches
                 .record(tier, crate::quota::DISK_QUOTA_MB);
-            return Err(RtError::new(format!(
-                "disk_quota_mb quota exceeded for `{u}` ({projected} bytes would be in use \
+            return Err(self.deny_quota(
+                crate::quota::DISK_QUOTA_MB,
+                format!(
+                    "disk_quota_mb quota exceeded for `{u}` ({projected} bytes would be in use \
                  under {dir}, quota is {max_bytes} bytes)"
-            )));
+                ),
+            ));
         }
         Ok(())
     }
@@ -2348,21 +2436,37 @@ impl<'a> RegistryHost<'a> {
         }
     }
 
-    /// `move_to`'s three confinement rules (OBI-121 S2c §7): a pure data
-    /// lookup against `Registry::program_flags`/`BcObject::ever_bound`/
-    /// the roles snapshot's tier -- no master apply, so this adds nothing
-    /// to `move_to`'s existing O(depth) cycle-check walk (V7 bench gate).
+    /// `move_to`'s three confinement rules (OBI-121 S2c §7, CTO review
+    /// B3): a pure data lookup against `Registry::program_flags`, each
+    /// object's `conn` (is it interactive, i.e. has a connection bound to
+    /// it *right now*?) and the roles snapshot's tier of its **euid** --
+    /// no master apply, so this adds nothing but O(1) map reads to
+    /// `move_to`'s existing O(depth) cycle-check walk (V7 bench gate).
     ///
     /// 1. A `Confined` object cannot move into a `Live` room.
     /// 2. A `Confined` object cannot move into a tier-0 player's
-    ///    inventory, but can move into a staff player's.
+    ///    inventory, but can move into a staff player's. "Tier-0 player's
+    ///    inventory" means **anywhere in `dest`'s environment chain**, not
+    ///    only `dest` itself -- `dest_chain_has_tier0_interactive` is
+    ///    precomputed by `move_to`'s own chain walk so this rule sees a
+    ///    confined item smuggled into a bag that is itself in a tier-0
+    ///    player's inventory.
     /// 3. A tier-0 player cannot enter a `Confined` room.
     ///
-    /// ("Room" vs "player" is not a separate object kind the driver
-    /// models (spec §7 leaves that to the mudlib) -- `ever_bound` (has
-    /// `dest`/`me` ever had a connection bound to it?) stands in for
-    /// "is a player", flagged as a simplification, not hidden.)
-    fn check_confinement(&mut self, me: ObjectId, dest: ObjectId) -> R<()> {
+    /// **Interactive, not owner/creator** (fixes B3): a real mudlib player
+    /// is a `mudlib`-owned `/std/player` clone whose *euid* is
+    /// `seteuid`'d to the account by `/secure/login` -- keying rules 2/3
+    /// on `uid`/`owner` would make every player (staff included) tier 0,
+    /// since `mudlib` itself is never staff. "Is this object a player"
+    /// is instead "does it have a connection bound to it right now"
+    /// (`BcObject::conn`), and its tier is its **euid**'s tier, not its
+    /// owner's.
+    fn check_confinement(
+        &mut self,
+        me: ObjectId,
+        dest: ObjectId,
+        dest_chain_has_tier0_interactive: bool,
+    ) -> R<()> {
         let Some(me_ob) = self.registry.get(me) else {
             return Ok(());
         };
@@ -2371,35 +2475,36 @@ impl<'a> RegistryHost<'a> {
         };
         let me_flags = self.registry.program_flags(&me_ob.program.path);
         let dest_flags = self.registry.program_flags(&dest_ob.program.path);
-        let me_is_player = me_ob.ever_bound;
-        let dest_is_player = dest_ob.ever_bound;
-        let me_uid = self.registry.syms.name(me_ob.uid).to_string();
-        let dest_uid = self.registry.syms.name(dest_ob.uid).to_string();
-        let roles = self.driver.as_ref().map(|d| d.roles.clone());
-        let tier_of = |name: &str| roles.as_ref().map_or(0, |r| r.tier(name));
+        let me_euid = self.registry.syms.name(me_ob.euid).to_string();
+        let me_is_interactive_tier0 = me_ob.conn.is_some() && self.euid_tier(&me_euid) == 0;
 
-        if me_flags == ProgramFlags::Confined {
-            if dest_is_player {
-                if tier_of(&dest_uid) == 0 {
-                    return Err(self.deny_confinement(
-                        me,
-                        "move_to(): a confined object cannot move into a tier-0 player's inventory",
-                    ));
-                }
-            } else if dest_flags == ProgramFlags::Live {
+        if me_flags.is_confined() {
+            if dest_chain_has_tier0_interactive {
+                return Err(self.deny_confinement(
+                    me,
+                    "move_to(): a confined object cannot move into a tier-0 player's inventory",
+                ));
+            } else if dest_flags.is_live() {
                 return Err(self.deny_confinement(
                     me,
                     "move_to(): a confined object cannot move into a live room",
                 ));
             }
         }
-        if me_is_player && tier_of(&me_uid) == 0 && dest_flags == ProgramFlags::Confined {
+        if me_is_interactive_tier0 && dest_flags.is_confined() {
             return Err(self.deny_confinement(
                 me,
                 "move_to(): a tier-0 player cannot enter a confined room",
             ));
         }
         Ok(())
+    }
+
+    /// `roles.tier(euid)`, or tier 0 with no driver/roles snapshot at all
+    /// (driver-less unit tests: nothing is ever staff without a snapshot,
+    /// same default `RolesSnapshot::tier` itself uses for an unknown uid).
+    fn euid_tier(&self, euid_name: &str) -> u32 {
+        self.driver.as_ref().map_or(0, |d| d.roles.tier(euid_name))
     }
 
     /// Audits a `move_to` confinement denial (spec: "an error and an audit
@@ -2414,6 +2519,28 @@ impl<'a> RegistryHost<'a> {
                 privilege: Privilege::P0,
                 apply: "confinement",
                 arg: msg.into(),
+                guard: GuardSet::empty(),
+                allowed: false,
+                denied_by: None,
+            });
+        }
+        RtError::new(msg)
+    }
+
+    /// Audits a quota denial (spec §3/§5: "quota breaches" go to the audit
+    /// sink, same as every other decision, CTO review S4) and returns the
+    /// error to raise. Not routed through `authorize`/`Operation`: a quota
+    /// breach is a driver rule derived from the S2 roles snapshot, not a
+    /// master `valid_*` decision.
+    fn deny_quota(&mut self, quota: &'static str, msg: String) -> RtError {
+        let caller = self.self_object();
+        if let Some(d) = self.driver.as_mut() {
+            d.security.push(AuditEntry {
+                caller,
+                efun: quota,
+                privilege: Privilege::P0,
+                apply: "quota",
+                arg: msg.clone().into(),
                 guard: GuardSet::empty(),
                 allowed: false,
                 denied_by: None,
@@ -2529,16 +2656,31 @@ impl<'a> RegistryHost<'a> {
             "move_to" => {
                 let dest = self.want_obj(name, &a0)?;
                 let me = self.self_object();
+                // The confined-chain check (rule 2) folds into this same
+                // O(depth) cycle-check walk (V7 bench gate: no extra pass,
+                // no master apply) -- "tier-0 player's inventory" means
+                // anywhere in `dest`'s environment chain, not only `dest`
+                // itself.
                 let mut cur = Some(dest);
+                let mut dest_chain_has_tier0_interactive = false;
                 while let Some(c) = cur {
                     if c == me {
                         return Err(RtError::new(
                             "move_to(): cannot move an object into itself or its contents",
                         ));
                     }
+                    if !dest_chain_has_tier0_interactive
+                        && let Some(o) = self.registry.get(c)
+                        && o.conn.is_some()
+                    {
+                        let euid = self.registry.syms.name(o.euid).to_string();
+                        if self.euid_tier(&euid) == 0 {
+                            dest_chain_has_tier0_interactive = true;
+                        }
+                    }
                     cur = self.registry.get(c).and_then(|o| o.env);
                 }
-                self.check_confinement(me, dest)?;
+                self.check_confinement(me, dest, dest_chain_has_tier0_interactive)?;
                 self.registry.move_object(me, dest);
                 Ok(Value::Null)
             }
@@ -2674,7 +2816,11 @@ impl<'a> RegistryHost<'a> {
                 }
                 let me = self.self_object();
                 let guard = Host::current_guard(self);
-                let quota_uid = Host::current_uid(self);
+                // OBI-121 S2c §4, CTO review B1: the execution's quota
+                // uid is the lowest-tier principal on the guard stack, not
+                // just whichever object happens to be running `call_out`
+                // right now.
+                let quota_uid = self.caller_quota_uid();
                 self.check_callout_quota(me, quota_uid)?;
                 let id = self
                     .driver
@@ -3306,46 +3452,54 @@ impl<'a> RegistryHost<'a> {
     /// parent's already-initialised variable, but never the reverse.
     /// Rolls back (removes the half-built object) on the first failing
     /// initialiser, matching `World::new_object`'s all-or-nothing create.
-    pub fn instantiate(&mut self, prog: Rc<CompiledProgram>) -> R<ObjectId> {
+    pub fn instantiate(&mut self, prog: Rc<CompiledProgram>, apply_r1: bool) -> R<ObjectId> {
         let prog_uid = self.uid_for(&prog.path);
         let guard = self.top_guard().clone();
-        // R1 (OBI-121 S2c spec §7): a load/clone whose current guard set
-        // does not already contain the program's own declared uid gets
-        // confined to the caller's own quota uid instead -- e.g. a
-        // T1-owned workroom object cloning a `/daemons`-style program
-        // cannot launder a clone into a higher-privileged owner it does
-        // not itself have; the clone is charged (and confined) to the
-        // apprentice, not to whatever `/daemons` would otherwise own.
+        // R1 (OBI-121 S2c spec §7, CTO review B1): a load/clone whose
+        // current guard set does not already contain the program's own
+        // declared uid (`prog_uid`, from `creator_file(path)`) gets
+        // `owner`/starting `euid` set to the caller's own quota uid
+        // instead -- e.g. a T1-owned workroom object cloning a
+        // `/daemons`-style program cannot launder a clone into a
+        // higher-privileged owner it does not itself have; the clone is
+        // charged (and confined) to the apprentice, not to whatever
+        // `/daemons` would otherwise own. `uid` itself (`creator_file`)
+        // never changes -- R1 only redirects `owner`/`euid` (spec: "Its
+        // `uid` stays `creator_file(p)`"; "Clone uid = caller" is
+        // explicitly rejected).
         //
-        // **Scoped to the always-unlimited owner uids** (`root`/`mudlib`/
-        // `domain:*`, `crate::quota::is_unlimited_uid`) rather than to
-        // every program's uid literally (flagged deviation from a fully
-        // literal reading of R1's wording): ownership (`uid`) and
-        // privilege (`euid`, gated by the master's `valid_*` applies) are
-        // deliberately orthogonal in this security model (OBI-35) --
-        // an ordinary `/builders/<u>/**` program's uid is just `<u>`,
-        // never itself a source of elevated rights, and loading/cloning
-        // one from anywhere is exactly the confused-deputy scenario
-        // `security.rs`'s `a_lower_privileged_caller_denies_a_higher_
-        // privileged_callee` already covers correctly *without* R1 (the
-        // caller's lower-privileged frame still denies any write the
-        // daemon's own euid could otherwise do). R1 only needs to stop a
-        // clone from picking up one of the uids that is *never* subject
-        // to a quota at all -- those are exactly the always-unlimited
-        // ones. Skipped entirely when the guard is empty (an all-root
-        // call chain, e.g. boot loading `/secure/master`).
-        let uid = if !guard.is_empty()
-            && crate::quota::is_unlimited_uid(self.registry.syms.name(prog_uid))
-            && !guard.has_euid(prog_uid)
-        {
-            self.current_uid()
+        // Applies to **every** program uid, not just the always-unlimited
+        // ones (root/mudlib/domain:*) -- narrowing this to only those
+        // uids was a quota-evasion hole (CTO review B1): an apprentice at
+        // `max_objects` could loop `clone_object("/builders/senior/x")`
+        // and have every clone billed to `senior` instead. Skipped
+        // entirely when the guard is empty (an all-root call chain, e.g.
+        // boot loading `/secure/master`).
+        //
+        // **`apply_r1` is `false` for `load_object`** (flagged deviation,
+        // CTO re-review requested): `load_object` returns the *same*
+        // object for `path` to every future caller (see `RegistryHost::
+        // load_object`'s cache check) -- it never multiplies billed
+        // objects, so it is not the clone-spam quota evasion R1 targets,
+        // and applying R1 there would let whichever caller happens to
+        // `load_object` a path *first* silently steal that path's
+        // owner/euid assignment forever (a regression against the
+        // pre-existing `security.rs` contract that a daemon object's own
+        // uid/euid do not depend on who first resolved it -- see
+        // `a_lower_privileged_caller_denies_a_higher_privileged_callee`,
+        // which loads `/builders/arch/daemon` from `appr`'s stack and
+        // still requires it owned/euid'd `arch`). `clone_object` always
+        // passes `true`.
+        let owner = if apply_r1 && !guard.is_empty() && !guard.has_euid(prog_uid) {
+            self.caller_quota_uid()
         } else {
             prog_uid
         };
-        self.check_max_objects(uid)?;
+        self.check_max_objects(owner)?;
         let mut obj = BcObject::new(prog.clone());
-        obj.uid = uid;
-        obj.euid = uid;
+        obj.uid = prog_uid;
+        obj.owner = owner;
+        obj.euid = owner;
         // Freshly created against whatever is registered right now:
         // nothing to lazily migrate until a *later* install changes it
         // (spec §7.2/§7.3, OBI-89). Stamping this now (rather than leaving
@@ -3538,13 +3692,24 @@ impl<'a> RegistryHost<'a> {
         for v in new_set.values() {
             self.registry.register_program(v.clone());
         }
-        // OBI-121 S2c: a recompiled path's cached `program_flags` result
-        // is stale (the master may return something different for the
-        // new code, or `program_flags` itself may only just have been
-        // added). Drop it; `RegistryHost::ensure_program_flags` recomputes
-        // it lazily the next time this path is loaded/cloned.
-        for path in new_set.keys() {
+        // OBI-121 S2c (CTO review B4): a recompiled path's cached
+        // `program_flags` result is stale (the master may return
+        // something different for the new code, or `program_flags` itself
+        // may only just have been added). Recompute it **now**, as part of
+        // install, not lazily on the next `load_object`/`clone_object` --
+        // an already-live clone of a workroom item that just got flagged
+        // `CONFINED` must be confined starting with this install, not
+        // starting with the next time anyone clones or loads that same
+        // path (a confinement bypass window otherwise: `move_to`'s
+        // `check_confinement` reads the cache by path, shared by every
+        // existing instance, so recomputing it here closes the gap for
+        // all of them at once).
+        let paths: Vec<String> = new_set.keys().cloned().collect();
+        for path in &paths {
             self.registry.set_program_flags(path, None);
+        }
+        for path in &paths {
+            self.ensure_program_flags(path);
         }
         self.registry.install_generation += 1;
         // Programs were replaced: an old `Rc<CompiledProgram>` may now be
@@ -3843,7 +4008,7 @@ impl Host for RegistryHost<'_> {
     /// directly on `Limits`.
     fn store_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
         let self_id = self.self_object();
-        let owner_uid = self.registry.get(self_id).map(|o| o.uid);
+        let owner_uid = self.registry.get(self_id).map(|o| o.owner);
         let quota = owner_uid.map_or(self.limits.mem_quota_bytes, |uid| {
             self.mem_quota_bytes_for(uid)
         });
@@ -3863,10 +4028,13 @@ impl Host for RegistryHost<'_> {
         if new_total > quota {
             let obj_name = o.name.clone();
             self.record_mem_quota_breach(owner_uid);
-            return Err(RtError::new(format!(
-                "{obj_name}: memory quota exceeded writing `{name}` ({new_total} bytes of vars would be \
+            return Err(self.deny_quota(
+                crate::quota::MAX_MEM_EXEC_MB,
+                format!(
+                    "{obj_name}: memory quota exceeded writing `{name}` ({new_total} bytes of vars would be \
                  in use, quota is {quota} bytes)"
-            )));
+                ),
+            ));
         }
         let old = o.vars.get(&key).cloned();
         o.mem_bytes = new_total;
@@ -4386,7 +4554,7 @@ pub fn get_derived() -> int {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(child_prog).expect("instantiate");
+        let obj = host.instantiate(child_prog, true).expect("instantiate");
 
         let base = host.call_on(obj, "get_base", vec![]).unwrap();
         assert!(base.equals(&Value::Int(10)));
@@ -4441,7 +4609,7 @@ pub fn doubled() -> int {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(v1).expect("instantiate");
+        let obj = host.instantiate(v1, true).expect("instantiate");
         host.call_on(obj, "set_counter", vec![Value::Int(42)])
             .unwrap();
 
@@ -4497,7 +4665,7 @@ pub fn get_data() -> string {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(v1).expect("instantiate");
+        let obj = host.instantiate(v1, true).expect("instantiate");
 
         let v2 = Rc::new(compile_program(
             "/obj/thing",
@@ -4538,7 +4706,7 @@ var other: int = 1
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(v1).expect("instantiate");
+        let obj = host.instantiate(v1, true).expect("instantiate");
         // OBI-80 deep accounting: a var's cost is its own 16-byte slot plus
         // the value's cached `deep_bytes` (here just the 40-byte string;
         // primitives/short containers still stay under any real quota, but
@@ -4621,7 +4789,7 @@ pub fn tripled() -> int {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(v1).expect("instantiate");
+        let obj = host.instantiate(v1, true).expect("instantiate");
         host.call_on(obj, "set_counter", vec![Value::Int(7)])
             .unwrap();
 
@@ -4675,7 +4843,7 @@ pub fn get_data() -> string {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(v1.clone()).expect("instantiate");
+        let obj = host.instantiate(v1.clone(), true).expect("instantiate");
 
         let v2 = Rc::new(compile_program(
             "/obj/thing",
@@ -4746,8 +4914,8 @@ pub fn upgrade(from_version: int, old: {string: any}) {
         };
         let (broken, fine) = {
             let mut host = RegistryHost::new(&mut registry, placeholder);
-            let broken = host.instantiate(v1.clone()).expect("instantiate");
-            let fine = host.instantiate(v1.clone()).expect("instantiate");
+            let broken = host.instantiate(v1.clone(), true).expect("instantiate");
+            let fine = host.instantiate(v1.clone(), true).expect("instantiate");
             host.call_on(broken, "set_short", vec![Value::str("BREAK ME")])
                 .unwrap();
             (broken, fine)
@@ -4848,7 +5016,7 @@ fn create() {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(hall).expect("instantiate");
+        let obj = host.instantiate(hall, true).expect("instantiate");
         // `create()` isn't called automatically by `instantiate` (that is
         // `World::new_object`'s job, not ported yet); call it explicitly
         // the way this slice's other tests call functions directly.
@@ -4889,7 +5057,7 @@ fn create() {
         for (i, path) in ["/t/a", "/t/b", "/t/c"].into_iter().enumerate() {
             let prog = compiler.ensure_program(&mut registry, path).unwrap();
             let mut host = RegistryHost::new(&mut registry, placeholder);
-            ids[i] = host.instantiate(prog).unwrap();
+            ids[i] = host.instantiate(prog, true).unwrap();
         }
         (root, registry, ids)
     }
@@ -5049,7 +5217,7 @@ fn create() {
         };
         let obj = {
             let mut host = RegistryHost::new(&mut registry, placeholder);
-            let obj = host.instantiate(hall).expect("instantiate");
+            let obj = host.instantiate(hall, true).expect("instantiate");
             host.call_on(obj, "create", vec![]).unwrap();
             obj
         };
@@ -5476,7 +5644,7 @@ pub fn get_n() -> int {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(prog).expect("instantiate");
+        let obj = host.instantiate(prog, true).expect("instantiate");
 
         let err = host.call_on(obj, "bump_then_fail", vec![]).unwrap_err();
         assert!(err.report().contains("boom"), "{}", err.report());
@@ -5510,7 +5678,7 @@ pub fn get_xs() -> [int] {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(prog).expect("instantiate");
+        let obj = host.instantiate(prog, true).expect("instantiate");
 
         host.call_on(obj, "mutate_then_fail", vec![]).unwrap_err();
 
@@ -5545,7 +5713,7 @@ atomic fn grow_then_fail() {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(prog).expect("instantiate");
+        let obj = host.instantiate(prog, true).expect("instantiate");
         let before = host.registry.get(obj).unwrap().mem_bytes;
 
         host.call_on(obj, "grow_then_fail", vec![]).unwrap_err();
@@ -5586,7 +5754,7 @@ pub fn get_n() -> int {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(prog).expect("instantiate");
+        let obj = host.instantiate(prog, true).expect("instantiate");
 
         host.call_on(obj, "bump", vec![]).unwrap();
         let n = host.call_on(obj, "get_n", vec![]).unwrap();
@@ -5620,7 +5788,7 @@ pub fn get_n() -> int {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(prog).expect("instantiate");
+        let obj = host.instantiate(prog, true).expect("instantiate");
 
         host.call_on(obj, "bump_and_catch", vec![]).unwrap();
         let n = host.call_on(obj, "get_n", vec![]).unwrap();
@@ -5658,7 +5826,7 @@ pub fn get_n() -> int {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(prog).expect("instantiate");
+        let obj = host.instantiate(prog, true).expect("instantiate");
 
         // Far fewer ticks than the infinite loop needs.
         host.ticks_left = 50;
@@ -5705,7 +5873,7 @@ pub fn get_n() -> int {
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(prog).expect("instantiate");
+        let obj = host.instantiate(prog, true).expect("instantiate");
 
         host.call_on(obj, "outer_then_fail", vec![]).unwrap_err();
         let n = host.call_on(obj, "get_n", vec![]).unwrap();
@@ -5918,7 +6086,7 @@ pub fn set_it() {{
             generation: 0,
         };
         let mut host = RegistryHost::new(&mut registry, placeholder);
-        let obj = host.instantiate(prog).expect("instantiate");
+        let obj = host.instantiate(prog, true).expect("instantiate");
         // Same 200-int nested payload as the array test above; a closure
         // that only charged its own slot (the OBI-78 bypass, or leaving
         // `HeapObj::Fn` at a flat 0 the way this cost() briefly did) would
@@ -6037,7 +6205,7 @@ pub fn fill() {{
                 generation: 0,
             };
             let mut host = RegistryHost::new(&mut registry, placeholder);
-            let obj = host.instantiate(prog).expect("instantiate");
+            let obj = host.instantiate(prog, true).expect("instantiate");
             host.limits.mem_quota_bytes = u64::MAX;
             heap::reset_cost_calls();
             host.call_on(obj, "fill", vec![]).expect("fill");
