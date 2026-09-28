@@ -736,3 +736,52 @@ fn a_call_through_a_mudlib_helper_still_bills_the_calling_apprentice() {
          its own (always-unlimited) uid"
     );
 }
+
+// -- OBI-149 (D-S2.4 amendment): a command-context clone of an
+// always-unlimited-uid program must still be billed to the calling
+// staff principal, even when the guard set *already* contains that
+// program's own uid (as every `/cmds/**` command frame's `mudlib`
+// euid does) --------------------------------------------------------------
+
+#[test]
+fn a_clone_from_a_mudlib_command_frame_is_still_billed_to_the_apprentice() {
+    let (mut world, mut host) = boot();
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+    // The workroom object itself already counts as 1 against `appr`.
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"max_objects": 2}"#)));
+
+    // `/cmds/goto` is a mudlib-owned command object (no `/builders`/
+    // `/domains` prefix, so its own uid is `mudlib`) -- exactly the
+    // `/cmds/**` shape every player command runs through. Its `run`
+    // pushes `mudlib` onto the guard *before* `workroom.spawn_daemon()`
+    // ever calls `clone_object("/daemons/thing")`, so by the time R1
+    // asks "is `/daemons/thing`'s own uid (`mudlib`) already in the
+    // guard set?" the answer is yes -- without the amendment the clone
+    // would be billed to `mudlib` (never billed at all) instead of
+    // `appr`, letting `max_objects` be evaded just by routing the same
+    // call through a command.
+    let cmd = world
+        .load_object("/cmds/goto", &mut host)
+        .expect("load cmd");
+
+    let clone = world
+        .call(cmd, "run", vec![Value::Object(workroom)], &mut host)
+        .expect("first clone is within the limit (workroom + this = 2)");
+    let Value::Object(clone_id) = clone else {
+        panic!("expected an object, got {clone:?}");
+    };
+    assert_eq!(
+        world.owner_uid(clone_id),
+        Some("appr"),
+        "billed to the apprentice, not laundered through mudlib's guard"
+    );
+
+    // A second clone the same way is refused -- `max_objects` actually
+    // applies once the clones are billed to a real (billable) uid.
+    let e = world
+        .call(cmd, "run", vec![Value::Object(workroom)], &mut host)
+        .unwrap_err();
+    assert!(e.contains("object quota exceeded"), "{e}");
+}
