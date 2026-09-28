@@ -24,6 +24,10 @@ serde_json = "1.0.145"
 # crate's telnet codec, not a wrapper around it).
 axum = { version = "0.8.4", default-features = false, features = ["ws"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+# Global-recorder facade only (OBI-149): whatever process installs a
+# recorder (`loom-obs::init_tracing`/`Metrics::install`, `loom-cli`) picks
+# these counters up; loom-net itself never depends on loom-obs.
+metrics = "0.24.6"
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
