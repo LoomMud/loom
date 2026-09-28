@@ -385,7 +385,12 @@ async fn run_connection(
                                 break;
                             }
                         }
-                        CodecOutcome::Disconnect => {
+                        CodecOutcome::Disconnect(reason) => {
+                            warn!(conn_id, reason = reason.as_str(), "disconnecting: {}", reason.as_str());
+                            if reason == DisconnectReason::RateLimited {
+                                metrics::counter!("loom_net_rate_limit_disconnects_total")
+                                    .increment(1);
+                            }
                             break;
                         }
                     }
@@ -408,7 +413,33 @@ enum CodecOutcome {
         responses: Vec<Vec<u8>>,
         events: Vec<TelnetEvent>,
     },
-    Disconnect,
+    Disconnect(DisconnectReason),
+}
+
+/// Why [`CodecOutcome::Disconnect`] fired (OBI-149): logged at the one
+/// call site that owns `conn_id` (`spawn_reader`) so a disconnect caused
+/// by the input rate limit (20 burst, 5/s, `TokenBucket`) is
+/// distinguishable in the logs from one caused by a client sending an
+/// over-long line -- previously *both* closed the connection with no log
+/// line at all, which cost an hour of flake-hunting in warp's smoke test
+/// (a legitimate burst of input got rate-limited and disconnected, and
+/// there was nothing to tell that apart from a client just hanging up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisconnectReason {
+    /// The per-connection input token bucket (burst/refill from
+    /// `NetConfig::rate_limit_burst`/`rate_limit_per_second`) was empty.
+    RateLimited,
+    /// A line exceeded `max_line_bytes` before a terminator arrived.
+    LineTooLong,
+}
+
+impl DisconnectReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            DisconnectReason::RateLimited => "input rate limit exceeded",
+            DisconnectReason::LineTooLong => "input line too long",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -479,14 +510,14 @@ impl TelnetCodec {
                         continue;
                     }
 
-                    if self.consume_data_byte(*byte, &mut lines) {
-                        return CodecOutcome::Disconnect;
+                    if let Some(reason) = self.consume_data_byte(*byte, &mut lines) {
+                        return CodecOutcome::Disconnect(reason);
                     }
                 }
                 ParseState::Iac => match *byte {
                     IAC => {
-                        if self.consume_data_byte(IAC, &mut lines) {
-                            return CodecOutcome::Disconnect;
+                        if let Some(reason) = self.consume_data_byte(IAC, &mut lines) {
+                            return CodecOutcome::Disconnect(reason);
                         }
                         self.state = ParseState::Data;
                     }
@@ -542,7 +573,7 @@ impl TelnetCodec {
                             // OBI-26): charge a token here too, not just
                             // on successfully-parsed frames below.
                             if !self.bucket.try_take() {
-                                return CodecOutcome::Disconnect;
+                                return CodecOutcome::Disconnect(DisconnectReason::RateLimited);
                             }
                         } else {
                             let is_gmcp = self.sub_buf.first() == Some(&telnet::OPT_GMCP);
@@ -560,7 +591,7 @@ impl TelnetCodec {
                             // client-controlled parser on the network
                             // edge, same as line input.
                             if is_gmcp && !self.bucket.try_take() {
-                                return CodecOutcome::Disconnect;
+                                return CodecOutcome::Disconnect(DisconnectReason::RateLimited);
                             }
                         }
                         self.sub_buf.clear();
@@ -594,42 +625,42 @@ impl TelnetCodec {
         }
     }
 
-    /// Returns true when the connection should be disconnected.
-    fn consume_data_byte(&mut self, byte: u8, lines: &mut Vec<String>) -> bool {
+    /// Returns `Some(reason)` when the connection should be disconnected.
+    fn consume_data_byte(&mut self, byte: u8, lines: &mut Vec<String>) -> Option<DisconnectReason> {
         if self.saw_cr {
             self.saw_cr = false;
             if byte == b'\n' || byte == 0 {
                 return self.finish_line(lines);
             }
 
-            if self.finish_line(lines) {
-                return true;
+            if let Some(reason) = self.finish_line(lines) {
+                return Some(reason);
             }
         }
 
         match byte {
             b'\r' => {
                 self.saw_cr = true;
-                false
+                None
             }
             b'\n' => self.finish_line(lines),
             _ => {
                 self.line_buf.push(byte);
-                self.line_buf.len() > self.max_line_bytes
+                (self.line_buf.len() > self.max_line_bytes).then_some(DisconnectReason::LineTooLong)
             }
         }
     }
 
-    /// Returns true when the connection should be disconnected.
-    fn finish_line(&mut self, lines: &mut Vec<String>) -> bool {
+    /// Returns `Some(reason)` when the connection should be disconnected.
+    fn finish_line(&mut self, lines: &mut Vec<String>) -> Option<DisconnectReason> {
         if !self.bucket.try_take() {
-            return true;
+            return Some(DisconnectReason::RateLimited);
         }
 
         let text = String::from_utf8_lossy(&self.line_buf).into_owned();
         self.line_buf.clear();
         lines.push(text);
-        false
+        None
     }
 }
 
@@ -767,7 +798,29 @@ mod tests {
     fn disconnects_on_overlong_line() {
         let mut codec = TelnetCodec::new(4, 20, 5.0, Vec::new());
         let out = codec.feed(b"abcde");
-        assert!(matches!(out, CodecOutcome::Disconnect));
+        assert!(matches!(
+            out,
+            CodecOutcome::Disconnect(DisconnectReason::LineTooLong)
+        ));
+    }
+
+    // OBI-149: a disconnect from the input token bucket (burst exhausted)
+    // must carry `DisconnectReason::RateLimited`, distinct from an
+    // over-long line -- the caller (`spawn_reader`) logs the two
+    // differently, and previously neither was logged at all.
+    #[test]
+    fn disconnects_with_rate_limited_reason_once_the_burst_is_exhausted() {
+        let mut codec = TelnetCodec::new(4096, 1, 0.0, Vec::new());
+        // First line consumes the lone burst token and is accepted.
+        let out = codec.feed(b"one\n");
+        assert!(matches!(out, CodecOutcome::Ok { .. }));
+        // The bucket never refills (0.0/s), so a second line disconnects
+        // -- and must be reported as rate-limited, not as an overlong line.
+        let out = codec.feed(b"two\n");
+        assert!(matches!(
+            out,
+            CodecOutcome::Disconnect(DisconnectReason::RateLimited)
+        ));
     }
 
     #[test]
@@ -1282,7 +1335,7 @@ mod tests {
             let _ = byte_at_a_time.start();
             for b in &data {
                 match byte_at_a_time.feed(std::slice::from_ref(b)) {
-                    CodecOutcome::Disconnect => break,
+                    CodecOutcome::Disconnect(_) => break,
                     CodecOutcome::Ok { .. } => {}
                 }
             }
@@ -1308,7 +1361,7 @@ mod tests {
             while offset < bytes.len() {
                 let take = sizes.next().unwrap_or(1).min(bytes.len() - offset);
                 match codec.feed(&bytes[offset..offset + take]) {
-                    CodecOutcome::Disconnect => break,
+                    CodecOutcome::Disconnect(_) => break,
                     CodecOutcome::Ok { .. } => {}
                 }
                 offset += take;

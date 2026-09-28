@@ -19,7 +19,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use axum::extract::ws::{Message, WebSocket};
 
@@ -106,7 +106,9 @@ pub(crate) async fn run_ws_connection(
                 match message {
                     Message::Text(text) => {
                         if !bucket.try_take() {
-                            debug!(conn_id, "disconnecting WS client: input rate limit exceeded");
+                            warn!(conn_id, "disconnecting: input rate limit exceeded");
+                            metrics::counter!("loom_net_rate_limit_disconnects_total")
+                                .increment(1);
                             break;
                         }
 
