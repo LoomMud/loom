@@ -46,6 +46,7 @@ pub const DISK_QUOTA_MB: &str = "disk_quota_mb";
 /// -- no `RolesSnapshot` needed -- so callers that only have a uid string
 /// (e.g. `Registry::insert`/`remove`'s object-count bookkeeping) can skip
 /// tracking a count for these without asking the driver for anything.
+#[inline]
 pub fn is_unlimited_uid(uid: &str) -> bool {
     uid == "root" || uid == "mudlib" || uid.starts_with("domain:")
 }
@@ -101,14 +102,25 @@ impl TierQuotas {
 /// policy row, falling back to the world default for the two
 /// always-finite quotas and to "no limit" for every count-based one the
 /// row omits.
+#[inline]
 pub fn resolve(roles: &RolesSnapshot, uid: &str) -> TierQuotas {
     if is_unlimited_uid(uid) {
         return TierQuotas::unlimited();
     }
     let tier = roles.tier(uid);
-    let row = roles.policy(tier);
-    let pos_u64 =
-        |k: &str| -> Option<u64> { row.get(k).copied().filter(|v| *v > 0).map(|v| v as u64) };
+    // `policy_row` (a borrow), not `policy` (an owned `HashMap` clone with
+    // per-key `String` allocations) -- `resolve` runs on *every*
+    // `store_global` (the per-object mem quota) and every heartbeat/
+    // call_out tick check, so cloning the whole row here was a measured
+    // hot-path regression (CI's V7 bench gate: `array_fill`, a tight
+    // var-write loop, +26% over `origin/main`).
+    let row = roles.policy_row(tier);
+    let pos_u64 = |k: &str| -> Option<u64> {
+        row.and_then(|r| r.get(k))
+            .copied()
+            .filter(|v| *v > 0)
+            .map(|v| v as u64)
+    };
     TierQuotas {
         max_ticks_exec: pos_u64(MAX_TICKS_EXEC).unwrap_or(WORLD_DEFAULT_MAX_TICKS_EXEC),
         max_mem_exec_mb: pos_u64(MAX_MEM_EXEC_MB).unwrap_or(WORLD_DEFAULT_MAX_MEM_EXEC_MB),

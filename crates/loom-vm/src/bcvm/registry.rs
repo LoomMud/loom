@@ -821,6 +821,16 @@ pub struct BcObject {
     /// `uid` (see `RegistryHost::instantiate`) -- otherwise equal to
     /// `uid`.
     pub owner: Sym,
+    /// `mem_quota_bytes_for(owner)`'s result, cached (OBI-121 S2c CTO
+    /// review, V7 bench gate follow-up): keyed on the roles snapshot's own
+    /// `Arc` identity, so it never needs invalidating explicitly -- a
+    /// `World::set_roles_snapshot` swap installs a new `Arc`, whose
+    /// address can never match a stale cache entry. `store_global` is a
+    /// hot loop (a tight global-array index-write is O(1) per write, spec
+    /// r5 §5.2.1/OBI-80); re-resolving the owner's tier/policy row
+    /// through the roles snapshot on every single write was a measured
+    /// regression against the pre-quota baseline.
+    pub mem_quota_cache: std::cell::Cell<Option<(usize, u64)>>,
 }
 
 impl BcObject {
@@ -841,6 +851,7 @@ impl BcObject {
             uid: ROOT,
             euid: ROOT,
             owner: ROOT,
+            mem_quota_cache: std::cell::Cell::new(None),
         }
     }
 
@@ -2230,6 +2241,7 @@ impl<'a> RegistryHost<'a> {
     /// (unit tests), falls back to `self.limits.mem_quota_bytes` --
     /// preserves the pre-OBI-121 test contract of a fixed quota set
     /// directly on `Limits`.
+    #[inline]
     fn mem_quota_bytes_for(&self, uid: Sym) -> u64 {
         let Some(driver) = self.driver.as_ref() else {
             return self.limits.mem_quota_bytes;
@@ -4008,10 +4020,32 @@ impl Host for RegistryHost<'_> {
     /// directly on `Limits`.
     fn store_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
         let self_id = self.self_object();
+        let quota = match self.registry.get(self_id) {
+            None => self.limits.mem_quota_bytes,
+            Some(o) => {
+                // Cached (`BcObject::mem_quota_cache`, V7 bench gate
+                // follow-up): re-resolving the owner's tier/policy row on
+                // every single write was a measured regression against
+                // the pre-quota baseline on a tight global-array
+                // index-write loop.
+                let roles_ptr = self
+                    .driver
+                    .as_ref()
+                    .map(|d| std::sync::Arc::as_ptr(&d.roles) as usize);
+                match (roles_ptr, o.mem_quota_cache.get()) {
+                    (Some(ptr), Some((cached_ptr, cached_bytes))) if ptr == cached_ptr => {
+                        cached_bytes
+                    }
+                    (Some(ptr), _) => {
+                        let bytes = self.mem_quota_bytes_for(o.owner);
+                        o.mem_quota_cache.set(Some((ptr, bytes)));
+                        bytes
+                    }
+                    (None, _) => self.limits.mem_quota_bytes,
+                }
+            }
+        };
         let owner_uid = self.registry.get(self_id).map(|o| o.owner);
-        let quota = owner_uid.map_or(self.limits.mem_quota_bytes, |uid| {
-            self.mem_quota_bytes_for(uid)
-        });
         let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
         let new_bytes = heap::cost(&v);
         let Some(o) = self.registry.get_mut(self_id) else {
