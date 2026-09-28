@@ -141,8 +141,11 @@ fn strv(v: Value) -> String {
 
 /// The apprentice loads one of its own programs (`load_object` from its
 /// workroom), then recompiles it with `compile_object` -- both under its
-/// own rights. Loading first matters: see OBI-37's follow-up on
-/// `compile_object` of a never-loaded program dropping its parent link.
+/// own rights. Loading first used to work around `compile_object` of a
+/// never-loaded program dropping its parent link. OBI-156 fixed that (see
+/// `obi_156_compile_never_loaded_parent.rs`), so the load is no longer
+/// required. It stays as an extra check that `load` works under the
+/// apprentice's rights.
 fn load_first(m: &mut Mud, path: &str) -> ObjectId {
     let Value::Object(ob) = m.call_s(APPR, "load", &[path]).expect("load") else {
         panic!("load_object must return an object")
