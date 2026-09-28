@@ -563,7 +563,15 @@ impl World {
     ) -> Result<T, RtError> {
         self.registry.debug_assert_atomic_scope_closed();
         let max_ticks = match ticks_quota_uid {
-            None => crate::quota::WORLD_DEFAULT_MAX_TICKS_EXEC,
+            // Player input, `connect`/`disconnect`, and every driver-only
+            // introspection/tooling call: the *configured* world default
+            // (`self.limits.max_ticks`, `Limits::default()` == the spec's
+            // 1,000,000 -- CTO review B2: a hardcoded constant here would
+            // silently ignore a world that configures a different default,
+            // e.g. `loom-vm`'s own `examples/vm_bench.rs`, which raises it
+            // to benchmark workloads heavier than the spec default without
+            // tripping a false quota breach).
+            None => self.limits.max_ticks,
             Some(uid) => {
                 let name = self.registry.syms.name(uid).to_string();
                 crate::quota::resolve(&self.roles, &name).max_ticks_exec
