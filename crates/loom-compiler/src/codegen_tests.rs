@@ -343,25 +343,15 @@ fn element_write_array_index_on_global() {
     );
     verify(&m).expect("verify");
     let text = disasm_fn(&m, "f");
-    // Take → mutate → put back: a `LoadGlobal` to take the array out, the
-    // `IndexSet` mutation, then a `StoreGlobal` writing the same register
-    // back — the bug this closes left out exactly that last step.
-    let load_reg = text
-        .lines()
-        .find(|l| l.contains("LoadGlobal"))
-        .and_then(|l| l.split_whitespace().nth(2))
-        .map(|s| s.trim_end_matches(','))
-        .expect("a LoadGlobal")
-        .to_string();
-    assert!(text.contains("IndexSet.Array"), "{text}");
-    let store_line = text
-        .lines()
-        .find(|l| l.contains("StoreGlobal"))
-        .unwrap_or_else(|| panic!("a StoreGlobal in:\n{text}"));
-    assert!(
-        store_line.contains(&load_reg),
-        "StoreGlobal must write back the same register LoadGlobal took: {store_line}"
-    );
+    // Single-level global index-assign takes the OBI-108 fast path: a
+    // single `IndexSetGlobal` op that takes the container straight out of
+    // the global, mutates it in place, and commits it back -- no
+    // `LoadGlobal`/`IndexSet`/`StoreGlobal` round trip (that shape is
+    // exactly the O(n^2)-on-repeated-writes bug OBI-108 closed).
+    assert!(!text.contains("LoadGlobal"), "{text}");
+    assert!(!text.contains("StoreGlobal"), "{text}");
+    assert!(!text.contains("IndexSet."), "{text}");
+    assert!(text.contains("IndexSetGlobal.Array"), "{text}");
 }
 
 #[test]
@@ -395,10 +385,17 @@ fn compound_element_write_map_key_on_global() {
     );
     verify(&m).expect("verify");
     let text = disasm_fn(&m, "f");
+    // The compound case still needs a read-only `LoadGlobal` + `Index` to
+    // combine the current element with the RHS (an O(1) element clone,
+    // never followed by a mutation of that register -- OBI-108), then
+    // writes the combined value back with the same single-op
+    // `IndexSetGlobal` fast path the plain `Set` case uses: no ordinary
+    // `IndexSet`/`StoreGlobal` round trip.
     assert!(text.contains("LoadGlobal"), "{text}");
     assert!(text.contains("Index.Map"), "{text}");
-    assert!(text.contains("IndexSet.Map"), "{text}");
-    assert!(text.contains("StoreGlobal"), "{text}");
+    assert!(text.contains("IndexSetGlobal.Map"), "{text}");
+    assert!(!text.contains("IndexSet."), "{text}");
+    assert!(!text.contains("StoreGlobal"), "{text}");
 }
 
 #[test]

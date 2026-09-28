@@ -826,7 +826,9 @@ mod tests {
                     b: 1,
                 },
                 Op::Return { src: None },
-            ],
+            ]
+            .into(),
+            capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_ok());
     }
@@ -850,7 +852,9 @@ mod tests {
                     b: 1,
                 },
                 Op::Return { src: None },
-            ],
+            ]
+            .into(),
+            capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
     }
