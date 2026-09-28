@@ -1,0 +1,15 @@
+// The mudlib-side facade for the roles snapshot (OBI-36 design note
+// D-S2.1/D-S2.2), trimmed to what the OBI-123 loom-cli wiring tests drive
+// directly (a builder command layer would normally wrap these, design §5).
+
+pub fn tier(uid: string) -> int {
+    return roles_tier(uid)
+}
+
+pub fn has_grant(uid: string, kind: string, target: string) -> bool {
+    return roles_has_grant(uid, kind, target)
+}
+
+pub fn set_tier(target: string, tier: int, reason: string) -> int {
+    return roles_set_tier(target, tier, reason)
+}

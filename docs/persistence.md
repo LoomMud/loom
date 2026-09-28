@@ -122,6 +122,14 @@ on top of 0001:
   round trip (a single multi-row `INSERT`), matching the driver's
   batched-write DB-worker pattern.
 
+## loom-cli wiring (OBI-123)
+
+`crates/loom-cli/src/main.rs` is the only caller of every API above (`loom-persist` itself never touches `loom-vm`):
+
+- **Snapshot loader**: `connect_persist()` connects `Persist` from `DATABASE_URL` if set. `run_roles_manager`, a dedicated `tokio::spawn`ed task, owns every refresh trigger design §1 lists (boot, `LISTEN roles_changed`, a pulse after every completed mutation, and a timer at the earliest grant expiry) in one loop, converts `RolesRows` to a `loom_vm::RolesSnapshot` (`build_roles_snapshot`) and publishes it on a `watch` channel. The world thread (which cannot itself be async: `World` is `!Send`) polls that channel once per event and calls `World::set_roles_snapshot`. With no `DATABASE_URL`, `spawn_world_thread` instead loads `LOOM_ROLES_SEED` synchronously at boot (`loom_vm::roles::load_seed_from_env`); a malformed seed is a boot failure.
+- **Mutation dispatch**: `ChannelRolesMutations` (a `loom_vm::RolesMutations` impl) turns each `roles_*` efun call into a `DbRequest::Roles*` sent to the same DB worker (`loom_persist::spawn_db_worker`/`spawn_dev_account_worker`) that already serves `account_create`/`account_login`; `try_send` never blocks the world thread and reports `false` (queue full/closed) exactly like `ChannelAccountAuth`. Answers come back as `DbEvent::RolesResult`, delivered to `World::deliver_roles_result` by the same drain loop that already handles `DbEvent::AccountResult`, which also pulses `run_roles_manager`'s reload channel.
+- **`audit_log` sink**: once per world tick, the world thread calls `World::drain_audit_since` and hands the new rows to `run_audit_sink` (another dedicated task), which appends them via `insert_audit_batch`. No `DATABASE_URL` means no sink task at all -- the rows are computed but never sent anywhere.
+
 ## SQLx offline metadata
 
 `loom-persist` uses `sqlx::query!` macros and commits generated metadata under

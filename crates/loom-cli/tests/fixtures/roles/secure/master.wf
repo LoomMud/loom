@@ -1,0 +1,28 @@
+// Test-only master (OBI-123): permissive except `valid_write`, which is
+// keyed on the roles snapshot's tier for the caller's own euid (same shape
+// as the loom-vm OBI-36/S2b fixture) -- enough to prove a `roles_changed`
+// NOTIFY or a completed mutation flushes the security cache end to end,
+// through a real `loom serve` process and a real Postgres.
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return roles_tier(effective_principal()) >= 2
+}
+
+fn valid_seteuid(ob: object, e: string) -> bool {
+    return true
+}

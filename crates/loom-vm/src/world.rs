@@ -29,6 +29,26 @@ use std::sync::Arc;
 /// Path of the master object.
 pub const MASTER_PATH: &str = "/secure/master";
 
+/// One [`AuditEntry`], resolved to owned strings, ready for a driver-side
+/// Postgres sink (OBI-36 D-S2.5; see [`World::drain_audit_since`]).
+/// `kind` and `apply` name the decision (`"unguarded"`,
+/// `"roles_set_tier"`, an efun name, ...) and the master apply it went
+/// through (`"valid_efun"`, `"roles_actor"`, ...); `class` is the
+/// `Privilege` numeric value (0-4); `allowed` is the verdict; `detail` is
+/// the denying euid's name, if any.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditRow {
+    pub kind: &'static str,
+    pub caller: Option<String>,
+    pub effective_principal: Option<String>,
+    pub apply: &'static str,
+    pub class: i16,
+    pub argument: String,
+    pub guard_set: Vec<String>,
+    pub allowed: bool,
+    pub detail: Option<String>,
+}
+
 /// The `account_create`/`account_login` async backend (spec, OBI-85):
 /// `World` calls this to *issue* a request (never blocking); the answer
 /// comes back out-of-band, through whatever channel the implementation
@@ -944,6 +964,52 @@ impl World {
     /// allowed or denied, oldest first.
     pub fn audit_log(&self) -> &[AuditEntry] {
         self.security.log()
+    }
+
+    /// Every audit decision recorded since `cursor`, resolved to owned
+    /// strings for a driver-side sink (`loom-cli`'s Postgres `audit_log`
+    /// writer, OBI-36 design §5/D-S2.5, wired by OBI-123): P2+
+    /// `valid_efun`/`valid_read`/`valid_write`/... decisions (allowed and
+    /// denied), `unguarded`, every `roles_*` mutation gate, and (once S2c
+    /// lands) quota breaches all flow through the same
+    /// `SecurityState::push`, so this one drain covers all of them.
+    /// `cursor` is [`SecurityState::audit_total`] as of the *last* call (0
+    /// for the very first); the returned `u64` is this call's total, to
+    /// pass in next time. The audit ring is bounded
+    /// ([`crate::security::AUDIT_LOG_CAPACITY`]): if the sink falls behind
+    /// by more than that many entries between calls, the oldest
+    /// still-retained entries are returned rather than erroring or
+    /// blocking the world thread -- a gap in the Postgres sink is
+    /// preferable to either.
+    pub fn drain_audit_since(&self, cursor: u64) -> (Vec<AuditRow>, u64) {
+        let log = self.security.log();
+        let total = self.security.audit_total();
+        let start = total.saturating_sub(log.len() as u64);
+        let skip = cursor.saturating_sub(start).min(log.len() as u64) as usize;
+        let rows = log[skip..].iter().map(|e| self.audit_row(e)).collect();
+        (rows, total)
+    }
+
+    fn audit_row(&self, e: &AuditEntry) -> AuditRow {
+        AuditRow {
+            kind: e.efun,
+            caller: self.object_name(e.caller).map(str::to_string),
+            effective_principal: e
+                .guard
+                .principals()
+                .last()
+                .map(|p| self.principal_name(p.euid).to_string()),
+            apply: e.apply,
+            class: e.privilege as i16,
+            argument: e.arg.to_string(),
+            guard_set: e
+                .guard
+                .euids()
+                .map(|s| self.principal_name(s).to_string())
+                .collect(),
+            allowed: e.allowed,
+            detail: e.denied_by.map(|s| self.principal_name(s).to_string()),
+        }
     }
 
     /// Stack-check state (OBI-35): cache hit/miss/denial counters, the

@@ -29,9 +29,10 @@ pub use bcvm::registry::UpgradeWarning;
 pub use bcvm::vm::RtError;
 pub use host::{Host, NullHost};
 pub use object::ObjectId;
-pub use roles::RolesSnapshot;
+pub use roles::{DomainRole, Grant, RolesSnapshot};
 pub use world::{
-    AccountAuth, BootError, Limits, NullAccountAuth, NullRolesMutations, RolesMutations, World,
+    AccountAuth, AuditRow, BootError, Limits, NullAccountAuth, NullRolesMutations, RolesMutations,
+    World,
 };
 
 /// Parse and link every `.wf` file under `root` without running any code

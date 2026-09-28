@@ -97,6 +97,20 @@ impl GrantKind {
             GrantKind::Path => "path",
         }
     }
+
+    /// Parse the wire-format string a [`DbRequest::RolesGrant`]/
+    /// [`DbRequest::RolesRevokeGrant`] carries (the same strings
+    /// `RolesSnapshot`'s `kind` field and the SQL functions use).
+    /// `None` for anything else -- the DB worker answers `"invalid_kind"`
+    /// rather than ever sending an unrecognised string to Postgres.
+    fn parse(s: &str) -> Option<GrantKind> {
+        match s {
+            "efun" => Some(GrantKind::Efun),
+            "db_query" => Some(GrantKind::DbQuery),
+            "path" => Some(GrantKind::Path),
+            _ => None,
+        }
+    }
 }
 
 /// Plain-data rows loaded by [`Persist::load_roles_snapshot`]. Deliberately
@@ -200,6 +214,65 @@ pub enum DbRequest {
         username: String,
         password: Password,
     },
+    /// `roles_set_tier()` (OBI-36 D-S2.2/OBI-123): `actor` is the
+    /// driver-computed actor-rule euid (see module docs), never a Weft
+    /// string. Answered with [`DbEvent::RolesResult`] (`detail` is
+    /// `"ok"` on success, else the Postgres function's `RAISE EXCEPTION`
+    /// message, or `"invalid_tier"`/`"unavailable"`).
+    RolesSetTier {
+        correlation_id: u64,
+        actor: String,
+        target: String,
+        tier: i64,
+        reason: String,
+    },
+    /// `roles_set_member()`. `role` is `"member"`, `"lead"`, or `"none"`
+    /// to remove the membership (the SQL function's own convention, so no
+    /// conversion happens here).
+    RolesSetMember {
+        correlation_id: u64,
+        actor: String,
+        domain: String,
+        target: String,
+        role: String,
+        reason: String,
+    },
+    /// `roles_grant()`. `expires_at` is Unix seconds; `None` answers
+    /// `"expires_at_required"` without a round trip (the SQL column is
+    /// `NOT NULL`).
+    RolesGrant {
+        correlation_id: u64,
+        actor: String,
+        target: String,
+        kind: String,
+        what: String,
+        expires_at: Option<i64>,
+        reason: String,
+    },
+    /// `roles_revoke_grant()`.
+    RolesRevokeGrant {
+        correlation_id: u64,
+        actor: String,
+        target: String,
+        kind: String,
+        what: String,
+        reason: String,
+    },
+    /// `roles_propose_tier()`: `detail` is the new proposal's id (as a
+    /// decimal string) on success.
+    RolesProposeTier {
+        correlation_id: u64,
+        actor: String,
+        target: String,
+        tier: i64,
+        reason: String,
+    },
+    /// `roles_approve_proposal()`.
+    RolesApprove {
+        correlation_id: u64,
+        actor: String,
+        proposal_id: i64,
+    },
 }
 
 #[derive(Debug)]
@@ -213,6 +286,12 @@ pub enum DbEvent {
     },
     /// The answer to a [`DbRequest::CreateAccount`]/[`DbRequest::VerifyLogin`].
     AccountResult {
+        correlation_id: u64,
+        ok: bool,
+        detail: String,
+    },
+    /// The answer to any `DbRequest::Roles*` request (OBI-123).
+    RolesResult {
         correlation_id: u64,
         ok: bool,
         detail: String,
@@ -760,6 +839,143 @@ pub fn spawn_db_worker(
                         detail,
                     }
                 }
+                DbRequest::RolesSetTier {
+                    correlation_id,
+                    actor,
+                    target,
+                    tier,
+                    reason,
+                } => {
+                    let (ok, detail) = match i16::try_from(tier) {
+                        Err(_) => (false, "invalid_tier".to_string()),
+                        Ok(tier) => {
+                            match persist.roles_set_tier(&actor, &target, tier, &reason).await {
+                                Ok(()) => (true, "ok".to_string()),
+                                Err(e) => (false, roles_error_detail(&e)),
+                            }
+                        }
+                    };
+                    DbEvent::RolesResult {
+                        correlation_id,
+                        ok,
+                        detail,
+                    }
+                }
+                DbRequest::RolesSetMember {
+                    correlation_id,
+                    actor,
+                    domain,
+                    target,
+                    role,
+                    reason,
+                } => {
+                    let (ok, detail) = match persist
+                        .roles_set_member(&actor, &domain, &target, Some(&role), &reason)
+                        .await
+                    {
+                        Ok(()) => (true, "ok".to_string()),
+                        Err(e) => (false, roles_error_detail(&e)),
+                    };
+                    DbEvent::RolesResult {
+                        correlation_id,
+                        ok,
+                        detail,
+                    }
+                }
+                DbRequest::RolesGrant {
+                    correlation_id,
+                    actor,
+                    target,
+                    kind,
+                    what,
+                    expires_at,
+                    reason,
+                } => {
+                    let (ok, detail) = match (GrantKind::parse(&kind), expires_at) {
+                        (None, _) => (false, "invalid_kind".to_string()),
+                        (_, None) => (false, "expires_at_required".to_string()),
+                        (Some(kind), Some(secs)) => {
+                            match OffsetDateTime::from_unix_timestamp(secs) {
+                                Err(_) => (false, "invalid_expires_at".to_string()),
+                                Ok(expires_at) => match persist
+                                    .roles_grant(&actor, &target, kind, &what, expires_at, &reason)
+                                    .await
+                                {
+                                    Ok(()) => (true, "ok".to_string()),
+                                    Err(e) => (false, roles_error_detail(&e)),
+                                },
+                            }
+                        }
+                    };
+                    DbEvent::RolesResult {
+                        correlation_id,
+                        ok,
+                        detail,
+                    }
+                }
+                DbRequest::RolesRevokeGrant {
+                    correlation_id,
+                    actor,
+                    target,
+                    kind,
+                    what,
+                    reason,
+                } => {
+                    let (ok, detail) = match GrantKind::parse(&kind) {
+                        None => (false, "invalid_kind".to_string()),
+                        Some(kind) => match persist
+                            .roles_revoke_grant(&actor, &target, kind, &what, &reason)
+                            .await
+                        {
+                            Ok(()) => (true, "ok".to_string()),
+                            Err(e) => (false, roles_error_detail(&e)),
+                        },
+                    };
+                    DbEvent::RolesResult {
+                        correlation_id,
+                        ok,
+                        detail,
+                    }
+                }
+                DbRequest::RolesProposeTier {
+                    correlation_id,
+                    actor,
+                    target,
+                    tier,
+                    reason,
+                } => {
+                    let (ok, detail) = match i16::try_from(tier) {
+                        Err(_) => (false, "invalid_tier".to_string()),
+                        Ok(tier) => match persist
+                            .roles_propose_tier(&actor, &target, tier, &reason)
+                            .await
+                        {
+                            Ok(id) => (true, id.to_string()),
+                            Err(e) => (false, roles_error_detail(&e)),
+                        },
+                    };
+                    DbEvent::RolesResult {
+                        correlation_id,
+                        ok,
+                        detail,
+                    }
+                }
+                DbRequest::RolesApprove {
+                    correlation_id,
+                    actor,
+                    proposal_id,
+                } => {
+                    let (ok, detail) =
+                        match persist.roles_approve_proposal(&actor, proposal_id).await {
+                            Ok(()) => (true, "ok".to_string()),
+                            Err(e) => (false, roles_error_detail(&e)),
+                        };
+                    DbEvent::RolesResult {
+                        correlation_id,
+                        ok,
+                        detail,
+                    }
+                }
             };
             if event_tx.send(event).await.is_err() {
                 warn!("db worker exiting: world event receiver dropped");
@@ -769,6 +985,18 @@ pub fn spawn_db_worker(
     });
 
     (request_tx, event_rx)
+}
+
+/// A denied/failed `roles_*` mutation's detail string: the Postgres
+/// function's own `RAISE EXCEPTION` message where there is one (never a
+/// secret -- these are all fixed, developer-authored strings, e.g.
+/// `"actor does not lead domain shire"`), else `"unavailable"` for any
+/// other database failure (connection loss, ...).
+fn roles_error_detail(err: &PersistError) -> String {
+    match err {
+        PersistError::Db(sqlx::Error::Database(db)) => db.message().to_string(),
+        _ => "unavailable".to_string(),
+    }
 }
 
 /// The in-memory dev backend for `account_create`/`account_login` (spec,
@@ -854,6 +1082,22 @@ pub fn spawn_dev_account_worker(
                                 },
                             }
                         }
+                    }
+                }
+                DbRequest::RolesSetTier { correlation_id, .. }
+                | DbRequest::RolesSetMember { correlation_id, .. }
+                | DbRequest::RolesGrant { correlation_id, .. }
+                | DbRequest::RolesRevokeGrant { correlation_id, .. }
+                | DbRequest::RolesProposeTier { correlation_id, .. }
+                | DbRequest::RolesApprove { correlation_id, .. } => {
+                    // No Postgres in dev mode: there is no roles schema to
+                    // mutate at all (`LOOM_ROLES_SEED` is read-only), so
+                    // every roles mutation is `"unavailable"` here, same as
+                    // any other DB outage -- never silently pending.
+                    DbEvent::RolesResult {
+                        correlation_id,
+                        ok: false,
+                        detail: "unavailable".to_string(),
                     }
                 }
             };
