@@ -15,6 +15,15 @@
 //! - `/metrics` (OBI-28/OBI-115): renders `HttpState`'s
 //!   [`loom_obs::PrometheusMetrics`] as Prometheus text exposition
 //!   format.
+//! - fallback (OBI-158): when `HttpState`'s `web_root` is set, serves the
+//!   built `web-client/` (`index.html` and its `dist/` bundle) as the
+//!   router fallback -- explicit routes above always win, so this can
+//!   never shadow `/ws`, `/healthz`, `/readyz`, or `/metrics`. With no
+//!   `web_root` (the default -- see `LOOM_WEB_ROOT` in `loom-cli`), the
+//!   fallback is a plain `404`, matching pre-OBI-158 behaviour for tests
+//!   and local runs that don't set it.
+
+use std::path::PathBuf;
 
 use axum::Router;
 use axum::extract::State;
@@ -24,6 +33,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use loom_obs::{PrometheusMetrics, Readiness};
 use tokio::sync::mpsc;
+use tower_http::services::ServeDir;
 use tracing::debug;
 
 /// Shared state for `loom-http`'s routes.
@@ -32,6 +42,7 @@ pub struct HttpState {
     ws_accept_tx: mpsc::Sender<WebSocket>,
     readiness: Readiness,
     metrics: PrometheusMetrics,
+    web_root: Option<PathBuf>,
 }
 
 impl HttpState {
@@ -44,17 +55,30 @@ impl HttpState {
             ws_accept_tx,
             readiness,
             metrics,
+            web_root: None,
         }
+    }
+
+    /// Serve the built web client (index.html + dist/) from `root` as the
+    /// router fallback (OBI-158). Unset by default -- see `LOOM_WEB_ROOT`.
+    pub fn with_web_root(mut self, root: PathBuf) -> Self {
+        self.web_root = Some(root);
+        self
     }
 }
 
 pub fn app(state: HttpState) -> Router {
-    Router::new()
+    let web_root = state.web_root.clone();
+    let router = Router::new()
         .route("/ws", get(ws_handler))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
-        .with_state(state)
+        .with_state(state);
+    match web_root {
+        Some(root) => router.fallback_service(ServeDir::new(root)),
+        None => router,
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<HttpState>) -> impl IntoResponse {
@@ -400,5 +424,61 @@ mod tests {
         // without error.
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let _ = String::from_utf8(body.to_vec()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn root_is_404_without_a_web_root() {
+        let app = spawn_health_test_server().await;
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        // No `LOOM_WEB_ROOT` set (`HttpState::new`'s default): unchanged
+        // pre-OBI-158 behaviour for tests and local runs.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn root_serves_index_html_with_a_web_root_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>loom</html>").unwrap();
+        std::fs::create_dir(dir.path().join("dist")).unwrap();
+        std::fs::write(dir.path().join("dist").join("app.js"), "export {};").unwrap();
+
+        let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
+        let state = HttpState::new(
+            ws_accept_tx,
+            Readiness::new(),
+            PrometheusMetrics::new_unregistered(),
+        )
+        .with_web_root(dir.path().to_path_buf());
+        let app = app(state);
+
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, "<html>loom</html>".as_bytes());
+
+        // A path inside the served tree (the built JS bundle) also comes
+        // through the fallback, not just `/` itself.
+        let request = axum::http::Request::builder()
+            .uri("/dist/app.js")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Explicit routes still win over the fallback.
+        let request = axum::http::Request::builder()
+            .uri("/healthz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

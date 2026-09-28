@@ -386,7 +386,10 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         .expect("metrics recorder installed exactly once per process");
 
     let (ws_accept_tx, ws_accept_rx) = mpsc::channel(WS_ACCEPT_QUEUE_DEPTH);
-    let http_state = loom_http::HttpState::new(ws_accept_tx, readiness, metrics);
+    let mut http_state = loom_http::HttpState::new(ws_accept_tx, readiness, metrics);
+    if let Some(web_root) = web_root_from_env() {
+        http_state = http_state.with_web_root(web_root);
+    }
     let mut http_server = tokio::spawn(async move {
         axum::serve(http_listener, loom_http::app(http_state))
             .await
@@ -462,6 +465,14 @@ const WS_ACCEPT_QUEUE_DEPTH: usize = 64;
 
 fn http_addr_from_env() -> String {
     std::env::var("LOOM_HTTP_ADDR").unwrap_or_else(|_| DEFAULT_HTTP_ADDR.to_string())
+}
+
+/// The built web client's directory (`index.html` + `dist/`), served by
+/// `loom-http`'s router fallback (OBI-158). Unset (the default) keeps
+/// `/` a plain `404`, matching pre-OBI-158 behaviour for tests and local
+/// runs that don't set it.
+fn web_root_from_env() -> Option<PathBuf> {
+    std::env::var_os("LOOM_WEB_ROOT").map(PathBuf::from)
 }
 
 /// The `serve()` world-tick timer (spec r5 N2, OBI-82): every `interval`
