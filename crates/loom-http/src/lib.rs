@@ -3,39 +3,57 @@
 
 //! `loom`'s axum HTTP server (§8/§9). Owner: Legolas.
 //!
-//! Phase 1 R1b (OBI-39) scope: the `/ws` route, giving a browser session
-//! the same seam as telnet (`loom_net::NetEvent`/`NetCommand`). Health and
-//! metrics endpoints (`loom-http`'s other planned routes, OBI-28) are not
-//! part of this module yet -- that work never reached `main` and is
-//! tracked separately; this crate is deliberately minimal until it lands.
+//! Routes:
+//! - `/ws` (OBI-39): a browser session gets the same seam as telnet
+//!   (`loom_net::NetEvent`/`NetCommand`).
+//! - `/healthz` (OBI-28/OBI-115): liveness -- "is the process up at
+//!   all". Always `200 OK` once the axum server itself is serving
+//!   requests; never consults readiness or any backend.
+//! - `/readyz` (OBI-28/OBI-115): readiness -- `200 OK` once
+//!   `HttpState`'s [`loom_obs::Readiness`] has been flipped by the world
+//!   thread (mudlib compiled, DB backend reachable), `503` before that.
+//! - `/metrics` (OBI-28/OBI-115): renders `HttpState`'s
+//!   [`loom_obs::PrometheusMetrics`] as Prometheus text exposition
+//!   format.
 
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use loom_obs::{PrometheusMetrics, Readiness};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-/// Shared state for the `/ws` route: every accepted WebSocket is handed
-/// off down this channel to whoever runs `loom_net::run_server_with_ws`
-/// (`loom-cli`'s `serve()`), which is what actually speaks the
-/// `NetEvent`/`NetCommand` seam and applies the shared backpressure/rate
-/// limit/line cap.
+/// Shared state for `loom-http`'s routes.
 #[derive(Clone)]
 pub struct HttpState {
     ws_accept_tx: mpsc::Sender<WebSocket>,
+    readiness: Readiness,
+    metrics: PrometheusMetrics,
 }
 
 impl HttpState {
-    pub fn new(ws_accept_tx: mpsc::Sender<WebSocket>) -> Self {
-        Self { ws_accept_tx }
+    pub fn new(
+        ws_accept_tx: mpsc::Sender<WebSocket>,
+        readiness: Readiness,
+        metrics: PrometheusMetrics,
+    ) -> Self {
+        Self {
+            ws_accept_tx,
+            readiness,
+            metrics,
+        }
     }
 }
 
 pub fn app(state: HttpState) -> Router {
     Router::new()
         .route("/ws", get(ws_handler))
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .with_state(state)
 }
 
@@ -47,6 +65,22 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<HttpState>) -> imp
     })
 }
 
+async fn healthz() -> impl IntoResponse {
+    StatusCode::OK
+}
+
+async fn readyz(State(state): State<HttpState>) -> impl IntoResponse {
+    if state.readiness.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
+    state.metrics.render()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,10 +88,12 @@ mod tests {
     use std::net::SocketAddr;
 
     use futures_util::{SinkExt, StreamExt};
+    use http_body_util::BodyExt;
     use loom_net::{NetCommand, NetConfig, NetEvent};
     use serde_json::json;
     use tokio::net::TcpListener as TokioTcpListener;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
+    use tower::ServiceExt;
 
     async fn spawn_test_server() -> (
         SocketAddr,
@@ -69,7 +105,11 @@ mod tests {
         let http_addr = http_listener.local_addr().unwrap();
 
         let (ws_accept_tx, ws_accept_rx) = mpsc::channel(16);
-        let state = HttpState::new(ws_accept_tx);
+        let state = HttpState::new(
+            ws_accept_tx,
+            Readiness::new(),
+            PrometheusMetrics::new_unregistered(),
+        );
         let app = app(state);
         tokio::spawn(async move {
             axum::serve(http_listener, app).await.unwrap();
@@ -193,7 +233,11 @@ mod tests {
         let http_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
         let http_addr = http_listener.local_addr().unwrap();
         let (ws_accept_tx, ws_accept_rx) = mpsc::channel(16);
-        let state = HttpState::new(ws_accept_tx);
+        let state = HttpState::new(
+            ws_accept_tx,
+            Readiness::new(),
+            PrometheusMetrics::new_unregistered(),
+        );
         let app = app(state);
         tokio::spawn(async move {
             axum::serve(http_listener, app).await.unwrap();
@@ -291,5 +335,70 @@ mod tests {
         // torn down) -- either way confirms it was actually dropped, not
         // just stalled.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), slow.next()).await;
+    }
+
+    async fn spawn_health_test_server() -> Router {
+        let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
+        let readiness = Readiness::new();
+        let state = HttpState::new(
+            ws_accept_tx,
+            readiness,
+            PrometheusMetrics::new_unregistered(),
+        );
+        app(state)
+    }
+
+    #[tokio::test]
+    async fn healthz_is_always_ok() {
+        let app = spawn_health_test_server().await;
+        let request = axum::http::Request::builder()
+            .uri("/healthz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_reflects_readiness_gate() {
+        let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
+        let readiness = Readiness::new();
+        let state = HttpState::new(
+            ws_accept_tx,
+            readiness.clone(),
+            PrometheusMetrics::new_unregistered(),
+        );
+        let app = app(state);
+
+        let request = axum::http::Request::builder()
+            .uri("/readyz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        readiness.set_ready();
+        let request = axum::http::Request::builder()
+            .uri("/readyz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_renders_prometheus_text() {
+        let app = spawn_health_test_server().await;
+        let request = axum::http::Request::builder()
+            .uri("/metrics")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // An empty recorder still renders valid (if empty) exposition
+        // text -- just check the route wires through to `render()`
+        // without error.
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let _ = String::from_utf8(body.to_vec()).unwrap();
     }
 }

@@ -17,11 +17,11 @@ axum = { version = "0.8.4", features = ["ws"] }
 loom-compiler = { path = "../loom-compiler" }
 loom-http = { path = "../loom-http" }
 loom-net = { path = "../loom-net" }
+loom-obs = { path = "../loom-obs" }
 loom-persist = { path = "../loom-persist" }
 loom-vm = { path = "../loom-vm" }
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
