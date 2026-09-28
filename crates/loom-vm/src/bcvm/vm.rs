@@ -36,7 +36,7 @@ use loom_compiler::bytecode::{
 
 use std::rc::Rc;
 
-use crate::bcvm::heap::{FnBody, FunctionValue, MAP_ENTRY_BYTES, MapData, Value};
+use crate::bcvm::heap::{self, FnBody, FunctionValue, MAP_ENTRY_BYTES, MapData, Value};
 use crate::object::ObjectId;
 use crate::security::GuardSet;
 
@@ -223,12 +223,22 @@ pub trait Host {
         Ok(v)
     }
     /// Commit the (possibly mutated) value [`Host::take_global`] handed
-    /// out. Subject to the same per-object memory quota as
+    /// out. `old_bytes` is `shallow_bytes` of the value *as `take_global`
+    /// handed it out*, captured by the caller before any mutation — a real
+    /// host needs it to correct the per-object memory total for exactly
+    /// this write (CTO review of PR #47, OBI-108: `take_global` must not
+    /// adjust that total itself, only `commit_global`/`restore_global`
+    /// may, or `reserve_global_growth`'s check in between runs against a
+    /// total that already excludes the very container being grown — a
+    /// quota bypass). Subject to the same per-object memory quota as
     /// [`Host::store_global`] (a map insert can grow the container) —
     /// though a real host checks that *before* mutating
     /// ([`Host::reserve_global_growth`]), so this itself never fails for
-    /// that reason once the write has actually reached this call.
-    fn commit_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
+    /// that reason once the write has actually reached this call. The
+    /// default here ignores `old_bytes`: `store_global` already recomputes
+    /// the total from scratch against the `Null` `take_global`'s own
+    /// default left behind, so there is nothing left to correct.
+    fn commit_global(&mut self, owner: &str, name: &str, _old_bytes: u64, v: Value) -> R<()> {
         self.store_global(owner, name, v)
     }
     /// Put the *untouched* value [`Host::take_global`] handed out straight
@@ -239,7 +249,9 @@ pub trait Host {
     /// fails). Never fails on the size the value already was before it was
     /// taken (it fit then, it fits now) — `self` having been destructed
     /// out from under the call is the only way this can still error.
-    fn restore_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
+    /// `old_bytes` — see `commit_global` — is unused by the default for
+    /// the same reason.
+    fn restore_global(&mut self, owner: &str, name: &str, _old_bytes: u64, v: Value) -> R<()> {
         self.store_global(owner, name, v)
     }
     /// Would committing `added_bytes` more onto the global `take_global`
@@ -994,6 +1006,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 let key = reg!(*index);
                 let val = reg!(*src);
                 let mut container = self.host.take_global(&owner_s, &name_s)?;
+                // CTO review of PR #47 (OBI-108): captured *before* any
+                // mutation below, so `commit_global`/`restore_global` can
+                // correct the per-object memory total for exactly this
+                // write. `take_global` must not touch that total itself —
+                // `reserve_global_growth` right below needs it to still
+                // include this container's own bytes (the pre-take total),
+                // or a map insert bypasses the quota entirely.
+                let old_bytes = heap::shallow_bytes(&container);
                 let shared = container.is_shared();
                 // A map insert of a genuinely new key is the one way this
                 // write can grow the container (an array's length never
@@ -1011,12 +1031,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
                         self.host
                             .reserve_global_growth(&owner_s, &name_s, MAP_ENTRY_BYTES)
                 {
-                    self.host.restore_global(&owner_s, &name_s, container)?;
+                    self.host
+                        .restore_global(&owner_s, &name_s, old_bytes, container)?;
                     return Err(e);
                 }
                 match Self::index_set(*kind, &mut container, key, val) {
                     Ok(()) => {
-                        self.host.commit_global(&owner_s, &name_s, container)?;
+                        self.host
+                            .commit_global(&owner_s, &name_s, old_bytes, container)?;
                         if shared {
                             let path = self.cur().path.clone();
                             self.host.record_cow_copy(&path);
@@ -1031,7 +1053,8 @@ impl<'a, H: Host> Interpreter<'a, H> {
                         // change (spec r5 OBI-108 acceptance: an out-of-
                         // range index on a global array leaves the global
                         // intact).
-                        self.host.restore_global(&owner_s, &name_s, container)?;
+                        self.host
+                            .restore_global(&owner_s, &name_s, old_bytes, container)?;
                         Err(e)
                     }
                 }

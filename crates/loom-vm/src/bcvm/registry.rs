@@ -3428,22 +3428,26 @@ impl Host for RegistryHost<'_> {
     /// (see `load_global` above) is exactly the extra `Rc` owner that made
     /// `IndexSet` see refcount 2 and clone the whole container on every
     /// single element write, an O(n²) fill of a global array/map by
-    /// index. `mem_bytes` is adjusted to match (this var's bytes are gone
-    /// until the matching `commit_global`/`restore_global` puts something
-    /// back), and the pre-take value is journaled once, right here, if an
-    /// atomic scope is open — the one place that still holds it whole.
+    /// index. `mem_bytes` is deliberately left untouched (CTO review of
+    /// PR #47, OBI-108: a prior version subtracted this container's bytes
+    /// here, which made the very next `reserve_global_growth` check run
+    /// against a total that no longer counted the container being grown —
+    /// a map could then grow past quota for free). It stays as the
+    /// pre-take total until the matching `commit_global`/`restore_global`
+    /// corrects it in one step, using the `old_bytes` its caller captured
+    /// right after this call returns. The pre-take value is still
+    /// journaled once, right here, if an atomic scope is open — the one
+    /// place that still holds it whole.
     fn take_global(&mut self, owner: &str, name: &str) -> R<Value> {
         let self_id = self.self_object();
         let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
         let Some(o) = self.registry.get_mut(self_id) else {
             return Err(RtError::new("self was destructed"));
         };
-        let old_bytes = o.vars.get(&key).map(heap::shallow_bytes).unwrap_or(0);
         let old = o
             .vars
             .insert(key.clone(), Value::Null)
             .unwrap_or(Value::Null);
-        o.mem_bytes = o.mem_bytes.saturating_sub(old_bytes);
         self.registry
             .journal_var_write(self_id, key, Some(old.clone()));
         Ok(old)
@@ -3453,14 +3457,21 @@ impl Host for RegistryHost<'_> {
     /// `shallow_bytes` never changes (`Op::IndexSet` cannot change its
     /// length) and a map growth was already reserved, before the mutation,
     /// by `reserve_global_growth` — this is just the actual write-back.
-    fn commit_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
+    /// `old_bytes` is `shallow_bytes` of the value as `take_global` handed
+    /// it out; since `take_global` left `mem_bytes` counting it, this is
+    /// the one place that subtracts it back out before adding the
+    /// (possibly larger, for a map growth) new size — a single atomic
+    /// correction rather than the subtract-in-`take`/add-in-`commit` split
+    /// that let `reserve_global_growth` see a stale total (CTO review of
+    /// PR #47).
+    fn commit_global(&mut self, owner: &str, name: &str, old_bytes: u64, v: Value) -> R<()> {
         let self_id = self.self_object();
         let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
         let new_bytes = heap::shallow_bytes(&v);
         let Some(o) = self.registry.get_mut(self_id) else {
             return Err(RtError::new("self was destructed"));
         };
-        o.mem_bytes += new_bytes;
+        o.mem_bytes = o.mem_bytes.saturating_sub(old_bytes) + new_bytes;
         o.vars.insert(key, v);
         Ok(())
     }
@@ -3468,20 +3479,30 @@ impl Host for RegistryHost<'_> {
     /// See `bcvm::vm::Host::restore_global`. No quota check (it fit
     /// before this take, it fits now) and no new journal entry
     /// (`take_global` already recorded the one undo point for this
-    /// write).
-    fn restore_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
+    /// write). `v` is exactly the value `take_global` handed out, so
+    /// `shallow_bytes(&v) == old_bytes` and this is always a net-zero
+    /// correction to `mem_bytes` — same formula as `commit_global`, for
+    /// symmetry and so a future caller that (mistakenly) restores a
+    /// different value still gets a consistent total rather than a
+    /// silently stale one.
+    fn restore_global(&mut self, owner: &str, name: &str, old_bytes: u64, v: Value) -> R<()> {
         let self_id = self.self_object();
         let key: (Rc<str>, Rc<str>) = (Rc::from(owner), Rc::from(name));
         let new_bytes = heap::shallow_bytes(&v);
         let Some(o) = self.registry.get_mut(self_id) else {
             return Err(RtError::new("self was destructed"));
         };
-        o.mem_bytes += new_bytes;
+        o.mem_bytes = o.mem_bytes.saturating_sub(old_bytes) + new_bytes;
         o.vars.insert(key, v);
         Ok(())
     }
 
-    /// See `bcvm::vm::Host::reserve_global_growth`.
+    /// See `bcvm::vm::Host::reserve_global_growth`. Checked against
+    /// `o.mem_bytes` while it is still the *pre-take* total (CTO review of
+    /// PR #47, OBI-108: `take_global` no longer subtracts this container's
+    /// own bytes before this check runs, which is what let a map grow past
+    /// quota for free — the check was comparing against a total that had
+    /// already forgotten the very container being grown).
     fn reserve_global_growth(&mut self, _owner: &str, name: &str, added_bytes: u64) -> R<()> {
         let self_id = self.self_object();
         let quota = self.limits.mem_quota_bytes;
@@ -4651,6 +4672,52 @@ pub fn grow(n: int) {
             err.report().contains("in grow()"),
             "a quota error must carry a Weft stack trace like any other RtError:\n{}",
             err.report()
+        );
+    }
+
+    /// CTO review of PR #47 (OBI-108): `Op::IndexSetGlobal`'s `take_global`
+    /// must not remove the container's own bytes from `mem_bytes` before
+    /// `reserve_global_growth` checks it — that let a global map grow
+    /// without bound as long as the object's *other* vars plus one entry
+    /// still fit under the quota, since the check no longer saw the map
+    /// being grown at all. A regression of this bypasses the same
+    /// §5.2.1 quota guarantee `store_global_rejects_a_write_that_exceeds_the_memory_quota`
+    /// checks, through the indexed-write path instead of a whole-var
+    /// assignment.
+    #[test]
+    fn cto_index_set_global_map_growth_respects_quota() {
+        const WF: &str = r#"
+var m: {int: int} = {:}
+
+pub fn grow(n: int) {
+    m = {:}
+    var i = 0
+    while i < n {
+        m[i] = i
+        i += 1
+    }
+}
+"#;
+        let module = compile("/obj/thing", &[("/obj/thing", WF)]);
+        let mut registry = Registry::default();
+        let prog = Rc::new(CompiledProgram::new(module, 1, None, Vec::new()));
+        registry.register_program(prog.clone());
+        let obj = make_object(&mut registry, prog);
+        let mut host = RegistryHost::new(&mut registry, obj);
+        host.limits.mem_quota_bytes = 256;
+        let err = host
+            .call_on(obj, "grow", vec![Value::Int(1000)])
+            .unwrap_err();
+        assert!(
+            err.report().contains("memory quota exceeded"),
+            "an IndexSetGlobal map growth must be quota-checked against the \
+             pre-take total, same as a whole-var store_global write:\n{}",
+            err.report()
+        );
+        let mem = host.registry.get(obj).unwrap().mem_bytes;
+        assert!(
+            mem <= 256,
+            "a rejected growth must never actually apply: mem_bytes={mem}, quota=256"
         );
     }
 
