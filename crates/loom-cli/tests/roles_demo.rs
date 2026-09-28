@@ -88,7 +88,7 @@ async fn seed_staff(owner: &PgPool, uid: &str, account_id: Uuid, tier: i16) {
 }
 
 async fn seed_domain(owner: &PgPool, name: &str) {
-    sqlx::query("INSERT INTO domains (name, state) VALUES ($1, 'active') ON CONFLICT DO NOTHING")
+    sqlx::query("INSERT INTO domains (name, state) VALUES ($1, 'live') ON CONFLICT DO NOTHING")
         .bind(name)
         .execute(owner)
         .await
@@ -155,7 +155,18 @@ async fn poll_audit_log_row(
     }
 }
 
+/// Seeds `staff` rows for both `uid` and `granted_by` (the `grants` table's
+/// two `REFERENCES staff(uid)` foreign keys) before inserting the grant
+/// itself. Tier 1 (the lowest `staff.tier` allows -- the `CHECK (tier
+/// BETWEEN 1 AND 5)` constraint; a player with no tier at all has no
+/// `staff` row, so 0 is not a valid tier here) for both; nothing here
+/// reads either uid's tier.
 async fn insert_expiring_grant(owner: &PgPool, uid: &str, granted_by: &str, seconds_from_now: i64) {
+    let uid_account = seed_account(owner, uid).await;
+    seed_staff(owner, uid, uid_account, 1).await;
+    let granter_account = seed_account(owner, granted_by).await;
+    seed_staff(owner, granted_by, granter_account, 1).await;
+
     sqlx::query(
         "INSERT INTO grants (uid, kind, target, granted_by, expires_at)
          VALUES ($1, 'efun', 'write_file', $2, NOW() + make_interval(secs => $3))",
@@ -293,6 +304,7 @@ fn a_roles_changed_notify_swaps_the_snapshot_and_flushes_the_security_cache() {
     // which is also < 2 -- so it would still deny, but for the wrong
     // reason; settle first so the test is about the notify, not a race
     // with the very first load).
+    send_line(&mut conn, "writefile /roles_demo_notify.txt hi");
     let out = poll_until_contains(&mut conn, "denied", Duration::from_secs(5));
     assert!(out.contains("denied"), "T1 must be denied: {out}");
 
@@ -307,8 +319,22 @@ fn a_roles_changed_notify_swaps_the_snapshot_and_flushes_the_security_cache() {
             .expect("promote bob directly");
     });
 
-    let out = poll_until_contains(&mut conn, "true", Duration::from_secs(10));
-    assert_eq!(out.trim_end(), "true", "{out:?}");
+    // Re-send the same command: the client must re-issue the request to
+    // see a fresh decision; the server does not push updates on its own.
+    // Retry it periodically until the notify-driven reload lands and it
+    // starts succeeding.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        send_line(&mut conn, "writefile /roles_demo_notify.txt hi");
+        if let Some(reply) = read_one_reply(&mut conn, Duration::from_secs(2))
+            && reply.trim_end() == "true"
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("writefile never started succeeding after the promotion");
+        }
+    }
 
     server.assert_alive();
 }
@@ -329,7 +355,6 @@ fn an_expired_grant_disappears_from_the_snapshot_without_a_restart() {
     let uid = unique_uid("carol");
     let granter = unique_uid("granter");
     rt.block_on(async {
-        seed_account(&fx.owner, &uid).await;
         insert_expiring_grant(&fx.owner, &uid, &granter, 3).await;
     });
 
@@ -413,6 +438,30 @@ fn audit_log_has_a_row_for_a_denied_p2_plus_check() {
     });
 
     server.assert_alive();
+}
+
+/// Reads exactly one line (one command's reply), waiting up to `timeout`.
+/// `None` if nothing arrived in time (the caller should retry the whole
+/// request -- some other in-flight reply may still show up later and
+/// would otherwise be misread as this one's).
+fn read_one_reply(reader: &mut BufReader<TcpStream>, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    let mut line = String::new();
+    loop {
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!("connection closed while waiting for a reply"),
+            Ok(_) => return Some(line.replace("\r\n", "\n")),
+            Err(err)
+                if err.kind() == std::io::ErrorKind::TimedOut
+                    || err.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                if Instant::now() > deadline {
+                    return None;
+                }
+            }
+            Err(err) => panic!("socket read failed while waiting for a reply: {err}"),
+        }
+    }
 }
 
 fn send_line(reader: &mut BufReader<TcpStream>, line: &str) {
