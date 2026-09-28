@@ -15,6 +15,7 @@ pub mod efuns;
 pub mod fileio;
 pub mod host;
 pub mod object;
+pub mod quota;
 pub mod rng;
 pub mod roles;
 pub mod scheduler;

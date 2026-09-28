@@ -1,0 +1,13 @@
+// A staff-owned interactive (owner `staffer`, given a nonzero tier by
+// this fixture's roles seed) for the confinement tests (spec §7 rule 2:
+// "... but can move into a staff player's [inventory]").
+pub fn logon() {
+    send(self, "ready\n")
+}
+
+pub fn move_into_obj(dest: object) {
+    move_to(dest)
+}
+
+pub fn net_dead() {
+}

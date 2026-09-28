@@ -1,0 +1,4 @@
+// A `Live` room (the master's `program_flags` default -- this path does
+// not contain "confined"): rule 1's "cannot move into a Live room" target.
+pub fn create() {
+}

@@ -169,6 +169,9 @@ pub enum Operation<'a> {
     Write { path: &'a str, op: &'static str },
     /// → `valid_compile(path, ob)` (the OBI-35 AC's `valid_exec`).
     Compile { path: &'a str },
+    /// → `valid_upgrade(path, ob)` (OBI-121/S2c): checked in `upgrade_all`
+    /// after `valid_efun`, exactly like `compile_object`'s `valid_compile`.
+    Upgrade { path: &'a str },
     /// → `valid_bind(ob, target)` (`bind_connection`, the spec's `exec`).
     Bind { target: ObjectId },
     /// → `valid_seteuid(ob, euid)`.
@@ -182,6 +185,7 @@ impl Operation<'_> {
             Operation::Read { .. } => "valid_read",
             Operation::Write { .. } => "valid_write",
             Operation::Compile { .. } => "valid_compile",
+            Operation::Upgrade { .. } => "valid_upgrade",
             Operation::Bind { .. } => "valid_bind",
             Operation::SetEuid { .. } => "valid_seteuid",
         }
@@ -194,6 +198,7 @@ impl Operation<'_> {
             Operation::Efun { name, .. } => Some(("", name)),
             Operation::Read { path, op } | Operation::Write { path, op } => Some((op, path)),
             Operation::Compile { path } => Some(("", path)),
+            Operation::Upgrade { path } => Some(("", path)),
             Operation::SetEuid { euid } => Some(("", euid)),
             Operation::Bind { .. } => None,
         }
@@ -205,7 +210,8 @@ impl Operation<'_> {
             Operation::Efun { .. } | Operation::Bind { .. } => "",
             Operation::Read { path, .. }
             | Operation::Write { path, .. }
-            | Operation::Compile { path } => path,
+            | Operation::Compile { path }
+            | Operation::Upgrade { path } => path,
             Operation::SetEuid { euid } => euid,
         }
     }
@@ -217,6 +223,7 @@ impl Operation<'_> {
             Operation::Read { path, op } => format!("{op} {path}"),
             Operation::Write { path, op } => format!("{op} {path}"),
             Operation::Compile { path } => format!("compile {path}"),
+            Operation::Upgrade { path } => format!("upgrade {path}"),
             Operation::Bind { .. } => "bind_connection".to_string(),
             Operation::SetEuid { euid } => format!("seteuid {euid}"),
         }

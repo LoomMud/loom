@@ -1,0 +1,57 @@
+// Test-only master (OBI-121 S2c): permissive everywhere (the point of
+// this fixture is quota/confinement enforcement, not privilege gating,
+// which is already covered by security.rs/roles.rs) except
+// `program_flags`, which is keyed on path so `move_to`'s confinement
+// tests can name a `Confined` program.
+//
+// `connect()` hands out three different owners by connection order, so
+// the confinement tests (which need a genuinely tier-0-owned player and
+// a genuinely staff-owned one, not just a `seteuid`d one -- `owner` is
+// immutable) can just `World::connect` more than once in the same test:
+// connection 1 gets the T1 apprentice (every other test in this fixture
+// only ever connects once), connection 2 a tier-0 guest, connection 3 a
+// staff member.
+persistent var connect_count: int = 0
+
+pub fn connect() -> object {
+    connect_count += 1
+    if connect_count == 2 {
+        return clone_object("/builders/guest/player")
+    }
+    if connect_count == 3 {
+        return clone_object("/builders/staffer/player")
+    }
+    return clone_object("/builders/appr/player")
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_seteuid(ob: object, e: string) -> bool {
+    return true
+}
+
+// `CONFINED` (1) for the two paths this fixture's confinement tests use, `LIVE` (2) otherwise.
+fn program_flags(path: string) -> int {
+    if path == "/std/confined_room" or path == "/std/confined_thing" {
+        return 1
+    }
+    return 2
+}

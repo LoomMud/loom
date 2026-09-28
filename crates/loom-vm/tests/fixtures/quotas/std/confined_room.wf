@@ -1,0 +1,4 @@
+// A `Confined` room (the master's `program_flags` returns 1 for this
+// exact path): rule 3's "a tier-0 player cannot enter a Confined room".
+pub fn create() {
+}

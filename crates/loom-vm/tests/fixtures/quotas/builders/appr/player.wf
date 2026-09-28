@@ -1,0 +1,71 @@
+// A T1-owned interactive (owner `appr`, via the `/builders/appr/**`
+// convention -- OBI-121 S2c AC: "a player-input execution through a T1
+// object still gets the 1M-tick default"). Also this fixture's
+// `max_ticks_exec`/`tick_share_per_min` row test: `heartbeat()` runs the
+// same loop `process_input`'s `grow` does, sized by `heartbeat_grow_n`,
+// so a tier row can make the *heartbeat* tick-exhaust while the identical
+// amount of work through player input still succeeds.
+persistent var grown: int = 0
+persistent var heartbeat_grow_n: int = 0
+persistent var heartbeat_runs: int = 0
+persistent var heartbeat_grown: int = 0
+
+pub fn logon() {
+    send(self, "ready\n")
+}
+
+fn do_grow(n: int) -> int {
+    var a: [int] = []
+    var i = 0
+    while i < n {
+        a = a + [i]
+        i += 1
+    }
+    return len(a)
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "grow" and len(words) == 2 {
+        let n = to_int(words[1]) ?? 0
+        grown = do_grow(n)
+        send(self, $"grown {grown}\n")
+    } else if verb == "sethbn" and len(words) == 2 {
+        heartbeat_grow_n = to_int(words[1]) ?? 0
+        send(self, "ok\n")
+    } else if verb == "heartbeaton" {
+        set_heartbeat(true)
+        send(self, "on\n")
+    } else if verb == "heartbeatoff" {
+        set_heartbeat(false)
+        send(self, "off\n")
+    } else if verb == "callout" {
+        call_out("do_work", 1)
+        send(self, "scheduled\n")
+    } else if verb == "write" and len(words) == 3 {
+        try {
+            send(self, $"{write_file(words[1], words[2])}\n")
+        } catch e {
+            send(self, $"denied: {e}\n")
+        }
+    } else {
+        send(self, "What?\n")
+    }
+}
+
+pub fn move_into_obj(dest: object) {
+    move_to(dest)
+}
+
+fn do_work() {
+    heartbeat_grown = do_grow(heartbeat_grow_n)
+}
+
+pub fn heartbeat() {
+    heartbeat_runs += 1
+    heartbeat_grown = do_grow(heartbeat_grow_n)
+}
+
+pub fn net_dead() {
+}
