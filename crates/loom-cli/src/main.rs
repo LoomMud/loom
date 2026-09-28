@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use loom_net::{NetCommand, NetConfig, NetEvent};
+use loom_net::{GmcpMessage, NetCommand, NetConfig, NetEvent};
 use loom_persist::{DbEvent, DbRequest, Password};
 use loom_vm::{AccountAuth, Host, World};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const COMMAND_CHANNEL_CAPACITY: usize = 1024;
@@ -414,7 +414,21 @@ fn spawn_world_thread(
                         info!(conn, %name, "TTYPE terminal type");
                     }
                     NetEvent::Gmcp(conn, msg) => {
-                        info!(conn, ?msg, "GMCP message");
+                        // `debug!`, module name only: GMCP payloads are
+                        // client-controlled JSON that routinely carries
+                        // credentials (e.g. `Char.Login {"name":...,
+                        // "password":...}`), so logging the payload itself
+                        // at `info` would put passwords in logs. This is
+                        // one line per client frame either way, which is
+                        // debug-log territory, not info-log territory.
+                        let module = match &msg {
+                            GmcpMessage::CoreHello { .. } => "Core.Hello",
+                            GmcpMessage::CoreSupportsSet(_) => "Core.Supports.Set",
+                            GmcpMessage::CoreSupportsAdd(_) => "Core.Supports.Add",
+                            GmcpMessage::CoreSupportsRemove(_) => "Core.Supports.Remove",
+                            GmcpMessage::Package { module, .. } => module.as_str(),
+                        };
+                        debug!(conn, module, "GMCP message");
                     }
                 }
                 drain_account_events(&mut world, &mut host);

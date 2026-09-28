@@ -352,6 +352,13 @@ impl TelnetOptionTable {
         self.options.entry(option).or_default()
     }
 
+    /// Whether *we* are currently enabled to speak `option` to the peer
+    /// (i.e. `us == Yes`). Used to gate outbound GMCP on having actually
+    /// negotiated it, rather than trusting the caller.
+    pub fn is_enabled_us(&self, option: u8) -> bool {
+        self.options.get(&option).map(|n| n.us) == Some(QState::Yes)
+    }
+
     /// Startup negotiation the server always offers: ask the client to do
     /// NAWS/TTYPE, offer to do GMCP/MSSP ourselves.
     pub fn start(&mut self) -> Vec<u8> {
@@ -391,12 +398,19 @@ impl TelnetOptionTable {
                 }
             }
             WONT => {
-                if let Some(resp) = self.entry(option).him.recv_refuse()
-                    && resp
-                {
-                    // recv_refuse only returns Some(true) transitioning
-                    // WantNoOpposite -> WantYes, i.e. we still want it.
-                    out.extend_from_slice(&[IAC, DO, option]);
+                match self.entry(option).him.recv_refuse() {
+                    Some(true) => {
+                        // recv_refuse only returns Some(true) transitioning
+                        // WantNoOpposite -> WantYes, i.e. we still want it.
+                        out.extend_from_slice(&[IAC, DO, option]);
+                    }
+                    Some(false) => {
+                        // Yes -> No: RFC 1143 requires acknowledging a
+                        // disable, or a Q-method peer is stuck in WANTNO
+                        // forever waiting for our answer.
+                        out.extend_from_slice(&[IAC, DONT, option]);
+                    }
+                    None => {}
                 }
             }
             DO => {
@@ -411,13 +425,15 @@ impl TelnetOptionTable {
                     out.extend_from_slice(&mssp_frame(&self.mssp_fields));
                 }
             }
-            DONT => {
-                if let Some(resp) = self.entry(option).us.recv_refuse()
-                    && resp
-                {
+            DONT => match self.entry(option).us.recv_refuse() {
+                Some(true) => {
                     out.extend_from_slice(&[IAC, WILL, option]);
                 }
-            }
+                Some(false) => {
+                    out.extend_from_slice(&[IAC, WONT, option]);
+                }
+                None => {}
+            },
             _ => unreachable!("caller only dispatches DO/DONT/WILL/WONT"),
         }
         out
@@ -426,6 +442,15 @@ impl TelnetOptionTable {
     /// Handles one complete subnegotiation body (`sub_buf[0]` is the option
     /// byte, the rest is the payload). Returns any bytes to send back plus
     /// a structured event for the world, if the option produced one.
+    ///
+    /// Deliberately lenient: this dispatches on the option byte alone, not
+    /// on whether that option's negotiation ever reached `Yes` (e.g. a
+    /// client that sends `IAC SB GMCP ... IAC SE` without having completed
+    /// `WILL`/`DO GMCP` first still gets parsed). A client sending data for
+    /// an option it never agreed to enable is a protocol quirk, not an
+    /// attack surface -- the frame is well-formed and size-capped either
+    /// way -- so we take the data rather than add a second state check on
+    /// every subnegotiation for no real gain.
     pub fn handle_subnegotiation(&mut self, sub_buf: &[u8]) -> (Vec<u8>, Option<TelnetEvent>) {
         let Some((&option, body)) = sub_buf.split_first() else {
             return (Vec::new(), None);
