@@ -351,7 +351,29 @@ fn run_recompile(root: &Path, path: &str, snapshot: &ProgramSnapshot) -> Compile
         .collect();
     dependents.sort_by_key(|p| snapshot.chain_len(p));
 
-    let mut to_compile: Vec<String> = vec![path.clone()];
+    // OBI-156: same gap as `Compiler::recompile` (see its comment) --
+    // `path` may inherit an ancestor the snapshot has never seen because
+    // it was never loaded/registered at all. Compile `path` first (which
+    // recursively compiles and checks every ancestor through this
+    // session, same as `ensure_program`) and queue any linearization
+    // member the snapshot doesn't know about, ancestor-first, so it gets
+    // a real `WireProgram` (and thus a real parent link) in this batch
+    // before `path` itself is built.
+    let linearization: Vec<std::rc::Rc<str>> = match session.compile(&path) {
+        Outcome::Ok(checked) => checked.info.linearization.clone(),
+        Outcome::Failed(msg) => return CompileOutcome::Failed(msg.clone()),
+        Outcome::Missing(msg) => return CompileOutcome::Failed(msg.clone()),
+    };
+    let mut to_compile: Vec<String> = Vec::new();
+    for anc in &linearization {
+        if **anc == *path {
+            continue;
+        }
+        if snapshot.entry(anc).is_none() {
+            to_compile.push(anc.to_string());
+        }
+    }
+    to_compile.push(path.clone());
     to_compile.extend(dependents);
     let in_batch: HashSet<String> = to_compile.iter().cloned().collect();
 

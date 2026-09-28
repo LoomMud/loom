@@ -411,7 +411,37 @@ impl Compiler {
             self.session.invalidate(&d.path);
         }
 
-        let mut to_compile: Vec<String> = vec![path.clone()];
+        // OBI-156: `path` may inherit an ancestor that has never been
+        // loaded/registered at all (only ever referenced from source, not
+        // yet compiled by anyone). The loop below resolves each program's
+        // `parent` link purely from `new_set`/`registry` — if such an
+        // ancestor is in neither, `path` silently installs with a `None`
+        // parent and every inherited function goes missing. `ensure_program`
+        // already handles this (it walks the whole linearization); mirror
+        // that here: ask the session to compile `path` (which recursively
+        // compiles and checks every ancestor, same as `ensure_program`),
+        // then queue any linearization member that isn't registered yet,
+        // in ancestor-first order, so a never-loaded ancestor gets a fresh
+        // `CompiledProgram` (and thus a real parent link) built for it in
+        // this same batch before `path` itself is built.
+        let linearization: Vec<Rc<str>> = match self.session.compile(&path) {
+            Outcome::Ok(checked) => checked.info.linearization.clone(),
+            Outcome::Failed(msg) => return Err(msg.clone()),
+            Outcome::Missing(msg) => return Err(msg.clone()),
+        };
+        let mut to_compile: Vec<String> = Vec::new();
+        for anc in &linearization {
+            if **anc == *path {
+                // `path` itself is queued explicitly below regardless of
+                // whether it was already registered: recompile always
+                // rebuilds `path`, that's the whole point of the call.
+                continue;
+            }
+            if registry.program(anc).is_none() {
+                to_compile.push(anc.to_string());
+            }
+        }
+        to_compile.push(path.clone());
         to_compile.extend(dependents.iter().map(|d| d.path.to_string()));
 
         let mut new_set: HashMap<String, Rc<CompiledProgram>> = HashMap::new();
