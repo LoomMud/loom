@@ -364,3 +364,48 @@ fn mutation_efun_is_refused_when_the_actors_euid_has_left_the_guard_set() {
         "a cut that drops the actor's euid from the guard set must still refuse: {out:?}"
     );
 }
+
+/// OBI-123 regression: `roles_result` must reach the **connected
+/// interactive**, not `/secure/roles` (the facade every mutation efun is
+/// actually called through, per design). Before the fix, the request's
+/// recorded recipient was `self_object()` at the point the efun ran --
+/// `/secure/roles` itself, since that is the object whose method body is
+/// executing -- which has no bound connection and no `roles_result` apply
+/// of its own, so `World::drain_roles_results` silently delivered the
+/// reply nowhere and the interactive's request hung forever with no
+/// error at all. This is exactly the call shape `/secure/roles.wf`'s
+/// facade requires (`player.wf`'s `settier` verb calls
+/// `load_object("/secure/roles").set_tier(...)`, switching `self` to
+/// `/secure/roles` for the duration of the efun call) -- the shape every
+/// other test in this file also uses, but none of them checked that the
+/// reply actually arrives.
+#[test]
+fn roles_result_reaches_the_connected_interactive_through_the_secure_roles_facade() {
+    let (mut world, mut host) = boot();
+    world.connect(1, &mut host);
+    host.take(1);
+    world.input(1, "become t3lead", &mut host);
+    host.take(1);
+
+    world.input(1, "settier root 5 haha", &mut host);
+    let out = host.take(1);
+    assert!(out.starts_with("req "), "{out:?}");
+    let id: u64 = out
+        .trim_start_matches("req ")
+        .trim()
+        .parse()
+        .expect("request id");
+
+    // Simulate the DB round trip completing (what `loom-cli`'s DB worker
+    // does in production once `roles_set_tier` returns).
+    world.deliver_roles_result(id, true, "ok");
+    world.drain_roles_results(&mut host);
+
+    let out = host.take(1);
+    assert_eq!(
+        out,
+        format!("roles_result {id} true ok\n"),
+        "the connected interactive (conn 1) must receive roles_result, not /secure/roles \
+         (which has no bound connection and no roles_result apply of its own): {out:?}"
+    );
+}

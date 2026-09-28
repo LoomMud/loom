@@ -3320,6 +3320,31 @@ impl<'a> RegistryHost<'a> {
         id
     }
 
+    /// Who a `roles_result(id, ok, detail)` apply is delivered to (OBI-123
+    /// bugfix): **not** `self_object()`. Every mutation efun is called
+    /// through `/secure/roles.wf`'s facade (the only documented, intended
+    /// way to reach these efuns -- design §5, `docs/security.md`), so by
+    /// the time the efun itself runs, `self_object()` is `/secure/roles`,
+    /// not the connected interactive who actually issued the request and
+    /// is waiting on the reply. `/secure/roles` is never bound to a
+    /// connection, so recording it as the recipient meant
+    /// `World::drain_roles_results` looked up an object with no `conn`,
+    /// found no `roles_result` apply on `/secure/roles.wf` either, and
+    /// silently delivered the reply nowhere -- the interactive's request
+    /// hung forever with no error. `this_player` is the right answer: set
+    /// once per top-level execution (`World::input`'s `exec` call) and
+    /// unchanged across every nested call in the chain, unlike
+    /// `self_object()`. Falls back to `self_object()` only for the
+    /// vanishingly unlikely case of no `this_player` at all (every real
+    /// caller already failed `roles_mutation_gate`'s actor-rule check
+    /// before reaching this point, since that also requires player input).
+    fn roles_result_recipient(&self) -> ObjectId {
+        self.driver
+            .as_ref()
+            .and_then(|d| d.this_player)
+            .unwrap_or_else(|| self.self_object())
+    }
+
     /// The backend's request queue was full or closed (`false` from a
     /// [`crate::world::RolesMutations`] method): never leave the request
     /// pending forever (same rule as `issue_account_request`, OBI-85 CTO
@@ -3350,7 +3375,7 @@ impl<'a> RegistryHost<'a> {
         let tier = Self::want_int(tier, "roles_set_tier(): expected int tier")?;
         let reason = Self::want_str(reason, "roles_set_tier(): expected string reason")?;
         let actor = self.roles_mutation_gate("roles_set_tier", &format!("{target} tier={tier}"))?;
-        let caller = self.self_object();
+        let caller = self.roles_result_recipient();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
         let d = self.driver.as_mut().expect("driver");
@@ -3379,7 +3404,7 @@ impl<'a> RegistryHost<'a> {
             "roles_set_member",
             &format!("{target} domain={domain} role={role}"),
         )?;
-        let caller = self.self_object();
+        let caller = self.roles_result_recipient();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
         let d = self.driver.as_mut().expect("driver");
@@ -3411,7 +3436,7 @@ impl<'a> RegistryHost<'a> {
         };
         let reason = Self::want_str(reason, "roles_grant(): expected string reason")?;
         let actor = self.roles_mutation_gate("roles_grant", &format!("{target} {kind}:{what}"))?;
-        let caller = self.self_object();
+        let caller = self.roles_result_recipient();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
         let d = self.driver.as_mut().expect("driver");
@@ -3438,7 +3463,7 @@ impl<'a> RegistryHost<'a> {
         let reason = Self::want_str(reason, "roles_revoke_grant(): expected string reason")?;
         let actor =
             self.roles_mutation_gate("roles_revoke_grant", &format!("{target} {kind}:{what}"))?;
-        let caller = self.self_object();
+        let caller = self.roles_result_recipient();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
         let d = self.driver.as_mut().expect("driver");
@@ -3458,7 +3483,7 @@ impl<'a> RegistryHost<'a> {
         let reason = Self::want_str(reason, "roles_propose_tier(): expected string reason")?;
         let actor =
             self.roles_mutation_gate("roles_propose_tier", &format!("{target} tier={tier}"))?;
-        let caller = self.self_object();
+        let caller = self.roles_result_recipient();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
         let d = self.driver.as_mut().expect("driver");
@@ -3476,7 +3501,7 @@ impl<'a> RegistryHost<'a> {
         let proposal_id = Self::want_int(proposal_id, "roles_approve(): expected int proposal_id")?;
         let actor =
             self.roles_mutation_gate("roles_approve", &format!("proposal={proposal_id}"))?;
-        let caller = self.self_object();
+        let caller = self.roles_result_recipient();
         let actor_name = self.registry.syms.name(actor).to_string();
         let id = self.roles_next_request(caller);
         let d = self.driver.as_mut().expect("driver");
