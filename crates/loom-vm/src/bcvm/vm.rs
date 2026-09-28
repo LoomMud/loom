@@ -766,9 +766,6 @@ impl<'a, H: Host> Interpreter<'a, H> {
     /// Execute one instruction of the top frame. `Returned(v)` means a
     /// frame returned `v` (popped); the caller keeps looping until the
     /// frame stack is empty.
-    /// Execute one instruction of the top frame. `Returned(v)` means a
-    /// frame returned `v` (popped); the caller keeps looping until the
-    /// frame stack is empty.
     ///
     /// **OBI-107:** `op` is a borrow out of `code_ops`, a local `Rc<[Op]>`
     /// clone of the running function's instruction stream (a refcount
@@ -1131,11 +1128,11 @@ impl<'a, H: Host> Interpreter<'a, H> {
             Op::MakeFn { dst, callee } => {
                 let callee = match callee {
                     CalleeOp::Virtual { name } => Callee::Virtual {
-                        name: Rc::from(self.str_of(name)),
+                        name: Rc::from(self.str_of(*name)),
                     },
                     CalleeOp::Static { program, name } => Callee::Static {
-                        program: Rc::from(self.str_of(program)),
-                        name: Rc::from(self.str_of(name)),
+                        program: Rc::from(self.str_of(*program)),
+                        name: Rc::from(self.str_of(*name)),
                     },
                 };
                 let creator = self.host.self_object();
@@ -1147,7 +1144,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     guard,
                     quota_uid,
                 });
-                set!(dst, v);
+                set!(*dst, v);
                 Ok(Step::Continue)
             }
             Op::MakeClosure {
@@ -1165,18 +1162,18 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     creator,
                     body: FnBody::Closure {
                         code,
-                        func,
+                        func: *func,
                         captures: captured,
                         program_version,
                     },
                     guard,
                     quota_uid,
                 });
-                set!(dst, v);
+                set!(*dst, v);
                 Ok(Step::Continue)
             }
             Op::CallValue { dst, func, args } => {
-                let fval = reg!(func);
+                let fval = reg!(*func);
                 let argv: Vec<Value> = args.iter().map(|r| reg!(*r)).collect();
                 let Some(f) = fval.as_fn() else {
                     return Err(self.err_with_trace(format!(
@@ -1188,7 +1185,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
                 let body = f.body.clone();
                 let guard = f.guard.clone();
                 let hc = self.host.dispatch_value(creator, &body, argv)?;
-                self.enter_or_store(hc, dst, Some(&guard))
+                self.enter_or_store(hc, *dst, Some(&guard))
             }
         }
     }
