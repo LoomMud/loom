@@ -391,6 +391,13 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         http_state = http_state.with_web_root(web_root);
     }
     let mut http_server = tokio::spawn(async move {
+        // Same reason as loom-net's telnet accept: WebSocket frames are
+        // small interactive writes, so disable Nagle on every HTTP socket.
+        let http_listener = axum::serve::ListenerExt::tap_io(http_listener, |tcp| {
+            if let Err(err) = tcp.set_nodelay(true) {
+                tracing::debug!(%err, "set_nodelay failed on an HTTP connection");
+            }
+        });
         axum::serve(http_listener, loom_http::app(http_state))
             .await
             .map_err(|err| format!("HTTP server failed: {err}"))

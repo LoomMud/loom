@@ -35,6 +35,28 @@ output queue at this population. `loom serve`'s own stderr/stdout log was
 empty at `RUST_LOG=warn` for the whole run: no slow-client disconnects, no
 warnings.
 
+## Re-run at Phase 1 exit: TCP_NODELAY (OBI-22)
+
+Same reference host, same command, loom `main` `826aa17`, warp `618b90c`,
+release build, in-memory accounts backend.
+
+| Run | p50 | p95 | p99 |
+|---|---|---|---|
+| `2026-09-30-150-players-main-826aa17` (before) | 41.03 ms | 45.02 ms | 48.97 ms |
+| `2026-09-30-150-players-nodelay` (this change) | 0.69 ms | 4.85 ms | **8.50 ms** |
+| `2026-09-30-500-players-nodelay` (stretch) | 430 ms | 589 ms | 698 ms |
+
+The ~40 ms floor in every earlier 150-player run (p50 41 ms) came from Nagle
+plus the client's delayed ACK, not from the driver. A command's output and
+its prompt go out as two small writes, and with Nagle the second one waits
+for the ACK of the first, which Linux delays by ~40 ms. `loom-net` now sets
+`TCP_NODELAY` on every accepted telnet socket, and `loom-cli` does the same
+for HTTP/WebSocket sockets. The actual driver time at 150 players is
+single-digit milliseconds.
+
+500 players is still over the SLA. That load is bound by fan-out in the single
+Entrance Hall (see below), and it is Phase 3's N1/N2 target, not Phase 1's.
+
 ## Stretch run (500 players)
 
 `2026-09-27-500-players-stretch.{json,md}`: **FAIL** relative to the 50 ms

@@ -253,6 +253,12 @@ pub async fn run_server_with_ws(
             }
             accepted = listener.accept() => {
                 let (stream, peer_addr) = accepted?;
+                // Interactive line protocol: disable Nagle, or a prompt written
+                // right after a command's output waits for the client's delayed
+                // ACK (~40 ms on Linux) before it is sent.
+                if let Err(err) = stream.set_nodelay(true) {
+                    debug!(%peer_addr, %err, "set_nodelay failed");
+                }
                 let conn_id = next_conn_id;
                 next_conn_id += 1;
 
