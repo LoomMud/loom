@@ -282,7 +282,9 @@ impl AuthService {
                 return Err(AuthError::InvalidCredentials);
             }
             RateLimitDecision::Allowed => {}
-            RateLimitDecision::IpThrottled => unreachable!("check_account never checks the IP bucket"),
+            RateLimitDecision::IpThrottled => {
+                unreachable!("check_account never checks the IP bucket")
+            }
         }
 
         let record = match self.directory.staff_login(username, password).await {

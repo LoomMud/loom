@@ -1849,4 +1849,59 @@ mod tests {
             DbEvent::AccountResult { ok: false, ref detail, .. } if detail == "bad_credentials"
         ));
     }
+
+    /// OBI-204 review must-fix 2: Argon2id verifies (real or dummy) run
+    /// under a semaphore, so no more than [`ARGON2_MAX_CONCURRENCY`] of
+    /// them ever hold their ~19 MiB of memory at once, however many
+    /// logins arrive concurrently. `connect_lazy` means this never
+    /// actually dials Postgres -- [`Persist::dummy_verify`] never touches
+    /// the pool at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn argon2_verify_concurrency_is_bounded_by_a_semaphore() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@localhost/nonexistent")
+            .expect("connect_lazy never dials out, so this never fails");
+        let persist = Arc::new(Persist::from_pool(pool).unwrap());
+        assert_eq!(
+            persist.argon2_concurrency.available_permits(),
+            ARGON2_MAX_CONCURRENCY
+        );
+
+        let total = ARGON2_MAX_CONCURRENCY * 3;
+        let mut handles = Vec::with_capacity(total);
+        for _ in 0..total {
+            let persist = persist.clone();
+            handles.push(tokio::spawn(async move {
+                persist.dummy_verify("whatever-password").await;
+            }));
+        }
+
+        // Poll for up to ~1s for the permit count to bottom out: with 3x
+        // as many callers as permits, and each real Argon2id verify
+        // taking several milliseconds of CPU, the semaphore should be
+        // fully saturated (0 available) at some point while the first
+        // wave is still running.
+        let mut min_seen = ARGON2_MAX_CONCURRENCY;
+        for _ in 0..200 {
+            min_seen = min_seen.min(persist.argon2_concurrency.available_permits());
+            if min_seen == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            min_seen, 0,
+            "expected the semaphore to be fully saturated at some point under {total} \
+             concurrent callers against only {ARGON2_MAX_CONCURRENCY} permits"
+        );
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        // Every permit is returned once every verify has finished.
+        assert_eq!(
+            persist.argon2_concurrency.available_permits(),
+            ARGON2_MAX_CONCURRENCY
+        );
+    }
 }

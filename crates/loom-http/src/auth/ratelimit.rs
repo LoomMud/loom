@@ -676,6 +676,35 @@ mod tests {
         assert_eq!(limiter.tracked_ip_count(), 0);
     }
 
+    /// OBI-204 review fix: once a hard-cap eviction runs, it evicts down
+    /// to ~90% of the cap rather than exactly to it, so a steady trickle
+    /// of one-off new keys doesn't force a fresh eviction pass on almost
+    /// every subsequent call.
+    #[test]
+    fn hard_cap_eviction_targets_ninety_percent_of_the_cap() {
+        let limiter = RateLimiter::with_test_tuning(
+            ACCOUNT_FAILURE_LIMIT,
+            ACCOUNT_FAILURE_WINDOW,
+            ACCOUNT_LOCKOUT_DURATION,
+            IP_BUCKET_CAPACITY,
+            IP_BUCKET_REFILL_INTERVAL,
+        )
+        .with_test_caps(100, 100);
+
+        // Fill the map to exactly the cap, then add one more entry --
+        // the single insert that tips it over triggers one eviction pass.
+        for i in 0..101 {
+            let user = format!("user{i}");
+            limiter.check(&user, None);
+            // Leave every reservation in place so nothing is idle-swept;
+            // only the hard cap can be bringing this back down.
+        }
+        // That one eviction pass should have brought it down to ~90
+        // (`EVICT_TARGET_FRACTION`), not merely back to 100.
+        assert!(limiter.tracked_account_count() <= 90);
+        assert!(limiter.tracked_account_count() >= 80);
+    }
+
     /// OBI-204 acceptance (hard cap): once the account map is over its
     /// cap, further distinct accounts still get tracked -- the oldest
     /// entries are evicted to make room rather than growing forever.
@@ -698,5 +727,51 @@ mod tests {
             // eviction path, not the idle sweep.
         }
         assert!(limiter.tracked_account_count() <= 10);
+    }
+
+    /// OBI-204 review must-fix 1: the hard-cap eviction must never remove
+    /// a `uid:`-keyed entry (a resolved staff member's bucket, bounded by
+    /// the number of staff rows), even once an attacker floods the map
+    /// with enough `user:*` (unresolved-username) keys to blow well past
+    /// the cap -- otherwise an attacker could use the hard cap itself to
+    /// erase a real staff member's in-progress lockout.
+    #[test]
+    fn hard_cap_eviction_never_removes_a_uid_keyed_account() {
+        let limiter = RateLimiter::with_test_tuning(
+            ACCOUNT_FAILURE_LIMIT,
+            ACCOUNT_FAILURE_WINDOW,
+            ACCOUNT_LOCKOUT_DURATION,
+            IP_BUCKET_CAPACITY,
+            IP_BUCKET_REFILL_INTERVAL,
+        )
+        .with_test_caps(10, 10);
+
+        // A real staff member, locked out (5 confirmed failures), well
+        // before the attacker shows up.
+        let uid_key = format!("{UID_KEY_PREFIX}gandalf");
+        for _ in 0..5 {
+            limiter.record_failure(&uid_key);
+        }
+        assert_eq!(
+            limiter.check(&uid_key, None),
+            RateLimitDecision::AccountLocked
+        );
+
+        // An attacker floods the map with far more than the cap's worth
+        // of distinct, never-resolved usernames, each left with an
+        // in-flight reservation so none of them can be swept as idle --
+        // exactly the hard-cap eviction path.
+        for i in 0..50 {
+            let user = format!("attacker{i}");
+            limiter.check(&user, None);
+        }
+
+        // The map was forced over its cap, so the hard cap evicted *some*
+        // entries -- but the staff member's `uid:`-keyed lockout must
+        // still be in force; it was never a candidate for eviction.
+        assert_eq!(
+            limiter.check(&uid_key, None),
+            RateLimitDecision::AccountLocked
+        );
     }
 }
