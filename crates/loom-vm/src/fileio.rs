@@ -42,6 +42,14 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
         if seg == ".." {
             return Err("path must not contain `..`".to_string());
         }
+        // P0 driver rule (D-B3.2, OBI-190): nothing named `.git` may
+        // exist anywhere in the VFS, regardless of master policy -- the
+        // driver's own git dir is a *separate* `GIT_DIR`
+        // (`/mudlib-git/warp.git`), never a path under the mudlib root a
+        // builder can reach through `read_file`/`write_file`.
+        if seg == ".git" {
+            return Err("path must not contain a `.git` segment".to_string());
+        }
         out.push(seg);
     }
     Ok(out)
@@ -235,6 +243,20 @@ mod tests {
         let root = tmp_root("dotdot");
         assert!(read_file(&root, "/domains/../../etc/passwd").is_err());
         assert!(write_file(&root, "/domains/../../etc/passwd.txt", "x").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dotgit_segment_is_rejected_anywhere_in_the_path() {
+        // P0 driver rule (D-B3.2, OBI-190): regardless of where it
+        // appears, a `.git` segment is never resolvable in the VFS --
+        // the driver's own git dir lives outside the mudlib root
+        // entirely.
+        let root = tmp_root("dotgit");
+        assert!(read_file(&root, "/.git/config").is_err());
+        assert!(read_file(&root, "/domains/x/.git/config").is_err());
+        assert!(write_file(&root, "/.git/config", "x").is_err());
+        assert!(write_file(&root, "/domains/x/.git/HEAD.txt", "x").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
