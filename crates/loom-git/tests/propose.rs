@@ -25,6 +25,7 @@ impl RecompileHost for NoopHost {
         RecompileOutcome {
             ok: true,
             recompiled: changed,
+            upgraded_instances: 0,
             failures: Vec::new(),
         }
     }

@@ -61,6 +61,11 @@ pub trait RecompileHost: Send + Sync {
 pub struct RecompileOutcome {
     pub ok: bool,
     pub recompiled: Vec<String>,
+    /// How many currently-live objects run one of `recompiled`'s programs
+    /// (mirrors `loom_vm::bcvm::RecompileReport::upgraded_instances`,
+    /// OBI-89: install is lazy, so this counts who *will* migrate on next
+    /// access, not a synchronous migration that already happened).
+    pub upgraded_instances: usize,
     pub failures: Vec<(String, String)>,
 }
 
@@ -1180,6 +1185,7 @@ mod tests {
             RecompileOutcome {
                 ok: true,
                 recompiled: changed,
+                upgraded_instances: 0,
                 failures: deleted.into_iter().map(|d| (d, String::new())).collect(),
             }
         }
