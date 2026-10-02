@@ -408,6 +408,7 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         )
         .unwrap_or_else(|err| panic!("LOOM_JWT_KEY_FILE ({}): {err}", key_file.display()));
         http_state = http_state.with_auth(loom_http::auth::AuthService::new(directory, keys));
+        http_state = http_state.with_staff_origins(staff_origins_from_env());
     } else {
         tracing::info!(
             "staff web auth (/auth/*) disabled: set both LOOM_DATABASE_URL (or DATABASE_URL) \
@@ -531,6 +532,24 @@ fn jwt_key_file_from_env() -> Option<PathBuf> {
 /// after a redeploy for no operational reason).
 fn jwt_issuer_from_env() -> String {
     std::env::var("LOOM_JWT_ISSUER").unwrap_or_else(|_| "https://build.loommud.com/".to_string())
+}
+
+/// The staff-origin allowlist (OBI-198, M-AUTH-6): exact `Origin` values
+/// (scheme + host + port, comma-separated) that `/auth/refresh` and
+/// `/auth/logout` accept. Unset by default, which refuses both routes
+/// outright -- an operator who wants a browser staff client to be able to
+/// refresh/log out must set this to that client's exact origin(s).
+fn staff_origins_from_env() -> Vec<String> {
+    std::env::var("LOOM_STAFF_ORIGINS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|origin| origin.trim().to_string())
+                .filter(|origin| !origin.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The `serve()` world-tick timer (spec r5 N2, OBI-82): every `interval`

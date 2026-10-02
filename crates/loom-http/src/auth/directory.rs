@@ -53,37 +53,11 @@ pub struct StaffAuthStatus {
 /// The outcome of atomically rotating a refresh token (OBI-195 review fix
 /// 1): lookup-then-revoke used to be two statements, so two concurrent
 /// requests presenting the same refresh token could both see "not yet
-/// revoked" and both succeed, defeating reuse detection. A single
-/// `UPDATE ... WHERE revoked_at IS NULL AND expires_at > NOW() RETURNING`
-/// means at most one caller ever observes [`RefreshRotation::Rotated`] for
-/// a given token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RefreshRotation {
-    /// This caller won the race (or there was no race): the old token is
-    /// now revoked and a new pair should be issued for `staff_uid`, in the
-    /// same token family -- `sid`/`amr`/`mfa_at` are the values carried
-    /// forward from the row that was just rotated out (OBI-203).
-    Rotated {
-        staff_uid: String,
-        sid: String,
-        amr: Vec<String>,
-        mfa_at: Option<OffsetDateTime>,
-    },
-    /// The token exists but was already revoked -- either rotated out by
-    /// an earlier, legitimate `refresh` call, or explicitly logged out.
-    /// Either way, a *second* presentation of it is either a lost race
-    /// (benign, the caller should have used the new token) or a replayed
-    /// stolen token (malicious) -- this service cannot tell those apart,
-    /// so it treats every reuse as the latter and the caller must revoke
-    /// the whole session family.
-    Reused { staff_uid: String },
-    /// The token exists, was never revoked, but its `expires_at` has
-    /// passed -- plain expiry, not a reuse signal, so the caller refuses
-    /// without killing other sessions.
-    Expired,
-    /// No row matches this hash at all.
-    NotFound,
-}
+/// revoked" and both succeed, defeating reuse detection. Superseded by
+/// [`SessionRotateOutcome`]/`session_rotate` (OBI-198, OBI-216): that path
+/// is strictly more atomic, since it also carries `sid`/`amr`/`mfa_at`/
+/// `expires_at` forward in the same statement and takes the owning
+/// staff row's lock.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshRecord {
@@ -101,6 +75,25 @@ pub struct RefreshRecord {
     /// M-ADM-2 step-up freshness window is always measured from this, not
     /// reset by a later refresh).
     pub mfa_at: Option<OffsetDateTime>,
+}
+
+/// Mirrors `loom_persist::SessionRotateOutcome` (OBI-198) -- kept as a
+/// separate type so `loom-http`'s `auth` module never has to depend on
+/// `loom_persist` types directly outside this file's `impl StaffDirectory
+/// for loom_persist::Persist`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRotateOutcome {
+    Rotated {
+        staff_uid: String,
+        sid: String,
+        amr: Vec<String>,
+        mfa_at: Option<OffsetDateTime>,
+        expires_at: OffsetDateTime,
+    },
+    Reused {
+        staff_uid: String,
+    },
+    Invalid,
 }
 
 /// Opaque directory failure: callers only ever see
@@ -150,15 +143,22 @@ pub trait StaffDirectory: Send + Sync {
         &self,
         token_hash: &str,
     ) -> Result<Option<RefreshRecord>, DirectoryError>;
-    /// Atomically rotate a refresh token (OBI-195 review fix 1): see
-    /// [`RefreshRotation`]. Used by the hot `refresh` path instead of a
-    /// separate lookup + revoke.
-    async fn refresh_token_rotate(
-        &self,
-        token_hash: &str,
-    ) -> Result<RefreshRotation, DirectoryError>;
     async fn refresh_token_revoke(&self, token_hash: &str) -> Result<(), DirectoryError>;
     async fn refresh_token_revoke_all(&self, uid: &str) -> Result<(), DirectoryError>;
+
+    /// Revoke every unrevoked session sharing `token_hash`'s family
+    /// (OBI-198: logout revokes the family).
+    async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<(), DirectoryError>;
+
+    /// Atomically rotate the session for `old_token_hash` to
+    /// `new_token_hash` (OBI-198 re-review, must-fix 1/2) -- see
+    /// `loom_persist::Persist::session_rotate`.
+    async fn session_rotate(
+        &self,
+        old_token_hash: &str,
+        new_token_hash: &str,
+        idle_cutoff: OffsetDateTime,
+    ) -> Result<SessionRotateOutcome, DirectoryError>;
 
     /// `None` means unlinked: GitHub login must refuse, never create staff.
     async fn github_lookup(&self, github_id: i64) -> Result<Option<String>, DirectoryError>;
@@ -209,33 +209,6 @@ impl StaffDirectory for loom_persist::Persist {
         loom_persist::Persist::totp_consume_step(self, uid, step as i64)
             .await
             .map_err(|_| DirectoryError)
-    }
-
-    async fn refresh_token_rotate(
-        &self,
-        token_hash: &str,
-    ) -> Result<RefreshRotation, DirectoryError> {
-        let outcome = loom_persist::Persist::refresh_token_rotate(self, token_hash)
-            .await
-            .map_err(|_| DirectoryError)?;
-        Ok(match outcome {
-            loom_persist::RefreshTokenRotation::Rotated {
-                staff_uid,
-                sid,
-                amr,
-                mfa_at,
-            } => RefreshRotation::Rotated {
-                staff_uid,
-                sid,
-                amr,
-                mfa_at,
-            },
-            loom_persist::RefreshTokenRotation::Reused { staff_uid } => {
-                RefreshRotation::Reused { staff_uid }
-            }
-            loom_persist::RefreshTokenRotation::Expired => RefreshRotation::Expired,
-            loom_persist::RefreshTokenRotation::NotFound => RefreshRotation::NotFound,
-        })
     }
 
     async fn totp_enroll(&self, uid: &str, secret_base32: &str) -> Result<(), DirectoryError> {
@@ -300,6 +273,47 @@ impl StaffDirectory for loom_persist::Persist {
         loom_persist::Persist::refresh_token_revoke_all(self, uid)
             .await
             .map_err(|_| DirectoryError)
+    }
+
+    async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<(), DirectoryError> {
+        loom_persist::Persist::session_revoke_family_by_token(self, token_hash)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn session_rotate(
+        &self,
+        old_token_hash: &str,
+        new_token_hash: &str,
+        idle_cutoff: OffsetDateTime,
+    ) -> Result<SessionRotateOutcome, DirectoryError> {
+        let outcome = loom_persist::Persist::session_rotate(
+            self,
+            old_token_hash,
+            new_token_hash,
+            idle_cutoff,
+        )
+        .await
+        .map_err(|_| DirectoryError)?;
+        Ok(match outcome {
+            loom_persist::SessionRotateOutcome::Rotated {
+                staff_uid,
+                sid,
+                amr,
+                mfa_at,
+                expires_at,
+            } => SessionRotateOutcome::Rotated {
+                staff_uid,
+                sid,
+                amr,
+                mfa_at,
+                expires_at,
+            },
+            loom_persist::SessionRotateOutcome::Reused { staff_uid } => {
+                SessionRotateOutcome::Reused { staff_uid }
+            }
+            loom_persist::SessionRotateOutcome::Invalid => SessionRotateOutcome::Invalid,
+        })
     }
 
     async fn github_lookup(&self, github_id: i64) -> Result<Option<String>, DirectoryError> {

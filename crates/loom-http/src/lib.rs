@@ -52,6 +52,12 @@ pub struct HttpState {
     web_root: Option<PathBuf>,
     auth: Option<auth::AuthService>,
     github: Option<std::sync::Arc<dyn auth::GithubIdentityProvider>>,
+    /// M-AUTH-6: the exact `Origin` values `/auth/refresh` and
+    /// `/auth/logout` accept (no CORS for anything else). Empty by
+    /// default, which refuses every cookie-bearing request -- an
+    /// operator who wants those routes reachable from a browser must set
+    /// `LOOM_STAFF_ORIGINS` themselves (see `loom-cli`).
+    staff_origins: Vec<String>,
     github_webhook: Option<webhook::GithubWebhookConfig>,
 }
 
@@ -68,6 +74,7 @@ impl HttpState {
             web_root: None,
             auth: None,
             github: None,
+            staff_origins: Vec::new(),
             github_webhook: None,
         }
     }
@@ -93,6 +100,15 @@ impl HttpState {
     /// login still goes through the same `AuthService`.
     pub fn with_github(mut self, github: std::sync::Arc<dyn auth::GithubIdentityProvider>) -> Self {
         self.github = Some(github);
+        self
+    }
+
+    /// Set the staff-origin allowlist (OBI-198, M-AUTH-6): the exact
+    /// `Origin` values `/auth/refresh` and `/auth/logout` accept. Unset
+    /// (empty) by default, which refuses both routes outright -- see
+    /// `LOOM_STAFF_ORIGINS` in `loom-cli`.
+    pub fn with_staff_origins(mut self, origins: Vec<String>) -> Self {
+        self.staff_origins = origins;
         self
     }
 

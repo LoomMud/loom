@@ -211,26 +211,35 @@ pub struct StaffTierStatus {
     pub totp_confirmed: bool,
 }
 
-/// The outcome of [`Persist::refresh_token_rotate`] (OBI-195 review fix 1):
-/// lookup-then-revoke used to be two statements, letting two concurrent
-/// presentations of the same refresh token both see "not yet revoked" and
-/// both succeed, which defeats reuse detection. A single
-/// `UPDATE ... WHERE revoked_at IS NULL AND expires_at > NOW() RETURNING`
-/// makes at most one caller ever observe [`RefreshTokenRotation::Rotated`]
-/// for a given token.
+/// The outcome of [`Persist::session_rotate`] (OBI-198 re-review,
+/// must-fix 1 and 2; supersedes the OBI-195 `refresh_token_rotate`/
+/// `RefreshTokenRotation` design this was rebased onto -- `session_rotate`
+/// is strictly more atomic, since it also carries `sid`/`amr`/`mfa_at`/
+/// `expires_at` forward and takes the staff-row lock): a single atomic
+/// consume-and-insert, so two concurrent rotations of the same token can
+/// never both win, and the new row always inherits the consumed row's
+/// `expires_at`/`sid`/`amr`/`mfa_at` rather than recomputing any of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RefreshTokenRotation {
+pub enum SessionRotateOutcome {
+    /// The old token was unrevoked, within its absolute expiry, and
+    /// within its idle window: it is now revoked and a fresh row exists
+    /// under `new_token_hash`, same family (`sid`), same `amr`/`mfa_at`,
+    /// same `expires_at`.
     Rotated {
         staff_uid: String,
         sid: String,
         amr: Vec<String>,
         mfa_at: Option<OffsetDateTime>,
+        expires_at: OffsetDateTime,
     },
-    Reused {
-        staff_uid: String,
-    },
-    Expired,
-    NotFound,
+    /// The old token was already revoked (a rotated-out or previously-
+    /// revoked token replayed) -- this is what a stolen refresh token
+    /// looks like, so the whole family (every row sharing its `sid`) is
+    /// now revoked too.
+    Reused { staff_uid: String },
+    /// Unknown token hash, or a known one past its absolute/idle expiry
+    /// (not revoked, just stale -- no family-wide response needed).
+    Invalid,
 }
 
 /// A row from the `active_grants` view (already excludes expired grants).
@@ -737,7 +746,7 @@ impl Persist {
     ) -> Result<Uuid> {
         use sqlx::Row;
         let row = sqlx::query(
-            "INSERT INTO refresh_tokens (staff_uid, token_hash, expires_at, sid, amr, mfa_at)
+            "INSERT INTO staff_sessions (staff_uid, token_hash, expires_at, sid, amr, mfa_at)
              VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING id",
         )
@@ -764,7 +773,7 @@ impl Persist {
         use sqlx::Row;
         let row = sqlx::query(
             "SELECT id, staff_uid, expires_at, revoked_at, sid, amr, mfa_at \
-             FROM refresh_tokens WHERE token_hash = $1",
+             FROM staff_sessions WHERE token_hash = $1",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
@@ -783,64 +792,10 @@ impl Persist {
         }))
     }
 
-    /// Atomically rotate a refresh token (OBI-174, OBI-195 review fix 1):
-    /// a single `UPDATE ... WHERE revoked_at IS NULL AND expires_at > NOW()
-    /// RETURNING` replaces the old lookup-then-revoke pair, so at most one
-    /// concurrent caller ever sees [`RefreshTokenRotation::Rotated`] for a
-    /// given token -- a second, racing presentation of the same bearer
-    /// value (the classic replay-of-a-stolen-token shape) always lands on
-    /// [`RefreshTokenRotation::Reused`], never on a second success.
-    pub async fn refresh_token_rotate(&self, token_hash: &str) -> Result<RefreshTokenRotation> {
-        use sqlx::Row;
-        let updated = sqlx::query(
-            "UPDATE refresh_tokens
-             SET revoked_at = NOW()
-             WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()
-             RETURNING staff_uid, sid, amr, mfa_at",
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(row) = updated {
-            return Ok(RefreshTokenRotation::Rotated {
-                staff_uid: row.try_get("staff_uid")?,
-                sid: row.try_get("sid")?,
-                amr: row.try_get("amr")?,
-                mfa_at: row.try_get("mfa_at")?,
-            });
-        }
-
-        // The UPDATE matched nothing: find out why, purely to classify the
-        // refusal (a reused/already-dead token is a stronger signal than a
-        // hash that was never issued) -- this second, read-only query does
-        // not reopen the race the UPDATE above closed, since nothing here
-        // changes state.
-        let existing = sqlx::query(
-            "SELECT staff_uid, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(match existing {
-            Some(row) => {
-                let revoked_at: Option<OffsetDateTime> = row.try_get("revoked_at")?;
-                if revoked_at.is_some() {
-                    RefreshTokenRotation::Reused {
-                        staff_uid: row.try_get("staff_uid")?,
-                    }
-                } else {
-                    RefreshTokenRotation::Expired
-                }
-            }
-            None => RefreshTokenRotation::NotFound,
-        })
-    }
-
     /// Revoke a single refresh token by its bearer-value hash (logout, or
     /// rotating it out after a single use).
     pub async fn refresh_token_revoke(&self, token_hash: &str) -> Result<()> {
-        sqlx::query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL")
+        sqlx::query("UPDATE staff_sessions SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL")
             .bind(token_hash)
             .execute(&self.pool)
             .await?;
@@ -852,11 +807,166 @@ impl Persist {
     /// stolen refresh token, so the whole session family is killed, not
     /// just the one token).
     pub async fn refresh_token_revoke_all(&self, uid: &str) -> Result<()> {
-        sqlx::query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE staff_uid = $1 AND revoked_at IS NULL")
+        sqlx::query("UPDATE staff_sessions SET revoked_at = NOW() WHERE staff_uid = $1 AND revoked_at IS NULL")
             .bind(uid)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Revoke every unrevoked session sharing `token_hash`'s `sid`
+    /// (family) -- OBI-198, M-AUTH-5: "logout revokes the family", not
+    /// just the one presented token. A no-op (not an error) if
+    /// `token_hash` is unknown.
+    ///
+    /// Goes through the `staff_sessions_revoke_family` security-definer
+    /// function (migration 0006) rather than a plain `UPDATE` (OBI-219,
+    /// same shape as `session_rotate`'s must-fix 2): it takes
+    /// `FOR UPDATE` on the owning `staff` row before revoking, which
+    /// conflicts with `session_rotate`'s `FOR SHARE` on that same row,
+    /// so a rotation racing this logout can't leave its freshly-rotated
+    /// row unrevoked (see the migration's doc comment).
+    pub async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<()> {
+        sqlx::query("SELECT staff_sessions_revoke_family($1)")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Atomically rotate the session identified by `old_token_hash` to a
+    /// fresh `new_token_hash` (OBI-198 re-review, must-fix 1 and 2):
+    ///
+    /// - **Must-fix 1 (absolute expiry must not slide):** the new row
+    ///   inherits the *consumed* row's `expires_at`, `sid`, `amr`, and
+    ///   `mfa_at` verbatim -- nothing here computes a fresh `now() + 14d`,
+    ///   so a session's 14-day absolute cap is fixed at login and never
+    ///   extended by a later rotation.
+    /// - **Must-fix 2 (serialize against revoke-all):** before touching
+    ///   any row, this takes `SELECT ... FOR SHARE` on the owning
+    ///   `staff` row, in the same transaction as the consume+insert.
+    ///   `staff_sessions_revoke_for_uid` (migration 0006) takes
+    ///   `FOR UPDATE` on that same row before its revoke `UPDATE` --
+    ///   `FOR UPDATE` conflicts with `FOR SHARE`, so whichever side asks
+    ///   first completes first and the other sees a fully-committed,
+    ///   consistent result (see the migration's doc comment for the two
+    ///   orderings). Without this, a tier change/password change/TOTP
+    ///   reset/GitHub unlink racing a concurrent refresh could miss the
+    ///   newly-inserted row.
+    ///
+    /// `idle_cutoff` is "now minus the idle TTL": a session whose
+    /// `last_used_at` is at or before it is treated as idle-expired, same
+    /// as a session past its absolute `expires_at`.
+    pub async fn session_rotate(
+        &self,
+        old_token_hash: &str,
+        new_token_hash: &str,
+        idle_cutoff: OffsetDateTime,
+    ) -> Result<SessionRotateOutcome> {
+        use sqlx::Row;
+        let mut tx = self.pool.begin().await?;
+
+        let Some(owner_row) =
+            sqlx::query("SELECT staff_uid FROM staff_sessions WHERE token_hash = $1")
+                .bind(old_token_hash)
+                .fetch_optional(&mut *tx)
+                .await?
+        else {
+            tx.commit().await?;
+            return Ok(SessionRotateOutcome::Invalid);
+        };
+        let owner_uid: String = owner_row.try_get("staff_uid")?;
+
+        // Serialize against `staff_sessions_revoke_for_uid`'s `FOR
+        // UPDATE` on the same row -- see migration 0006's doc comment.
+        // Taken through `staff_sessions_lock_for_rotate` (security
+        // definer) since Postgres's row-locking clauses require
+        // `UPDATE`/`DELETE` privilege on the table, which `loom_app`
+        // never has on `staff` (D-27.4: `SELECT` only). A missing
+        // `staff` row (shouldn't happen for a session that was ever
+        // legitimately issued, but cheap to tolerate) just means
+        // nothing to lock against; proceed.
+        sqlx::query("SELECT staff_sessions_lock_for_rotate($1)")
+            .bind(&owner_uid)
+            .execute(&mut *tx)
+            .await?;
+
+        let consumed = sqlx::query(
+            "UPDATE staff_sessions
+             SET revoked_at = NOW()
+             WHERE token_hash = $1
+               AND revoked_at IS NULL
+               AND expires_at > NOW()
+               AND last_used_at > $2
+             RETURNING staff_uid, sid, amr, mfa_at, expires_at",
+        )
+        .bind(old_token_hash)
+        .bind(idle_cutoff)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(consumed) = consumed else {
+            // Didn't match the guarded UPDATE above -- find out why.
+            let existing =
+                sqlx::query("SELECT sid, revoked_at FROM staff_sessions WHERE token_hash = $1")
+                    .bind(old_token_hash)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(existing) = existing else {
+                tx.commit().await?;
+                return Ok(SessionRotateOutcome::Invalid);
+            };
+            let revoked_at: Option<OffsetDateTime> = existing.try_get("revoked_at")?;
+            if revoked_at.is_none() {
+                // Not revoked, but didn't match: past its absolute or
+                // idle expiry. Stale, not malicious -- no family-wide
+                // response.
+                tx.commit().await?;
+                return Ok(SessionRotateOutcome::Invalid);
+            }
+            // Already revoked and presented again: a stolen (rotated-out,
+            // or previously logged-out) refresh token. Kill the whole
+            // family.
+            let sid: String = existing.try_get("sid")?;
+            sqlx::query(
+                "UPDATE staff_sessions SET revoked_at = NOW() WHERE sid = $1 AND revoked_at IS NULL",
+            )
+            .bind(&sid)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(SessionRotateOutcome::Reused {
+                staff_uid: owner_uid,
+            });
+        };
+
+        let staff_uid: String = consumed.try_get("staff_uid")?;
+        let sid: String = consumed.try_get("sid")?;
+        let amr: Vec<String> = consumed.try_get("amr")?;
+        let mfa_at: Option<OffsetDateTime> = consumed.try_get("mfa_at")?;
+        let expires_at: OffsetDateTime = consumed.try_get("expires_at")?;
+
+        sqlx::query(
+            "INSERT INTO staff_sessions (staff_uid, token_hash, expires_at, sid, amr, mfa_at, last_used_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW())",
+        )
+        .bind(&staff_uid)
+        .bind(new_token_hash)
+        .bind(expires_at)
+        .bind(&sid)
+        .bind(&amr)
+        .bind(mfa_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(SessionRotateOutcome::Rotated {
+            staff_uid,
+            sid,
+            amr,
+            mfa_at,
+            expires_at,
+        })
     }
 
     /// Resolve a numeric GitHub user id to a linked staff uid
