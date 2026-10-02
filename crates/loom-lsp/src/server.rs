@@ -15,20 +15,26 @@
 //! job once that call actually returns, so a pool slot is occupied for
 //! exactly as long as real compile work is running, never released early
 //! just because the client-facing deadline fired. The deadline itself is
-//! enforced by a separate, cheap (sleep-only) timer thread per in-flight
-//! job, which sends a timeout response to the client without touching
-//! the worker -- the worker keeps running to completion regardless (Rust
-//! has no safe thread-kill, so "cancellation honoured" means the
-//! *response* is cancelled/timed-out immediately, not that the CPU work
-//! inside `loom-compiler` stops early; documented limitation, not a
-//! silent gap). When the job queue is full, a new request is refused
-//! immediately with no thread spawned at all (M-LSP-4's backpressure).
+//! enforced by a single, cheap (sleep-only) **timer thread per session**
+//! (CTO re-review of OBI-168, G1/M-LSP-4): every job gets the same
+//! `REQUEST_DEADLINE` offset from when its worker starts it, so deadlines
+//! arrive at the timer thread in FIFO order, and the timer thread just
+//! sleeps until each one in turn and fires if the request isn't answered
+//! yet -- one OS thread total, not one per request, so a client
+//! pipelining thousands of trivial (microsecond) requests cannot grow the
+//! process's thread count at all. The worker keeps running to completion
+//! regardless of the deadline firing (Rust has no safe thread-kill, so
+//! "cancellation honoured" means the *response* is cancelled/timed-out
+//! immediately, not that the CPU work inside `loom-compiler` stops early;
+//! documented limitation, not a silent gap). When the job queue is full,
+//! a new request is refused immediately with no thread spawned at all
+//! (M-LSP-4's backpressure).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use loom_compiler::Checked;
 use loom_compiler::mudlib::{Outcome, Session};
@@ -107,6 +113,17 @@ struct Job {
     ws: Workspace,
 }
 
+/// One deadline, read off the timer channel by the single per-session
+/// timer thread (OBI-228 / G1, CTO re-review of OBI-168 M-LSP-4): the
+/// timer thread has nothing but these three fields, no access to
+/// `Workspace` or the compiler, so it can never itself become a resource
+/// problem no matter how many of these it ever processes.
+struct TimerEntry {
+    deadline: Instant,
+    id: RequestId,
+    answered: Arc<AtomicBool>,
+}
+
 /// Run the server against `connection` until the client shuts it down.
 /// `root` is the warp/mudlib checkout this server serves (one server
 /// instance per root; a multi-root client needs one server per folder,
@@ -159,8 +176,18 @@ pub fn run_with_workspace(
 
     let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
     let (job_tx, job_rx) = crossbeam_channel::bounded::<Job>(MAX_PENDING_REQUESTS);
+    // One timer thread for the whole session (G1, OBI-228): every worker
+    // sends its job's deadline here instead of spawning a sleeping thread
+    // of its own.
+    let (timer_tx, timer_rx) = crossbeam_channel::unbounded::<TimerEntry>();
+    spawn_timer(connection.sender.clone(), timer_rx);
     for _ in 0..MAX_CONCURRENT_REQUESTS {
-        spawn_worker(connection.sender.clone(), inflight.clone(), job_rx.clone());
+        spawn_worker(
+            connection.sender.clone(),
+            inflight.clone(),
+            job_rx.clone(),
+            timer_tx.clone(),
+        );
     }
 
     for msg in &connection.receiver {
@@ -202,14 +229,25 @@ fn dispatch_or_refuse(
         req,
         ws: ws.clone(),
     };
+    // G2 (CTO re-review of OBI-168, M-LSP-4): insert into `inflight`
+    // *before* handing the job to the queue, not after. If this were
+    // reversed, a worker could dequeue and finish the job (or a
+    // `$/cancelRequest` could arrive) in the window between `try_send`
+    // succeeding and the `insert` running, finding no entry and treating
+    // the request as already gone; the late `insert` would then leak a
+    // map entry forever, and a legitimate cancel racing it would be
+    // silently ignored. Inserting first means a worker or a cancel can
+    // only ever observe the entry once it genuinely exists; if `try_send`
+    // then fails (queue full), the entry is removed again since the job
+    // was never actually queued.
+    inflight
+        .lock()
+        .unwrap()
+        .insert(id.clone(), Arc::new(AtomicBool::new(false)));
     match job_tx.try_send(job) {
-        Ok(()) => {
-            inflight
-                .lock()
-                .unwrap()
-                .insert(id, Arc::new(AtomicBool::new(false)));
-        }
+        Ok(()) => {}
         Err(_) => {
+            inflight.lock().unwrap().remove(&id);
             let resp = Response::new_err(
                 id,
                 ErrorCode::RequestFailed as i32,
@@ -223,16 +261,50 @@ fn dispatch_or_refuse(
     Ok(())
 }
 
+/// The single per-session deadline timer thread (G1, CTO re-review of
+/// OBI-168 M-LSP-4): reads `TimerEntry`s in the order workers send them
+/// -- which is FIFO-by-deadline, since every entry's deadline is the same
+/// constant offset from the time it is sent (see [`spawn_worker`]) -- and
+/// for each one just sleeps until its deadline and fires if the request
+/// is still unanswered. Processing one entry at a time, in send order, is
+/// correct precisely because that offset is constant: entry N+1's
+/// deadline can never be earlier than entry N's, so there is never a
+/// later entry this thread should have serviced first while it was
+/// asleep on an earlier one.
+fn spawn_timer(
+    sender: crossbeam_channel::Sender<Message>,
+    timer_rx: crossbeam_channel::Receiver<TimerEntry>,
+) {
+    std::thread::spawn(move || {
+        for entry in timer_rx {
+            let remaining = entry.deadline.saturating_duration_since(Instant::now());
+            if remaining > Duration::ZERO {
+                std::thread::sleep(remaining);
+            }
+            if !entry.answered.swap(true, Ordering::SeqCst) {
+                let resp = Response::new_err(
+                    entry.id,
+                    ErrorCode::RequestFailed as i32,
+                    format!("exceeded the {REQUEST_DEADLINE:?} analysis deadline (M-LSP-4)"),
+                );
+                let _ = sender.send(Message::Response(resp));
+            }
+        }
+    });
+}
+
 /// One persistent worker thread (spec M-LSP-4): pulls a [`Job`] off the
 /// queue, runs it to completion on *this* thread (so the pool never grows
 /// past `MAX_CONCURRENT_REQUESTS`, and a slot only frees when the real
-/// work is actually done -- CTO review F3.3), and races a cheap timer
-/// thread against it purely to answer the client within
-/// [`REQUEST_DEADLINE`] even if the compile itself runs long.
+/// work is actually done -- CTO review F3.3), and registers its deadline
+/// with the single session-wide timer thread (G1, OBI-228) purely to
+/// answer the client within [`REQUEST_DEADLINE`] even if the compile
+/// itself runs long.
 fn spawn_worker(
     sender: crossbeam_channel::Sender<Message>,
     inflight: Inflight,
     job_rx: crossbeam_channel::Receiver<Job>,
+    timer_tx: crossbeam_channel::Sender<TimerEntry>,
 ) {
     std::thread::spawn(move || {
         for job in job_rx {
@@ -242,26 +314,17 @@ fn spawn_worker(
                 None => Arc::new(AtomicBool::new(false)), // cancelled before dequeue is handled below anyway
             };
 
-            // Cheap (sleep-only) deadline timer: never runs any compiler
-            // code, so it can't itself become a resource problem.
-            {
-                let sender = sender.clone();
-                let answered = answered.clone();
-                let id = id.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(REQUEST_DEADLINE);
-                    if !answered.swap(true, Ordering::SeqCst) {
-                        let resp = Response::new_err(
-                            id,
-                            ErrorCode::RequestFailed as i32,
-                            format!(
-                                "exceeded the {REQUEST_DEADLINE:?} analysis deadline (M-LSP-4)"
-                            ),
-                        );
-                        let _ = sender.send(Message::Response(resp));
-                    }
-                });
-            }
+            // G1 (CTO re-review of OBI-168, M-LSP-4): hand the deadline to
+            // the single session-wide timer thread instead of spawning a
+            // sleeping thread per job. Every job gets the same
+            // `REQUEST_DEADLINE` offset from "now", so deadlines reach the
+            // timer thread in non-decreasing order no matter which worker
+            // (or how many) sends them concurrently.
+            let _ = timer_tx.send(TimerEntry {
+                deadline: Instant::now() + REQUEST_DEADLINE,
+                id: id.clone(),
+                answered: answered.clone(),
+            });
 
             let resp = dispatch_request(&job.ws, job.req);
             if !answered.swap(true, Ordering::SeqCst) {
@@ -481,4 +544,80 @@ fn handle_completion(ws: &Workspace, p: CompletionParams) -> Option<Vec<Completi
     let path = ws.program_path(&uri)?;
     let (_, _, checked) = compile_for(ws, &path)?;
     Some(completion::all_items(checked.as_ref().map(|c| &c.info)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::bounded;
+
+    /// G2 regression (CTO re-review of OBI-168, M-LSP-4): `dispatch_or_refuse`
+    /// must insert into `inflight` *before* the job becomes visible to any
+    /// worker, not after. This is checked deterministically, not just by
+    /// timing luck: a capacity-1 job channel plus a synchronous rendezvous
+    /// means the background "worker" thread's `recv()` cannot return the
+    /// job until after `try_send` on the dispatching thread returns, and
+    /// `try_send` cannot run until the `insert` immediately before it (in
+    /// program order, on the same thread) has completed. So if `inflight`
+    /// doesn't contain the entry the instant the worker sees the job, the
+    /// ordering in `dispatch_or_refuse` has regressed to insert-after-send.
+    #[test]
+    fn g2_inflight_entry_exists_before_the_job_is_visible_to_a_worker() {
+        let (job_tx, job_rx) = bounded::<Job>(1);
+        let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
+        let id = RequestId::from(1);
+
+        let missing_at_dequeue = Arc::new(AtomicBool::new(false));
+        let worker_inflight = inflight.clone();
+        let worker_missing = missing_at_dequeue.clone();
+        let worker_id = id.clone();
+        let (ready_tx, ready_rx) = bounded::<()>(0);
+        let handle = std::thread::spawn(move || {
+            let job = job_rx.recv().unwrap();
+            assert_eq!(job.req.id, worker_id);
+            if !worker_inflight.lock().unwrap().contains_key(&worker_id) {
+                worker_missing.store(true, Ordering::SeqCst);
+            }
+            let _ = ready_tx.send(());
+        });
+
+        let (connection, _client) = Connection::memory();
+        let ws = Workspace::new(std::env::temp_dir());
+        let req = Request {
+            id: id.clone(),
+            method: "textDocument/hover".to_string(),
+            params: serde_json::Value::Null,
+        };
+        dispatch_or_refuse(&connection, &ws, &job_tx, &inflight, req).unwrap();
+        ready_rx.recv().unwrap();
+        handle.join().unwrap();
+
+        assert!(
+            !missing_at_dequeue.load(Ordering::SeqCst),
+            "a worker observed the job before `inflight` held its entry (G2 race)"
+        );
+    }
+
+    /// The symmetric half of the G2 fix: if `try_send` fails (queue full),
+    /// the entry inserted just before it must be removed again, not leaked.
+    #[test]
+    fn g2_a_refused_request_does_not_leak_its_inflight_entry() {
+        let (job_tx, _job_rx) = bounded::<Job>(0); // capacity 0: try_send always fails here
+        let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
+        let id = RequestId::from(7);
+
+        let (connection, _client) = Connection::memory();
+        let ws = Workspace::new(std::env::temp_dir());
+        let req = Request {
+            id: id.clone(),
+            method: "textDocument/hover".to_string(),
+            params: serde_json::Value::Null,
+        };
+        dispatch_or_refuse(&connection, &ws, &job_tx, &inflight, req).unwrap();
+
+        assert!(
+            !inflight.lock().unwrap().contains_key(&id),
+            "a refused (queue-full) request must not leave a leaked `inflight` entry"
+        );
+    }
 }

@@ -485,3 +485,49 @@ fn m_lsp_3_a_file_uri_is_rejected_in_vfs_mode() {
     let resp = c.recv_response(id);
     assert_eq!(resp.response_result.unwrap(), Value::Null);
 }
+
+/// Spec `docs/threat-model-phase2.md` §6.3 **M-LSP-4**, CTO re-review of
+/// OBI-168 (G1, OBI-228): a client pipelining a flood of *trivial* (here:
+/// unknown-method, so they never even reach the compiler) requests must
+/// not grow the server's OS thread count. Before this fix, every job got
+/// its own sleeping 5 s deadline-timer thread, spawned from inside the
+/// worker before the (microsecond-fast) real work even started, so this
+/// exact scenario created one thread per request. Now there is exactly
+/// one timer thread for the whole session, so the thread count should
+/// stay essentially flat.
+#[test]
+fn g1_pipelining_many_trivial_requests_does_not_grow_the_thread_count() {
+    fn thread_count() -> usize {
+        std::fs::read_dir("/proc/self/task")
+            .expect("this test requires /proc (Linux)")
+            .count()
+    }
+
+    let mut c = TestClient::start();
+    // Let the fixed-size worker pool and the one timer thread actually
+    // spin up before baselining -- the first request's dispatch starts
+    // them lazily relative to test start, not `TestClient::start` itself.
+    let id = c.send_request("loom-lsp/warmup", json!({}));
+    let resp = c.recv_response(id);
+    assert!(resp.response_result.is_err(), "unknown method must error");
+    std::thread::sleep(Duration::from_millis(200));
+    let baseline = thread_count();
+
+    for _ in 0..10_000 {
+        let id = c.send_request("loom-lsp/trivial", json!({}));
+        let resp = c.recv_response(id);
+        assert!(resp.response_result.is_err(), "unknown method must error");
+    }
+
+    // Give any (incorrectly) spawned per-request threads a moment to
+    // exist before counting -- they'd be alive immediately on spawn, this
+    // just absorbs scheduling jitter.
+    std::thread::sleep(Duration::from_millis(200));
+    let after = thread_count();
+    assert!(
+        after <= baseline + 8,
+        "thread count grew from {baseline} to {after} after pipelining 10,000 trivial requests \
+         (G1, M-LSP-4): expected at most baseline + 8 (4 workers + 1 timer + slack), got a \
+         per-request thread leak"
+    );
+}
