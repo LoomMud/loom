@@ -36,6 +36,7 @@ use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 use tracing::debug;
 
+mod admin;
 pub mod auth;
 mod client_ip;
 mod handlers;
@@ -96,6 +97,12 @@ impl HttpState {
         self
     }
 
+    /// `Some` iff [`Self::with_auth`] was called -- shared by `handlers.rs`
+    /// and `admin.rs` (OBI-185) for bearer-token extraction.
+    pub(crate) fn auth_service(&self) -> Option<&auth::AuthService> {
+        self.auth.as_ref()
+    }
+
     /// Mount `POST /api/v1/hooks/github` (OBI-212, D-B3.12). Unset by
     /// default -- answers `503` until `loom-cli` configures a webhook
     /// secret and wires a `GitWorkerHandle`.
@@ -113,6 +120,7 @@ pub fn app(state: HttpState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .merge(handlers::auth_router())
+        .merge(admin::admin_router())
         .merge(webhook::webhook_router())
         .with_state(state);
     match web_root {

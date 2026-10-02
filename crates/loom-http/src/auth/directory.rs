@@ -110,6 +110,42 @@ pub struct RefreshRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DirectoryError;
 
+/// A failure from one of the admin (OBI-185) directory calls.
+///
+/// Unlike [`DirectoryError`], this one distinguishes "the
+/// `security definer` function itself refused the call" (a real policy
+/// decision -- self-promotion, actor tier too low, tier out of Phase-1
+/// range, etc, M-ADM-1) from "the database connection failed" -- the
+/// former is a `4xx` the admin UI should show the staff member, the
+/// latter is a `503`. `Rejected`'s message is always the SQL function's
+/// own `RAISE EXCEPTION` text, which is policy prose (same kind of thing
+/// as the comment next to the `RAISE`), never a credential or a row's
+/// contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminDirectoryError {
+    Unavailable,
+    Rejected(String),
+}
+
+/// One row read back from `audit_log` for the admin audit view (OBI-185,
+/// M-ADM-4). Mirrors [`loom_persist::AuditLogEntry`] at the `loom-http`
+/// boundary, same pattern as [`AuditEvent`]/[`loom_persist::AuditRow`] on
+/// the write side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminAuditEntry {
+    pub id: i64,
+    pub at: OffsetDateTime,
+    pub kind: String,
+    pub caller: Option<String>,
+    pub effective_principal: Option<String>,
+    pub apply: Option<String>,
+    pub class: Option<i16>,
+    pub argument: Option<String>,
+    pub guard_set: Vec<String>,
+    pub verdict: String,
+    pub detail: Option<String>,
+}
+
 #[async_trait::async_trait]
 pub trait StaffDirectory: Send + Sync {
     async fn staff_login(
@@ -176,6 +212,31 @@ pub trait StaffDirectory: Send + Sync {
     /// `INSERT` would be worse), so [`crate::auth::AuthService`] logs and
     /// swallows any `Err` from this instead of propagating it.
     async fn record_audit(&self, event: AuditEvent) -> Result<(), DirectoryError>;
+
+    /// Admin role-tier change (OBI-185, M-ADM-1): goes through
+    /// `roles_set_tier` and nothing else. `actor` MUST be the token's
+    /// `sub`, never a caller-supplied value -- enforced by
+    /// [`crate::auth::AuthService::admin_set_tier`], which is the only
+    /// caller of this method. A SQL-level refusal (wrong actor tier,
+    /// self-promotion, tier outside the Phase-1 1-3 range, ...) comes
+    /// back as [`AdminDirectoryError::Rejected`], distinct from a plain
+    /// connection failure, so the HTTP layer can answer a `4xx` instead
+    /// of a `503`.
+    async fn admin_set_tier(
+        &self,
+        actor: &str,
+        target_uid: &str,
+        new_tier: i16,
+        reason: &str,
+    ) -> Result<(), AdminDirectoryError>;
+
+    /// Read back the most recent `audit_log` rows for the admin audit
+    /// view (OBI-185, M-ADM-4), newest first.
+    async fn admin_audit_recent(
+        &self,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> Result<Vec<AdminAuditEntry>, AdminDirectoryError>;
 }
 
 #[async_trait::async_trait]
@@ -342,5 +403,44 @@ impl StaffDirectory for loom_persist::Persist {
         loom_persist::Persist::insert_audit_batch(self, std::slice::from_ref(&row))
             .await
             .map_err(|_| DirectoryError)
+    }
+
+    async fn admin_set_tier(
+        &self,
+        actor: &str,
+        target_uid: &str,
+        new_tier: i16,
+        reason: &str,
+    ) -> Result<(), AdminDirectoryError> {
+        loom_persist::Persist::roles_set_tier(self, actor, target_uid, new_tier, reason)
+            .await
+            .map_err(|err| AdminDirectoryError::Rejected(err.to_string()))
+    }
+
+    async fn admin_audit_recent(
+        &self,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> Result<Vec<AdminAuditEntry>, AdminDirectoryError> {
+        loom_persist::Persist::audit_log_recent(self, limit, before_id)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| AdminAuditEntry {
+                        id: row.id,
+                        at: row.at,
+                        kind: row.kind,
+                        caller: row.caller,
+                        effective_principal: row.effective_principal,
+                        apply: row.apply,
+                        class: row.class,
+                        argument: row.argument,
+                        guard_set: row.guard_set,
+                        verdict: row.verdict,
+                        detail: row.detail,
+                    })
+                    .collect()
+            })
+            .map_err(|_| AdminDirectoryError::Unavailable)
     }
 }

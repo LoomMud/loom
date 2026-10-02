@@ -35,6 +35,10 @@ struct FakeDirectoryInner {
     /// (OBI-204 review fix): used to prove `login` checks the IP bucket
     /// *before* paying for this lookup.
     resolve_uid_calls: u32,
+    /// How many times [`StaffDirectory::admin_set_tier`] has actually
+    /// reached the directory (OBI-185): used to prove a forbidden/
+    /// step-up-refused call never gets this far.
+    admin_set_tier_calls: u32,
 }
 
 #[derive(Default, Clone)]
@@ -124,6 +128,14 @@ impl FakeDirectory {
 
     fn audit_events(&self) -> Vec<AuditEvent> {
         self.inner.lock().unwrap().audit_events.clone()
+    }
+
+    fn admin_set_tier_calls(&self) -> u32 {
+        self.inner.lock().unwrap().admin_set_tier_calls
+    }
+
+    fn tier_of(&self, uid: &str) -> Option<i16> {
+        self.inner.lock().unwrap().staff.get(uid).map(|s| s.tier)
     }
 
     fn resolve_uid_calls(&self) -> u32 {
@@ -311,6 +323,78 @@ impl StaffDirectory for FakeDirectory {
     async fn record_audit(&self, event: AuditEvent) -> Result<(), DirectoryError> {
         self.inner.lock().unwrap().audit_events.push(event);
         Ok(())
+    }
+
+    /// A simplified re-implementation of `roles_set_tier`'s own rules
+    /// (OBI-185, M-ADM-1): self-promotion, Phase-1 tier range, and actor
+    /// tier floor. This is the fake's analogue of "the SQL function is
+    /// the real boundary" -- tests exercise it to prove `AuthService`'s
+    /// tier/step-up checks are UX, not the only thing standing between a
+    /// caller and an illegal promotion.
+    async fn admin_set_tier(
+        &self,
+        actor: &str,
+        target_uid: &str,
+        new_tier: i16,
+        _reason: &str,
+    ) -> Result<(), AdminDirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.admin_set_tier_calls += 1;
+        if actor == target_uid {
+            return Err(AdminDirectoryError::Rejected(
+                "self-promotion is not permitted".to_string(),
+            ));
+        }
+        if !(1..=3).contains(&new_tier) {
+            return Err(AdminDirectoryError::Rejected(
+                "roles_set_tier may only set tiers 1-3 in Phase 1".to_string(),
+            ));
+        }
+        let actor_tier = inner.staff.get(actor).map(|s| s.tier).unwrap_or(0);
+        if actor_tier < 3 {
+            return Err(AdminDirectoryError::Rejected(
+                "actor tier may not change roles".to_string(),
+            ));
+        }
+        let Some(staff) = inner.staff.get_mut(target_uid) else {
+            return Err(AdminDirectoryError::Rejected(
+                "no account found for uid".to_string(),
+            ));
+        };
+        staff.tier = new_tier;
+        Ok(())
+    }
+
+    async fn admin_audit_recent(
+        &self,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> Result<Vec<AdminAuditEntry>, AdminDirectoryError> {
+        let inner = self.inner.lock().unwrap();
+        let mut rows: Vec<AdminAuditEntry> = inner
+            .audit_events
+            .iter()
+            .enumerate()
+            .map(|(idx, event)| AdminAuditEntry {
+                id: idx as i64,
+                at: now(),
+                kind: event.kind.to_string(),
+                caller: event.uid.clone(),
+                effective_principal: None,
+                apply: None,
+                class: None,
+                argument: None,
+                guard_set: Vec::new(),
+                verdict: event.verdict.to_string(),
+                detail: event.detail.clone(),
+            })
+            .collect();
+        rows.reverse();
+        if let Some(before) = before_id {
+            rows.retain(|r| r.id < before);
+        }
+        rows.truncate(limit.max(0) as usize);
+        Ok(rows)
     }
 }
 
@@ -1207,4 +1291,188 @@ async fn concurrent_refresh_rotation_only_succeeds_once() {
     let second = service.refresh(&pair.refresh_token, &ctx()).await;
     assert!(first.is_ok());
     assert_eq!(second.unwrap_err(), AuthError::InvalidRefreshToken);
+}
+
+// ---------------------------------------------------------------------------
+// OBI-185 (P2-O2 admin UI): role management through `admin_set_tier`, and
+// the audit view through `admin_audit_recent`. See
+// `docs/threat-model-phase2.md` M-ADM-1 ("role mutations only through the
+// existing `roles_*` security-definer functions; actor = the token's
+// `sub`") and M-ADM-2 (step-up MFA + tier >= 3 for role changes).
+// ---------------------------------------------------------------------------
+
+fn fake_claims(sub: &str, tier: i16, mfa_at: Option<i64>) -> AccessClaims {
+    let now_secs = now().unix_timestamp();
+    AccessClaims {
+        sub: sub.to_string(),
+        tier,
+        scopes: scopes_for_tier(tier),
+        iss: "https://build.loommud.com/".to_string(),
+        aud: jwt::AUDIENCE.to_string(),
+        iat: now_secs,
+        nbf: now_secs,
+        exp: now_secs + 600,
+        sid: "sid".to_string(),
+        amr: vec!["pwd".to_string(), "otp".to_string()],
+        mfa_at,
+    }
+}
+
+/// M-ADM-2: a T3 actor with a fresh step-up may change another uid's
+/// tier within `roles_set_tier`'s own rules, and the change (and its
+/// audit row) actually lands.
+#[tokio::test]
+async fn admin_set_tier_succeeds_for_t3_with_fresh_step_up() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("lead", "pw", 3);
+    directory.add_staff("apprentice", "pw", 1);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("lead", 3, Some(now().unix_timestamp()));
+    service
+        .admin_set_tier(&claims, &ctx(), "apprentice", 2, "promotion")
+        .await
+        .expect("T3 with fresh step-up may promote T1 -> T2");
+
+    assert_eq!(directory.tier_of("apprentice"), Some(2));
+    let events = directory.audit_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "admin.roles.set_tier" && e.verdict == "allow"),
+        "role change must be audited as allow: {events:?}"
+    );
+}
+
+/// M-ADM-2: tier < 3 is refused by `AuthService` itself, before the
+/// directory (and therefore the SQL function) is ever called.
+#[tokio::test]
+async fn admin_set_tier_forbidden_below_tier_3() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("builder", "pw", 2);
+    directory.add_staff("target", "pw", 1);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("builder", 2, Some(now().unix_timestamp()));
+    let result = service
+        .admin_set_tier(&claims, &ctx(), "target", 2, "nope")
+        .await;
+    assert_eq!(result, Err(AdminError::Forbidden));
+    assert_eq!(
+        directory.admin_set_tier_calls(),
+        0,
+        "a forbidden caller must never reach the directory/SQL layer"
+    );
+    let events = directory.audit_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "admin.roles.set_tier" && e.verdict == "deny"),
+        "the forbidden attempt must still be audited: {events:?}"
+    );
+}
+
+/// M-ADM-2: tier >= 3 but no fresh step-up (`mfa_at` absent or stale) is
+/// refused -- a mere bearer token is not enough for a role change.
+#[tokio::test]
+async fn admin_set_tier_requires_fresh_step_up() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("lead", "pw", 3);
+    directory.add_staff("target", "pw", 1);
+    let service = test_service(directory.clone());
+
+    // No mfa_at at all.
+    let claims = fake_claims("lead", 3, None);
+    let result = service
+        .admin_set_tier(&claims, &ctx(), "target", 2, "no mfa")
+        .await;
+    assert_eq!(result, Err(AdminError::StepUpRequired));
+
+    // Stale mfa_at (older than the 5-minute window).
+    let stale = fake_claims("lead", 3, Some(now().unix_timestamp() - 600));
+    let result = service
+        .admin_set_tier(&stale, &ctx(), "target", 2, "stale mfa")
+        .await;
+    assert_eq!(result, Err(AdminError::StepUpRequired));
+
+    assert_eq!(directory.admin_set_tier_calls(), 0);
+}
+
+/// M-ADM-1: a request that somehow got a T5 claim is still refused for a
+/// T3->T4 promotion -- `roles_set_tier`'s own Phase-1 range check (here
+/// re-implemented by the fake, the real boundary in Postgres) is what
+/// actually stops this, not `AuthService`'s tier floor (which only
+/// enforces >= 3, not "<= 3"). This is the "even with the UI check
+/// removed" acceptance test: nothing in `AuthService::admin_set_tier`
+/// checks `new_tier` at all before calling the directory.
+#[tokio::test]
+async fn admin_set_tier_t3_to_t4_promotion_is_rejected_by_the_directory() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("root", "pw", 5);
+    directory.add_staff("target", "pw", 3);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("root", 5, Some(now().unix_timestamp()));
+    let result = service
+        .admin_set_tier(&claims, &ctx(), "target", 4, "attempted T4 grant")
+        .await;
+    match result {
+        Err(AdminError::Rejected(message)) => {
+            assert!(message.contains("1-3"), "unexpected message: {message}")
+        }
+        other => panic!("expected AdminError::Rejected, got {other:?}"),
+    }
+    assert_eq!(
+        directory.tier_of("target"),
+        Some(3),
+        "tier must be unchanged after the rejected call"
+    );
+}
+
+/// M-ADM-1: the actor is always `claims.sub` -- there is no parameter on
+/// `admin_set_tier` a caller-controlled body could use to override it.
+/// (The HTTP-layer half of this guarantee -- a body `actor` field is a
+/// 400 -- is covered by `admin::tests` in `loom-http`.)
+#[tokio::test]
+async fn admin_set_tier_self_promotion_is_rejected() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("root", "pw", 5);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("root", 5, Some(now().unix_timestamp()));
+    let result = service
+        .admin_set_tier(&claims, &ctx(), "root", 4, "self promotion")
+        .await;
+    assert!(matches!(result, Err(AdminError::Rejected(_))));
+}
+
+/// M-ADM-3/M-ADM-4: the audit view itself requires tier >= 3, and its
+/// own access is audited.
+#[tokio::test]
+async fn admin_audit_recent_requires_tier_3_and_is_itself_audited() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("builder", "pw", 2);
+    directory.add_staff("lead", "pw", 3);
+    let service = test_service(directory.clone());
+
+    let low = fake_claims("builder", 2, Some(now().unix_timestamp()));
+    assert_eq!(
+        service
+            .admin_audit_recent(&low, &ctx(), 10, None)
+            .await
+            .unwrap_err(),
+        AdminError::Forbidden
+    );
+
+    let high = fake_claims("lead", 3, Some(now().unix_timestamp()));
+    service
+        .admin_audit_recent(&high, &ctx(), 10, None)
+        .await
+        .expect("T3 may view the audit log");
+
+    let events = directory.audit_events();
+    assert!(
+        events.iter().any(|e| e.kind == "admin.audit.view"),
+        "the audit view itself must be audited: {events:?}"
+    );
 }
