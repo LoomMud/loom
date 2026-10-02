@@ -61,7 +61,17 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     if !trimmed.starts_with('/') {
         return Err("path must be mudlib-absolute (start with `/`)".to_string());
     }
-    let normalized: String = trimmed.nfc().collect();
+    // Perf (bench-gate regression on `priv_miss`/`priv_read_hit`, CI):
+    // the overwhelming majority of real mudlib paths are already NFC
+    // (plain ASCII qualifies trivially), so `is_nfc_quick` -- a cheap
+    // per-codepoint scan with no allocation -- lets that common case
+    // skip the `nfc().collect()` allocation entirely; only a path that
+    // actually needs normalising pays for it.
+    let normalized: std::borrow::Cow<str> =
+        match unicode_normalization::is_nfc_quick(trimmed.chars()) {
+            unicode_normalization::IsNormalized::Yes => std::borrow::Cow::Borrowed(trimmed),
+            _ => std::borrow::Cow::Owned(trimmed.nfc().collect()),
+        };
     let mut out = root.to_path_buf();
     for (i, seg) in normalized.split('/').enumerate() {
         if seg.is_empty() {
