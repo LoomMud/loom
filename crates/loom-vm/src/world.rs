@@ -522,6 +522,89 @@ impl World {
         Ok(w)
     }
 
+    /// Begin a binary world snapshot (design spec §8.1 model 2, OBI-173):
+    /// captures the object graph copy-on-write and returns a job the
+    /// caller drives to completion with
+    /// `SnapshotJob::encode_step`/`encode_all` -- see `crate::snapshot`'s
+    /// module docs for the full copy-on-write story and current scope
+    /// limits. The capture itself (`Registry::capture`) is the *entire*
+    /// synchronous "pause" this costs the world thread: its result does
+    /// not borrow `self`, so further `World::tick` calls can run
+    /// immediately after this returns, even while the job's bytes are
+    /// still being encoded.
+    ///
+    /// `Err` only while an `atomic fn` scope is open (see
+    /// `Registry::capture`'s own docs for why).
+    pub fn begin_snapshot(
+        &self,
+    ) -> Result<crate::snapshot::SnapshotJob, crate::snapshot::SnapshotError> {
+        self.registry
+            .capture()
+            .map(crate::snapshot::SnapshotJob::new)
+            .map_err(|_| crate::snapshot::SnapshotError::AtomicScopeOpen)
+    }
+
+    /// Load a binary world snapshot into a fresh driver process (the
+    /// standby side of copyover, design spec §8.1/OBI-173): `mudlib_root`
+    /// is compiled on demand per distinct program path the snapshot
+    /// references, exactly as [`World::boot`] would, and every object's
+    /// dynamic state (vars, placement, connections) is restored from
+    /// `bytes`. Does **not** run master's `connect()`/boot-time applies --
+    /// `master` is simply whichever restored object was registered under
+    /// [`MASTER_PATH`], `None` if the snapshot had none.
+    ///
+    /// Fails cleanly (no panic) on a bad magic, an incompatible ABI
+    /// version, a truncated/corrupt file, a value kind this build cannot
+    /// yet decode, or a program path that no longer compiles against this
+    /// `mudlib_root` -- see `crate::snapshot::SnapshotError`.
+    pub fn load_snapshot(
+        mudlib_root: &Path,
+        limits: Limits,
+        bytes: &[u8],
+    ) -> Result<World, crate::snapshot::SnapshotError> {
+        if !mudlib_root.is_dir() {
+            return Err(crate::snapshot::SnapshotError::Restore(format!(
+                "{} is not a directory",
+                mudlib_root.display()
+            )));
+        }
+        let decoded = crate::snapshot::decode_snapshot(bytes)?;
+        let mut registry = Registry::default();
+        let mut compiler = Compiler::new(mudlib_root.to_path_buf());
+        registry
+            .restore(decoded, &mut compiler)
+            .map_err(crate::snapshot::SnapshotError::Restore)?;
+        let master = registry.names.get(MASTER_PATH).copied();
+        Ok(World {
+            root: mudlib_root.to_path_buf(),
+            registry,
+            compiler,
+            master,
+            limits,
+            scheduler: Scheduler::new(),
+            pending_recompiles: Vec::new(),
+            finished_recompiles: Vec::new(),
+            next_recompile_token: 0,
+            pending_recompile_sets: Vec::new(),
+            finished_recompile_sets: Vec::new(),
+            next_recompile_set_token: 0,
+            account_auth: Box::new(NullAccountAuth),
+            account_next_id: 0,
+            account_pending: HashMap::new(),
+            account_results: VecDeque::new(),
+            security: SecurityState::new(),
+            roles: Arc::new(RolesSnapshot::empty()),
+            roles_generation: 0,
+            roles_backend: Box::new(NullRolesMutations),
+            roles_next_id: 0,
+            roles_pending: HashMap::new(),
+            roles_results: VecDeque::new(),
+            last_call_out_quota_uid: None,
+            tick_share: HashMap::new(),
+            disk_usage: crate::disk_usage::DiskUsage::default(),
+        })
+    }
+
     /// Install the real `account_create`/`account_login` backend (OBI-85);
     /// until this is called, every account request is issued but never
     /// answered ([`NullAccountAuth`]).
@@ -1310,6 +1393,15 @@ impl World {
 
     pub fn environment(&self, ob: ObjectId) -> Option<ObjectId> {
         self.registry.get(ob).and_then(|o| o.env)
+    }
+
+    /// `ob`'s current inventory (tests/introspection; mirrors
+    /// `environment`, its inverse).
+    pub fn inventory(&self, ob: ObjectId) -> Vec<ObjectId> {
+        self.registry
+            .get(ob)
+            .map(|o| o.inventory.clone())
+            .unwrap_or_default()
     }
 
     /// Current version of a registered program.
