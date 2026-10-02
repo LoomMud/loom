@@ -288,10 +288,22 @@ fn spawn_worker_no_token(
     (handle, calls)
 }
 
+/// Polls `pred` every 20ms until it's true, or panics after a generous
+/// timeout. OBI-222: widened from 10s to 30s after the original budget
+/// was observed timing out on real CI (not locally) twice, on two PRs
+/// that didn't touch `loom-git` at all -- a loaded shared runner running
+/// `cargo test --workspace` alongside `bench`/`fuzz-smoke`/`loadtest-*`
+/// in the same job can legitimately starve this worker's debounced
+/// commit/push timers (`commit_coalesce`/`push_debounce`, tens of ms
+/// each in `spawn_worker`'s fixture config) for longer than 10s of wall
+/// clock under contention, even though nothing is actually stuck. If this
+/// starts timing out again even at 30s, that's a stronger signal of a
+/// real race, not scheduling noise, and is worth investigating as a bug
+/// rather than widening further.
 fn wait_for<F: FnMut() -> bool>(mut pred: F, what: &str) {
     let start = Instant::now();
     while !pred() {
-        if start.elapsed() > Duration::from_secs(10) {
+        if start.elapsed() > Duration::from_secs(30) {
             panic!("timed out waiting for: {what}");
         }
         std::thread::sleep(Duration::from_millis(20));
