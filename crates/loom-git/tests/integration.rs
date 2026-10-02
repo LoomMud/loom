@@ -114,26 +114,33 @@ impl Fixture {
         &self.work_tree
     }
 
-    /// Read `path` (work-tree relative) from a fresh clone of the bare
-    /// remote's `live/<env>` branch, so assertions never depend on the
-    /// driver's own work tree having been fast-forwarded yet.
+    /// Read `path` (work-tree relative) from the bare remote's
+    /// `live/<env>` branch, so assertions never depend on the driver's own
+    /// work tree having been fast-forwarded yet.
+    ///
+    /// OBI-222: this used to spin up a brand-new `git clone` (new temp
+    /// dir, full checkout) on *every* `wait_for` poll -- cheap on an idle
+    /// box, but on a loaded self-hosted runner each clone can itself take
+    /// much longer than the 20ms poll interval, so the polling loop's own
+    /// cost dominates the `wait_for` budget instead of the thing it's
+    /// actually waiting on (the push). `git show <ref>:<path>` reads the
+    /// blob straight out of the bare repo's object store -- no temp dir,
+    /// no working tree, no index -- so polling stays cheap regardless of
+    /// runner load.
     fn remote_live_file(&self, env: &str, path: &str) -> Option<String> {
-        let clone = self.tmp.path().join(format!("peek-{}", rand_suffix()));
         let out = Command::new("git")
             .args([
-                "clone",
-                "--quiet",
-                "-b",
-                &format!("live/{env}"),
+                "--git-dir",
                 &self.bare.to_string_lossy(),
-                &clone.to_string_lossy(),
+                "show",
+                &format!("live/{env}:{path}"),
             ])
             .output()
             .ok()?;
         if !out.status.success() {
             return None;
         }
-        std::fs::read_to_string(clone.join(path)).ok()
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     fn remote_has_ref(&self, ref_name: &str) -> bool {
@@ -150,16 +157,6 @@ impl Fixture {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-}
-
-fn rand_suffix() -> String {
-    format!(
-        "{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
 }
 
 fn setup() -> Fixture {
@@ -288,10 +285,20 @@ fn spawn_worker_no_token(
     (handle, calls)
 }
 
+// OBI-222: was 10s. The worker's own debounce/coalesce/tick budget in
+// `spawn_worker` adds up to well under 100ms on an idle box, so 10s
+// looked like a generous margin -- but on a loaded self-hosted ARC
+// runner (other workflow jobs sharing the node, cgroup CPU throttling)
+// every `git` subprocess call in the polling predicate can itself stall
+// for seconds, and the two observed flakes (OBI-222) both happened
+// during exactly that kind of contention. 30s gives real headroom
+// without the fixture ever being expected to actually need it in the
+// unloaded case. See also the `remote_live_file` fix in this same patch,
+// which removed the main source of per-poll cost.
 fn wait_for<F: FnMut() -> bool>(mut pred: F, what: &str) {
     let start = Instant::now();
     while !pred() {
-        if start.elapsed() > Duration::from_secs(10) {
+        if start.elapsed() > Duration::from_secs(30) {
             panic!("timed out waiting for: {what}");
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -386,6 +393,23 @@ fn push_lands_on_live_env_branch() {
     handle
         .record_write("appr1", identity, "/room.wf", "ed /room.wf")
         .unwrap();
+    // OBI-222: this test previously relied purely on the worker's
+    // timer-based commit_coalesce/push_debounce to land the write and
+    // push it -- the *second* wait_for below needs a full extra
+    // commit+push cycle after the boot-time sync's own push (which is
+    // what made the first wait_for below pass quickly even under load:
+    // it only needs *a* push to have landed, not this write's content).
+    // On a CPU-starved self-hosted runner, waiting on wall-clock timers
+    // to fire is unbounded -- the worker thread only gets to check its
+    // deadlines when the OS schedules it at all. `kick()` (same
+    // mechanism `upstream_main_move_is_rebased_in_and_recompile_is_called`
+    // and the conflict test already use) forces an immediate
+    // flush-all-pending-commits-then-sync-then-push pass the next time
+    // the worker thread runs at all, instead of making convergence
+    // depend on comparing `Instant::now()` against a short coalesce/
+    // debounce deadline that can be missed by many ticks in a row under
+    // contention.
+    handle.kick();
 
     wait_for(
         || fx.remote_has_ref("refs/heads/live/test"),
