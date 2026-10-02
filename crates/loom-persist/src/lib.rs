@@ -321,6 +321,24 @@ pub struct AuditRow {
     pub detail: Option<String>,
 }
 
+/// One `audit_log` row as read back by [`Persist::audit_log_recent`]
+/// (OBI-185, M-ADM-4): the admin audit view's row shape, with the
+/// serial `id` the write side ([`AuditRow`]) never carries.
+#[derive(Debug, Clone)]
+pub struct AuditLogEntry {
+    pub id: i64,
+    pub at: OffsetDateTime,
+    pub kind: String,
+    pub caller: Option<String>,
+    pub effective_principal: Option<String>,
+    pub apply: Option<String>,
+    pub class: Option<i16>,
+    pub argument: Option<String>,
+    pub guard_set: Vec<String>,
+    pub verdict: String,
+    pub detail: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum DbRequest {
     Sleep {
@@ -1443,6 +1461,57 @@ impl Persist {
         });
         builder.build().execute(&self.pool).await?;
         Ok(())
+    }
+
+    /// Read back the most recent `audit_log` rows, newest first (OBI-185,
+    /// M-ADM-4: the admin audit view). `before_id`, if set, only returns
+    /// rows strictly older than that id (keyset pagination -- stable
+    /// under concurrent inserts, unlike an `OFFSET`). `limit` is clamped
+    /// to 200 so a caller can never force an unbounded read of the whole
+    /// table through this path.
+    ///
+    /// Read-only: `loom_app` has `SELECT` on `audit_log` (0006 migration)
+    /// and nothing else, so this is the only operation this function (or
+    /// any other `loom_app` code path) can perform against the table --
+    /// there is no corresponding update/delete method because there is no
+    /// grant that would let one work.
+    pub async fn audit_log_recent(
+        &self,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> Result<Vec<AuditLogEntry>> {
+        let limit = limit.clamp(1, 200);
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, at, kind, caller, effective_principal, apply, class,
+                   guard_set, verdict, detail, argument
+            FROM audit_log
+            WHERE $1::BIGINT IS NULL OR id < $1
+            ORDER BY id DESC
+            LIMIT $2
+            "#,
+            before_id,
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| AuditLogEntry {
+                id: row.id,
+                at: row.at,
+                kind: row.kind,
+                caller: row.caller,
+                effective_principal: row.effective_principal,
+                apply: row.apply,
+                class: row.class,
+                argument: row.argument,
+                guard_set: row.guard_set.unwrap_or_default(),
+                verdict: row.verdict,
+                detail: row.detail,
+            })
+            .collect())
     }
 }
 

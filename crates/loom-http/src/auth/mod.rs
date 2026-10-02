@@ -77,8 +77,8 @@ mod totp;
 
 pub use claims::{AccessClaims, scopes_for_tier};
 pub use directory::{
-    AuditEvent, DirectoryError, RefreshRecord, RefreshRotation, StaffAuthRecord, StaffAuthStatus,
-    StaffDirectory,
+    AdminAuditEntry, AdminDirectoryError, AuditEvent, DirectoryError, RefreshRecord,
+    RefreshRotation, StaffAuthRecord, StaffAuthStatus, StaffDirectory,
 };
 pub use github::{GithubAuthError, GithubIdentityProvider, GithubUser};
 pub use jwt::{AUDIENCE, JwtKeys, TokenPair};
@@ -174,6 +174,48 @@ impl std::fmt::Display for AuthError {
 }
 
 impl std::error::Error for AuthError {}
+
+/// Tier floor for role-change actions (M-ADM-2/§5.11.2): a domain lead
+/// (T3) may act (within `roles_set_tier`'s own, narrower SQL rules), but
+/// nothing below that.
+pub const ADMIN_ROLE_CHANGE_MIN_TIER: i16 = 3;
+/// Step-up MFA freshness window for role changes, grants, another user's
+/// TOTP reset, and broadcast (M-ADM-2): `mfa_at` must be within this many
+/// seconds of "now".
+pub const STEP_UP_WINDOW_SECS: i64 = 5 * 60;
+
+/// A failure from one of the admin (OBI-185) actions on [`AuthService`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminError {
+    /// The caller's tier is below the action's floor (M-ADM-2:
+    /// tier >= 3 for role changes).
+    Forbidden,
+    /// The caller's tier is high enough, but their session has no
+    /// `mfa_at` within the last 5 minutes (M-ADM-2 step-up).
+    StepUpRequired,
+    /// The request body carried a client-supplied `actor`, or otherwise
+    /// failed input validation -- M-ADM-1: the actor is always the
+    /// token's `sub`, never anything the body can override.
+    BadRequest,
+    /// The `security definer` function itself refused the call (M-ADM-1:
+    /// e.g. self-promotion, actor tier too low for *this* target, tier
+    /// outside the Phase-1 1-3 range). The admin UI's own tier/step-up
+    /// checks above are UX, not the security boundary -- this is what
+    /// actually enforces it, and this variant is reachable even if every
+    /// check above it were removed.
+    Rejected(String),
+    /// The directory (Postgres) failed outright.
+    DirectoryUnavailable,
+}
+
+impl From<AdminDirectoryError> for AdminError {
+    fn from(err: AdminDirectoryError) -> Self {
+        match err {
+            AdminDirectoryError::Rejected(message) => AdminError::Rejected(message),
+            AdminDirectoryError::Unavailable => AdminError::DirectoryUnavailable,
+        }
+    }
+}
 
 impl From<DirectoryError> for AuthError {
     fn from(_: DirectoryError) -> Self {
@@ -606,6 +648,15 @@ impl AuthService {
             .map_err(|_| AuthError::InvalidRefreshToken)
     }
 
+    /// Sign arbitrary claims directly, bypassing `login`/`refresh`
+    /// entirely -- test-only, so `loom-http`'s HTTP-wire admin tests
+    /// (`admin.rs`) can mint a token with a specific tier/`mfa_at`
+    /// without needing a full `StaffDirectory` fake to drive `login`.
+    #[cfg(test)]
+    pub fn sign_for_test(&self, claims: &AccessClaims) -> String {
+        self.keys.encode(claims).expect("encode test claims")
+    }
+
     /// Read `uid`'s fresh tier/TOTP status, refusing outright (and
     /// dropping any sessions it might still hold) if it has no `staff`
     /// row at all (OBI-195 review fix 5): the old `tier_of`-based design
@@ -744,6 +795,133 @@ impl AuthService {
             // RFC 6238-valid, but this step was already used.
             Err(AuthError::TotpInvalid)
         }
+    }
+
+    /// Admin role-tier change (OBI-185, M-ADM-1/M-ADM-2): `claims` is the
+    /// caller's *verified* access-token claims -- `claims.sub` is always
+    /// the actor passed to `roles_set_tier`, never anything the request
+    /// body supplies (the HTTP layer's `AdminSetTierRequest` has no
+    /// `actor` field at all; see `admin.rs`). Enforces tier >= 3
+    /// (§5.11.2) and step-up freshness (`mfa_at` within the last 5
+    /// minutes) *before* ever calling the directory -- but the real
+    /// boundary is `roles_set_tier` itself: a caller who somehow got past
+    /// both checks (e.g. a build with the tier check deleted) still gets
+    /// refused by SQL for anything the function doesn't allow, which is
+    /// what [`AdminError::Rejected`] surfaces. Every outcome -- forbidden,
+    /// step-up required, rejected, or allowed -- is audited (M-ADM-4).
+    pub async fn admin_set_tier(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        target_uid: &str,
+        new_tier: i16,
+        reason: &str,
+    ) -> Result<(), AdminError> {
+        let detail = format!("target={target_uid} new_tier={new_tier}");
+        if claims.tier < ADMIN_ROLE_CHANGE_MIN_TIER {
+            self.audit(
+                "admin.roles.set_tier",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!("{detail} reason=forbidden")),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        if !self.has_fresh_step_up(claims) {
+            self.audit(
+                "admin.roles.set_tier",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!("{detail} reason=step_up_required")),
+            )
+            .await;
+            return Err(AdminError::StepUpRequired);
+        }
+        match self
+            .directory
+            .admin_set_tier(&claims.sub, target_uid, new_tier, reason)
+            .await
+        {
+            Ok(()) => {
+                self.audit(
+                    "admin.roles.set_tier",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(detail),
+                )
+                .await;
+                Ok(())
+            }
+            Err(err) => {
+                let admin_err: AdminError = err.into();
+                let reason_detail = match &admin_err {
+                    AdminError::Rejected(message) => format!("{detail} reason={message}"),
+                    _ => format!("{detail} reason=directory_unavailable"),
+                };
+                self.audit(
+                    "admin.roles.set_tier",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(reason_detail),
+                )
+                .await;
+                Err(admin_err)
+            }
+        }
+    }
+
+    /// Admin audit view (OBI-185, M-ADM-4): read-only, tier-gated the
+    /// same as object listing (§5.11.2-adjacent: T3+), and itself
+    /// audited -- "every admin endpoint audited" includes the audit view.
+    pub async fn admin_audit_recent(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> Result<Vec<AdminAuditEntry>, AdminError> {
+        if claims.tier < ADMIN_ROLE_CHANGE_MIN_TIER {
+            self.audit(
+                "admin.audit.view",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                None,
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        let rows = self
+            .directory
+            .admin_audit_recent(limit, before_id)
+            .await
+            .map_err(AdminError::from)?;
+        self.audit(
+            "admin.audit.view",
+            Some(claims.sub.clone()),
+            ctx,
+            "allow",
+            Some(format!("limit={limit} before_id={before_id:?}")),
+        )
+        .await;
+        Ok(rows)
+    }
+
+    /// M-ADM-2: a session is "stepped up" if its `mfa_at` is within the
+    /// last 5 minutes. A session that never completed a second factor
+    /// (`mfa_at: None`, e.g. a sub-T3 password-only login) is never
+    /// stepped up, regardless of its current tier.
+    fn has_fresh_step_up(&self, claims: &AccessClaims) -> bool {
+        let Some(mfa_at) = claims.mfa_at else {
+            return false;
+        };
+        let now_secs = now().unix_timestamp();
+        now_secs.saturating_sub(mfa_at) <= STEP_UP_WINDOW_SECS
     }
 
     /// Append one audit row (M-AUTH-9), logging and swallowing any

@@ -277,7 +277,10 @@ async fn only_roots_may_propose_or_approve_a_two_root_change() {
 }
 
 /// `loom_app` cannot write the new tables directly -- only through the
-/// `roles_*` security-definer functions -- except `INSERT` on `audit_log`.
+/// `roles_*` security-definer functions -- except `INSERT`/`SELECT` on
+/// `audit_log` (OBI-185, M-ADM-4: the admin audit view reads `audit_log`
+/// directly, but the sink stays append-only end to end -- `UPDATE`/
+/// `DELETE` are still denied).
 #[tokio::test]
 async fn loom_app_cannot_dml_new_tables_except_insert_audit_log() {
     let Some(fx) = support::setup().await else {
@@ -307,14 +310,14 @@ async fn loom_app_cannot_dml_new_tables_except_insert_audit_log() {
         "direct INSERT into role_proposals",
     );
 
-    denied(
-        sqlx::query("SELECT * FROM audit_log")
-            .execute(fx.app.pool())
-            .await,
-        "direct SELECT on audit_log",
-    );
+    // SELECT on audit_log succeeds (OBI-185, M-ADM-4: the admin audit
+    // view).
+    sqlx::query("SELECT * FROM audit_log")
+        .execute(fx.app.pool())
+        .await
+        .expect("loom_app may SELECT audit_log");
 
-    // The one exception: INSERT on audit_log succeeds.
+    // INSERT on audit_log succeeds too (unchanged from 0002).
     sqlx::query("INSERT INTO audit_log (kind, verdict) VALUES ('quota_breach', 'deny')")
         .execute(fx.app.pool())
         .await
