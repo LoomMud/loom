@@ -1,0 +1,48 @@
+// Player for the P2-B7 canary-update tests (OBI-182, spec §7.4):
+// `clone_thing` to populate a cohort, `touch <name>` to access one (the
+// trigger `RegistryHost::ensure_current` lazily migrates/routes on),
+// `canary <path> <pct> <window_ticks> <max_new_errors>` to drive
+// `canary_update`, and `status <path>` to drive `canary_status`.
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "clone_thing" {
+        let t = clone_object("/std/thing")
+        send(self, $"cloned {object_name(t)}\n")
+    } else if verb == "touch" and len(words) == 2 {
+        let t = find_object(words[1])
+        if t == null {
+            send(self, "no such object\n")
+        } else {
+            let v = t.touch()
+            send(self, $"{v}\n")
+        }
+    } else if verb == "canary" and len(words) == 5 {
+        let path = words[1]
+        let pct = to_int(words[2]) ?? 0
+        let window = to_int(words[3]) ?? 0
+        let max_new_errors = to_int(words[4]) ?? 0
+        let err = canary_update(path, pct, window, max_new_errors)
+        if err == null {
+            send(self, "ok\n")
+        } else {
+            send(self, $"{err}\n")
+        }
+    } else if verb == "status" and len(words) == 2 {
+        let s = canary_status(words[1])
+        if s == null {
+            send(self, "none\n")
+        } else {
+            let pct = s["pct"] ?? -1
+            let new_errors = s["new_errors"] ?? -1
+            let max_new_errors = s["max_new_errors"] ?? -1
+            let ticks_left = s["ticks_left"] ?? -1
+            send(self, $"pct={pct} new_errors={new_errors} max_new_errors={max_new_errors} ticks_left={ticks_left}\n")
+        }
+    } else {
+        send(self, "What?\n")
+    }
+}
+
+pub fn net_dead() {
+}

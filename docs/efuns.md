@@ -19,6 +19,8 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `bind_connection` | `bind_connection(Object) -> Void` | P3 | 2 |
 | `compile_object` | `compile_object(String) -> Optional(String)` | P1 | 500 |
 | `upgrade_all` | `upgrade_all(String) -> Int` | P1 | 50 |
+| `canary_update` | `canary_update(String, Int, Int, Int) -> Optional(String)` | P1 | 500 |
+| `canary_status` | `canary_status(String) -> Optional(Map(String, Any))` | P1 | 5 |
 | `len` | `len(string \| [T] \| {K: V}) -> Int` | P0 | 1 |
 | `split` | `split(String, String) -> Array(String)` | P0 | 5 |
 | `join` | `join(Array(String), String) -> String` | P0 | 5 |

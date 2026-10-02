@@ -79,6 +79,15 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     // mass upgrade, not a single recompile), so P1 pending the CTO's
     // sign-off on efun privilege/tier (flagged, not decided here).
     ("upgrade_all", 1, 1, Privilege::P1, 50),
+    // Spec §7.4, OBI-182 (P2-B7): `update --canary N%` -- compile +
+    // install (lazy, same as `compile_object`) plus start routing a
+    // fraction of accesses to it; see `bcvm::registry::RegistryHost::
+    // canary_update_efun`. Same tier/cost ballpark as `compile_object`
+    // (it does a full recompile too).
+    ("canary_update", 4, 4, Privilege::P1, 500),
+    // Introspection for the above; cheap (a map lookup), same tier as
+    // `canary_update` itself -- see `canary_status_efun`.
+    ("canary_status", 1, 1, Privilege::P1, 5),
     ("len", 1, 1, Privilege::P0, 1),
     ("split", 2, 2, Privilege::P0, 5),
     ("join", 2, 2, Privilege::P0, 5),
