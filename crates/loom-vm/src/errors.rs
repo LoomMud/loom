@@ -12,18 +12,6 @@
 //! ([`crate::world::World::report`]) or silently dropped (a heartbeat, a
 //! `call_out`, `net_dead`, ...).
 //!
-//! **Spec deviation (flagged for the CTO, OBI-169):** the acceptance
-//! criterion groups by `(program, line, message)`. The bytecode carries
-//! no per-instruction source-line debug info yet -- `loom-compiler`'s
-//! `codegen.rs` lowers HIR (which does have spans) straight to flat `Op`s
-//! with none retained, so [`vm::RtError`]'s call trace is function names
-//! only ("in `foo`()"), not `path.wf:line:col`. This groups by `(program,
-//! function, message)` instead: the finest attribution available without
-//! a `loom-compiler` change to carry a `lines: Vec<u32>` debug table
-//! through `FunctionCode`/`Op` to the interpreter. Follow-up filed and
-//! linked from the PR: a `loom-compiler` line-table change to close this
-//! gap.
-//!
 //! **M-ERR-1 (CTO review, OBI-169/PR #72, design `docs/threat-model-
 //! phase2.md`):** a group's `program` is always the **innermost frame's**
 //! own declaring program (`RtError::trace_programs`, parallel to
@@ -38,6 +26,20 @@
 //! before it's stored or grouped, and the `errors` efun
 //! (`crate::bcvm::registry::RegistryHost::errors_efun`) masks a redacted
 //! message to `"<redacted>"` unless the caller's own euid is tier 5.
+//!
+//! **OBI-231 (closes the OBI-169 flagged deviation):** the acceptance
+//! criterion groups by `(program, line, message)`, literally now --
+//! `loom-compiler`'s `codegen.rs` attaches a 1-based source line to every
+//! assembled `Op` (`bytecode::FunctionCode::lines`), and
+//! [`vm::RtError::trace_lines`] carries the innermost frame's line
+//! alongside its formatted trace string, so [`ErrorKey`] groups by that
+//! line instead of standing in with the function name. The function name
+//! is kept too (`ErrorEntry::function`/`ErrorRecord::function`): still
+//! useful context, just no longer part of the grouping key. A line of
+//! `0` means "unknown" (see `vm::RtError::trace_lines`'s doc for when
+//! that happens -- hand-assembled bytecode with no line table, or an
+//! error raised before any frame's `pc` advanced) and groups like any
+//! other line value, not specially.
 //!
 //! Exported metric (P2-O4/P2-B7): every [`ErrorInbox::record`] bumps
 //! `loom_runtime_errors_total{program}` through the process-global
@@ -81,17 +83,25 @@ fn cap_message(message: &str) -> &str {
     &message[..end]
 }
 
-/// Grouping key (spec: "(program, line, message)" -- see the module doc's
-/// flagged deviation: `function` stands in for `line` here).
+/// Grouping key (spec: "(program, line, message)", OBI-231: now literally
+/// that -- see [`line_of`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ErrorKey {
     program: String,
-    function: String,
+    /// `0` = unknown (see [`RtError::trace_lines`]): still a valid group,
+    /// distinct from any known line, the same way a different `function`
+    /// used to be before OBI-231.
+    line: u32,
     message: String,
 }
 
 #[derive(Clone, Debug)]
 struct ErrorEntry {
+    /// The innermost frame's function name the *first* time this group
+    /// was seen (OBI-231: no longer part of the grouping key, but still
+    /// useful context alongside the line -- kept for the `errors` efun and
+    /// `ErrorRecord`'s existing `function` column).
+    function: String,
     count: u64,
     first_seen_unix_ms: u64,
     last_seen_unix_ms: u64,
@@ -116,6 +126,8 @@ struct ErrorEntry {
 pub struct ErrorRecord {
     pub program: String,
     pub function: String,
+    /// `0` = unknown (see [`RtError::trace_lines`]'s doc).
+    pub line: u32,
     pub message: String,
     pub count: u64,
     pub first_seen_unix_ms: u64,
@@ -148,10 +160,12 @@ impl ErrorInbox {
     /// before it becomes part of the grouping key or is stored (M-ERR-1
     /// must-fix 3). `redacted` is the caller's own M-ERR-1 call: `World::
     /// note_error` sets it when the origin `program` is under `/secure/`.
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         program: &str,
         function: &str,
+        line: u32,
         message: &str,
         trace: &[String],
         now_unix_ms: u64,
@@ -163,7 +177,7 @@ impl ErrorInbox {
             .increment(1);
         let key = ErrorKey {
             program: program.to_string(),
-            function: function.to_string(),
+            line,
             message: message.to_string(),
         };
         if let Some(entry) = self.groups.get_mut(&key) {
@@ -179,6 +193,7 @@ impl ErrorInbox {
         self.groups.insert(
             key,
             ErrorEntry {
+                function: function.to_string(),
                 count: 1,
                 first_seen_unix_ms: now_unix_ms,
                 last_seen_unix_ms: now_unix_ms,
@@ -219,7 +234,8 @@ impl ErrorInbox {
             .filter(|(k, _)| program_prefix.is_none_or(|p| k.program.starts_with(p)))
             .map(|(k, e)| ErrorRecord {
                 program: k.program.clone(),
-                function: k.function.clone(),
+                function: e.function.clone(),
+                line: k.line,
                 message: k.message.clone(),
                 count: e.count,
                 first_seen_unix_ms: e.first_seen_unix_ms,
@@ -233,7 +249,7 @@ impl ErrorInbox {
                 .cmp(&a.last_seen_unix_ms)
                 .then_with(|| b.count.cmp(&a.count))
                 .then_with(|| a.program.cmp(&b.program))
-                .then_with(|| a.function.cmp(&b.function))
+                .then_with(|| a.line.cmp(&b.line))
         });
         rows
     }
@@ -266,20 +282,28 @@ impl ErrorInbox {
 }
 
 /// Derive the grouping key's `function` component from an [`RtError`]'s
-/// trace (its innermost frame, formatted `"in name()"` by the
-/// interpreter -- see `bcvm::vm::Interpreter::run`), falling back to `"?"`
-/// for an error with no trace at all (e.g. one raised before any frame
-/// ever pushed, such as `start`'s "no function" lookup failure).
+/// trace (its innermost frame, formatted `"in name()"` or `"in name() at
+/// path:line"` by the interpreter -- see `bcvm::vm::Interpreter::run`),
+/// falling back to `"?"` for an error with no trace at all (e.g. one
+/// raised before any frame ever pushed, such as `start`'s "no function"
+/// lookup failure).
 pub fn function_of(e: &RtError) -> String {
     match e.trace.first() {
-        Some(f) => f
-            .strip_prefix("in ")
-            .unwrap_or(f)
-            .strip_suffix("()")
-            .unwrap_or(f)
-            .to_string(),
+        Some(f) => {
+            let f = f.strip_prefix("in ").unwrap_or(f);
+            let f = f.split(" at ").next().unwrap_or(f);
+            f.strip_suffix("()").unwrap_or(f).to_string()
+        }
         None => "?".to_string(),
     }
+}
+
+/// The grouping key's `line` component (OBI-231, spec §8.3): the innermost
+/// frame's source line, or `0` ("unknown") for an error with no trace, or
+/// whose innermost frame's line was never recovered -- see
+/// [`RtError::trace_lines`]'s doc for when that happens.
+pub fn line_of(e: &RtError) -> u32 {
+    e.trace_lines.first().copied().unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -289,16 +313,19 @@ mod tests {
     fn err(msg: &str, trace: &[&str]) -> RtError {
         let mut e = RtError::new(msg);
         e.trace = trace.iter().map(|s| s.to_string()).collect();
+        e.trace_lines = vec![0; e.trace.len()];
         e
     }
 
     #[test]
-    fn groups_by_program_function_message_and_counts_occurrences() {
+    fn groups_by_program_line_message_and_counts_occurrences() {
         let mut inbox = ErrorInbox::new();
-        let e = err("division by zero", &["in calc()"]);
+        let mut e = err("division by zero", &["in calc()"]);
+        e.trace_lines = vec![12];
         inbox.record(
             "/d/shire/calc.wf",
             &function_of(&e),
+            line_of(&e),
             &e.message,
             &e.trace,
             1_000,
@@ -307,41 +334,62 @@ mod tests {
         inbox.record(
             "/d/shire/calc.wf",
             &function_of(&e),
+            line_of(&e),
             &e.message,
             &e.trace,
             2_000,
             false,
         );
-        // A different message on the same program/function is a
-        // different group.
-        let e2 = err("index out of range", &["in calc()"]);
+        // A different message on the same program/line is a different
+        // group.
+        let mut e2 = err("index out of range", &["in calc()"]);
+        e2.trace_lines = vec![12];
         inbox.record(
             "/d/shire/calc.wf",
             &function_of(&e2),
+            line_of(&e2),
             &e2.message,
             &e2.trace,
             3_000,
             false,
         );
+        // Same message, same program, but a *different* line is also a
+        // different group (spec §8.3: "(program, line, message)", OBI-231).
+        let mut e3 = err("division by zero", &["in calc()"]);
+        e3.trace_lines = vec![40];
+        inbox.record(
+            "/d/shire/calc.wf",
+            &function_of(&e3),
+            line_of(&e3),
+            &e3.message,
+            &e3.trace,
+            4_000,
+            false,
+        );
 
-        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox.len(), 3);
         let rows = inbox.snapshot(None);
         let calc_div = rows
             .iter()
-            .find(|r| r.message == "division by zero")
+            .find(|r| r.message == "division by zero" && r.line == 12)
             .unwrap();
         assert_eq!(calc_div.count, 2);
         assert_eq!(calc_div.first_seen_unix_ms, 1_000);
         assert_eq!(calc_div.last_seen_unix_ms, 2_000);
         assert_eq!(calc_div.function, "calc");
         assert_eq!(calc_div.sample_trace, vec!["in calc()".to_string()]);
+        let other_line = rows
+            .iter()
+            .find(|r| r.message == "division by zero" && r.line == 40)
+            .unwrap();
+        assert_eq!(other_line.count, 1);
     }
 
     #[test]
     fn snapshot_filters_by_program_prefix() {
         let mut inbox = ErrorInbox::new();
-        inbox.record("/d/shire/a.wf", "f", "boom", &[], 1, false);
-        inbox.record("/d/mordor/b.wf", "g", "boom", &[], 1, false);
+        inbox.record("/d/shire/a.wf", "f", 1, "boom", &[], 1, false);
+        inbox.record("/d/mordor/b.wf", "g", 1, "boom", &[], 1, false);
 
         let shire_only = inbox.snapshot(Some("/d/shire"));
         assert_eq!(shire_only.len(), 1);
@@ -357,13 +405,13 @@ mod tests {
     #[test]
     fn count_for_program_sums_every_group_for_an_exact_program_match() {
         let mut inbox = ErrorInbox::new();
-        inbox.record("/d/shire/calc.wf", "f", "boom one", &[], 1, false);
-        inbox.record("/d/shire/calc.wf", "f", "boom one", &[], 2, false);
-        inbox.record("/d/shire/calc.wf", "g", "boom two", &[], 3, false);
+        inbox.record("/d/shire/calc.wf", "f", 1, "boom one", &[], 1, false);
+        inbox.record("/d/shire/calc.wf", "f", 1, "boom one", &[], 2, false);
+        inbox.record("/d/shire/calc.wf", "g", 1, "boom two", &[], 3, false);
         // A different program (even a prefix match of the first) must not
         // be counted: `snapshot`'s prefix filter is deliberately not what
         // this method does.
-        inbox.record("/d/shire/calc.wf.bak", "f", "boom one", &[], 4, false);
+        inbox.record("/d/shire/calc.wf.bak", "f", 1, "boom one", &[], 4, false);
 
         assert_eq!(inbox.count_for_program("/d/shire/calc.wf"), 3);
         assert_eq!(inbox.count_for_program("/d/shire/calc.wf.bak"), 1);
@@ -374,12 +422,12 @@ mod tests {
     fn evicts_the_least_recently_touched_group_once_at_capacity() {
         let mut inbox = ErrorInbox::new();
         for i in 0..MAX_GROUPS {
-            inbox.record("/p.wf", "f", &format!("err {i}"), &[], i as u64, false);
+            inbox.record("/p.wf", "f", 1, &format!("err {i}"), &[], i as u64, false);
         }
         assert_eq!(inbox.len(), MAX_GROUPS);
         // One more distinct group evicts the oldest-touched one (group 0,
         // never touched again) rather than growing past the cap.
-        inbox.record("/p.wf", "f", "err new", &[], MAX_GROUPS as u64, false);
+        inbox.record("/p.wf", "f", 1, "err new", &[], MAX_GROUPS as u64, false);
         assert_eq!(inbox.len(), MAX_GROUPS);
         let rows = inbox.snapshot(None);
         assert!(!rows.iter().any(|r| r.message == "err 0"));
@@ -390,6 +438,8 @@ mod tests {
     fn function_of_strips_the_trace_frame_formatting() {
         let e = err("x", &["in look()"]);
         assert_eq!(function_of(&e), "look");
+        let with_line = err("x", &["in look() at /std/room:7"]);
+        assert_eq!(function_of(&with_line), "look");
         let no_trace = RtError::new("x");
         assert_eq!(function_of(&no_trace), "?");
     }
@@ -407,8 +457,8 @@ mod tests {
         // of panicking/producing invalid UTF-8.
         let huge = format!("boom {}☃{}", "a".repeat(10_000), "tail-one");
         let huge2 = format!("boom {}☃{}", "a".repeat(10_000), "tail-two");
-        inbox.record("/p.wf", "f", &huge, &[], 1, false);
-        inbox.record("/p.wf", "f", &huge2, &[], 2, false);
+        inbox.record("/p.wf", "f", 1, &huge, &[], 1, false);
+        inbox.record("/p.wf", "f", 1, &huge2, &[], 2, false);
 
         assert_eq!(
             inbox.len(),
@@ -422,6 +472,15 @@ mod tests {
             "truncation must never split a multi-byte char"
         );
         assert_eq!(rows[0].count, 2);
+    }
+
+    #[test]
+    fn line_of_reads_the_innermost_frame_and_defaults_to_unknown() {
+        let mut e = err("x", &["in look() at /std/room:7"]);
+        e.trace_lines = vec![7];
+        assert_eq!(line_of(&e), 7);
+        let no_trace = RtError::new("x");
+        assert_eq!(line_of(&no_trace), 0);
     }
 
     /// P2-O4/P2-B7: every `record` bumps `loom_runtime_errors_total` through
@@ -485,8 +544,8 @@ mod tests {
         let recorder = TestRecorder(count.clone());
         metrics::with_local_recorder(&recorder, || {
             let mut inbox = ErrorInbox::new();
-            inbox.record("/std/vault", "heartbeat", "boom", &[], 1, false);
-            inbox.record("/std/vault", "heartbeat", "boom", &[], 2, false);
+            inbox.record("/std/vault", "heartbeat", 1, "boom", &[], 1, false);
+            inbox.record("/std/vault", "heartbeat", 1, "boom", &[], 2, false);
         });
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }

@@ -59,6 +59,14 @@ pub struct RtError {
     /// message to whatever `valid_read` lets the entry object's own
     /// program see.
     pub trace_programs: Vec<String>,
+    /// Source line each [`Self::trace`] frame was at when this error
+    /// unwound past it, same length and order as `trace` always (OBI-231,
+    /// spec §8.3: the error inbox's `(program, line, message)` grouping).
+    /// `0` means "unknown" -- the frame never had a pc yet (e.g. the
+    /// native-stack-budget check in `bcvm::registry::Host::call_in`, which
+    /// fails before any `Op` of the callee ever runs) or the running
+    /// `Module`'s `FunctionCode::lines` table is empty (no debug info).
+    pub trace_lines: Vec<u32>,
     /// `false` for tick/call-depth exhaustion (spec: not catchable — a
     /// `try`/`catch` in the unwind path must not stop it). `true` for
     /// everything else, including `throw` and ordinary runtime errors
@@ -76,6 +84,7 @@ impl RtError {
             message: message.into(),
             trace: Vec::new(),
             trace_programs: Vec::new(),
+            trace_lines: Vec::new(),
             catchable: true,
             thrown: None,
         }
@@ -95,6 +104,7 @@ impl RtError {
             message,
             trace: Vec::new(),
             trace_programs: Vec::new(),
+            trace_lines: Vec::new(),
             catchable: true,
             thrown: Some(value),
         }
@@ -664,6 +674,35 @@ impl<'a, H: Host> Interpreter<'a, H> {
         &m.strings[m.functions[f.func as usize].name as usize]
     }
 
+    /// 1-based source line `f` was at when its containing frame unwound
+    /// (OBI-231): the line table entry for the *previous* instruction --
+    /// `f.pc` is already past it, [`Interpreter::step`] increments it
+    /// right after fetching but before executing, so the instruction that
+    /// actually raised/propagated the error is at `f.pc - 1`. `0`
+    /// ("unknown") if `f.pc` is `0` (no instruction has run in this frame
+    /// yet) or the function's line table is empty (no debug info, e.g.
+    /// hand-assembled test bytecode -- see `bytecode::FunctionCode::lines`).
+    fn frame_line(&self, f: &Frame) -> u32 {
+        let m = self.module_of(f);
+        let func = &m.functions[f.func as usize];
+        match (f.pc as usize).checked_sub(1) {
+            Some(idx) => func.lines.get(idx).copied().unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// `"in foo()"`, or `"in foo() at /path.wf:12"` when a line is known
+    /// (OBI-231): the format `RtError::trace` stores and `errors::function_of`
+    /// parses back out.
+    fn format_frame(&self, f: &Frame, line: u32) -> String {
+        let name = self.frame_name(f);
+        if line == 0 {
+            format!("in {name}()")
+        } else {
+            format!("in {name}() at {}:{line}", self.module_of(f).path)
+        }
+    }
+
     fn str_of(&self, id: u32) -> &str {
         &self.cur().strings[id as usize]
     }
@@ -938,30 +977,29 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     // than the entry object's.
                     if e.trace.len() < 12 {
                         let take = 12 - e.trace.len();
-                        let names: Vec<String> = self
-                            .stack
-                            .iter()
-                            .rev()
-                            .take(take)
-                            .map(|f| format!("in {}()", self.frame_name(f)))
-                            .collect();
-                        let programs: Vec<String> = self
+                        let frames: Vec<(String, String, u32)> = self
                             .stack
                             .iter()
                             .rev()
                             .take(take)
                             .map(|f| {
-                                f.code
+                                let line = self.frame_line(f);
+                                let program = f
+                                    .code
                                     .as_ref()
                                     .and_then(|c| c.program_path())
                                     .map(str::to_string)
                                     .unwrap_or_else(|| {
                                         self.base_program.as_deref().unwrap_or("?").to_string()
-                                    })
+                                    });
+                                (self.format_frame(f, line), program, line)
                             })
                             .collect();
-                        e.trace.extend(names);
-                        e.trace_programs.extend(programs);
+                        for (name, program, line) in frames {
+                            e.trace.push(name);
+                            e.trace_programs.push(program);
+                            e.trace_lines.push(line);
+                        }
                     }
                     while !self.stack.is_empty() {
                         self.pop_frame_on_error();
@@ -2017,6 +2055,7 @@ mod tests {
                 reg_types: vec![Ty::Int; 6],
                 entry_points: vec![0],
                 code: code.into(),
+                lines: Vec::new(),
                 capture_targets: Vec::new(),
             }],
         }
@@ -2252,6 +2291,7 @@ mod tests {
                 reg_types: vec![Ty::array(Ty::Int), Ty::array(Ty::Int), Ty::Int, Ty::Int],
                 entry_points: vec![0],
                 code: code.into(),
+                lines: Vec::new(),
                 capture_targets: Vec::new(),
             }],
         };
