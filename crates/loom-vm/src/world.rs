@@ -1914,10 +1914,19 @@ impl World {
     /// `force: true` themselves (a host-side caller is trusted to decide
     /// that for itself; there is no master/efun-privilege gate at this
     /// level, unlike the `profile_stop` efun's P3 check).
+    ///
+    /// Exception (OBI-238, follow-up to should-fix 5): a window that has
+    /// already hit its own auto-expiry cap is replaced outright, even by
+    /// a different owner, no `profile_stop`/`force` required -- an
+    /// expired window is not sampling anything anymore (`wants` already
+    /// answers `false` for it), so refusing to replace it would just let
+    /// a builder who forgot to close their window block everyone else's
+    /// profiling indefinitely.
     pub fn profile_start(&mut self, program: &str, owner: &str) -> Result<(), String> {
         let path = loom_compiler::mudlib::normalize_path(program)?;
         if let Some(existing) = &self.registry.profiler
             && existing.owner() != owner
+            && !existing.is_expired()
         {
             return Err(format!(
                 "profile: a window on {:?} is already open, owned by {} -- profile_stop() it \
@@ -1953,6 +1962,18 @@ impl World {
     /// is open.
     pub fn profiling_program(&self) -> Option<&str> {
         self.registry.profiler.as_ref().map(|p| p.program())
+    }
+
+    /// **Test-only.** Force the currently-open `profile` window straight
+    /// to expired -- see `Profiler::force_expire_for_test`'s doc for why
+    /// (OBI-238's integration test needs to exercise auto-expiry without
+    /// actually waiting `MAX_WINDOW` or making `MAX_CALLS` real calls).
+    /// A no-op if no window is open.
+    #[doc(hidden)]
+    pub fn force_expire_profiler_for_test(&mut self) {
+        if let Some(p) = self.registry.profiler.as_mut() {
+            p.force_expire_for_test();
+        }
     }
 
     /// `ob`'s owner uid (OBI-121 S2c: immutable, set at creation --

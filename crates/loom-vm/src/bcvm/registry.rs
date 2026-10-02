@@ -3920,6 +3920,14 @@ impl<'a> RegistryHost<'a> {
             // profile. The same owner re-calling `profile_start` (e.g. to
             // retarget to a different program) still just replaces their
             // own window, same as before.
+            //
+            // Exception (OBI-238): a window that has already hit its own
+            // auto-expiry cap (`Profiler::is_expired`) is replaced
+            // outright, even by a different principal -- it is not
+            // sampling anything anymore (`wants` already answers `false`
+            // for it), so holding the ownership lock on it would just let
+            // a builder who forgot to call `profile_stop` block everyone
+            // else's profiling indefinitely.
             "profile_start" => {
                 let p = a0
                     .as_str()
@@ -3932,6 +3940,7 @@ impl<'a> RegistryHost<'a> {
                     .to_string();
                 if let Some(existing) = self.registry.profiler.as_ref()
                     && existing.owner() != owner
+                    && !existing.is_expired()
                 {
                     return Err(RtError::new(format!(
                         "profile_start(): a profiling window on {:?} is already open, owned by \
