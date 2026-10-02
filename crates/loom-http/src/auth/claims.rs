@@ -26,6 +26,31 @@ pub struct AccessClaims {
 /// every tier below it -- and deliberately conservative: this is a first
 /// cut for Phase 2, to be refined with the CTO as the web IDE's actual
 /// endpoints get scope-gated (see the OBI-174 PR description).
+/// Claims for a short-lived, single-purpose token identifying a GitHub
+/// numeric user id that OAuth already resolved but which still needs a
+/// TOTP code to finish signing in (OBI-201, M-AUTH-7: "GitHub counts as
+/// the password factor only"). Carries `github_id`, not a staff uid --
+/// [`crate::auth::AuthService::github_login`] re-resolves the link fresh
+/// when this is redeemed, the same as the original OAuth callback would
+/// have, rather than trusting a uid baked into an earlier token (a link
+/// could be revoked in between). Deliberately **not** [`AccessClaims`]
+/// with placeholder tier/scopes -- a field-shape collision would let a
+/// pending token decode as (or be confused with) a real access token.
+/// `purpose` is checked on decode as a second guard even though the field
+/// shapes already differ (`AccessClaims` has no `purpose`, this has no
+/// `tier`/`scopes`, so cross-decoding fails on missing fields regardless).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubPendingClaims {
+    pub github_id: i64,
+    pub purpose: String,
+    pub iat: i64,
+    pub exp: i64,
+}
+
+/// The only valid [`GithubPendingClaims::purpose`] value. Checked on
+/// decode, not just set on encode.
+pub const GITHUB_PENDING_PURPOSE: &str = "github_totp_pending";
+
 pub fn scopes_for_tier(tier: i16) -> Vec<String> {
     let mut scopes = Vec::new();
     if tier >= 1 {

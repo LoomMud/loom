@@ -70,13 +70,17 @@ mod jwt;
 pub mod ratelimit;
 mod totp;
 
-pub use claims::{AccessClaims, scopes_for_tier};
+pub use claims::{AccessClaims, GITHUB_PENDING_PURPOSE, GithubPendingClaims, scopes_for_tier};
 pub use directory::{
     AuditEvent, DirectoryError, RefreshRecord, RefreshRotation, StaffAuthRecord, StaffAuthStatus,
     StaffDirectory,
 };
-pub use github::{GithubAuthError, GithubIdentityProvider, GithubUser};
-pub use jwt::{JwtKeys, TokenPair};
+pub use github::{
+    GithubAuthError, GithubIdentityProvider, GithubLoginConfig, GithubOAuthConfig, GithubUser,
+    LiveGithubProvider, OAUTH_STATE_PURPOSE, OAuthStateClaims, PkcePair, generate_pkce,
+    generate_state,
+};
+pub use jwt::{Expires, JwtKeys, TokenPair};
 pub use ratelimit::{RateLimitDecision, RateLimiter};
 pub use totp::{
     TotpEnrollment, generate_totp_secret, totp_for_secret, totp_step_for_code, verify_totp_code,
@@ -117,6 +121,16 @@ pub const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 /// Tiers at or above this one must have a confirmed TOTP secret to obtain a
 /// session (design §9/D-P2.5: "mandatory for T3+").
 pub const MANDATORY_TOTP_TIER: i16 = 3;
+/// A GitHub-login-pending-TOTP token (OBI-201) is a narrow, single-use
+/// credential: it only ever proves "GitHub's authorization-code exchange
+/// already resolved to this numeric github_id", not "this uid is signed
+/// in". Kept short so a leaked one (log, referrer, browser history on a
+/// JSON response) is cheap to wait out.
+pub const GITHUB_PENDING_TTL: Duration = Duration::from_secs(5 * 60);
+/// How long a GitHub OAuth `state`/PKCE-verifier cookie is good for
+/// (OBI-201, M-AUTH-7) -- long enough for a human to authorize on GitHub,
+/// short enough that a captured cookie isn't useful for long.
+pub const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
@@ -150,6 +164,13 @@ pub enum AuthError {
     /// throttle is not account-specific and doesn't leak anything about
     /// a particular username.
     RateLimited,
+    /// The GitHub-login-pending-TOTP token is unknown, expired, malformed,
+    /// or was issued for a different purpose (OBI-201).
+    InvalidPendingToken,
+    /// The OAuth `state` cookie is missing, expired, malformed, signed for
+    /// a different purpose, or doesn't match the `state` GitHub echoed
+    /// back (OBI-201, M-AUTH-7).
+    InvalidOAuthState,
 }
 
 impl std::fmt::Display for AuthError {
@@ -162,6 +183,8 @@ impl std::fmt::Display for AuthError {
             AuthError::InvalidRefreshToken => "invalid refresh token",
             AuthError::DirectoryUnavailable => "directory unavailable",
             AuthError::RateLimited => "rate limited",
+            AuthError::InvalidPendingToken => "invalid pending token",
+            AuthError::InvalidOAuthState => "invalid oauth state",
         };
         f.write_str(s)
     }
@@ -316,9 +339,9 @@ impl AuthService {
         }
     }
 
-    /// GitHub login (design §9): `github_id` is the numeric id the caller
-    /// already obtained by exchanging an OAuth code and calling GitHub's
-    /// `/user` endpoint (see [`GithubIdentityProvider`]) -- this function
+    /// GitHub login (design §9, M-AUTH-7): `github_id` is the numeric id
+    /// the caller already obtained from the real OAuth2 + PKCE exchange
+    /// (see [`GithubIdentityProvider`]/`crate::handlers`) -- this function
     /// never talks to GitHub itself, it only resolves the link. An
     /// unlinked id is always refused; this never creates a staff row.
     ///
@@ -328,17 +351,153 @@ impl AuthService {
     /// for the *link*, not for a second factor on *this* login -- a GitHub
     /// account takeover must not bypass the mandatory-TOTP floor just
     /// because an arch linked it once.
+    ///
+    /// Shares the password path's rate limiter and audit trail (OBI-206:
+    /// GitHub login previously bypassed both, so a compromised GitHub
+    /// account -- or a stolen/forged authorization code -- could brute
+    /// force TOTP codes through repeated callbacks with no lockout and no
+    /// record). The limiter key is `github:{github_id}` rather than a
+    /// uid: the id is known before the link is resolved, so a flood of
+    /// bogus/unlinked ids is throttled too, not just guesses against a
+    /// linked account.
     pub async fn github_login(
         &self,
         github_id: i64,
         totp_code: Option<&str>,
+        ctx: &AuthContext,
     ) -> Result<TokenPair, AuthError> {
-        let uid = self
-            .directory
-            .github_lookup(github_id)
-            .await?
-            .ok_or(AuthError::InvalidCredentials)?;
-        self.issue_tokens(&uid, totp_code).await
+        let rate_limit_key = format!("github:{github_id}");
+        match self.rate_limiter.check(&rate_limit_key, ctx.ip) {
+            RateLimitDecision::IpThrottled => {
+                self.audit(
+                    "auth.login.fail",
+                    None,
+                    ctx,
+                    "deny",
+                    Some("ip_rate_limited".to_string()),
+                )
+                .await;
+                return Err(AuthError::RateLimited);
+            }
+            RateLimitDecision::AccountLocked => {
+                self.audit(
+                    "auth.login.fail",
+                    None,
+                    ctx,
+                    "deny",
+                    Some("account_locked".to_string()),
+                )
+                .await;
+                return Err(AuthError::InvalidCredentials);
+            }
+            RateLimitDecision::Allowed => {}
+        }
+
+        let uid = match self.directory.github_lookup(github_id).await {
+            Ok(Some(uid)) => uid,
+            Ok(None) => {
+                self.rate_limiter.record_failure(&rate_limit_key);
+                self.audit(
+                    "auth.login.fail",
+                    None,
+                    ctx,
+                    "deny",
+                    Some("github_unlinked".to_string()),
+                )
+                .await;
+                return Err(AuthError::InvalidCredentials);
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        match self.issue_tokens(&uid, totp_code).await {
+            Ok(pair) => {
+                self.rate_limiter.record_success(&rate_limit_key);
+                self.audit("auth.login.ok", Some(uid.clone()), ctx, "allow", None)
+                    .await;
+                Ok(pair)
+            }
+            Err(err) => {
+                if err == AuthError::TotpInvalid {
+                    self.rate_limiter.record_failure(&rate_limit_key);
+                }
+                self.audit(
+                    "auth.login.fail",
+                    Some(uid.clone()),
+                    ctx,
+                    "deny",
+                    Some(totp_gate_detail(&err).to_string()),
+                )
+                .await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Mint a short-lived, single-purpose token asserting "GitHub's
+    /// authorization-code exchange already resolved to this numeric
+    /// `github_id`" (OBI-201), for the callback handler to hand back when
+    /// [`Self::github_login`] refuses with [`AuthError::TotpRequired`]:
+    /// the authorization code is single-use and already spent by that
+    /// point, so the client can't just redo the OAuth dance with a
+    /// `totp_code` attached -- it redeems this token instead, via
+    /// [`Self::github_login_with_pending`].
+    pub fn issue_github_pending(&self, github_id: i64) -> Result<String, AuthError> {
+        let issued_at = now();
+        let claims = GithubPendingClaims {
+            github_id,
+            purpose: GITHUB_PENDING_PURPOSE.to_string(),
+            iat: issued_at.unix_timestamp(),
+            exp: (issued_at + GITHUB_PENDING_TTL).unix_timestamp(),
+        };
+        self.keys
+            .encode_claims(&claims)
+            .map_err(|_| AuthError::DirectoryUnavailable)
+    }
+
+    /// Redeem a [`Self::issue_github_pending`] token plus a TOTP code,
+    /// completing a GitHub login that stopped at the TOTP gate. Resolves
+    /// the link fresh (same as [`Self::github_login`] would), rather than
+    /// trusting a uid baked into the pending token, so a link revoked in
+    /// the interim is honoured.
+    pub async fn github_login_with_pending(
+        &self,
+        pending_token: &str,
+        totp_code: Option<&str>,
+        ctx: &AuthContext,
+    ) -> Result<TokenPair, AuthError> {
+        let claims: GithubPendingClaims = self
+            .keys
+            .decode_claims(pending_token)
+            .map_err(|_| AuthError::InvalidPendingToken)?;
+        if claims.purpose != GITHUB_PENDING_PURPOSE {
+            return Err(AuthError::InvalidPendingToken);
+        }
+        self.github_login(claims.github_id, totp_code, ctx).await
+    }
+
+    /// Sign an [`OAuthStateClaims`] bundle for the `__Host-` state cookie
+    /// (OBI-201, M-AUTH-7). Used by `crate::handlers::github_start`.
+    pub fn sign_oauth_state(&self, claims: &OAuthStateClaims) -> Result<String, AuthError> {
+        self.keys
+            .encode_claims(claims)
+            .map_err(|_| AuthError::DirectoryUnavailable)
+    }
+
+    /// Verify and decode the `__Host-` state cookie (OBI-201, M-AUTH-7).
+    /// Refuses an expired cookie, a bad signature, or one signed for a
+    /// different purpose -- used by `crate::handlers::github_callback`
+    /// before it trusts anything in the cookie (the PKCE verifier
+    /// especially).
+    pub fn verify_oauth_state(&self, cookie_value: &str) -> Result<OAuthStateClaims, AuthError> {
+        let claims: OAuthStateClaims = self
+            .keys
+            .decode_claims(cookie_value)
+            .map_err(|_| AuthError::InvalidOAuthState)?;
+        if claims.purpose != OAUTH_STATE_PURPOSE {
+            return Err(AuthError::InvalidOAuthState);
+        }
+        Ok(claims)
     }
 
     /// Rotate a refresh token: the presented token must be unexpired and

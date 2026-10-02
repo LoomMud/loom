@@ -22,6 +22,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, KeyInit, Mac};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use time::OffsetDateTime;
@@ -71,6 +72,18 @@ impl JwtKeys {
     }
 
     pub fn encode(&self, claims: &AccessClaims) -> Result<String, JwtError> {
+        self.encode_claims(claims)
+    }
+
+    pub fn decode(&self, token: &str) -> Result<AccessClaims, JwtError> {
+        self.decode_claims(token)
+    }
+
+    /// Sign any `Serialize` claims type as an HS256 JWT. Shared by access
+    /// tokens ([`Self::encode`]) and the GitHub-login TOTP-pending token
+    /// ([`super::claims::GithubPendingClaims`]) so there is exactly one
+    /// signing implementation -- never two copies that could drift.
+    pub fn encode_claims<T: Serialize>(&self, claims: &T) -> Result<String, JwtError> {
         let header_b64 =
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header()).map_err(|_| JwtError)?);
         let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).map_err(|_| JwtError)?);
@@ -80,7 +93,12 @@ impl JwtKeys {
         Ok(format!("{signing_input}.{signature_b64}"))
     }
 
-    pub fn decode(&self, token: &str) -> Result<AccessClaims, JwtError> {
+    /// Verify and decode any `DeserializeOwned + `[`Expires`]` claims type.
+    /// Pins `alg: HS256` (no negotiation, so `alg: none` is refused
+    /// outright), verifies the signature in constant time, and refuses an
+    /// expired token -- the same checks [`Self::decode`] always did,
+    /// generalised so a second claims shape doesn't need its own copy.
+    pub fn decode_claims<T: DeserializeOwned + Expires>(&self, token: &str) -> Result<T, JwtError> {
         let mut parts = token.split('.');
         let (Some(header_b64), Some(claims_b64), Some(signature_b64), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -105,10 +123,10 @@ impl JwtKeys {
         self.verify(signing_input.as_bytes(), &signature)?;
 
         let claims_bytes = URL_SAFE_NO_PAD.decode(claims_b64).map_err(|_| JwtError)?;
-        let claims: AccessClaims = serde_json::from_slice(&claims_bytes).map_err(|_| JwtError)?;
+        let claims: T = serde_json::from_slice(&claims_bytes).map_err(|_| JwtError)?;
 
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        if claims.exp <= now {
+        if claims.exp() <= now {
             return Err(JwtError);
         }
 
@@ -129,6 +147,30 @@ impl JwtKeys {
             HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts a key of any length");
         mac.update(data);
         mac.verify_slice(signature).map_err(|_| JwtError)
+    }
+}
+
+/// A claims type that carries a Unix-seconds expiry, so
+/// [`JwtKeys::decode_claims`] can enforce it generically.
+pub trait Expires {
+    fn exp(&self) -> i64;
+}
+
+impl Expires for AccessClaims {
+    fn exp(&self) -> i64 {
+        self.exp
+    }
+}
+
+impl Expires for super::claims::GithubPendingClaims {
+    fn exp(&self) -> i64 {
+        self.exp
+    }
+}
+
+impl Expires for super::github::OAuthStateClaims {
+    fn exp(&self) -> i64 {
+        self.exp
     }
 }
 
