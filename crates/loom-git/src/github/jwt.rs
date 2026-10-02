@@ -20,6 +20,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{self, RsaKeyPair};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JwtError {
@@ -56,13 +57,14 @@ struct Claims<'a> {
 /// `ring::signature::RsaKeyPair::from_pkcs8` requires and GitHub's own
 /// PKCS#1 PEM is missing. No RSA math: this only rearranges bytes
 /// already present in the PKCS#1 encoding into the PKCS#8 ASN.1 shape.
-fn pkcs1_der_to_pkcs8_der(pkcs1_der: &[u8]) -> Result<Vec<u8>, JwtError> {
+fn pkcs1_der_to_pkcs8_der(pkcs1_der: &[u8]) -> Result<Zeroizing<Vec<u8>>, JwtError> {
     let algorithm = pkcs8::AlgorithmIdentifierRef {
         oid: pkcs1::ALGORITHM_OID,
         parameters: Some(der::asn1::AnyRef::from(der::asn1::Null)),
     };
     pkcs8::PrivateKeyInfo::new(algorithm, pkcs1_der)
         .to_der()
+        .map(Zeroizing::new)
         .map_err(|e| JwtError::BadKey(format!("pkcs1->pkcs8 wrap: {e}")))
 }
 
@@ -73,6 +75,7 @@ fn pkcs1_der_to_pkcs8_der(pkcs1_der: &[u8]) -> Result<Vec<u8>, JwtError> {
 pub fn load_private_key(pem: &str) -> Result<RsaKeyPair, JwtError> {
     let (label, der_bytes) = pem_rfc7468::decode_vec(pem.as_bytes())
         .map_err(|e| JwtError::BadKey(format!("not a PEM document: {e}")))?;
+    let der_bytes = Zeroizing::new(der_bytes);
     let pkcs8_der = match label {
         "PRIVATE KEY" => der_bytes,
         "RSA PRIVATE KEY" => pkcs1_der_to_pkcs8_der(&der_bytes)?,

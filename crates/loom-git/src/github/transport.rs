@@ -21,6 +21,7 @@
 
 use std::io::Read;
 
+#[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,

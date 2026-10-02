@@ -17,7 +17,7 @@
 //! reasonable here instead of pulling in a general-purpose HTTP stack.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +28,19 @@ use super::{HttpClient, HttpError, HttpResponse};
 
 /// Read/write/connect timeout (matches [`super::UreqClient`]'s).
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard cap on response header bytes (status line + headers, up to and
+/// including the terminating blank line) -- a well-behaved GitHub API
+/// response is a few hundred bytes of headers; anything past 64 KiB is
+/// either a misbehaving peer or an attempt to exhaust memory on an
+/// unbounded read.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Hard cap on response body bytes. The GitHub REST responses this
+/// crate parses (installation tokens, PR-create results) are tiny; 8
+/// MiB is generous headroom while still bounding a slow or malicious
+/// peer's ability to make this client buffer an unbounded body.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 /// A minimal HTTP/1.1-over-`rustls` client. Build one with
 /// [`RustlsHttpClient::default`] for the real platform root store
@@ -79,6 +92,12 @@ impl RustlsHttpClient {
         body: Option<&[u8]>,
     ) -> Result<HttpResponse, HttpError> {
         let parsed = url::Url::parse(url).map_err(|e| HttpError(format!("bad URL {url}: {e}")))?;
+        if parsed.scheme() != "https" {
+            return Err(HttpError(format!(
+                "refusing non-https URL: {url} (scheme {:?})",
+                parsed.scheme()
+            )));
+        }
         let host = parsed
             .host_str()
             .ok_or_else(|| HttpError(format!("URL has no host: {url}")))?
@@ -99,8 +118,7 @@ impl RustlsHttpClient {
             .map_err(|e| HttpError(format!("bad TLS server name {host}: {e}")))?;
         let conn = ClientConnection::new(self.config.clone(), server_name)
             .map_err(|e| HttpError(format!("TLS setup: {e}")))?;
-        let sock = TcpStream::connect((host.as_str(), port))
-            .map_err(|e| HttpError(format!("connect {host}:{port}: {e}")))?;
+        let sock = connect_with_timeout(&host, port, TIMEOUT)?;
         sock.set_read_timeout(Some(TIMEOUT))
             .map_err(|e| HttpError(e.to_string()))?;
         sock.set_write_timeout(Some(TIMEOUT))
@@ -143,6 +161,31 @@ impl HttpClient for RustlsHttpClient {
     }
 }
 
+/// Resolves `host:port` and connects with a bounded per-address timeout,
+/// trying each resolved address in turn -- plain `TcpStream::connect`
+/// has no timeout at all and can hang far past [`TIMEOUT`] against an
+/// unresponsive or firewalled address.
+fn connect_with_timeout(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, HttpError> {
+    let addrs: Vec<_> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| HttpError(format!("resolve {host}:{port}: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(HttpError(format!("no addresses for {host}:{port}")));
+    }
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(sock) => return Ok(sock),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(HttpError(format!(
+        "connect {host}:{port}: {}",
+        last_err.expect("at least one address was tried")
+    )))
+}
+
 /// Reads an HTTP/1.1 response: status line, headers (just far enough to
 /// find `Content-Length` or `Transfer-Encoding: chunked`), and the body.
 /// Falls back to "read until the server closes the connection" when
@@ -153,6 +196,11 @@ fn read_response(stream: &mut impl Read) -> Result<HttpResponse, HttpError> {
     let header_end = loop {
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
             break pos + 4;
+        }
+        if buf.len() >= MAX_HEADER_BYTES {
+            return Err(HttpError(format!(
+                "response headers exceeded {MAX_HEADER_BYTES} bytes without a terminating blank line"
+            )));
         }
         let mut chunk = [0u8; 4096];
         let n = stream
@@ -187,30 +235,87 @@ fn read_response(stream: &mut impl Read) -> Result<HttpResponse, HttpError> {
 
     let mut body = buf.split_off(header_end);
     if chunked {
-        read_rest_to_end(stream, &mut body)?;
+        // The raw chunked bytes are read until the peer closes the
+        // connection (every request here sends `Connection: close`);
+        // an early close -- including one that surfaces as
+        // `UnexpectedEof` rather than a clean TCP close -- is tolerated
+        // here because `dechunk` below only succeeds if it finds a
+        // well-formed terminating zero-size chunk, so a truncated
+        // stream still surfaces as an error, just from `dechunk`
+        // instead of the read.
+        read_rest_to_end(stream, &mut body, MAX_BODY_BYTES)?;
         body = dechunk(&body)?;
     } else if let Some(len) = content_length {
-        while body.len() < len {
-            let mut chunk = [0u8; 4096];
-            let n = stream
-                .read(&mut chunk)
-                .map_err(|e| HttpError(format!("read response body: {e}")))?;
-            if n == 0 {
-                break; // server closed early; return what we have
-            }
-            body.extend_from_slice(&chunk[..n]);
+        if len > MAX_BODY_BYTES {
+            return Err(HttpError(format!(
+                "response Content-Length {len} exceeds the {MAX_BODY_BYTES}-byte cap"
+            )));
         }
-        body.truncate(len);
+        read_exact_body(stream, &mut body, len)?;
     } else {
-        read_rest_to_end(stream, &mut body)?;
+        // No length information at all: the only way to know the body
+        // is complete is the peer closing the connection, so an
+        // `UnexpectedEof`-as-close is tolerated here too, same as the
+        // chunked path.
+        read_rest_to_end(stream, &mut body, MAX_BODY_BYTES)?;
     }
 
     Ok(HttpResponse { status, body })
 }
 
-fn read_rest_to_end(stream: &mut impl Read, buf: &mut Vec<u8>) -> Result<(), HttpError> {
+/// Reads until `buf` holds exactly `len` bytes, treating *any* early
+/// close -- a clean `Ok(0)` or an `UnexpectedEof` I/O error -- as a
+/// truncated response and returning an error, since `Content-Length`
+/// makes the expected size unambiguous (unlike the chunked/no-length
+/// paths, where [`read_rest_to_end`] tolerates an EOF-shaped close as
+/// the end-of-body signal).
+fn read_exact_body(stream: &mut impl Read, buf: &mut Vec<u8>, len: usize) -> Result<(), HttpError> {
+    buf.reserve(len.saturating_sub(buf.len()));
+    while buf.len() < len {
+        let mut chunk = [0u8; 4096];
+        let want = (len - buf.len()).min(chunk.len());
+        let read_result = stream.read(&mut chunk[..want]);
+        let n = match read_result {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(HttpError(format!(
+                    "response body truncated: expected {len} bytes, connection closed after {}",
+                    buf.len()
+                )));
+            }
+            Err(e) => return Err(HttpError(format!("read response body: {e}"))),
+        };
+        if n == 0 {
+            return Err(HttpError(format!(
+                "response body truncated: expected {len} bytes, connection closed after {}",
+                buf.len()
+            )));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(())
+}
+
+/// Reads until the peer closes the connection or `buf` reaches `cap`
+/// bytes, whichever comes first. An `UnexpectedEof` arriving instead of
+/// a clean `Ok(0)` is treated the same as a clean close here: a client
+/// that sent `Connection: close` has no length to check completeness
+/// against anyway, so this is only ever called from paths where the
+/// caller independently verifies the body is complete (chunked
+/// framing's terminating zero-size chunk) or where there was never any
+/// length to be truncated against in the first place.
+fn read_rest_to_end(
+    stream: &mut impl Read,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> Result<(), HttpError> {
     let mut chunk = [0u8; 4096];
     loop {
+        if buf.len() >= cap {
+            return Err(HttpError(format!(
+                "response body exceeded the {cap}-byte cap"
+            )));
+        }
         match stream.read(&mut chunk) {
             Ok(0) => return Ok(()),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
@@ -412,5 +517,66 @@ mod tests {
     fn dechunk_handles_multiple_chunks_and_trailer() {
         let chunked = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
         assert_eq!(dechunk(chunked).unwrap(), b"Wikipedia");
+    }
+
+    #[test]
+    fn non_https_url_is_rejected_before_any_connection_is_attempted() {
+        // No network I/O should happen at all for a rejected scheme --
+        // this doesn't even need a running server.
+        let client = RustlsHttpClient::with_root_store(RootCertStore::empty());
+        let err = client
+            .get("http://localhost:1/x", "tok")
+            .expect_err("plain-http URL must be rejected");
+        assert!(err.0.contains("non-https"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn content_length_early_close_is_an_error_not_a_silent_truncation() {
+        // Full headers claiming a 100-byte body, but the connection
+        // supplies only 5 bytes before EOF -- must surface as an error,
+        // not a silently short-truncated `Ok` response.
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nhello";
+        let err =
+            read_response(&mut std::io::Cursor::new(&raw[..])).expect_err("must be truncated");
+        assert!(err.0.contains("truncated"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn content_length_above_cap_is_rejected_up_front() {
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let err = read_response(&mut std::io::Cursor::new(raw.as_bytes()))
+            .expect_err("oversized Content-Length must be rejected");
+        assert!(err.0.contains("exceeds"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn content_length_body_delivered_in_full_is_accepted() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        let resp = read_response(&mut std::io::Cursor::new(&raw[..])).unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, b"hello");
+    }
+
+    #[test]
+    fn oversized_header_section_is_rejected() {
+        // No `\r\n\r\n` terminator anywhere, well past `MAX_HEADER_BYTES`.
+        let raw = vec![b'a'; MAX_HEADER_BYTES + 1];
+        let err = read_response(&mut std::io::Cursor::new(&raw[..]))
+            .expect_err("oversized unterminated headers must be rejected");
+        assert!(err.0.contains("headers"), "got: {}", err.0);
+    }
+
+    #[test]
+    fn oversized_unbounded_body_is_rejected() {
+        // No Content-Length, no chunked encoding: body is read until the
+        // cap, which this input exceeds without ever closing.
+        let mut raw = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', MAX_BODY_BYTES + 1));
+        let err = read_response(&mut std::io::Cursor::new(&raw[..]))
+            .expect_err("oversized unbounded body must be rejected");
+        assert!(err.0.contains("cap"), "got: {}", err.0);
     }
 }
