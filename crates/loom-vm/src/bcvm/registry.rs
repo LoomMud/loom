@@ -913,6 +913,173 @@ impl Compiler {
         }
         Ok(new_set)
     }
+
+    /// Kick off `recompile_set`'s compile stage (D-B3.14, OBI-207 P2-B3.1b)
+    /// on a background OS thread -- the multi-root generalisation of
+    /// [`Self::begin_recompile`]. Returns immediately; nothing about
+    /// `root`/`changed`/`deleted` is shared with anything the world thread
+    /// touches afterwards except the [`compile_worker::ProgramSnapshot`]
+    /// captured right now.
+    pub fn begin_recompile_set(
+        &self,
+        root: &Path,
+        registry: &Registry,
+        changed: &[String],
+        deleted: &[String],
+    ) -> compile_worker::RecompileSetJob {
+        self.begin_recompile_set_after(root, registry, changed, deleted, std::time::Duration::ZERO)
+    }
+
+    /// [`Self::begin_recompile_set`], but the background thread sleeps for
+    /// `delay` before compiling -- test/tooling support, same as
+    /// [`Self::begin_recompile_after`].
+    #[doc(hidden)]
+    pub fn begin_recompile_set_after(
+        &self,
+        root: &Path,
+        registry: &Registry,
+        changed: &[String],
+        deleted: &[String],
+        delay: std::time::Duration,
+    ) -> compile_worker::RecompileSetJob {
+        let snapshot = self.snapshot(registry);
+        compile_worker::spawn_recompile_set_after(
+            root.to_path_buf(),
+            changed.to_vec(),
+            deleted.to_vec(),
+            snapshot,
+            delay,
+        )
+    }
+
+    /// Apply a finished [`compile_worker::RecompileSetJob`]'s outcome
+    /// (D-B3.14, OBI-207 P2-B3.1b): the multi-root generalisation of
+    /// [`Self::finish_recompile`].
+    ///
+    /// **Staleness (same three checks as `finish_recompile`, generalised
+    /// to a batch):** re-snapshot `registry` right now and compare it with
+    /// `begin_snapshot`. Refuse the whole batch (empty `new_set`, the
+    /// diagnostic in `failures`) if:
+    /// - any program this compile actually produced has a different
+    ///   `(parent, version, source_hash)` now than at `begin_recompile_set`
+    ///   time (someone else already changed it, e.g. a second overlapping
+    ///   `recompile_set`/`recompile`/`ensure_program`);
+    /// - re-classifying `changed`/`deleted` against the fresh snapshot
+    ///   (same [`compile_worker::classify_targets`] the background thread
+    ///   used) no longer agrees with what the background thread saw --
+    ///   a different root set, a changed reverse-inherit expansion, or a
+    ///   newly-(un)loaded path all count; or
+    /// - any out-of-batch ancestor this compile actually consulted has a
+    ///   different on-disk source now than what is currently installed.
+    ///
+    /// Otherwise: invalidate every compiled path in `self.session`, decode
+    /// and **re-verify** each program (same trust boundary as
+    /// `finish_recompile`), wire up real `Rc<CompiledProgram>` parent
+    /// links, and return a [`RecompileSetOutcome`] ready for
+    /// [`RegistryHost::install`] -- still all on the world thread, still
+    /// all-or-nothing.
+    pub fn finish_recompile_set(
+        &mut self,
+        registry: &Registry,
+        changed: &[String],
+        deleted: &[String],
+        begin_snapshot: &compile_worker::ProgramSnapshot,
+        outcome: compile_worker::CompileSetOutcome,
+    ) -> RecompileSetOutcome {
+        let bail = |failures: Vec<(String, String)>| RecompileSetOutcome {
+            new_set: HashMap::new(),
+            recompiled: Vec::new(),
+            skipped_unloaded: Vec::new(),
+            deleted_loaded: Vec::new(),
+            failures,
+        };
+        let result = match outcome {
+            compile_worker::CompileSetOutcome::Ready(r) => r,
+            compile_worker::CompileSetOutcome::Failed(failures) => return bail(failures),
+        };
+
+        let now = compile_worker::ProgramSnapshot::capture(registry);
+        for wp in &result.programs {
+            if now.entry(&wp.path) != begin_snapshot.entry(&wp.path) {
+                return bail(vec![(
+                    wp.path.clone(),
+                    format!(
+                        "stale: registry changed during background compile of {}; re-issue update",
+                        wp.path
+                    ),
+                )]);
+            }
+        }
+        let then = compile_worker::classify_targets(begin_snapshot, changed, deleted);
+        let now_classified = compile_worker::classify_targets(&now, changed, deleted);
+        if then != now_classified {
+            return bail(vec![(
+                "<batch>".to_string(),
+                "stale: changed-set classification (roots/dependents) changed during background \
+                 compile; re-issue update"
+                    .to_string(),
+            )]);
+        }
+        for (path, hash) in &result.ancestor_hashes {
+            if now.source_hash_of(path) != Some(*hash) {
+                return bail(vec![(
+                    path.clone(),
+                    format!("ancestor {path} changed on disk since it was installed; update it first"),
+                )]);
+            }
+        }
+
+        for p in &result.programs {
+            self.session.invalidate(&p.path);
+        }
+        let mut new_set: HashMap<String, Rc<CompiledProgram>> = HashMap::new();
+        let mut failures: Vec<(String, String)> = Vec::new();
+        for wp in result.programs {
+            let decoded = (|| -> Result<CompiledProgram, String> {
+                let module = loom_compiler::bytecode::decode(&wp.module_bytes)
+                    .map_err(|e| format!("{}: corrupt background compile result: {e}", wp.path))?;
+                loom_compiler::verify::verify(&module)
+                    .map_err(|e| format!("{}: failed re-verification: {e}", wp.path))?;
+                let var_specs: Vec<VarSpec> = wp
+                    .var_specs
+                    .iter()
+                    .map(|v| {
+                        Ok(VarSpec {
+                            name: Rc::from(v.name.as_str()),
+                            ty: loom_compiler::bytecode::decode_ty(&v.ty_bytes)
+                                .map_err(|e| format!("{}: corrupt var type: {e}", wp.path))?,
+                            has_init: v.has_init,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?;
+                let parent = wp
+                    .parent_path
+                    .as_ref()
+                    .and_then(|pp| new_set.get(pp).cloned().or_else(|| registry.program(pp)));
+                let mut prog = CompiledProgram::new(module, wp.version, parent, var_specs);
+                prog.non_public = wp.non_public.iter().map(|s| Rc::from(s.as_str())).collect();
+                prog.source_hash = wp.source_hash;
+                Ok(prog)
+            })();
+            match decoded {
+                Ok(prog) => {
+                    new_set.insert(wp.path.clone(), Rc::new(prog));
+                }
+                Err(e) => failures.push((wp.path.clone(), e)),
+            }
+        }
+        if !failures.is_empty() {
+            return bail(failures);
+        }
+
+        RecompileSetOutcome {
+            new_set,
+            recompiled: result.recompiled,
+            skipped_unloaded: result.skipped_unloaded,
+            deleted_loaded: result.deleted_loaded,
+            failures: Vec::new(),
+        }
+    }
 }
 
 /// A verified [`Module`] plus the metadata dispatch needs: its own
@@ -4425,6 +4592,66 @@ impl<'a> RegistryHost<'a> {
                 .compiler
                 .recompile_set(self.registry, changed, deleted)
         };
+        self.finish_set_outcome(set)
+    }
+
+    /// Kick off [`Self::recompile_set`]'s compile stage on a background OS
+    /// thread (D-B3.14, OBI-207 P2-B3.1b) -- the multi-root generalisation
+    /// of [`RegistryHost`]'s existing single-root `begin_recompile`
+    /// (`Compiler::begin_recompile`, driven by `World`). Returns
+    /// immediately; nothing about `registry`/`self.session` is touched
+    /// until [`Self::finish_recompile_set`] applies the result.
+    pub fn begin_recompile_set(
+        &self,
+        root: &Path,
+        changed: &[String],
+        deleted: &[String],
+    ) -> compile_worker::RecompileSetJob {
+        let driver = self
+            .driver
+            .as_ref()
+            .expect("begin_recompile_set needs a driver context");
+        driver
+            .compiler
+            .begin_recompile_set(root, self.registry, changed, deleted)
+    }
+
+    /// Apply a background [`compile_worker::RecompileSetJob`]'s outcome
+    /// (D-B3.14, OBI-207 P2-B3.1b): decode + re-verify each program the
+    /// background thread produced, refuse the whole batch if the registry
+    /// drifted while it was running (same staleness contract as
+    /// [`Self::finish_recompile`], generalised to a batch -- see
+    /// [`Compiler::finish_recompile_set`]), then install -- registry
+    /// mutation + per-object migration, master/cache flush, security-epoch
+    /// bump -- exactly like [`Self::recompile_set`], all still on the
+    /// world thread, all still all-or-nothing.
+    pub fn finish_recompile_set(
+        &mut self,
+        changed: &[String],
+        deleted: &[String],
+        begin_snapshot: &compile_worker::ProgramSnapshot,
+        outcome: compile_worker::CompileSetOutcome,
+    ) -> RecompileReport {
+        let set = {
+            let driver = self
+                .driver
+                .as_mut()
+                .expect("finish_recompile_set needs a driver context");
+            driver
+                .compiler
+                .finish_recompile_set(self.registry, changed, deleted, begin_snapshot, outcome)
+        };
+        self.finish_set_outcome(set)
+    }
+
+    /// Shared tail of [`Self::recompile_set`]/[`Self::finish_recompile_set`]
+    /// (D-B3.14): given a [`RecompileSetOutcome`] from either the
+    /// synchronous or background compile stage, either report its
+    /// failures (nothing installed) or install `new_set` as a whole --
+    /// master/`program_flags`-cache rule, security-epoch bump,
+    /// `loom_mudlib_sync_total` -- and build the public
+    /// [`RecompileReport`].
+    fn finish_set_outcome(&mut self, set: RecompileSetOutcome) -> RecompileReport {
         if !set.failures.is_empty() {
             self.registry.sync_metrics.record(false);
             return RecompileReport {
