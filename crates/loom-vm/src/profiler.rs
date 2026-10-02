@@ -36,8 +36,18 @@ use std::time::{Duration, Instant};
 #[derive(Default, Clone, Copy)]
 struct FuncStat {
     calls: u64,
+    /// Inclusive (gprof "cumulative"): everything charged/elapsed while
+    /// a call's frame was on the stack, including whatever it called.
     ticks: u64,
     wall: Duration,
+    /// Self (gprof "self"/"exclusive", CTO review OBI-170 PR #67
+    /// must-fix 2): the same call's own cost with every directly-nested
+    /// call into this same sampled program subtracted out --
+    /// `Interpreter::pop_frame`'s `ProfFrame::child_ticks`/`child_wall`.
+    /// This is what a builder chasing a hot function actually wants:
+    /// recursion no longer inflates it depth-many times over.
+    self_ticks: u64,
+    self_wall: Duration,
 }
 
 /// One open sampling window for a single program (spec: `profile
@@ -70,13 +80,25 @@ impl Profiler {
     }
 
     /// Record one completed call into the sampled program: `function`'s
-    /// name, `ticks` charged while its frame was active, and `wall` time
-    /// elapsed over the same span.
-    pub fn record(&mut self, function: &str, ticks: u64, wall: Duration) {
+    /// name, `ticks`/`wall` charged while its frame was active
+    /// (inclusive -- includes whatever it called), and
+    /// `self_ticks`/`self_wall`, the same call's own cost with nested
+    /// same-program calls subtracted (CTO review, OBI-170, PR #67
+    /// must-fix 2).
+    pub fn record(
+        &mut self,
+        function: &str,
+        ticks: u64,
+        self_ticks: u64,
+        wall: Duration,
+        self_wall: Duration,
+    ) {
         let entry = self.stats.entry(function.to_string()).or_default();
         entry.calls += 1;
         entry.ticks += ticks;
         entry.wall += wall;
+        entry.self_ticks += self_ticks;
+        entry.self_wall += self_wall;
     }
 
     /// Close the window out as a [`ProfileReport`] (does not consume
@@ -91,12 +113,23 @@ impl Profiler {
                 calls: s.calls,
                 ticks: s.ticks,
                 wall_us: s.wall.as_micros() as u64,
+                self_ticks: s.self_ticks,
+                self_wall_us: s.self_wall.as_micros() as u64,
             })
             .collect();
-        // Busiest (most ticks charged) function first -- the one a
-        // builder chasing a "too long evaluation" tick-limit error, or a
-        // slow command, wants to see at the top.
-        rows.sort_by(|a, b| b.ticks.cmp(&a.ticks).then(b.wall_us.cmp(&a.wall_us)));
+        // Busiest by **self** ticks first (CTO review, OBI-170, PR #67
+        // must-fix 2): inclusive ticks sort the outermost entry point
+        // (`process_input`, `heartbeat`) to the top every time (it
+        // always has the largest inclusive total, by construction --
+        // it's on the stack for the whole call), hiding the actually hot
+        // function underneath it. Self ticks is where the function a
+        // builder chasing a tick-limit/slow-command actually spent time
+        // surfaces.
+        rows.sort_by(|a, b| {
+            b.self_ticks
+                .cmp(&a.self_ticks)
+                .then(b.self_wall_us.cmp(&a.self_wall_us))
+        });
         ProfileReport {
             program: self.program.clone(),
             window_ms: self.started.elapsed().as_millis() as u64,
@@ -105,12 +138,16 @@ impl Profiler {
     }
 }
 
-/// One function's totals over a sampling window.
+/// One function's totals over a sampling window. `self_*` sorts the
+/// report (CTO review, OBI-170, PR #67 must-fix 2); `ticks`/`wall_us`
+/// (inclusive) are kept as a second column, not dropped.
 pub struct ProfileRow {
     pub function: String,
     pub calls: u64,
     pub ticks: u64,
     pub wall_us: u64,
+    pub self_ticks: u64,
+    pub self_wall_us: u64,
 }
 
 /// `profile <program>`'s result: every function of `program` observed
@@ -132,14 +169,13 @@ impl ProfileReport {
             return out;
         }
         out.push_str(&format!(
-            "  {:<28} {:>8} {:>10} {:>10} {:>10}\n",
-            "FUNCTION", "CALLS", "TICKS", "US", "US/CALL"
+            "  {:<28} {:>8} {:>10} {:>10} {:>10} {:>10}\n",
+            "FUNCTION", "CALLS", "SELF_TICKS", "TICKS", "SELF_US", "US"
         ));
         for r in &self.rows {
-            let us_per_call = r.wall_us.checked_div(r.calls).unwrap_or(0);
             out.push_str(&format!(
-                "  {:<28} {:>8} {:>10} {:>10} {:>10}\n",
-                r.function, r.calls, r.ticks, r.wall_us, us_per_call
+                "  {:<28} {:>8} {:>10} {:>10} {:>10} {:>10}\n",
+                r.function, r.calls, r.self_ticks, r.ticks, r.self_wall_us, r.wall_us
             ));
         }
         out
@@ -160,41 +196,99 @@ mod tests {
     #[test]
     fn record_accumulates_calls_ticks_and_wall_per_function() {
         let mut p = Profiler::new("/std/room".to_string());
-        p.record("look", 5, Duration::from_micros(100));
-        p.record("look", 7, Duration::from_micros(200));
-        p.record("enter", 2, Duration::from_micros(50));
+        p.record(
+            "look",
+            5,
+            5,
+            Duration::from_micros(100),
+            Duration::from_micros(100),
+        );
+        p.record(
+            "look",
+            7,
+            7,
+            Duration::from_micros(200),
+            Duration::from_micros(200),
+        );
+        p.record(
+            "enter",
+            2,
+            2,
+            Duration::from_micros(50),
+            Duration::from_micros(50),
+        );
         let report = p.report();
         let look = report.rows.iter().find(|r| r.function == "look").unwrap();
         assert_eq!(look.calls, 2);
         assert_eq!(look.ticks, 12);
         assert_eq!(look.wall_us, 300);
+        assert_eq!(look.self_ticks, 12);
+        assert_eq!(look.self_wall_us, 300);
         let enter = report.rows.iter().find(|r| r.function == "enter").unwrap();
         assert_eq!(enter.calls, 1);
         assert_eq!(enter.ticks, 2);
     }
 
     /// Acceptance: "a test covers a known hot function" -- the busiest
-    /// function (most ticks charged over the window) sorts first, so a
-    /// builder reading the report top-down finds it immediately.
+    /// function by **self** ticks sorts first (CTO review, OBI-170, PR
+    /// #67 must-fix 2), so a builder reading the report top-down finds
+    /// it immediately -- `outer`'s inclusive total is the largest here
+    /// (it's on the stack for the whole call, same as any entry point),
+    /// but its own self cost is small; sorting by inclusive instead
+    /// would have hidden `hot` underneath it.
     #[test]
-    fn report_sorts_hottest_function_first() {
+    fn report_sorts_by_self_ticks_not_inclusive() {
         let mut p = Profiler::new("/std/room".to_string());
-        p.record("cold", 1, Duration::from_micros(1));
-        p.record("hot", 1000, Duration::from_micros(500));
-        p.record("warm", 50, Duration::from_micros(10));
+        p.record(
+            "cold",
+            1,
+            1,
+            Duration::from_micros(1),
+            Duration::from_micros(1),
+        );
+        p.record(
+            "hot",
+            1000,
+            1000,
+            Duration::from_micros(500),
+            Duration::from_micros(500),
+        );
+        p.record(
+            "warm",
+            50,
+            50,
+            Duration::from_micros(10),
+            Duration::from_micros(10),
+        );
+        // `outer`'s inclusive total (2000) dwarfs everything above, but
+        // its self cost (10) does not.
+        p.record(
+            "outer",
+            2000,
+            10,
+            Duration::from_micros(2000),
+            Duration::from_micros(10),
+        );
         let report = p.report();
         let names: Vec<&str> = report.rows.iter().map(|r| r.function.as_str()).collect();
-        assert_eq!(names, vec!["hot", "warm", "cold"]);
+        assert_eq!(names, vec!["hot", "warm", "outer", "cold"]);
     }
 
     #[test]
     fn render_is_readable_in_game_text() {
         let mut p = Profiler::new("/std/room".to_string());
-        p.record("look", 500, Duration::from_micros(1200));
+        p.record(
+            "look",
+            500,
+            500,
+            Duration::from_micros(1200),
+            Duration::from_micros(1200),
+        );
         let report = p.report();
         let text = report.render();
         assert!(text.starts_with("profile /std/room ("));
         assert!(text.contains("FUNCTION"));
+        assert!(text.contains("SELF_TICKS"));
         assert!(text.contains("look"));
         assert!(text.contains("500")); // ticks
     }

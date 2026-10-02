@@ -422,17 +422,24 @@ pub trait Host {
         false
     }
     /// One profiled call just returned (normally, or by unwinding past
-    /// its frame): `function` is its name, `ticks` is the budget charged
-    /// while its frame was on the stack, `wall` is the elapsed real time
-    /// over the same span. Only called when [`Host::profiling_active`]
-    /// answered `true` for `program` at the matching `push_call`, so the
-    /// default (no-op) never runs on the hot "profiling off" path either.
+    /// its frame): `function` is its name. `ticks`/`wall` are
+    /// **inclusive** (gprof "cumulative" -- everything charged/elapsed
+    /// while this frame was on the stack, including whatever it called);
+    /// `self_ticks`/`self_wall` are the same call's own cost with every
+    /// directly-nested call *into the same sampled program* subtracted
+    /// out (CTO review, OBI-170, PR #67 must-fix 2: recursion/nested
+    /// calls must not be double-counted in the figure a builder actually
+    /// reads). Only called when [`Host::profiling_active`] answered
+    /// `true` for `program` at the matching `push_call`, so the default
+    /// (no-op) never runs on the hot "profiling off" path either.
     fn profile_record(
         &mut self,
         _program: &str,
         _function: &str,
         _ticks: u64,
+        _self_ticks: u64,
         _wall: std::time::Duration,
+        _self_wall: std::time::Duration,
     ) {
     }
 }
@@ -479,14 +486,51 @@ struct Frame {
     /// its own" (OBI-35 scope): the host is the only place a `GuardSet`
     /// lives.
     creator_frame: bool,
-    /// `Some((start, ticks_before))` iff [`Host::profiling_active`]
-    /// answered `true` for this frame's program when it was pushed
-    /// (spec Phase 2 B5, OBI-170): `pop_frame` reports its cost once via
+    /// `Some(ProfFrame { .. })` iff [`Host::profiling_active`] answered
+    /// `true` for this frame's program when it was pushed (spec Phase 2
+    /// B5, OBI-170): `pop_frame` reports this call's cost once via
     /// [`Host::profile_record`] using the wall-clock elapsed since
-    /// `start` and the ticks charged since `ticks_before`. `None`
-    /// (profiling off, or this isn't the sampled program) is the common
-    /// case and the only thing `pop_frame` has to check on that path.
-    prof: Option<(std::time::Instant, u64)>,
+    /// `start` and the ticks charged since `ticks_before`, inclusive and
+    /// self (CTO review, PR #67 must-fix 2: `child_ticks`/`child_wall`
+    /// subtracted out). `None` (profiling off, or this isn't the sampled
+    /// program) is the common case and the only thing `pop_frame` has to
+    /// check on that path.
+    // `Box`ed (CTO review follow-up, OBI-170, PR #67 bench evidence):
+    // keeps this variant's footprint to one pointer (`Option<Box<T>>`
+    // niche-optimizes the same as a raw pointer) instead of inlining
+    // `ProfFrame`'s four fields into every `Frame` whether or not
+    // profiling is ever used -- `vm_bench`'s `monocall` (minimal
+    // per-call payload, maximally sensitive to `Frame`'s own size)
+    // showed a small but measurable regression with `ProfFrame`
+    // inlined; boxing it removed that (see the PR body's before/after
+    // numbers).
+    prof: Option<Box<ProfFrame>>,
+}
+
+/// A profiled frame's own bookkeeping (CTO review, OBI-170, PR #67
+/// must-fix 2): `child_ticks`/`child_wall` accumulate the **inclusive**
+/// cost of every direct child call that was *also* into the sampled
+/// program (same-program recursion, direct or indirect through this
+/// frame) -- [`Interpreter::pop_frame`] adds a popped child's inclusive
+/// figures here, on its new top-of-stack parent, right before computing
+/// that parent's own self figures when it in turn pops. Subtracting
+/// this from the frame's own inclusive ticks/wall at pop time is what
+/// turns "every frame's inclusive total summed" (which double-counts
+/// recursion depth-many times) into a true per-call self cost.
+///
+/// **Scope note:** only tracks children whose own frame was pushed with
+/// `prof: Some` too, i.e. calls into the *same* sampled program.
+/// recursion through an intervening call into a *different* program is
+/// not subtracted (consistent with this profiler's existing "one
+/// program at a time" scope, `crate::profiler`'s module doc) -- rare in
+/// practice (a function recurses into itself, not through someone
+/// else's code, to become "hot"), and inclusive ticks/wall are still
+/// reported alongside self for exactly this case.
+struct ProfFrame {
+    start: std::time::Instant,
+    ticks_before: u64,
+    child_ticks: u64,
+    child_wall: std::time::Duration,
 }
 
 /// Per-execution limits (spec §5.9): every tick-metered op consumes one
@@ -769,10 +813,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
         // whether a `profile` window wants this call. `false` (the
         // default, and every ordinary call while profiling is off) skips
         // straight past the `Instant::now()`/tick snapshot below.
-        let prof = self
-            .host
-            .profiling_active(&m.path)
-            .then(|| (std::time::Instant::now(), *self.ticks_left));
+        let prof = self.host.profiling_active(&m.path).then(|| {
+            Box::new(ProfFrame {
+                start: std::time::Instant::now(),
+                ticks_before: *self.ticks_left,
+                child_ticks: 0,
+                child_wall: std::time::Duration::ZERO,
+            })
+        });
         self.stack.push(Frame {
             code,
             code_ops,
@@ -801,12 +849,30 @@ impl<'a, H: Host> Interpreter<'a, H> {
         // unwind, `pop_frame_on_error` calls through here too). Skipped
         // entirely when `f.prof` is `None` -- profiling off, or this
         // frame's program wasn't the one being sampled.
-        if let Some((start, ticks_before)) = f.prof {
-            let wall = start.elapsed();
-            let ticks = ticks_before.saturating_sub(*self.ticks_left);
+        if let Some(prof) = &f.prof {
+            let wall = prof.start.elapsed();
+            let ticks = prof.ticks_before.saturating_sub(*self.ticks_left);
+            // CTO review (OBI-170, PR #67, must-fix 2): subtract every
+            // direct child call *into the same sampled program*
+            // (`ProfFrame`'s own doc) so recursion/nested calls are not
+            // double-counted in the self figure.
+            let self_ticks = ticks.saturating_sub(prof.child_ticks);
+            let self_wall = wall.saturating_sub(prof.child_wall);
             let program = self.module_of(&f).path.to_string();
             let function = self.frame_name(&f).to_string();
-            self.host.profile_record(&program, &function, ticks, wall);
+            self.host
+                .profile_record(&program, &function, ticks, self_ticks, wall, self_wall);
+            // Propagate this frame's *inclusive* cost up to its new
+            // top-of-stack parent's own child accumulator, but only if
+            // that parent is itself being profiled (same sampled
+            // program) -- see `ProfFrame`'s doc for the cross-program
+            // scope note.
+            if let Some(parent) = self.stack.last_mut()
+                && let Some(pprof) = &mut parent.prof
+            {
+                pprof.child_ticks += ticks;
+                pprof.child_wall += wall;
+            }
         }
         if f.entered {
             self.host.leave_self();
@@ -2027,7 +2093,7 @@ mod tests {
     struct ProfHost {
         inner: NoHost,
         target: &'static str,
-        calls: std::cell::RefCell<std::collections::HashMap<String, (u64, u64)>>,
+        calls: std::cell::RefCell<std::collections::HashMap<String, (u64, u64, u64)>>,
     }
     impl Host for ProfHost {
         fn self_object(&self) -> ObjectId {
@@ -2059,12 +2125,15 @@ mod tests {
             _program: &str,
             function: &str,
             ticks: u64,
+            self_ticks: u64,
             _wall: std::time::Duration,
+            _self_wall: std::time::Duration,
         ) {
             let mut calls = self.calls.borrow_mut();
-            let entry = calls.entry(function.to_string()).or_insert((0, 0));
+            let entry = calls.entry(function.to_string()).or_insert((0, 0, 0));
             entry.0 += 1;
             entry.1 += ticks;
+            entry.2 += self_ticks;
         }
     }
 
@@ -2077,7 +2146,8 @@ mod tests {
             calls: std::cell::RefCell::new(std::collections::HashMap::new()),
         };
         let limits = Limits::default();
-        let mut ticks = 1_000_000u64;
+        let total_ticks = 1_000_000u64;
+        let mut ticks = total_ticks;
         let mut interp = Interpreter::new(&module, &mut host, &limits, &mut ticks);
         let result = interp.call("countdown", vec![Value::Int(50)]);
         match result.unwrap() {
@@ -2085,10 +2155,24 @@ mod tests {
             other => panic!("expected Int(0), got {other:?}"),
         }
         let calls = host.calls.borrow();
-        let (call_count, tick_count) = *calls.get("countdown").expect("countdown was profiled");
+        let (call_count, inclusive_ticks, self_ticks) =
+            *calls.get("countdown").expect("countdown was profiled");
         // One top-level call plus 50 recursive calls down to the base case.
         assert_eq!(call_count, 51);
-        assert!(tick_count > 0, "expected nonzero ticks charged");
+        assert!(self_ticks > 0, "expected nonzero self ticks charged");
+        // CTO review (OBI-170, PR #67, must-fix 2): the old, inclusive-
+        // only accounting summed every recursive frame's *inclusive*
+        // ticks, which for 51 nested frames could run to roughly 51x the
+        // window's own total -- self ticks summed across every call must
+        // never exceed what the whole window actually charged.
+        let ticks_used = total_ticks - ticks;
+        assert!(
+            self_ticks <= ticks_used,
+            "self ticks ({self_ticks}) must not exceed the window's total ({ticks_used})"
+        );
+        // Inclusive is still reported, and for genuine recursion is
+        // strictly larger than self once there's more than one frame.
+        assert!(inclusive_ticks >= self_ticks);
     }
 
     #[test]

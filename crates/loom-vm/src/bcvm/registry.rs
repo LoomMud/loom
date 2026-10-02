@@ -6098,10 +6098,12 @@ impl Host for RegistryHost<'_> {
         _program: &str,
         function: &str,
         ticks: u64,
+        self_ticks: u64,
         wall: std::time::Duration,
+        self_wall: std::time::Duration,
     ) {
         if let Some(p) = self.registry.profiler.as_mut() {
-            p.record(function, ticks, wall);
+            p.record(function, ticks, self_ticks, wall, self_wall);
         }
     }
 
