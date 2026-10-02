@@ -662,6 +662,11 @@ async fn serve(
 
     let (ws_accept_tx, ws_accept_rx) = mpsc::channel(WS_ACCEPT_QUEUE_DEPTH);
     let mut http_state = loom_http::HttpState::new(ws_accept_tx, readiness, metrics);
+    // OBI-233: `/api/v1/admin/broadcast` delivers through the same
+    // `NetCommand` channel the world thread itself sends on -- never a
+    // side channel, and never a direct hold on `conns` from the HTTP
+    // side.
+    http_state = http_state.with_net_commands(command_tx.clone());
     if let Some(web_root) = web_root_from_env() {
         http_state = http_state.with_web_root(web_root);
     }

@@ -1476,3 +1476,148 @@ async fn admin_audit_recent_requires_tier_3_and_is_itself_audited() {
         "the audit view itself must be audited: {events:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// OBI-233 (P2-O2 admin UI): server-wide staff broadcast through
+// `AuthService::admin_broadcast`. See `docs/threat-model-phase2.md`
+// M-ADM-2 (tier >= 4 + step-up for broadcast, a higher floor than role
+// changes given the blast radius), M-ADM-4 (every attempt audited), and
+// M-ADM-5 (strip C0/C1 controls except `\n`; cap at 1 KiB).
+// ---------------------------------------------------------------------------
+
+/// M-ADM-5: every C0 control character (except `\n`), DEL, and every C1
+/// control character is stripped before the text would ever reach the
+/// output path -- ordinary printable text and `\n` pass through
+/// untouched.
+#[test]
+fn sanitize_broadcast_text_strips_c0_c1_controls_except_newline() {
+    let input = "line one\nline\ttwo\x00\x07\x1b[31mred\x7f\u{0080}\u{009f} end\r\n";
+    let sanitized = sanitize_broadcast_text(input);
+    // `\t` (0x09) is C0 and *not* excepted -- only `\n` survives.
+    assert_eq!(sanitized, "line one\nlinetwo[31mred end\n");
+    assert!(
+        !sanitized.chars().any(|c| {
+            let code = c as u32;
+            c != '\n' && (code <= 0x1F || code == 0x7F || (0x80..=0x9F).contains(&code))
+        }),
+        "no C0/C1 control character (other than \\n) may survive sanitization: {sanitized:?}"
+    );
+}
+
+/// M-ADM-5: a broadcast body containing C0/C1 controls is sanitized
+/// *before* it would reach the output path -- `admin_broadcast`'s `Ok`
+/// payload is already the sanitized string, not the raw input.
+#[tokio::test]
+async fn admin_broadcast_sanitizes_control_characters_before_delivery() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("root", "pw", 5);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("root", 5, Some(now().unix_timestamp()));
+    let raw = "server will restart\x07 in 5m\x1b[0m";
+    let sanitized = service
+        .admin_broadcast(&claims, &ctx(), raw)
+        .await
+        .expect("T5 with fresh step-up may broadcast");
+
+    assert_eq!(sanitized, "server will restart in 5m[0m");
+    assert!(
+        !sanitized.chars().any(|c| (c as u32) <= 0x1F && c != '\n'),
+        "sanitized text must not carry a control character: {sanitized:?}"
+    );
+    let events = directory.audit_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "admin.broadcast" && e.verdict == "allow"),
+        "a successful broadcast must be audited as allow: {events:?}"
+    );
+}
+
+/// M-ADM-5: a body over 1 KiB is rejected outright, not truncated.
+#[tokio::test]
+async fn admin_broadcast_rejects_a_body_over_1kib() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("root", "pw", 5);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("root", 5, Some(now().unix_timestamp()));
+    let oversized = "a".repeat(BROADCAST_MAX_BYTES + 1);
+    let result = service.admin_broadcast(&claims, &ctx(), &oversized).await;
+    assert_eq!(result, Err(AdminError::BodyTooLarge));
+
+    let events = directory.audit_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "admin.broadcast" && e.verdict == "deny"),
+        "an oversized broadcast attempt must still be audited: {events:?}"
+    );
+}
+
+/// An exactly-1-KiB body is accepted (the cap is inclusive).
+#[tokio::test]
+async fn admin_broadcast_accepts_a_body_at_exactly_1kib() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("root", "pw", 5);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("root", 5, Some(now().unix_timestamp()));
+    let exact = "a".repeat(BROADCAST_MAX_BYTES);
+    let result = service.admin_broadcast(&claims, &ctx(), &exact).await;
+    assert!(result.is_ok(), "a body of exactly the cap must be accepted");
+}
+
+/// M-ADM-2: tier < 4 is forbidden, even though that tier is enough for a
+/// role change (`admin_set_tier`'s floor is 3) -- broadcast has a higher
+/// floor given its blast radius.
+#[tokio::test]
+async fn admin_broadcast_forbidden_below_tier_4() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("lead", "pw", 3);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("lead", 3, Some(now().unix_timestamp()));
+    let result = service
+        .admin_broadcast(&claims, &ctx(), "server restart")
+        .await;
+    assert_eq!(result, Err(AdminError::Forbidden));
+
+    let events = directory.audit_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "admin.broadcast" && e.verdict == "deny"),
+        "the forbidden attempt must still be audited: {events:?}"
+    );
+}
+
+/// M-ADM-2: tier >= 4 but no fresh step-up is refused.
+#[tokio::test]
+async fn admin_broadcast_requires_fresh_step_up() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("root", "pw", 5);
+    let service = test_service(directory.clone());
+
+    let no_mfa = fake_claims("root", 5, None);
+    let result = service
+        .admin_broadcast(&no_mfa, &ctx(), "server restart")
+        .await;
+    assert_eq!(result, Err(AdminError::StepUpRequired));
+
+    let stale = fake_claims("root", 5, Some(now().unix_timestamp() - 600));
+    let result = service
+        .admin_broadcast(&stale, &ctx(), "server restart")
+        .await;
+    assert_eq!(result, Err(AdminError::StepUpRequired));
+
+    let events = directory.audit_events();
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.kind == "admin.broadcast" && e.verdict == "deny")
+            .count()
+            >= 2,
+        "both step-up failures must be audited: {events:?}"
+    );
+}

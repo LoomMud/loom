@@ -98,6 +98,13 @@ pub enum NetCommand {
     /// uses to mask the field. `enabled = false` is the password-prompt
     /// state.
     SetEcho(ConnId, bool),
+    /// Send one line of plain text to every currently-connected session
+    /// (telnet and WebSocket alike), through the same per-connection
+    /// output queue and slow-client-drop handling as `Send` -- used by
+    /// `loom-http`'s `/api/v1/admin/broadcast` (OBI-233). Never blocks
+    /// the world thread: a full queue drops that one slow client exactly
+    /// like `Send` does, instead of waiting for it.
+    Broadcast(String),
 }
 
 /// Output framing: the world sends text verbatim and owns its line breaks
@@ -355,6 +362,39 @@ pub async fn run_server_full(
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 conns.remove(&conn);
                             }
+                        }
+                    }
+                    NetCommand::Broadcast(text) => {
+                        // Same per-connection backpressure as `Send`: a
+                        // slow client's full queue gets *that* client
+                        // dropped, never a wait that would stall this
+                        // loop (and with it, every other connection and
+                        // the world thread's own command sends). A
+                        // connection whose receiver already hung up is
+                        // just removed, matching `Send`'s `Closed` arm --
+                        // its own task already reported `Disconnected`.
+                        let mut to_abort: Vec<ConnId> = Vec::new();
+                        let mut to_remove: Vec<ConnId> = Vec::new();
+                        for (&conn, entry) in conns.iter() {
+                            match entry.tx.try_send(ConnControl::Send(text.clone())) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!(conn, "disconnecting slow client: output queue full");
+                                    to_abort.push(conn);
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    to_remove.push(conn);
+                                }
+                            }
+                        }
+                        for conn in to_abort {
+                            if let Some(entry) = conns.remove(&conn) {
+                                entry.task.abort();
+                            }
+                            let _ = event_tx.send(NetEvent::Disconnected(conn)).await;
+                        }
+                        for conn in to_remove {
+                            conns.remove(&conn);
                         }
                     }
                 }
@@ -1959,6 +1999,54 @@ mod tests {
         let mut buf = [0_u8; 8];
         let n = client.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hi\r\n");
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    /// OBI-233 smoke test: `NetCommand::Broadcast` reaches every
+    /// currently-connected session (telnet here; the WebSocket path
+    /// shares the same `conns` map and `ConnControl::Send`), through the
+    /// normal output path -- same wire framing (`to_wire`'s `\n` ->
+    /// `\r\n`) as a targeted `NetCommand::Send`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_reaches_every_connected_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server = tokio::spawn(run_server(listener, config, event_tx, cmd_rx, shutdown_rx));
+
+        let mut alice = TcpStream::connect(addr).await.unwrap();
+        drain_preamble(&mut alice).await;
+        let mut bob = TcpStream::connect(addr).await.unwrap();
+        drain_preamble(&mut bob).await;
+
+        // Wait for both `Connected` events before broadcasting, so
+        // neither client can race the server into missing it.
+        let mut connected = 0;
+        while connected < 2 {
+            if let NetEvent::Connected(_) = event_rx.recv().await.expect("event channel closed") {
+                connected += 1;
+            }
+        }
+
+        cmd_tx
+            .send(NetCommand::Broadcast(
+                "server restarting in 5m\n".to_string(),
+            ))
+            .await
+            .unwrap();
+
+        for client in [&mut alice, &mut bob] {
+            let mut buf = [0_u8; 64];
+            let n = client.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"server restarting in 5m\r\n");
+        }
 
         shutdown_tx.send(true).unwrap();
         server.await.unwrap().unwrap();
