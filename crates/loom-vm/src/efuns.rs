@@ -136,6 +136,18 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     ("seteuid", 1, 1, Privilege::P3, 10),
     ("read_file", 1, 1, Privilege::P0, 20),
     ("write_file", 2, 2, Privilege::P1, 50),
+    // OBI-171 (spec §8.1): player/character persistence. `save_object`
+    // writes only `persistent` vars, through the §7.3 migration path on
+    // restore; both go through the same confined, atomic
+    // write+rename-backed storage `read_file`/`write_file` use, just a
+    // separate root and a `.o` suffix (`crate::fileio::write_file_atomic`)
+    // -- not the mudlib VFS, so saves never land in the Git-backed `.wf`
+    // tree. `save_object` is P1 (it writes); `restore_object` is P0 like
+    // `read_file` (both still go through `valid_write`/`valid_read` with
+    // `op` set to `"save_object"`/`"restore_object"`, so the master can
+    // apply whatever path policy it wants to this separate namespace).
+    ("save_object", 1, 1, Privilege::P1, 100),
+    ("restore_object", 1, 1, Privilege::P0, 50),
     ("unguarded", 1, 2, Privilege::P4, 10),
     // OBI-36 (S2b), design note D-S2.2: the roles snapshot's read efuns.
     // Secure-only (a driver rule, exactly like `unguarded`'s D-S1.5, not

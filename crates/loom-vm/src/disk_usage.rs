@@ -67,6 +67,25 @@ impl DiskUsage {
         self.note_write(to_u, 0, bytes);
     }
 
+    /// `<u>`'s total, seeded from its own save file under `save_root`
+    /// (OBI-171 `save_object`'s `disk_quota_mb` charge; CTO review on
+    /// PR #75: "charge the save to the writing object's uid, using the
+    /// same `seeded_total`/`note_write` path, but seeded from the save
+    /// root"), if it has not already been seeded by [`Self::seeded_total`].
+    /// One counter per `<u>`, shared with [`Self::seeded_total`]:
+    /// `disk_quota_mb` is one number covering everything `<u>` has on
+    /// disk, builder-authored source under `/builders/<u>/**` and the
+    /// uid's own save file alike. Unlike `seeded_total`'s directory walk,
+    /// this is a single `metadata()` stat (`fileio::file_size_bytes`):
+    /// the master's save-path authorization contract (`docs/save-objects
+    /// .md`) confines a uid to exactly one save path, so there is nothing
+    /// to recursively walk.
+    pub fn seeded_save_total(&mut self, save_root: &Path, u: &str, save_file_rel: &str) -> u64 {
+        *self.totals.entry(u.to_string()).or_insert_with(|| {
+            crate::fileio::file_size_bytes(save_root, save_file_rel).unwrap_or(0)
+        })
+    }
+
     #[cfg(test)]
     fn total_for(&self, u: &str) -> Option<u64> {
         self.totals.get(u).copied()

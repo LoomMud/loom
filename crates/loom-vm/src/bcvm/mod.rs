@@ -17,6 +17,7 @@
 pub mod compile;
 pub mod compile_worker;
 pub mod heap;
+pub mod persist;
 pub mod registry;
 pub mod schema_convert;
 pub mod vm;

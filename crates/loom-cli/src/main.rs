@@ -63,7 +63,7 @@ async fn run() -> Result<(), String> {
     match command.as_str() {
         "serve" => {
             let args = parse_serve_args(args)?;
-            serve(args.mudlib, args.adopt_control_fd).await
+            serve(args.mudlib, args.save_dir, args.adopt_control_fd).await
         }
         "supervise" => {
             let mudlib = parse_mudlib_arg(args)?;
@@ -301,13 +301,23 @@ fn parse_mudlib_arg(mut args: impl Iterator<Item = String>) -> Result<PathBuf, S
 /// user-facing CLI surface -- it is only ever passed by `loom supervise`
 /// itself, to its own spawned standby child, with an fd number that is
 /// meaningless to type by hand.
+///
+/// `save_dir` (OBI-171) overrides [`loom_vm::World`]'s default
+/// player-save root -- a `saves` directory beside the mudlib root; see
+/// `World::set_save_root`'s docs for why that default deliberately
+/// isn't *inside* the mudlib's own Git-backed working tree.
+/// `LOOM_SAVE_DIR` is the same override as an environment variable, for
+/// Compose/Flux-style deployments that set env vars rather than args;
+/// the flag wins if both are given.
 struct ServeArgs {
     mudlib: PathBuf,
+    save_dir: Option<PathBuf>,
     adopt_control_fd: Option<std::os::fd::RawFd>,
 }
 
 fn parse_serve_args(mut args: impl Iterator<Item = String>) -> Result<ServeArgs, String> {
     let mut mudlib: Option<PathBuf> = None;
+    let mut save_dir: Option<PathBuf> = None;
     let mut adopt_control_fd: Option<std::os::fd::RawFd> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -316,6 +326,12 @@ fn parse_serve_args(mut args: impl Iterator<Item = String>) -> Result<ServeArgs,
                     return Err("--mudlib requires a value".to_string());
                 };
                 mudlib = Some(PathBuf::from(path));
+            }
+            "--save-dir" => {
+                let Some(path) = args.next() else {
+                    return Err("--save-dir requires a value".to_string());
+                };
+                save_dir = Some(PathBuf::from(path));
             }
             "--adopt-control-fd" => {
                 let Some(value) = args.next() else {
@@ -329,9 +345,15 @@ fn parse_serve_args(mut args: impl Iterator<Item = String>) -> Result<ServeArgs,
             other => return Err(format!("unexpected argument: {other}")),
         }
     }
+    if save_dir.is_none()
+        && let Some(env_dir) = std::env::var_os("LOOM_SAVE_DIR")
+    {
+        save_dir = Some(PathBuf::from(env_dir));
+    }
 
     Ok(ServeArgs {
         mudlib: mudlib.ok_or_else(|| "missing required --mudlib <path>".to_string())?,
+        save_dir,
         adopt_control_fd,
     })
 }
@@ -571,6 +593,7 @@ fn spawn_and_handoff(
 
 async fn serve(
     mudlib_root: PathBuf,
+    save_dir: Option<PathBuf>,
     adopt_control_fd: Option<std::os::fd::RawFd>,
 ) -> Result<(), String> {
     let (listener, http_listener) = acquire_listeners(adopt_control_fd).await?;
@@ -637,6 +660,7 @@ async fn serve(
 
     let world_handle = spawn_world_thread(
         mudlib_root.clone(),
+        save_dir,
         event_rx,
         command_tx.clone(),
         db_req_tx,
@@ -1303,6 +1327,7 @@ fn to_persist_audit_row(r: loom_vm::AuditRow) -> loom_persist::AuditRow {
 #[allow(clippy::too_many_arguments)]
 fn spawn_world_thread(
     mudlib_root: PathBuf,
+    save_dir: Option<PathBuf>,
     mut event_rx: mpsc::Receiver<NetEvent>,
     command_tx: mpsc::Sender<NetCommand>,
     db_req_tx: mpsc::Sender<DbRequest>,
@@ -1325,6 +1350,9 @@ fn spawn_world_thread(
                     return;
                 }
             };
+            if let Some(dir) = save_dir {
+                world.set_save_root(dir);
+            }
             // OBI-123: without Postgres (`persist` was `None`), `LOOM_ROLES_SEED`
             // is the dev/CI path (`crate::roles::load_seed_from_env`'s doc): a
             // set-but-malformed seed is a boot failure, never a silent empty

@@ -1,0 +1,26 @@
+// Master object: hands every new connection a fresh player.
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+// Phase 0 policy (OBI-35): the driver fails closed without these applies.
+// Everyone may use every efun and recompile anything; real tiers are S2.
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}

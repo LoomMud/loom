@@ -83,6 +83,11 @@ pub struct VarSpec {
     pub name: Rc<str>,
     pub ty: Ty,
     pub has_init: bool,
+    /// `persistent var` (spec §8.1, OBI-171): [`RegistryHost::save_object`]
+    /// writes only these, keyed the same (declaring program, name) way
+    /// hot-reload migration is (§7.2/§7.3) -- a persisted var and an
+    /// upgraded var share one identity.
+    pub persistent: bool,
 }
 
 /// One object whose migration to a newer program version failed and was
@@ -314,6 +319,7 @@ pub(crate) fn compile_hir_unit(hir: &hir::Program) -> Result<CompiledUnit, Compi
             name: v.name.clone(),
             ty: v.ty.clone(),
             has_init: v.init.is_some(),
+            persistent: v.persistent,
         })
         .collect();
     let module = if let Some(init_fn) = synth_init_function(hir) {
@@ -899,6 +905,7 @@ impl Compiler {
                         ty: loom_compiler::bytecode::decode_ty(&v.ty_bytes)
                             .map_err(|e| format!("{}: corrupt var type: {e}", wp.path))?,
                         has_init: v.has_init,
+                        persistent: v.persistent,
                     })
                 })
                 .collect::<Result<_, String>>()?;
@@ -1051,6 +1058,7 @@ impl Compiler {
                             ty: loom_compiler::bytecode::decode_ty(&v.ty_bytes)
                                 .map_err(|e| format!("{}: corrupt var type: {e}", wp.path))?,
                             has_init: v.has_init,
+                            persistent: v.persistent,
                         })
                     })
                     .collect::<Result<_, String>>()?;
@@ -2384,6 +2392,13 @@ struct Driver<'a> {
     input_actor: Option<Sym>,
     /// Mudlib root, for the `read_file`/`write_file` VFS.
     root: PathBuf,
+    /// Player-save root for `save_object`/`restore_object` (spec §8.1,
+    /// OBI-171): deliberately **not** the mudlib VFS root above -- save
+    /// data is driver state, not mudlib source, and must never end up
+    /// inside the Git-backed `.wf` tree (§8.5) or get swept up by a
+    /// `revert`/recompile. Confined the same way (`crate::fileio`'s
+    /// lexical + symlink-escape checks), just against this root instead.
+    save_root: PathBuf,
     /// `disk_quota_mb`'s per-`<u>` byte counter (OBI-137 S1), owned by
     /// `World`; see `crate::disk_usage::DiskUsage`.
     disk_usage: &'a mut crate::disk_usage::DiskUsage,
@@ -2671,6 +2686,7 @@ impl<'a> RegistryHost<'a> {
         input_actor: Option<Sym>,
         disk_usage: &'a mut crate::disk_usage::DiskUsage,
         errors: &'a mut crate::errors::ErrorInbox,
+        save_root: PathBuf,
     ) -> Self {
         let base = cut_guard
             .unwrap_or_else(|| GuardSet::empty().with(principal_of(registry, self_object)));
@@ -2699,6 +2715,7 @@ impl<'a> RegistryHost<'a> {
                 roles_ctx,
                 input_actor,
                 root,
+                save_root,
                 disk_usage,
                 errors,
             }),
@@ -3279,6 +3296,60 @@ impl<'a> RegistryHost<'a> {
                 format!(
                     "disk_quota_mb quota exceeded for `{u}` ({projected} bytes would be in \
                      use under /builders/{u}, quota is {max_bytes} bytes)"
+                ),
+            );
+            return Ok(false);
+        }
+        let driver = self.driver.as_mut().expect("checked above");
+        driver.disk_usage.note_write(&u, old_bytes, new_bytes);
+        Ok(true)
+    }
+
+    /// `disk_quota_mb` for `save_object` (OBI-171, CTO review on PR #75,
+    /// must-fix 2): `check_disk_quota` attributes a write to the `<u>`
+    /// named *in the path* (`/builders/<u>/**`), but a save path carries
+    /// no uid in its text at all -- so without this, any P1 object could
+    /// fill the disk by calling `save_object` against arbitrarily many
+    /// paths, entirely outside `disk_quota_mb`. Instead this charges the
+    /// *writing* object's own uid (`principal_of(self_object()).uid`),
+    /// the same principal the master's save-path authorization contract
+    /// (`docs/save-objects.md`) is responsible for confining each save to
+    /// in the first place. Same seeded-once/`O(1)`-after contract and the
+    /// same non-raising `Ok(false)`-on-breach shape as `check_disk_quota`;
+    /// see [`crate::disk_usage::DiskUsage::seeded_save_total`] for why the
+    /// seed here is one `metadata()` stat instead of a directory walk.
+    fn check_save_disk_quota(&mut self, save_file_rel: &str, new_bytes: u64) -> R<bool> {
+        let Some(driver) = self.driver.as_ref() else {
+            return Ok(true);
+        };
+        let uid = principal_of(self.registry, self.self_object()).uid;
+        let u = self.registry.syms.name(uid).to_string();
+        if crate::quota::is_unlimited_uid(&u) {
+            return Ok(true);
+        }
+        let tier = driver.roles.tier(&u);
+        let Some(max_mb) =
+            crate::quota::resolve(&driver.roles, &u, self.quota_defaults()).disk_quota_mb
+        else {
+            return Ok(true);
+        };
+        let save_root = driver.save_root.clone();
+        let old_bytes = crate::fileio::file_size_bytes(&save_root, save_file_rel).unwrap_or(0);
+        let max_bytes = max_mb.saturating_mul(crate::quota::MB);
+        let driver = self.driver.as_mut().expect("checked above");
+        let seeded = driver
+            .disk_usage
+            .seeded_save_total(&save_root, &u, save_file_rel);
+        let projected = seeded.saturating_sub(old_bytes).saturating_add(new_bytes);
+        if projected > max_bytes {
+            self.registry
+                .quota_breaches
+                .record(tier, crate::quota::DISK_QUOTA_MB);
+            self.audit_quota_denial(
+                crate::quota::DISK_QUOTA_MB,
+                format!(
+                    "disk_quota_mb quota exceeded for `{u}` ({projected} bytes would be in \
+                     use for save_object(\"{save_file_rel}\"), quota is {max_bytes} bytes)"
                 ),
             );
             return Ok(false);
@@ -4064,6 +4135,36 @@ impl<'a> RegistryHost<'a> {
                 crate::fileio::write_file(root, &p, text)
                     .map(Value::Bool)
                     .map_err(|e| RtError::new(format!("write_file(\"{p}\") failed: {e}")))
+            }
+            "save_object" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("save_object(): expected string path"))?;
+                let p = security::normalize_file_path(p).map_err(RtError::new)?;
+                self.authorize(
+                    name,
+                    Privilege::P1,
+                    Operation::Write {
+                        path: &p,
+                        op: "save_object",
+                    },
+                )?;
+                self.save_object(&p).map(Value::Bool)
+            }
+            "restore_object" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("restore_object(): expected string path"))?;
+                let p = security::normalize_file_path(p).map_err(RtError::new)?;
+                self.authorize(
+                    name,
+                    Privilege::P0,
+                    Operation::Read {
+                        path: &p,
+                        op: "restore_object",
+                    },
+                )?;
+                self.restore_object(&p).map(Value::Bool)
             }
             "account_create" => self.issue_account_request(true, &a0, &a1),
             "account_login" => self.issue_account_request(false, &a0, &a1),
@@ -5303,6 +5404,194 @@ impl<'a> RegistryHost<'a> {
             skipped_unloaded: set.skipped_unloaded,
             deleted_loaded: set.deleted_loaded,
             failures: Vec::new(),
+        }
+    }
+
+    /// `<path>` normalised to the on-disk save-file name `save_object`/
+    /// `restore_object` use under the save root: `.o` appended unless
+    /// already present (classic LPMud convention: `save_object("bob")`
+    /// and `save_object("bob.o")` name the same file).
+    fn save_file_name(path: &str) -> String {
+        if path.ends_with(".o") {
+            path.to_string()
+        } else {
+            format!("{path}.o")
+        }
+    }
+
+    /// `save_object(path)` (spec §8.1, OBI-171): serialise every
+    /// `persistent` var of `self()`, across its whole inherit chain, keyed
+    /// by *(declaring program, name)* -- the same identity hot-reload
+    /// migration uses, §7.2/§7.3 -- into a JSON document (`crate::bcvm::
+    /// persist::encode_value`, spec r5 §7.3's portable form) alongside
+    /// the declaring program's path/version/schema hash, and write it
+    /// atomically (write + rename, `crate::fileio::write_file_atomic`)
+    /// under the save root (never the mudlib VFS -- see
+    /// `World::save_root`'s docs) at `<path>.o`. `Ok(false)`: the write
+    /// failed (oversized, a filesystem error) -- this never mutates the
+    /// object itself, so a failed save can't corrupt live state.
+    fn save_object(&mut self, raw_path: &str) -> R<bool> {
+        let id = self.self_object();
+        let Some(obj) = self.registry.get(id) else {
+            return Err(RtError::new("save_object(): object was destructed"));
+        };
+        let program = obj.program.clone();
+        let mut vars = serde_json::Map::new();
+        for ancestor in &program.chain() {
+            for spec in &ancestor.var_specs {
+                if !spec.persistent {
+                    continue;
+                }
+                let key = (ancestor.path.clone(), spec.name.clone());
+                let v = self
+                    .registry
+                    .get(id)
+                    .and_then(|o| o.vars.get(&key))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                vars.insert(
+                    format!("{}\u{0}{}", ancestor.path, spec.name),
+                    crate::bcvm::persist::encode_value(&v),
+                );
+            }
+        }
+        let doc = serde_json::json!({
+            "program": &*program.path,
+            "version": program.version,
+            "schema_hash": program.schema_hash,
+            "vars": serde_json::Value::Object(vars),
+        });
+        let text =
+            serde_json::to_string(&doc).map_err(|e| RtError::new(format!("save_object(): {e}")))?;
+        let save_file = Self::save_file_name(raw_path);
+        if !self.check_save_disk_quota(&save_file, text.len() as u64)? {
+            // Same shape as `write_file`'s own `disk_quota_mb` breach
+            // (OBI-137 S1): over quota is not an error, so `upgrade()`'s
+            // caller-visible contract (never silently mutating on a
+            // rejected save) still holds -- this runs before the write,
+            // not after.
+            return Ok(false);
+        }
+        let save_root = self
+            .driver
+            .as_ref()
+            .expect("checked above")
+            .save_root
+            .clone();
+        crate::fileio::write_file_atomic(&save_root, &save_file, &text)
+            .map_err(|e| RtError::new(format!("save_object(\"{raw_path}\") failed: {e}")))
+    }
+
+    /// `restore_object(path)` (spec §8.1/§7.3, OBI-171): the converse of
+    /// [`Self::save_object`]. Reads `<path>.o` from the save root
+    /// (`Ok(false)`, not an error, if it does not exist or fails to
+    /// parse -- a missing/corrupt save is not a crash). For every
+    /// `persistent` var in `self()`'s *current* inherit chain, the saved
+    /// value (decoded to a type-erased portable form,
+    /// `crate::bcvm::persist::decode_value`) either carries straight over
+    /// if it still conforms to the var's declared type
+    /// (`crate::bcvm::schema_convert::hydrate`), or is hashed into
+    /// `upgrade(from_version, old)`'s `old` map in portable form --
+    /// exactly the §7.2/§7.3 hot-reload migration path, run here against
+    /// the save file's recorded version instead of a recompiled program
+    /// (spec: "restoring an old save into a new program runs the same
+    /// migration path"). A var the save has nothing for keeps whatever
+    /// it already holds (e.g. `create()`'s own default), unchanged.
+    ///
+    /// All-or-nothing for this object (spec §7.2 step 6.4's rollback
+    /// rule, mirrored here): if `upgrade()` is defined and raises, every
+    /// var this call touched reverts to what it held before the call and
+    /// `Ok(false)` is returned. There is no `runtime_error` apply wired up
+    /// yet to report this to (OBI-34 tracks that), so the detail goes to
+    /// stderr in the meantime, same as `compile_object`'s per-object
+    /// upgrade-warning reporting.
+    fn restore_object(&mut self, raw_path: &str) -> R<bool> {
+        let id = self.self_object();
+        let Some(obj) = self.registry.get(id) else {
+            return Err(RtError::new("restore_object(): object was destructed"));
+        };
+        let program = obj.program.clone();
+        let save_root = self
+            .driver
+            .as_ref()
+            .expect("checked above")
+            .save_root
+            .clone();
+        let text = match crate::fileio::read_file(&save_root, &Self::save_file_name(raw_path)) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Ok(false),
+            Err(e) => {
+                eprintln!("restore_object(\"{raw_path}\") failed: {e}");
+                return Ok(false);
+            }
+        };
+        let doc: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("restore_object(\"{raw_path}\"): corrupt save: {e}");
+                return Ok(false);
+            }
+        };
+        let from_version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let saved_vars = doc.get("vars").and_then(|v| v.as_object());
+        let old_vars_snapshot = obj.vars.clone();
+        let mut new_vars = old_vars_snapshot.clone();
+        let mut old_map = heap::MapData::default();
+        for ancestor in &program.chain() {
+            for spec in &ancestor.var_specs {
+                if !spec.persistent {
+                    continue;
+                }
+                let saved_key = format!("{}\u{0}{}", ancestor.path, spec.name);
+                let Some(saved_json) = saved_vars.and_then(|m| m.get(&saved_key)) else {
+                    continue;
+                };
+                let portable = crate::bcvm::persist::decode_value(saved_json);
+                match crate::bcvm::schema_convert::hydrate(&portable, &spec.ty) {
+                    crate::bcvm::schema_convert::Migrated::Lossless(v) => {
+                        new_vars.insert((ancestor.path.clone(), spec.name.clone()), v);
+                    }
+                    crate::bcvm::schema_convert::Migrated::Lossy { portable } => {
+                        old_map.insert(Value::str(&spec.name), portable);
+                    }
+                }
+            }
+        }
+        let outcome: R<()> = (|| {
+            if let Some(o) = self.registry.get_mut(id) {
+                o.vars = new_vars.clone();
+                o.recompute_mem_bytes();
+            }
+            self.call_cache.clear();
+            if !old_map.entries.is_empty()
+                && let Some((target, idx)) = program.resolve("upgrade")
+            {
+                let mark = self.begin_atomic();
+                let args = vec![Value::Int(from_version as i64), Value::map(old_map.clone())];
+                match self.call_in(id, &target, idx, args) {
+                    Ok(_) => self.commit_atomic(mark),
+                    Err(e) => {
+                        self.rollback_atomic(mark);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                if let Some(o) = self.registry.get_mut(id) {
+                    o.vars = old_vars_snapshot;
+                    o.recompute_mem_bytes();
+                }
+                self.call_cache.clear();
+                eprintln!(
+                    "restore_object(\"{raw_path}\"): upgrade() failed: {}",
+                    e.report()
+                );
+                Ok(false)
+            }
         }
     }
 }

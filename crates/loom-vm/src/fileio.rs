@@ -205,6 +205,119 @@ pub fn write_file(root: &Path, path: &str, text: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// `save_object()`'s durable write (spec §8.1, OBI-171): same
+/// confinement as [`write_file`] (lexical `resolve` + symlink-escape
+/// `confine_canonical`) and the same [`MAX_FILE_BYTES`] cap, but a
+/// different suffix allow-list (`.o`, the classic save-file extension,
+/// not `.wf`/`.txt`) and a different durability contract: the new
+/// content is written to a sibling temp file in the same directory,
+/// `fsync`ed, then atomically renamed over the target. A crash (process
+/// kill, power loss) at any point before the rename leaves whatever was
+/// at `path` before this call completely untouched -- there is no
+/// window where a reader can observe a half-written save. See
+/// [`stage_write`]/[`commit_write`] (split out for
+/// `crash_before_rename_leaves_the_previous_save_intact` below, which
+/// exercises exactly that window without needing to actually kill a
+/// process) for the two halves this composes.
+pub fn write_file_atomic(root: &Path, path: &str, text: &str) -> Result<bool, String> {
+    let tmp = stage_write(root, path, text)?;
+    commit_write(root, path, &tmp)
+}
+
+/// Phase 1: validate, confine, and durably write `text` to a sibling
+/// temp file next to where `path` resolves -- but do not yet touch
+/// `path` itself. Returns the temp file's path, still present on disk.
+fn stage_write(root: &Path, path: &str, text: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if !trimmed.ends_with(".o") {
+        return Err(format!("{path}: save files must end in .o"));
+    }
+    if text.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!(
+            "{path}: {} bytes exceeds the {MAX_FILE_BYTES}-byte cap",
+            text.len()
+        ));
+    }
+    let resolved = resolve(root, path)?;
+    // Confine before *and* after `create_dir_all`, exactly like
+    // `write_file`: catches a symlink planted at `resolved` itself as
+    // well as one along a not-yet-created parent directory.
+    confine_canonical(root, &resolved)?;
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{path}: {e}"))?;
+    }
+    confine_canonical(root, &resolved)?;
+    let parent = resolved
+        .parent()
+        .expect("resolved always has a parent under root");
+    let leaf = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("save");
+    let tmp = parent.join(format!(".{leaf}.tmp-{}", std::process::id()));
+    // CTO review (OBI-171, PR #75): a previous crash between this
+    // `stage_write` and its matching `commit_write` can leave a stale
+    // tmp file at this exact name (same pid is reused by the OS only
+    // after a reboot, but a retried `save_object` call from the *same*
+    // still-running process reuses it immediately) -- clear it first so
+    // `create_new` below can't spuriously fail on it. Not found is fine;
+    // any other removal error is surfaced; it's safer to fail the save
+    // than silently clobber or follow something unexpected left in its
+    // place.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{path}: clearing stale tmp file: {e}")),
+    }
+    {
+        use std::io::Write;
+        // `create_new` (O_EXCL), not `File::create` (CTO review, OBI-171,
+        // PR #75): `File::create` truncates-or-creates and *follows* a
+        // symlink planted at this exact tmp-file name, so a symlink
+        // planted here pointing outside `root` would have this write its
+        // save contents through it. `create_new` atomically fails
+        // instead of following anything already at this path -- and
+        // nothing legitimate is ever already at this path (the removal
+        // above just cleared the one case that can be, a stale tmp file
+        // of this process's own making).
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| format!("{path}: {e}"))?;
+        f.write_all(text.as_bytes())
+            .map_err(|e| format!("{path}: {e}"))?;
+        f.sync_all().map_err(|e| format!("{path}: {e}"))?;
+    }
+    Ok(tmp)
+}
+
+/// Phase 2: atomically rename a temp file staged by [`stage_write`] over
+/// `path`'s resolved location -- the single filesystem operation after
+/// which the new content is durably in place -- then `fsync` the parent
+/// directory (CTO review, OBI-171, PR #75). The rename alone is only
+/// atomic, not durable: on most filesystems a directory entry update is
+/// itself buffered, so a power loss shortly after a `rename()` returns
+/// can roll the rename back on the next boot even though `save_object`
+/// already reported success. `fsync`ing the parent's directory fd is
+/// what makes the *directory entry* for the rename durable, matching
+/// `stage_write`'s own `sync_all()` on the tmp file's *contents* before
+/// the rename. Cleans up `tmp` on a rename failure rather than leaving
+/// it behind.
+fn commit_write(root: &Path, path: &str, tmp: &Path) -> Result<bool, String> {
+    let resolved = resolve(root, path)?;
+    std::fs::rename(tmp, &resolved).map_err(|e| {
+        let _ = std::fs::remove_file(tmp);
+        format!("{path}: {e}")
+    })?;
+    if let Some(parent) = resolved.parent() {
+        std::fs::File::open(parent)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| format!("{path}: fsync parent dir: {e}"))?;
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +411,160 @@ mod tests {
         let root = tmp_root("suffix");
         assert!(write_file(&root, "/domains/x/y.exe", "no").is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn atomic_write_round_trips_and_only_allows_dot_o() {
+        let root = tmp_root("atomic-roundtrip");
+        assert!(write_file_atomic(&root, "/players/bob.o", "{\"hp\":10}").unwrap());
+        assert_eq!(
+            read_file(&root, "/players/bob.o").unwrap(),
+            Some("{\"hp\":10}".to_string())
+        );
+        assert!(write_file_atomic(&root, "/players/bob.txt", "nope").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_old_save_and_leaves_no_temp_file_behind() {
+        let root = tmp_root("atomic-replace");
+        assert!(write_file_atomic(&root, "/players/bob.o", "old").unwrap());
+        assert!(write_file_atomic(&root, "/players/bob.o", "new").unwrap());
+        assert_eq!(
+            read_file(&root, "/players/bob.o").unwrap(),
+            Some("new".to_string())
+        );
+        let entries: Vec<_> = std::fs::read_dir(root.join("players"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["bob.o".to_string()],
+            "no leftover .tmp-* file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The crash-safety contract `write_file_atomic` exists for: a crash
+    /// (process kill, power loss) between the temp write and the rename
+    /// must leave whatever was already saved completely untouched. This
+    /// drives exactly that window by calling `stage_write` (temp file
+    /// written and fsynced) without ever calling `commit_write` --
+    /// equivalent to the process dying right there -- and asserts the
+    /// previous save is still exactly as it was (OBI-171 acceptance:
+    /// "crash during write leaves the old save intact").
+    #[test]
+    fn crash_before_rename_leaves_the_previous_save_intact() {
+        let root = tmp_root("atomic-crash");
+        assert!(write_file_atomic(&root, "/players/bob.o", "original save").unwrap());
+
+        let tmp = stage_write(&root, "/players/bob.o", "corrupted half-written save").unwrap();
+        assert!(tmp.exists(), "the staged temp file exists mid-\"crash\"");
+
+        // "Crash": nothing calls `commit_write`. The real save file must
+        // be exactly what it was before this attempt.
+        assert_eq!(
+            read_file(&root, "/players/bob.o").unwrap(),
+            Some("original save".to_string()),
+            "a crash before the rename must not touch the previous save"
+        );
+
+        // Finishing the commit afterwards (the process restarts and a
+        // later save succeeds) still works and replaces it.
+        assert!(commit_write(&root, "/players/bob.o", &tmp).unwrap());
+        assert_eq!(
+            read_file(&root, "/players/bob.o").unwrap(),
+            Some("corrupted half-written save".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CTO review (OBI-171, PR #75, must-fix 3/4): `stage_write` must
+    /// not blindly `File::create` the tmp-file name -- a symlink planted
+    /// there (e.g. a race with something else writing under the save
+    /// root) must never be followed to write through it. This plants one
+    /// pointing outside the save root, then asserts the save still
+    /// succeeds (the stale-clear step unlinks the symlink itself --
+    /// `unlink`/`remove_file` always targets the link entry, never what
+    /// it points to -- and `create_new` then makes a fresh regular file)
+    /// and, the actual security property, that the symlink's target was
+    /// never written through.
+    #[cfg(unix)]
+    #[test]
+    fn stage_write_does_not_follow_a_symlink_planted_at_the_tmp_name() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("atomic-tmp-symlink");
+        std::fs::create_dir_all(root.join("players")).unwrap();
+        let outside = std::env::temp_dir().join(format!(
+            "loom-fileio-test-outside-{}-{}",
+            "tmp-symlink",
+            std::process::id()
+        ));
+        std::fs::write(&outside, "do not touch").unwrap();
+
+        let tmp_name = format!(".bob.o.tmp-{}", std::process::id());
+        symlink(&outside, root.join("players").join(&tmp_name)).unwrap();
+
+        let tmp = stage_write(&root, "/players/bob.o", "attacker-controlled").unwrap();
+        assert!(commit_write(&root, "/players/bob.o", &tmp).unwrap());
+        assert_eq!(
+            read_file(&root, "/players/bob.o").unwrap(),
+            Some("attacker-controlled".to_string()),
+            "the save itself still succeeds, into a fresh real file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "do not touch",
+            "the symlink target must never be written through"
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// CTO review (OBI-171, PR #75, must-fix 3): a tmp file left behind
+    /// by an earlier crashed attempt (same pid, process never got to
+    /// `commit_write`) must be cleared before `create_new`, not treated
+    /// as a pre-existing-file error.
+    #[test]
+    fn stage_write_clears_a_stale_tmp_file_from_an_earlier_crashed_attempt() {
+        let root = tmp_root("atomic-stale-tmp");
+        std::fs::create_dir_all(root.join("players")).unwrap();
+        let tmp_name = format!(".bob.o.tmp-{}", std::process::id());
+        std::fs::write(root.join("players").join(&tmp_name), "stale half-write").unwrap();
+
+        let tmp = stage_write(&root, "/players/bob.o", "fresh save").unwrap();
+        assert_eq!(std::fs::read_to_string(&tmp).unwrap(), "fresh save");
+        assert!(commit_write(&root, "/players/bob.o", &tmp).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn atomic_write_oversized_is_rejected_without_touching_disk() {
+        let root = tmp_root("atomic-oversize");
+        let big = "a".repeat(MAX_FILE_BYTES as usize + 1);
+        assert!(write_file_atomic(&root, "/players/bob.o", &big).is_err());
+        assert_eq!(read_file(&root, "/players/bob.o").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_write_through_a_symlink_escape_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("atomic-symlink-escape");
+        let outside = tmp_root("atomic-symlink-escape-outside");
+        std::fs::create_dir_all(root.join("players")).unwrap();
+        symlink(&outside, root.join("players/evil")).unwrap();
+
+        let result = write_file_atomic(&root, "/players/evil/pwned.o", "pwned");
+        assert!(result.is_err(), "expected an error, got {result:?}");
+        assert!(!outside.join("pwned.o").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
