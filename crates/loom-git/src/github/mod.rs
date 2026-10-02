@@ -16,16 +16,18 @@
 
 pub mod jwt;
 pub mod pulls;
+pub mod tls_transport;
 pub mod transport;
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
-use rsa::RsaPrivateKey;
+use ring::signature::RsaKeyPair;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+pub use tls_transport::RustlsHttpClient;
 pub use transport::{HttpClient, HttpError, HttpResponse, UreqClient};
 
 use crate::worker::TokenProvider;
@@ -91,10 +93,10 @@ pub(super) fn truncate_body(body: &[u8]) -> String {
     }
 }
 
-pub struct GitHubAppClient<C: HttpClient = UreqClient> {
+pub struct GitHubAppClient<C: HttpClient = RustlsHttpClient> {
     app_id: String,
     installation_id: String,
-    private_key: RsaPrivateKey,
+    private_key: RsaKeyPair,
     /// `https://api.github.com` in production; a loopback fake server in
     /// tests.
     api_base: String,
@@ -103,10 +105,12 @@ pub struct GitHubAppClient<C: HttpClient = UreqClient> {
     now: fn() -> SystemTime,
 }
 
-impl GitHubAppClient<UreqClient> {
+impl GitHubAppClient<RustlsHttpClient> {
     /// Reads the PEM from `path` (e.g. `/run/secrets/warp_app.pem`,
     /// D-B3.11) once at construction. The key never touches the VFS or
-    /// any other persistence after this.
+    /// any other persistence after this. Uses [`RustlsHttpClient`] (TLS,
+    /// OBI-215) to actually reach `https://api.github.com` -- this is
+    /// the production constructor, not the test seam.
     pub fn from_pem_file(
         app_id: impl Into<String>,
         installation_id: impl Into<String>,
@@ -114,7 +118,7 @@ impl GitHubAppClient<UreqClient> {
     ) -> Result<Self, GitHubAppError> {
         let pem = std::fs::read_to_string(pem_path)
             .map_err(|e| GitHubAppError::BadKey(format!("reading {pem_path:?}: {e}")))?;
-        Self::new(app_id, installation_id, &pem, UreqClient::default())
+        Self::new(app_id, installation_id, &pem, RustlsHttpClient::default())
     }
 }
 
@@ -228,10 +232,10 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    // Shared throwaway test fixture (see `jwt`'s test module docs): not a
+    // real GitHub App key, just something `load_private_key` accepts.
     fn test_pem() -> String {
-        use rsa::pkcs8::EncodePrivateKey;
-        let key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
-        key.to_pkcs8_pem(Default::default()).unwrap().to_string()
+        include_str!("testdata/test_key.pkcs8.pem").to_string()
     }
 
     /// A tiny fake GitHub `/app/installations/.../access_tokens` server:

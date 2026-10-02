@@ -100,11 +100,10 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
+    // Shared throwaway test fixture (see `jwt`'s test module docs): not a
+    // real GitHub App key, just something `load_private_key` accepts.
     fn test_pem() -> String {
-        use rsa::RsaPrivateKey;
-        use rsa::pkcs8::EncodePrivateKey;
-        let key = RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
-        key.to_pkcs8_pem(Default::default()).unwrap().to_string()
+        include_str!("testdata/test_key.pkcs8.pem").to_string()
     }
 
     /// Spawns a fake GitHub server that answers the installation-token
