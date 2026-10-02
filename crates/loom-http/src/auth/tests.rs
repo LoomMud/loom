@@ -31,6 +31,10 @@ struct FakeDirectoryInner {
     refresh_tokens: HashMap<String, RefreshRecord>, // keyed by token_hash
     github_links: HashMap<i64, String>,
     audit_events: Vec<AuditEvent>,
+    /// How many times [`StaffDirectory::resolve_uid`] has been called
+    /// (OBI-204 review fix): used to prove `login` checks the IP bucket
+    /// *before* paying for this lookup.
+    resolve_uid_calls: u32,
 }
 
 #[derive(Default, Clone)]
@@ -121,6 +125,10 @@ impl FakeDirectory {
     fn audit_events(&self) -> Vec<AuditEvent> {
         self.inner.lock().unwrap().audit_events.clone()
     }
+
+    fn resolve_uid_calls(&self) -> u32 {
+        self.inner.lock().unwrap().resolve_uid_calls
+    }
 }
 
 #[async_trait::async_trait]
@@ -143,6 +151,12 @@ impl StaffDirectory for FakeDirectory {
             totp_secret: staff.totp_secret.clone(),
             totp_confirmed: staff.totp_confirmed,
         }))
+    }
+
+    async fn resolve_uid(&self, username: &str) -> Result<Option<String>, DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.resolve_uid_calls += 1;
+        Ok(inner.staff.get(username).map(|s| s.uid.clone()))
     }
 
     async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError> {
@@ -673,6 +687,46 @@ async fn wrong_totp_codes_count_toward_the_account_lockout() {
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
 }
 
+/// OBI-204 acceptance: `login`'s wrong-password failures and
+/// `totp_confirm`'s wrong-code failures land on the *same* account
+/// counter -- both resolve to the one `uid:` namespaced key, so an
+/// attacker can't double their effective guess budget by splitting
+/// attempts across the two entry points.
+#[tokio::test]
+async fn wrong_login_password_and_wrong_totp_confirm_share_one_account_counter() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory);
+
+    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+    let code = totp.generate_current().to_string();
+    service
+        .totp_confirm("gandalf", &code, &ctx())
+        .await
+        .unwrap();
+
+    // 3 wrong login passwords...
+    for _ in 0..3 {
+        let result = service.login("gandalf", "wrong", None, &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+    }
+    // ...and 2 wrong TOTP codes via totp_confirm -- 5 total against the
+    // same account.
+    for _ in 0..2 {
+        let result = service.totp_confirm("gandalf", "000000", &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::TotpInvalid);
+    }
+
+    // The account is now locked from the combined count -- even the
+    // correct password+code combo is refused.
+    let fresh_code = totp.generate_current().to_string();
+    let result = service
+        .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
 /// A missing TOTP code ("not supplied") is not a guess and must not count
 /// toward the lockout.
 #[tokio::test]
@@ -696,6 +750,36 @@ async fn a_missing_totp_code_does_not_count_as_a_failure() {
     }
 
     // Still not locked -- the current code succeeds.
+    let fresh_code = totp.generate_current().to_string();
+    assert!(
+        service
+            .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
+            .await
+            .is_ok()
+    );
+}
+
+/// OBI-204 CTO review: an in-flight reservation must never *itself* set
+/// the lockout. After 4 wrong passwords, a correct password with no TOTP
+/// code (`TotpRequired`, the normal two-step login flow) releases its
+/// reservation; it must not leave the account locked for 15 minutes.
+#[tokio::test]
+async fn totp_required_after_four_failures_does_not_lock_the_account() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory.clone());
+
+    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gandalf");
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+
+    for _ in 0..4 {
+        let result = service.login("gandalf", "wrong", None, &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+    }
+    let result = service.login("gandalf", "mithrandir", None, &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
+
     let fresh_code = totp.generate_current().to_string();
     assert!(
         service
@@ -732,6 +816,33 @@ async fn ip_bucket_throttles_logins_across_many_accounts() {
     let other_ip = ctx_from("203.0.113.51");
     let result = service.login("nobody-5", "whatever", None, &other_ip).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
+/// OBI-204 review fix: `login` checks the (cheap, no-DB) IP bucket
+/// *before* resolving the username to a uid, so a throttled IP never pays
+/// for that lookup.
+#[tokio::test]
+async fn login_checks_the_ip_bucket_before_resolving_the_account() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("frodo", "ringbearer", 1);
+    let service = test_service(directory.clone()).with_rate_limiter(RateLimiter::with_test_tuning(
+        5,
+        std::time::Duration::from_secs(900),
+        std::time::Duration::from_secs(900),
+        1.0,
+        std::time::Duration::from_secs(3600),
+    ));
+
+    let from_ip = ctx_from("198.51.100.20");
+    // Spends the IP bucket's one token.
+    let _ = service.login("frodo", "wrong", None, &from_ip).await;
+    assert_eq!(directory.resolve_uid_calls(), 1);
+
+    // The bucket is now dry: a second attempt must be refused by the IP
+    // check alone, without ever calling `resolve_uid` again.
+    let result = service.login("frodo", "wrong", None, &from_ip).await;
+    assert_eq!(result.unwrap_err(), AuthError::RateLimited);
+    assert_eq!(directory.resolve_uid_calls(), 1);
 }
 
 /// Acceptance: "audit rows written for each event" -- login ok, login

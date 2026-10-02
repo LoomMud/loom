@@ -34,7 +34,7 @@ use serde_json::Value;
 use sqlx::QueryBuilder;
 use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -77,7 +77,24 @@ pub struct Persist {
     /// user's wrong-password attempt would, so response timing never
     /// reveals whether a username exists.
     dummy_password_hash: String,
+    /// Bounds how many Argon2id verifies (real or dummy) can run
+    /// concurrently on the blocking pool (OBI-204 review fix, must-fix
+    /// 2): each verify at `m=19MiB` holds that much memory for its
+    /// duration, and Tokio's blocking pool defaults to up to 512 threads,
+    /// so without a cap a login flood could reserve `512 * 19MiB` (~9.5
+    /// GiB) of memory concurrently. The permit is held for the duration
+    /// of the `spawn_blocking` closure, not just the `.await`.
+    argon2_concurrency: Arc<tokio::sync::Semaphore>,
 }
+
+/// Max Argon2id verifies (real or dummy) running at once (OBI-204 review
+/// fix 2). Chosen to keep peak Argon2 memory well under 512 MiB
+/// (`32 * 19 MiB` ~= 608 MiB is already generous for a single-replica
+/// StatefulSet; tune alongside the pod's memory limit if that changes)
+/// while still giving the 150-simulated-player load test (E1.1) plenty of
+/// headroom -- login/TOTP attempts are a small fraction of in-game
+/// traffic and never happen on the world thread's own executor.
+const ARGON2_MAX_CONCURRENCY: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
@@ -533,6 +550,7 @@ impl Persist {
             pool,
             argon2,
             dummy_password_hash,
+            argon2_concurrency: Arc::new(tokio::sync::Semaphore::new(ARGON2_MAX_CONCURRENCY)),
         })
     }
 
@@ -541,10 +559,45 @@ impl Persist {
     /// time as a wrong-password attempt against a real one (OBI-200,
     /// M-AUTH-2). The result is always discarded -- this exists purely
     /// for its timing, never its outcome.
-    fn dummy_verify(&self, password: &str) {
-        let parsed = PasswordHash::new(&self.dummy_password_hash)
-            .expect("the dummy hash computed in from_pool is always a valid PHC string");
-        let _ = self.argon2.verify_password(password.as_bytes(), &parsed);
+    ///
+    /// Runs on `spawn_blocking` (OBI-204): Argon2id at these parameters
+    /// is tens of milliseconds of pure CPU, and running it inline would
+    /// block whatever async worker thread handles the request for that
+    /// long -- never acceptable on the world thread's executor.
+    async fn dummy_verify(&self, password: &str) {
+        let argon2 = self.argon2.clone();
+        let dummy_hash = self.dummy_password_hash.clone();
+        let password = password.to_string();
+        let permit = self.argon2_concurrency.clone().acquire_owned().await;
+        let _ = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let parsed = PasswordHash::new(&dummy_hash)
+                .expect("the dummy hash computed in from_pool is always a valid PHC string");
+            argon2.verify_password(password.as_bytes(), &parsed)
+        })
+        .await;
+    }
+
+    /// Verify `password` against `password_hash` off the calling task
+    /// (OBI-204), returning `true` only on a successful Argon2id match. A
+    /// `spawn_blocking` panic/join failure is treated as a verify failure,
+    /// never as a success.
+    async fn verify_password_blocking(&self, password: &str, password_hash: &str) -> Result<bool> {
+        let argon2 = self.argon2.clone();
+        let password_hash = password_hash.to_string();
+        let password = password.to_string();
+        let permit = self.argon2_concurrency.clone().acquire_owned().await;
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let parsed = PasswordHash::new(&password_hash)
+                .map_err(|error| PersistError::PasswordHash(error.to_string()))?;
+            Ok::<bool, PersistError>(argon2.verify_password(password.as_bytes(), &parsed).is_ok())
+        })
+        .await;
+        match result {
+            Ok(inner) => inner,
+            Err(_join_err) => Ok(false),
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -588,16 +641,13 @@ impl Persist {
         let Some(row) = row else {
             // OBI-200, M-AUTH-2: dummy verify so timing doesn't reveal that
             // this username doesn't exist.
-            self.dummy_verify(password);
+            self.dummy_verify(password).await;
             return Ok(None);
         };
 
-        let parsed = PasswordHash::new(&row.password_hash)
-            .map_err(|error| PersistError::PasswordHash(error.to_string()))?;
-        if self
-            .argon2
-            .verify_password(password.as_bytes(), &parsed)
-            .is_err()
+        if !self
+            .verify_password_blocking(password, &row.password_hash)
+            .await?
         {
             return Ok(None);
         }
@@ -633,18 +683,15 @@ impl Persist {
         let Some(row) = row else {
             // OBI-200, M-AUTH-2: dummy verify so timing doesn't reveal that
             // this username doesn't exist (or isn't staff).
-            self.dummy_verify(password);
+            self.dummy_verify(password).await;
             return Ok(None);
         };
         use sqlx::Row;
         let password_hash: String = row.try_get("password_hash")?;
 
-        let parsed = PasswordHash::new(&password_hash)
-            .map_err(|error| PersistError::PasswordHash(error.to_string()))?;
-        if self
-            .argon2
-            .verify_password(password.as_bytes(), &parsed)
-            .is_err()
+        if !self
+            .verify_password_blocking(password, &password_hash)
+            .await?
         {
             return Ok(None);
         }
@@ -658,6 +705,23 @@ impl Persist {
                 .try_get::<Option<OffsetDateTime>, _>("totp_confirmed_at")?
                 .is_some(),
         }))
+    }
+
+    /// Resolve a login username to its staff uid, with no password
+    /// check at all (OBI-204): used only to pick a stable, uid-namespaced
+    /// rate-limiter key *before* the password is verified, so `login`'s
+    /// account lockout and `totp_confirm`'s account lockout are always
+    /// the same bucket for the same staff member. `None` for a username
+    /// that doesn't exist or isn't staff -- callers fall back to a
+    /// username-namespaced key in that case.
+    pub async fn staff_uid_for_username(&self, username: &str) -> Result<Option<String>> {
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT s.uid FROM accounts a JOIN staff s ON s.account_id = a.id WHERE a.username = $1",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
     }
 
     /// Enrol (or re-enrol) `uid`'s TOTP secret via the `auth_totp_enroll`
@@ -1819,5 +1883,60 @@ mod tests {
             event,
             DbEvent::AccountResult { ok: false, ref detail, .. } if detail == "bad_credentials"
         ));
+    }
+
+    /// OBI-204 review must-fix 2: Argon2id verifies (real or dummy) run
+    /// under a semaphore, so no more than [`ARGON2_MAX_CONCURRENCY`] of
+    /// them ever hold their ~19 MiB of memory at once, however many
+    /// logins arrive concurrently. `connect_lazy` means this never
+    /// actually dials Postgres -- [`Persist::dummy_verify`] never touches
+    /// the pool at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn argon2_verify_concurrency_is_bounded_by_a_semaphore() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@localhost/nonexistent")
+            .expect("connect_lazy never dials out, so this never fails");
+        let persist = Arc::new(Persist::from_pool(pool).unwrap());
+        assert_eq!(
+            persist.argon2_concurrency.available_permits(),
+            ARGON2_MAX_CONCURRENCY
+        );
+
+        let total = ARGON2_MAX_CONCURRENCY * 3;
+        let mut handles = Vec::with_capacity(total);
+        for _ in 0..total {
+            let persist = persist.clone();
+            handles.push(tokio::spawn(async move {
+                persist.dummy_verify("whatever-password").await;
+            }));
+        }
+
+        // Poll for up to ~1s for the permit count to bottom out: with 3x
+        // as many callers as permits, and each real Argon2id verify
+        // taking several milliseconds of CPU, the semaphore should be
+        // fully saturated (0 available) at some point while the first
+        // wave is still running.
+        let mut min_seen = ARGON2_MAX_CONCURRENCY;
+        for _ in 0..200 {
+            min_seen = min_seen.min(persist.argon2_concurrency.available_permits());
+            if min_seen == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            min_seen, 0,
+            "expected the semaphore to be fully saturated at some point under {total} \
+             concurrent callers against only {ARGON2_MAX_CONCURRENCY} permits"
+        );
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        // Every permit is returned once every verify has finished.
+        assert_eq!(
+            persist.argon2_concurrency.available_permits(),
+            ARGON2_MAX_CONCURRENCY
+        );
     }
 }

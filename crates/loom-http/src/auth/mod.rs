@@ -54,13 +54,16 @@
 //! `Persist::github_link`, T4+). An unlinked id is refused outright --
 //! this module has no code path that inserts a `staff` row.
 //!
-//! ## Rate limiting, lockout, and audit (OBI-200)
+//! ## Rate limiting, lockout, and audit (OBI-200, OBI-204)
 //!
 //! [`AuthService::login`]/[`AuthService::totp_confirm`] share one
 //! [`RateLimiter`] (see that module's docs for the exact numbers): a
 //! wrong password or wrong TOTP code counts as a failure toward both a
 //! per-account lockout and a per-IP token bucket, and a locked account
-//! gets exactly the same response as a wrong password. Every login,
+//! gets exactly the same response as a wrong password. Both entry points
+//! key the account lockout by the same resolved staff uid (OBI-204), so
+//! splitting guesses across `login` and `totp_confirm` can't double an
+//! attacker's effective budget. Every login,
 //! refresh-reuse, and TOTP enrol/reset is appended to `audit_log` via
 //! [`StaffDirectory::record_audit`] (M-AUTH-9); see
 //! `docs/threat-model-phase2.md` §6.1 (M-AUTH-1, M-AUTH-2, M-AUTH-9).
@@ -242,18 +245,35 @@ impl AuthService {
         totp_code: Option<&str>,
         ctx: &AuthContext,
     ) -> Result<TokenPair, AuthError> {
-        match self.rate_limiter.check(username, ctx.ip) {
-            RateLimitDecision::IpThrottled => {
-                self.audit(
-                    "auth.login.fail",
-                    None,
-                    ctx,
-                    "deny",
-                    Some("ip_rate_limited".to_string()),
-                )
-                .await;
-                return Err(AuthError::RateLimited);
-            }
+        // OBI-204 review fix: check the (cheap, no-DB) IP bucket before
+        // paying for the `resolve_uid` lookup below, so a throttled IP is
+        // refused without ever touching Postgres.
+        if let Some(ip) = ctx.ip
+            && self.rate_limiter.check_ip(ip) == RateLimitDecision::IpThrottled
+        {
+            self.audit(
+                "auth.login.fail",
+                None,
+                ctx,
+                "deny",
+                Some("ip_rate_limited".to_string()),
+            )
+            .await;
+            return Err(AuthError::RateLimited);
+        }
+
+        // OBI-204: resolve the account limiter key to the staff uid up
+        // front (no password check involved -- this is a plain lookup),
+        // the same namespace `totp_confirm` uses, so a wrong login
+        // password and a wrong TOTP code for the same staff member always
+        // land on the same bucket. A username that doesn't resolve (wrong
+        // username, or the directory itself is unavailable) falls back to
+        // a username-namespaced key -- there is no uid to share, and that
+        // namespace can never collide with a real `uid:` key.
+        let resolved_uid = self.directory.resolve_uid(username).await.unwrap_or(None);
+        let account_key = account_rate_key(resolved_uid.as_deref(), username);
+
+        match self.rate_limiter.check_account(&account_key) {
             RateLimitDecision::AccountLocked => {
                 self.audit(
                     "auth.login.fail",
@@ -266,12 +286,15 @@ impl AuthService {
                 return Err(AuthError::InvalidCredentials);
             }
             RateLimitDecision::Allowed => {}
+            RateLimitDecision::IpThrottled => {
+                unreachable!("check_account never checks the IP bucket")
+            }
         }
 
         let record = match self.directory.staff_login(username, password).await {
             Ok(Some(record)) => record,
             Ok(None) => {
-                self.rate_limiter.record_failure(username);
+                self.rate_limiter.record_failure(&account_key);
                 self.audit(
                     "auth.login.fail",
                     None,
@@ -282,7 +305,12 @@ impl AuthService {
                 .await;
                 return Err(AuthError::InvalidCredentials);
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                // Neither a guess nor a success -- give the reservation
+                // back rather than let it sit as a phantom failure.
+                self.rate_limiter.release(&account_key);
+                return Err(err.into());
+            }
         };
 
         // Re-read tier/TOTP state fresh rather than trusting `record`,
@@ -291,6 +319,9 @@ impl AuthService {
         let status = match self.require_staff_status(&record.uid).await {
             Ok(status) => status,
             Err(err) => {
+                // Not a guess (directory error or removed staff row):
+                // give the reservation back (OBI-204).
+                self.rate_limiter.release(&account_key);
                 self.audit(
                     "auth.login.fail",
                     Some(record.uid.clone()),
@@ -316,7 +347,12 @@ impl AuthService {
             Ok(verified) => verified,
             Err(err) => {
                 if err == AuthError::TotpInvalid {
-                    self.rate_limiter.record_failure(username);
+                    self.rate_limiter.record_failure(&account_key);
+                } else {
+                    // TotpRequired (or any other non-guess outcome): not
+                    // a guess, give the reservation back rather than
+                    // count it toward the lockout.
+                    self.rate_limiter.release(&account_key);
                 }
                 self.audit(
                     "auth.login.fail",
@@ -335,7 +371,7 @@ impl AuthService {
             (vec!["pwd".to_string()], None)
         };
 
-        self.rate_limiter.record_success(username);
+        self.rate_limiter.record_success(&account_key);
         let pair = self
             .issue_tokens(&record.uid, status.tier, generate_sid(), amr, mfa_at)
             .await?;
@@ -523,25 +559,37 @@ impl AuthService {
         code: &str,
         ctx: &AuthContext,
     ) -> Result<(), AuthError> {
-        match self.rate_limiter.check(uid, ctx.ip) {
+        let account_key = uid_rate_key(uid);
+        match self.rate_limiter.check(&account_key, ctx.ip) {
             RateLimitDecision::IpThrottled => return Err(AuthError::RateLimited),
             RateLimitDecision::AccountLocked => return Err(AuthError::TotpInvalid),
             RateLimitDecision::Allowed => {}
         }
 
-        let secret = self
-            .directory
-            .totp_secret_for(uid)
-            .await?
-            .ok_or(AuthError::TotpInvalid)?;
+        let secret = match self.directory.totp_secret_for(uid).await {
+            Ok(Some(secret)) => secret,
+            Ok(None) => {
+                // No secret to check against -- not a guess, give the
+                // reservation back rather than count it as a failure.
+                self.rate_limiter.release(&account_key);
+                return Err(AuthError::TotpInvalid);
+            }
+            Err(err) => {
+                self.rate_limiter.release(&account_key);
+                return Err(err.into());
+            }
+        };
         match self.verify_and_consume_totp(uid, &secret, code).await {
             Ok(()) => {
-                self.directory.totp_confirm(uid).await?;
-                self.rate_limiter.record_success(uid);
+                if let Err(err) = self.directory.totp_confirm(uid).await {
+                    self.rate_limiter.release(&account_key);
+                    return Err(err.into());
+                }
+                self.rate_limiter.record_success(&account_key);
                 Ok(())
             }
             Err(err) => {
-                self.rate_limiter.record_failure(uid);
+                self.rate_limiter.record_failure(&account_key);
                 Err(err)
             }
         }
@@ -731,6 +779,29 @@ fn totp_gate_detail(error: &AuthError) -> &'static str {
         AuthError::TotpInvalid => "totp_invalid",
         AuthError::InvalidCredentials => "staff_row_missing",
         _ => "totp_gate_failed",
+    }
+}
+
+/// The rate limiter's account key for a resolved staff uid (OBI-204): the
+/// one namespace both [`AuthService::login`] and
+/// [`AuthService::totp_confirm`] use, so a wrong password and a wrong
+/// TOTP code for the same staff member always land on the same bucket.
+fn uid_rate_key(uid: &str) -> String {
+    format!("{}{uid}", ratelimit::UID_KEY_PREFIX)
+}
+
+/// The rate limiter's account key for a login attempt whose username
+/// didn't resolve to a uid (unknown username, or the directory was
+/// unavailable for the resolve lookup) -- namespaced distinctly from
+/// [`uid_rate_key`] so it can never collide with a real uid's bucket.
+fn username_rate_key(username: &str) -> String {
+    format!("user:{username}")
+}
+
+fn account_rate_key(resolved_uid: Option<&str>, username: &str) -> String {
+    match resolved_uid {
+        Some(uid) => uid_rate_key(uid),
+        None => username_rate_key(username),
     }
 }
 

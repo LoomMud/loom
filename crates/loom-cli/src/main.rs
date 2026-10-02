@@ -62,8 +62,12 @@ async fn run() -> Result<(), String> {
 
     match command.as_str() {
         "serve" => {
+            let args = parse_serve_args(args)?;
+            serve(args.mudlib, args.adopt_control_fd).await
+        }
+        "supervise" => {
             let mudlib = parse_mudlib_arg(args)?;
-            serve(mudlib).await
+            supervise(mudlib).await
         }
         "check" => {
             let mut root = None;
@@ -289,19 +293,290 @@ fn parse_mudlib_arg(mut args: impl Iterator<Item = String>) -> Result<PathBuf, S
     mudlib.ok_or_else(|| "missing required --mudlib <path>".to_string())
 }
 
-async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
+/// `loom serve`'s parsed arguments. `adopt_control_fd` is `loom
+/// supervise`'s own internal handoff protocol (OBI-184): an inherited,
+/// already-open control-socket fd number this `serve` process should wait
+/// on (via [`loom_supervise::fdpass::recv_fds`]) for its listening
+/// sockets, instead of binding them itself. Not documented as
+/// user-facing CLI surface -- it is only ever passed by `loom supervise`
+/// itself, to its own spawned standby child, with an fd number that is
+/// meaningless to type by hand.
+struct ServeArgs {
+    mudlib: PathBuf,
+    adopt_control_fd: Option<std::os::fd::RawFd>,
+}
+
+fn parse_serve_args(mut args: impl Iterator<Item = String>) -> Result<ServeArgs, String> {
+    let mut mudlib: Option<PathBuf> = None;
+    let mut adopt_control_fd: Option<std::os::fd::RawFd> = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--mudlib" => {
+                let Some(path) = args.next() else {
+                    return Err("--mudlib requires a value".to_string());
+                };
+                mudlib = Some(PathBuf::from(path));
+            }
+            "--adopt-control-fd" => {
+                let Some(value) = args.next() else {
+                    return Err("--adopt-control-fd requires a value".to_string());
+                };
+                adopt_control_fd =
+                    Some(value.parse().map_err(|err| {
+                        format!("--adopt-control-fd: not a valid fd number: {err}")
+                    })?);
+            }
+            other => return Err(format!("unexpected argument: {other}")),
+        }
+    }
+
+    Ok(ServeArgs {
+        mudlib: mudlib.ok_or_else(|| "missing required --mudlib <path>".to_string())?,
+        adopt_control_fd,
+    })
+}
+
+/// `serve()`'s listening sockets, acquired one of two ways (OBI-184):
+/// bound fresh (the historical, still-default path -- `adopt_control_fd`
+/// is `None`), or adopted from `loom supervise`'s standby hand-off over
+/// an inherited control-socket fd. Both paths return live, non-blocking
+/// Tokio listeners ready for `axum::serve`/`loom_net::run_server_with_ws`
+/// exactly as before; callers downstream of this function never need to
+/// know which path was taken.
+async fn acquire_listeners(
+    adopt_control_fd: Option<std::os::fd::RawFd>,
+) -> Result<(TcpListener, TcpListener), String> {
+    match adopt_control_fd {
+        None => {
+            let bind_addr = loom_net::telnet_addr_from_env();
+            let listener = TcpListener::bind(&bind_addr)
+                .await
+                .map_err(|err| format!("failed to bind {bind_addr}: {err}"))?;
+            let http_bind_addr = http_addr_from_env();
+            let http_listener = TcpListener::bind(&http_bind_addr)
+                .await
+                .map_err(|err| format!("failed to bind {http_bind_addr}: {err}"))?;
+            Ok((listener, http_listener))
+        }
+        Some(fd) => {
+            // The handshake with `loom supervise` is a handful of
+            // blocking syscalls (one `write`, one `recvmsg`) run via
+            // `spawn_blocking` so they cannot stall the async runtime's
+            // worker threads -- this is a one-time startup cost, not
+            // something steady-state traffic ever waits on.
+            let (std_telnet, std_http) = tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                // SAFETY: `fd` is the number `loom supervise` itself
+                // passed down via `--adopt-control-fd`, inherited at
+                // `exec` specifically because the supervisor cleared its
+                // `FD_CLOEXEC` for that purpose (`spawn_and_handoff`) --
+                // nothing else in this freshly-exec'd process has opened
+                // or wrapped this fd number yet.
+                //
+                // `loom-cli` otherwise denies `unsafe_code` workspace-wide;
+                // this is the one call site that needs the exception
+                // (CTO review, OBI-184/OBI-225: the safety argument above
+                // depends on *how this process was invoked*, which only
+                // this call site -- not `loom-supervise::listener` itself
+                // -- actually knows).
+                #[allow(unsafe_code)]
+                let mut control =
+                    unsafe { loom_supervise::listener::control_stream_from_raw_fd(fd) }
+                        .map_err(|err| format!("adopt-control-fd: adopt control socket: {err}"))?;
+                // Tell `loom supervise` we're ready to receive the
+                // listening sockets ...
+                control
+                    .write_all(b"R")
+                    .map_err(|err| format!("adopt-control-fd: ready signal: {err}"))?;
+                // ... then block for its SCM_RIGHTS reply: exactly two
+                // fds, telnet first then HTTP -- a fixed, out-of-band-
+                // agreed order (see `loom_supervise::fdpass`'s module doc
+                // for why there's no self-describing framing on the
+                // wire).
+                //
+                // TODO(OBI-184 abort/fallback slice): neither this call
+                // nor the `read_exact` on the supervisor's side
+                // (`spawn_and_handoff`) has a timeout, so a standby/
+                // supervisor that hangs mid-handshake blocks the other
+                // side forever. Acceptable for this slice (no
+                // already-running-process copyover to abort out of yet);
+                // needs `set_read_timeout` on both ends before this
+                // becomes part of a real copyover against a live old
+                // process (CTO review, OBI-225).
+                let fds = loom_supervise::fdpass::recv_fds(&control)
+                    .map_err(|err| format!("adopt-control-fd: recv_fds: {err}"))?;
+                let [telnet_fd, http_fd]: [std::os::fd::OwnedFd; 2] =
+                    fds.try_into().map_err(|fds: Vec<_>| {
+                        format!(
+                            "adopt-control-fd: expected 2 fds (telnet, http), got {}",
+                            fds.len()
+                        )
+                    })?;
+                let telnet = loom_supervise::listener::adopt_tcp_listener(telnet_fd)
+                    .map_err(|err| format!("adopt-control-fd: adopt telnet listener: {err}"))?;
+                let http = loom_supervise::listener::adopt_tcp_listener(http_fd)
+                    .map_err(|err| format!("adopt-control-fd: adopt HTTP listener: {err}"))?;
+                telnet
+                    .set_nonblocking(true)
+                    .map_err(|err| format!("adopt-control-fd: set_nonblocking (telnet): {err}"))?;
+                http.set_nonblocking(true)
+                    .map_err(|err| format!("adopt-control-fd: set_nonblocking (http): {err}"))?;
+                Ok::<_, String>((telnet, http))
+            })
+            .await
+            .map_err(|err| format!("adopt-control-fd: join: {err}"))??;
+
+            let listener = TcpListener::from_std(std_telnet).map_err(|err| {
+                format!("adopt-control-fd: tokio TcpListener::from_std (telnet): {err}")
+            })?;
+            let http_listener = TcpListener::from_std(std_http).map_err(|err| {
+                format!("adopt-control-fd: tokio TcpListener::from_std (http): {err}")
+            })?;
+            Ok((listener, http_listener))
+        }
+    }
+}
+
+/// `loom supervise` (OBI-184, design §7.5/§9.2): the in-pod supervisor
+/// that owns the listening sockets and spawns `loom serve` as a standby
+/// child, handing it those sockets over a private control-socket
+/// `SCM_RIGHTS` channel (`loom_supervise::fdpass`) rather than letting
+/// the child bind them itself.
+///
+/// **This is the first slice** (see OBI-184's tracking comments): it
+/// proves the handoff mechanism end to end against one child and then
+/// just waits for it to exit -- there is deliberately no version
+/// watching, no cosign/GHCR artifact staging, no standby-vs-already-
+/// running-process copyover, and no respawn-on-crash yet. Each of those
+/// is a separate, tracked follow-up; this function is not a stand-in
+/// implementation of them.
+///
+/// **Not yet safe as a container entrypoint** (CTO review, OBI-225),
+/// tracked on OBI-184: this process installs no signal handling of its
+/// own, so a `SIGTERM` (e.g. a pod shutdown) kills the supervisor
+/// immediately, the kernel then `SIGKILL`s the orphaned standby child
+/// (or leaves it running detached, depending on PID-namespace reaping
+/// behaviour), and `serve`'s own graceful `shutdown_signal` drain never
+/// runs -- a regression versus running `serve` directly. Before
+/// `supervise` replaces `serve` as the `Dockerfile`'s entrypoint, it
+/// needs to forward `SIGTERM`/`SIGINT` to the child and reap it, and the
+/// child should set `PR_SET_PDEATHSIG` so an unexpected supervisor exit
+/// doesn't orphan it either.
+async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     let bind_addr = loom_net::telnet_addr_from_env();
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .map_err(|err| format!("failed to bind {bind_addr}: {err}"))?;
+    let http_bind_addr = http_addr_from_env();
+
+    // Bound with the plain `std` listener, not Tokio's: this supervisor
+    // process does almost no async work of its own (one blocking
+    // handshake, then a blocking `wait()`) and the fds need to be
+    // `BorrowedFd`-able for `fdpass::send_fds` regardless.
+    let telnet_listener = std::net::TcpListener::bind(&bind_addr)
+        .map_err(|err| format!("supervise: failed to bind {bind_addr}: {err}"))?;
+    let http_listener = std::net::TcpListener::bind(&http_bind_addr)
+        .map_err(|err| format!("supervise: failed to bind {http_bind_addr}: {err}"))?;
+    info!(
+        bind = %bind_addr,
+        http_bind = %http_bind_addr,
+        "loom supervise: listening sockets bound, spawning standby child"
+    );
+
+    // A blocking spawn-and-handoff on a dedicated blocking thread: this
+    // whole function has nothing else running concurrently yet (no
+    // world thread, no other listeners) to protect from a blocking call,
+    // and `std::process::Command`/`UnixStream` are themselves blocking
+    // APIs -- `spawn_blocking` just keeps the async runtime's own
+    // bookkeeping honest about that.
+    tokio::task::spawn_blocking(move || {
+        spawn_and_handoff(&mudlib_root, &telnet_listener, &http_listener)
+    })
+    .await
+    .map_err(|err| format!("supervise: join: {err}"))??;
+    Ok(())
+}
+
+/// Spawn one `loom serve --adopt-control-fd <n>` standby child and hand
+/// it `telnet_listener`/`http_listener` over a dedicated control
+/// `UnixStream` pair. Blocks (by design -- see [`supervise`]'s doc) until
+/// the child signals it's ready to receive the fds, then again until the
+/// child process itself exits (this slice has nothing else for the
+/// supervisor to do once the handoff is done).
+fn spawn_and_handoff(
+    mudlib_root: &std::path::Path,
+    telnet_listener: &std::net::TcpListener,
+    http_listener: &std::net::TcpListener,
+) -> Result<(), String> {
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    use std::os::unix::net::UnixStream;
+
+    let (supervisor_end, child_end) =
+        UnixStream::pair().map_err(|err| format!("supervise: UnixStream::pair: {err}"))?;
+    loom_supervise::listener::clear_cloexec(loom_supervise::listener::raw_fd_of(&child_end))
+        .map_err(|err| format!("supervise: clear_cloexec: {err}"))?;
+    let child_fd = loom_supervise::listener::raw_fd_of(&child_end);
+
+    let self_exe =
+        std::env::current_exe().map_err(|err| format!("supervise: current_exe: {err}"))?;
+    let mut child = std::process::Command::new(self_exe)
+        .arg("serve")
+        .arg("--mudlib")
+        .arg(mudlib_root)
+        .arg("--adopt-control-fd")
+        .arg(child_fd.to_string())
+        .spawn()
+        .map_err(|err| format!("supervise: spawn standby child: {err}"))?;
+    // `Command::spawn` already duplicated the whole fd table (including
+    // `child_end`, left non-close-on-exec by `clear_cloexec` above) into
+    // the child; our own copy of `child_end` has nothing further to do
+    // and must be dropped so the supervisor isn't itself holding a
+    // second reference to the socket the child now owns its end of.
+    drop(child_end);
+
+    let mut ready = [0u8; 1];
+    let mut supervisor_end_reader = &supervisor_end;
+    // TODO(OBI-184 abort/fallback slice): no read timeout here -- see
+    // the matching TODO on `acquire_listeners`'s adopt-control-fd path.
+    supervisor_end_reader
+        .read_exact(&mut ready)
+        .map_err(|err| format!("supervise: waiting for standby ready signal: {err}"))?;
+    if ready != *b"R" {
+        // CTO review (OBI-225): a byte that isn't the expected marker
+        // means this isn't the handshake we think it is -- handing off
+        // the listening sockets anyway would be wrong (e.g. a corrupted
+        // or out-of-protocol-version child).
+        return Err(format!(
+            "supervise: unexpected standby ready byte {:?} (expected {:?})",
+            ready, b'R'
+        ));
+    }
+
+    loom_supervise::fdpass::send_fds(
+        &supervisor_end,
+        &[telnet_listener.as_fd(), http_listener.as_fd()],
+    )
+    .map_err(|err| format!("supervise: send_fds: {err}"))?;
+    info!(
+        child_pid = child.id(),
+        "loom supervise: listening sockets handed off to standby child"
+    );
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("supervise: wait on standby child: {err}"))?;
+    if !status.success() {
+        return Err(format!("standby child exited with {status}"));
+    }
+    Ok(())
+}
+
+async fn serve(
+    mudlib_root: PathBuf,
+    adopt_control_fd: Option<std::os::fd::RawFd>,
+) -> Result<(), String> {
+    let (listener, http_listener) = acquire_listeners(adopt_control_fd).await?;
     let actual_addr = listener
         .local_addr()
         .map_err(|err| format!("failed to read local addr: {err}"))?;
-
-    let http_bind_addr = http_addr_from_env();
-    let http_listener = TcpListener::bind(&http_bind_addr)
-        .await
-        .map_err(|err| format!("failed to bind {http_bind_addr}: {err}"))?;
     let http_actual_addr = http_listener
         .local_addr()
         .map_err(|err| format!("failed to read HTTP local addr: {err}"))?;
