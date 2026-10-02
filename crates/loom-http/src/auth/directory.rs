@@ -106,6 +106,12 @@ pub trait StaffDirectory: Send + Sync {
     /// defaulted a missing row to tier 0 instead of refusing outright.
     async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError>;
 
+    /// Resolve `username` to its staff uid with no password check at all
+    /// (OBI-204) -- used only to pick a rate-limiter key before the
+    /// password is verified. `None` for a username that doesn't exist or
+    /// isn't staff.
+    async fn resolve_uid(&self, username: &str) -> Result<Option<String>, DirectoryError>;
+
     async fn totp_enroll(&self, uid: &str, secret_base32: &str) -> Result<(), DirectoryError>;
     async fn totp_confirm(&self, uid: &str) -> Result<(), DirectoryError>;
     /// The uid's currently enrolled secret, confirmed or not -- used by
@@ -179,6 +185,12 @@ impl StaffDirectory for loom_persist::Persist {
             totp_secret: s.totp_secret,
             totp_confirmed: s.totp_confirmed,
         }))
+    }
+
+    async fn resolve_uid(&self, username: &str) -> Result<Option<String>, DirectoryError> {
+        loom_persist::Persist::staff_uid_for_username(self, username)
+            .await
+            .map_err(|_| DirectoryError)
     }
 
     async fn totp_consume_step(&self, uid: &str, step: u64) -> Result<bool, DirectoryError> {
