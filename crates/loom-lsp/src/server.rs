@@ -277,6 +277,13 @@ fn spawn_timer(
 ) {
     std::thread::spawn(move || {
         for entry in timer_rx {
+            // Already answered (the common case for trivial requests):
+            // drop it without sleeping, so a pipelining client can't park
+            // `rate x REQUEST_DEADLINE` entries in this channel behind one
+            // slow head entry.
+            if entry.answered.load(Ordering::SeqCst) {
+                continue;
+            }
             let remaining = entry.deadline.saturating_duration_since(Instant::now());
             if remaining > Duration::ZERO {
                 std::thread::sleep(remaining);
