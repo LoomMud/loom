@@ -39,9 +39,15 @@
 //! what order the two call sites run in. A quota check still has to see
 //! "everything `<u>` has on disk" as the spec requires, so both
 //! `check_disk_quota` and `check_save_disk_quota` add the *other* pool's
-//! current total (0 if that pool has never been seeded yet -- see
-//! [`Self::dir_total`]/[`Self::save_total`]) to their own projected delta
-//! before comparing against `disk_quota_mb`.
+//! total to their own projected delta before comparing against
+//! `disk_quota_mb`. `check_save_disk_quota` seeds the directory pool
+//! itself if needed (`seeded_total`; the walk root is always known).
+//! `check_disk_quota` cannot do the same for the save pool, because only
+//! `save_object` learns the save path, so it uses [`Self::save_total`]
+//! (0 until `<u>`'s first save this process). Known, bounded gap: until
+//! then, a pre-existing save file (at most one per uid) is not counted
+//! against `write_file`; the next save is checked against the full
+//! total.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -70,16 +76,6 @@ impl DiskUsage {
         *self.dir_totals.entry(u.to_string()).or_insert_with(|| {
             crate::fileio::dir_size_bytes(root, &format!("/builders/{u}")).unwrap_or(0)
         })
-    }
-
-    /// `<u>`'s current `/builders/<u>/**` total *without* seeding it --
-    /// `0` if `<u>` has never gone through [`Self::seeded_total`]. Used
-    /// by `check_save_disk_quota` to fold the directory pool into a
-    /// save's projected total without forcing a directory walk on every
-    /// save (that pool only needs the walk once something actually asks
-    /// about `/builders/<u>/**` itself).
-    pub fn dir_total(&self, u: &str) -> u64 {
-        self.dir_totals.get(u).copied().unwrap_or(0)
     }
 
     /// Record a write under `/builders/<u>/**` that replaces a file which
@@ -262,7 +258,11 @@ mod tests {
         // Save seeds first (as `check_save_disk_quota` would on an
         // autosave that fires before the builder ever calls `write_file`).
         assert_eq!(usage.seeded_save_total(&save_root, "appr", "/appr.o"), 5);
-        assert_eq!(usage.dir_total("appr"), 0, "directory pool not seeded yet");
+        assert_eq!(
+            usage.total_for("appr"),
+            None,
+            "directory pool not seeded yet"
+        );
 
         // `write_file` runs later: its own pool must still walk and see
         // the full 10-byte tree, not come back 0 or 5 because the shared

@@ -560,6 +560,52 @@ fn disk_quota_mb_counts_the_builders_tree_even_when_save_object_seeds_first() {
     );
 }
 
+/// Save seeds first, and the save itself is the over-quota write: the
+/// save check must seed and count the `/builders/<u>/**` tree too, not
+/// treat an unseeded directory pool as 0 (OBI-236 CTO review).
+#[test]
+fn disk_quota_mb_save_object_counts_the_builders_tree_when_it_seeds_first() {
+    let (mut world, mut host) = boot();
+    world.set_save_root(common::scratch("quotas-save-order-save-over"));
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+
+    let preexisting = "a".repeat(600_000);
+    world
+        .call(
+            workroom,
+            "write_disk",
+            vec![
+                Value::str("/builders/appr/old.txt"),
+                Value::str(&preexisting),
+            ],
+            &mut host,
+        )
+        .expect("write before any quota row is unconditional");
+
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"disk_quota_mb": 1}"#)));
+
+    // 600_000 bytes already under /builders/appr + a 600_000-byte save is
+    // over the 1 MB quota, and this save is the first quota check for appr.
+    let big_save = "a".repeat(600_000);
+    world
+        .call(workroom, "set_blob", vec![Value::str(&big_save)], &mut host)
+        .expect("set_blob");
+    let result = world
+        .call(
+            workroom,
+            "save_disk",
+            vec![Value::str("/appr-save")],
+            &mut host,
+        )
+        .expect("an over-quota save_object must not raise");
+    assert!(
+        matches!(result, Value::Bool(false)),
+        "the /builders/appr/** tree must count toward a save that seeds first: {result:?}"
+    );
+}
+
 /// `write_file` seeds first: before this fix, seeding the shared counter
 /// from the directory walk alone (no save file in it) meant
 /// `check_save_disk_quota` still unconditionally subtracted the save

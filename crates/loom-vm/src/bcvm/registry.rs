@@ -3352,10 +3352,11 @@ impl<'a> RegistryHost<'a> {
     /// (`seeded_save_total`/`note_save_write`), seeded independently of
     /// `check_disk_quota`'s directory pool -- whichever of the two runs
     /// first for a given `<u>` no longer determines what the other
-    /// starts from. `projected` folds in `DiskUsage::dir_total`'s current
-    /// directory-pool total (0 if `<u>` has never gone through
-    /// `check_disk_quota` yet) so a save is still checked against
-    /// everything `<u>` has on disk, not just its own save file.
+    /// starts from. `projected` folds in the directory pool via
+    /// `seeded_total` (seeding it with one walk if `<u>` has never gone
+    /// through `check_disk_quota` yet, since the walk root is known here)
+    /// so a save is checked against everything `<u>` has on disk, not
+    /// just its own save file, even when the save runs first.
     fn check_save_disk_quota(&mut self, save_file_rel: &str, new_bytes: u64) -> R<bool> {
         let Some(driver) = self.driver.as_ref() else {
             return Ok(true);
@@ -3372,13 +3373,14 @@ impl<'a> RegistryHost<'a> {
             return Ok(true);
         };
         let save_root = driver.save_root.clone();
+        let root = driver.root.clone();
         let old_bytes = crate::fileio::file_size_bytes(&save_root, save_file_rel).unwrap_or(0);
         let max_bytes = max_mb.saturating_mul(crate::quota::MB);
         let driver = self.driver.as_mut().expect("checked above");
         let seeded = driver
             .disk_usage
             .seeded_save_total(&save_root, &u, save_file_rel);
-        let dir_now = driver.disk_usage.dir_total(&u);
+        let dir_now = driver.disk_usage.seeded_total(&root, &u);
         let projected = seeded
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes)
