@@ -858,3 +858,81 @@ async fn revoke_all_blocks_behind_an_in_flight_rotation_and_still_revokes_its_ne
     assert!(session_is_revoked(&fx.owner, &new_hash).await);
     assert_eq!(unrevoked_sessions_for(&fx.owner, &uid).await, 0);
 }
+
+/// OBI-219: logout's family revoke must take the same `staff`-row lock
+/// as `session_rotate`/`staff_sessions_revoke_for_uid`, or a rotation in
+/// flight on the same family can race it: the rotation has taken
+/// `FOR SHARE` on `staff` and inserted its new row but not committed,
+/// and a concurrent logout on the old token must block on that lock
+/// (through `staff_sessions_revoke_family`'s `FOR UPDATE`) rather than
+/// revoking the pre-rotation row unguarded and missing the new one once
+/// the rotation commits.
+///
+/// The in-flight rotation is driven by hand on a second connection,
+/// same as `revoke_all_blocks_behind_an_in_flight_rotation_...` above,
+/// so the test can hold it open across the race window.
+#[tokio::test]
+async fn logout_family_revoke_blocks_behind_an_in_flight_rotation_and_still_revokes_its_new_row() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("faramir4");
+    let account = seed_account(&fx.owner, &unique_uid("faramir4-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let old_hash = "race-c-old".to_string() + &"r".repeat(8);
+    let new_hash = "race-c-new".to_string() + &"s".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &old_hash, expires_at, "sid-race-c", &[], None)
+        .await
+        .unwrap();
+
+    let mut rotate_tx = fx.owner.begin().await.unwrap();
+    sqlx::query("SELECT staff_sessions_lock_for_rotate($1)")
+        .bind(&uid)
+        .execute(&mut *rotate_tx)
+        .await
+        .unwrap();
+    let consumed = sqlx::query(
+        "UPDATE staff_sessions SET revoked_at = NOW()
+         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()
+         RETURNING staff_uid",
+    )
+    .bind(&old_hash)
+    .fetch_optional(&mut *rotate_tx)
+    .await
+    .unwrap();
+    assert!(consumed.is_some());
+    sqlx::query(
+        "INSERT INTO staff_sessions (staff_uid, token_hash, expires_at, sid, amr, mfa_at, last_used_at)
+         VALUES ($1, $2, $3, 'sid-race-c', '{}', NULL, NOW())",
+    )
+    .bind(&uid)
+    .bind(&new_hash)
+    .bind(expires_at)
+    .execute(&mut *rotate_tx)
+    .await
+    .unwrap();
+
+    let logout_done = std::sync::atomic::AtomicBool::new(false);
+    let logout = async {
+        let result = fx.app.session_revoke_family_by_token(&old_hash).await;
+        logout_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        result
+    };
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !logout_done.load(std::sync::atomic::Ordering::SeqCst),
+            "logout's family revoke must block on the staff row lock held by the in-flight rotation"
+        );
+        rotate_tx.commit().await.unwrap();
+    };
+    let (result, ()) = tokio::join!(logout, release);
+    result.unwrap();
+
+    assert!(session_is_revoked(&fx.owner, &new_hash).await);
+    assert_eq!(unrevoked_sessions_for(&fx.owner, &uid).await, 0);
+}

@@ -788,16 +788,19 @@ impl Persist {
     /// (family) -- OBI-198, M-AUTH-5: "logout revokes the family", not
     /// just the one presented token. A no-op (not an error) if
     /// `token_hash` is unknown.
+    ///
+    /// Goes through the `staff_sessions_revoke_family` security-definer
+    /// function (migration 0006) rather than a plain `UPDATE` (OBI-219,
+    /// same shape as `session_rotate`'s must-fix 2): it takes
+    /// `FOR UPDATE` on the owning `staff` row before revoking, which
+    /// conflicts with `session_rotate`'s `FOR SHARE` on that same row,
+    /// so a rotation racing this logout can't leave its freshly-rotated
+    /// row unrevoked (see the migration's doc comment).
     pub async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE staff_sessions
-             SET revoked_at = NOW()
-             WHERE revoked_at IS NULL
-               AND sid = (SELECT sid FROM staff_sessions WHERE token_hash = $1)",
-        )
-        .bind(token_hash)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("SELECT staff_sessions_revoke_family($1)")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
