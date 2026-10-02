@@ -3494,6 +3494,27 @@ impl<'a> RegistryHost<'a> {
         }
     }
 
+    /// Driver-side `valid_read` check (OBI-237, the admin query
+    /// world-thread side, OBI-234 follow-up): the exact `authorize`/
+    /// `Operation::Read` call path every other `valid_read` call-site
+    /// uses (`read_file`, the `errors` efun's per-program filter) --
+    /// same decision cache, same master apply, same audit trail -- just
+    /// invoked directly by `World`'s admin-query handling instead of
+    /// from inside a running program (there is no in-game efun call, or
+    /// caller object, to attribute this to; `World::admin_list_objects`/
+    /// `admin_object_vars` instead run this inside a `cut_guard`
+    /// carrying the HTTP-authenticated staff account's own euid, see
+    /// their doc comments). The `"admin_query"` name passed to
+    /// `authorize` does not match any registered efun (never
+    /// player-callable), so it is recorded in the audit trail's `kind`
+    /// field as `"?"` -- a cosmetic gap (flagged for CTO review), not a
+    /// security one: the actual allow/deny decision and the audit
+    /// record's other fields (euid, operation, verdict) are all real.
+    pub(crate) fn admin_valid_read(&mut self, op: &'static str, path: &str) -> bool {
+        self.authorize("admin_query", Privilege::P1, Operation::Read { path, op })
+            .is_ok()
+    }
+
     fn apply_args(&self, op: &Operation<'_>, caller: ObjectId) -> Vec<Value> {
         let ob = Value::Object(caller);
         match op {
