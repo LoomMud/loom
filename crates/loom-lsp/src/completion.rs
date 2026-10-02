@@ -18,22 +18,55 @@ use lsp_types::{CompletionItem, CompletionItemKind};
 /// side names these as plain string literals at call sites, not a single
 /// registry table the way efuns are (`efuns::names`, \u00a75.5).
 const APPLIES: &[(&str, &str)] = &[
-    ("create", "runs once after load/clone (spec `/std/object` convention); never re-run on update"),
-    ("heartbeat", "called once per heartbeat tick while `set_heartbeat(true)`"),
-    ("connect", "called on the master when a new connection arrives"),
+    (
+        "create",
+        "runs once after load/clone (spec `/std/object` convention); never re-run on update",
+    ),
+    (
+        "heartbeat",
+        "called once per heartbeat tick while `set_heartbeat(true)`",
+    ),
+    (
+        "connect",
+        "called on the master when a new connection arrives",
+    ),
     ("logon", "called on a player object right after login"),
     ("process_input", "called with one line of raw player input"),
-    ("net_dead", "called when a player's connection drops unexpectedly"),
-    ("account_result", "async result of `account_create`/`account_login`, by correlation id"),
-    ("roles_result", "async result of a `roles_*` efun, by correlation id"),
+    (
+        "net_dead",
+        "called when a player's connection drops unexpectedly",
+    ),
+    (
+        "account_result",
+        "async result of `account_create`/`account_login`, by correlation id",
+    ),
+    (
+        "roles_result",
+        "async result of a `roles_*` efun, by correlation id",
+    ),
     ("valid_read", "master apply: may `euid` read `path`?"),
     ("valid_write", "master apply: may `euid` write `path`?"),
     ("valid_efun", "master apply: may `euid` call this P1+ efun?"),
-    ("valid_compile", "master apply: may `euid` compile/update `path`?"),
-    ("valid_upgrade", "master apply: may `euid` `upgrade_all(path)`?"),
-    ("valid_seteuid", "master apply: may the caller `seteuid` to this principal?"),
-    ("valid_bind", "master apply: may the caller `bind_connection` this object? (never cached)"),
-    ("program_flags", "master apply: `CONFINED`/`LIVE` bitset for `path` (movement/confinement rules)"),
+    (
+        "valid_compile",
+        "master apply: may `euid` compile/update `path`?",
+    ),
+    (
+        "valid_upgrade",
+        "master apply: may `euid` `upgrade_all(path)`?",
+    ),
+    (
+        "valid_seteuid",
+        "master apply: may the caller `seteuid` to this principal?",
+    ),
+    (
+        "valid_bind",
+        "master apply: may the caller `bind_connection` this object? (never cached)",
+    ),
+    (
+        "program_flags",
+        "master apply: `CONFINED`/`LIVE` bitset for `path` (movement/confinement rules)",
+    ),
 ];
 
 fn efun_item(name: &str) -> CompletionItem {
@@ -114,10 +147,20 @@ pub fn member_items(info: &Rc<ProgramInfo>) -> Vec<CompletionItem> {
         });
     }
     for v in info.vars.values() {
-        out.push(member_item(&v.name, &v.owner, &v.ty, CompletionItemKind::FIELD));
+        out.push(member_item(
+            &v.name,
+            &v.owner,
+            &v.ty,
+            CompletionItemKind::FIELD,
+        ));
     }
     for c in info.consts.values() {
-        out.push(member_item(&c.name, &c.owner, &c.ty, CompletionItemKind::CONSTANT));
+        out.push(member_item(
+            &c.name,
+            &c.owner,
+            &c.ty,
+            CompletionItemKind::CONSTANT,
+        ));
     }
     out
 }
@@ -156,7 +199,8 @@ mod tests {
 
     #[test]
     fn member_items_include_inherited_std_functions() {
-        let (ast, diags) = loom_syntax::parse("pub fn short() -> string {\n  return \"a thing\"\n}\n");
+        let (ast, diags) =
+            loom_syntax::parse("pub fn short() -> string {\n  return \"a thing\"\n}\n");
         assert!(diags.is_empty());
         let parent = loom_compiler::check_program("/std/object", &ast, vec![], vec![]).unwrap();
         let items = member_items(&parent.info);

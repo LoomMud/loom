@@ -29,7 +29,9 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--stdio" => transport = Transport::Stdio,
             "--ws" => {
-                let addr = it.next().ok_or("--ws needs an address, e.g. 127.0.0.1:7777")?;
+                let addr = it
+                    .next()
+                    .ok_or("--ws needs an address, e.g. 127.0.0.1:7777")?;
                 transport = Transport::Ws(
                     addr.parse()
                         .map_err(|e| format!("invalid --ws address {addr:?}: {e}"))?,
@@ -58,6 +60,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    // Spec M-LSP-5: drop every inherited env var except a small
+    // allowlist before doing anything else (no connection accepted yet,
+    // no secrets read). Only returns if the re-exec itself failed.
+    loom_lsp::env_guard::maybe_reexec();
 
     let args = parse_args().map_err(|e| {
         eprintln!("loom-lsp: {e}");

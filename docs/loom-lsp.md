@@ -46,6 +46,55 @@ client debounces this the same as any LSP server) keeps the file the
 builder is actually looking at accurate, which is what the acceptance
 criterion asks for.
 
+## Security (spec P2-S1 threat model, `docs/threat-model-phase2.md` §6.3)
+
+`loom-lsp` implements the mitigations the threat model assigns to OBI-168:
+
+- **M-LSP-2 (never reads the filesystem directly).** All source text goes
+  through a `FileProvider` trait (`src/file_provider.rs`): a
+  `LocalDirectoryProvider` for `--stdio`/`--root` (a trusted local
+  checkout -- "directory impl for stdio/local"), or a `GatedProvider`
+  wrapping a `ReadAuthorizer` for the per-session/web-IDE case. A denied
+  read looks **exactly** like a missing file (same error string, same
+  `W0114` diagnostic, no distinct "exists but denied" signal), and
+  `textDocument/definition` returns **no** `Location` at all -- not a
+  zero-range one -- for a target it cannot read. `loom-lsp` has no
+  session/uid/Postgres concept of its own (by design: D-TM5 rejects "an
+  HTTP-side ACL mirroring the master"), so the real `valid_read`-backed
+  `ReadAuthorizer` is OBI-180's to wire in; this crate only defines and
+  tests the policy shape (`tests/lsp_integration.rs`'s
+  `m_lsp_2_*` test is literally the threat model's own T1/T4 example).
+- **M-LSP-3 (`loom-vfs://` only in session mode).** `Workspace::new_vfs`
+  accepts and emits only `loom-vfs:///path` URIs; a `file://` URI is
+  rejected outright (`program_path` returns `None`), so a host path can
+  never reach a response and never be accepted as one. `--stdio`/`--root`
+  (`Workspace::new`) keeps `file://`, which is correct and expected for a
+  local editor on a trusted checkout -- the threat model's trust boundary
+  is "a browser reaching the service", not a local editor.
+- **M-LSP-4 (limits, deadline, cancellation, fuzzing).** Documents over 1
+  MiB and a 65th open document are refused (with a `publishDiagnostics`
+  explaining why, not a silent drop). Every request runs on its own
+  worker thread, bounded to 4 concurrent, with a 5 s deadline and
+  `$/cancelRequest` honoured -- whichever of "finished" / "timed out" /
+  "cancelled" happens first wins, and the other two become no-ops (the
+  in-flight compile itself cannot be force-stopped; see `server.rs`'s
+  module docs for why). `crates/loom-lsp/fuzz`'s `lsp_requests` target
+  fuzzes `hover`/`definition`/`completion` over arbitrary `(offset,
+  source)` pairs (`scripts/fuzz-smoke.sh lsp`, wired into the same
+  PR-triggered smoke job as the parser/bytecode fuzz targets -- there is
+  no separate scheduled *nightly* workflow in this repo yet for any fuzz
+  target, parser/bytecode included, so this matches the existing pattern
+  rather than inventing a new one).
+- **M-LSP-5 (no inherited secrets).** `env_guard::maybe_reexec` (called
+  first thing in `main`) re-execs the process with every environment
+  variable dropped except a small allowlist (`PATH`, `HOME`, `LANG`,
+  `LC_ALL`, `TMPDIR`, `RUST_LOG`). It cannot mutate the current process's
+  environment in place -- `std::env::remove_var` is `unsafe fn`, and this
+  crate (like every crate except `loom-vm`) carries `unsafe_code =
+  "deny"` -- so it re-execs itself via the safe `std::process::Command`
+  builder instead, which configures the *child's* environment at spawn
+  time without needing `unsafe` at all.
+
 ## Running it
 
 ### VS Code

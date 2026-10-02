@@ -12,7 +12,9 @@
 
 use std::rc::Rc;
 
-use loom_compiler::hir::{Block, Callee, Expr, ExprKind, Place, Program as HirProgram, Stmt, StmtKind};
+use loom_compiler::hir::{
+    Block, Callee, Expr, ExprKind, Place, Program as HirProgram, Stmt, StmtKind,
+};
 use loom_compiler::interface::ProgramInfo;
 use loom_syntax::{Span, ast};
 
@@ -235,8 +237,10 @@ mod tests {
 
     #[test]
     fn call_resolves_to_declaring_program_and_fn_span_in_it() {
-        let (parent_ast, _) = loom_syntax::parse("pub fn greet() -> string {\n  return \"hi\"\n}\n");
-        let parent = loom_compiler::check_program("/std/object", &parent_ast, vec![], vec![]).unwrap();
+        let (parent_ast, _) =
+            loom_syntax::parse("pub fn greet() -> string {\n  return \"hi\"\n}\n");
+        let parent =
+            loom_compiler::check_program("/std/object", &parent_ast, vec![], vec![]).unwrap();
         let child_src = "inherit /std/object\nfn f() {\n  greet()\n}\n";
         let (child_ast, _) = loom_syntax::parse(child_src);
         let parents = vec![loom_compiler::interface::ParentInfo {

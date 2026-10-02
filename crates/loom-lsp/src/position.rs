@@ -77,7 +77,13 @@ mod tests {
         let src = "fn a() {\n  let x = 1\n}\n";
         let off = src.find("x").unwrap() as u32;
         let pos = offset_to_position(src, off);
-        assert_eq!(pos, Position { line: 1, character: 6 });
+        assert_eq!(
+            pos,
+            Position {
+                line: 1,
+                character: 6
+            }
+        );
         assert_eq!(position_to_offset(src, pos), off);
     }
 

@@ -13,6 +13,8 @@
 pub mod completion;
 pub mod definition;
 pub mod diagnostics;
+pub mod env_guard;
+pub mod file_provider;
 pub mod hover;
 pub mod position;
 pub mod server;

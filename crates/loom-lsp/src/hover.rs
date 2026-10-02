@@ -9,8 +9,8 @@
 use std::rc::Rc;
 
 use loom_compiler::hir::{
-    Block, Callee, Expr, ExprKind, Function, InterpPart, Local, Place, Program as HirProgram,
-    Stmt, StmtKind,
+    Block, Callee, Expr, ExprKind, Function, InterpPart, Local, Place, Program as HirProgram, Stmt,
+    StmtKind,
 };
 use loom_compiler::interface::ProgramInfo;
 use loom_compiler::{efuns, ty::Ty};
@@ -73,7 +73,11 @@ pub fn hover(
             {
                 return Some(r);
             }
-            let kw = if v.persistent { "persistent var" } else { "var" };
+            let kw = if v.persistent {
+                "persistent var"
+            } else {
+                "var"
+            };
             return Some(HoverResult {
                 span: v.span,
                 text: format!("{kw} `{}`: {}", v.name, v.ty),
@@ -140,7 +144,12 @@ fn fn_sig_text(f: &Function) -> String {
     }
 }
 
-fn hover_block(b: &Block, locals: &[Local], info: &Rc<ProgramInfo>, offset: u32) -> Option<HoverResult> {
+fn hover_block(
+    b: &Block,
+    locals: &[Local],
+    info: &Rc<ProgramInfo>,
+    offset: u32,
+) -> Option<HoverResult> {
     if !in_span(b.span, offset) {
         return None;
     }
@@ -152,7 +161,12 @@ fn hover_block(b: &Block, locals: &[Local], info: &Rc<ProgramInfo>, offset: u32)
     None
 }
 
-fn hover_stmt(s: &Stmt, locals: &[Local], info: &Rc<ProgramInfo>, offset: u32) -> Option<HoverResult> {
+fn hover_stmt(
+    s: &Stmt,
+    locals: &[Local],
+    info: &Rc<ProgramInfo>,
+    offset: u32,
+) -> Option<HoverResult> {
     if !in_span(s.span, offset) {
         return None;
     }
@@ -176,13 +190,14 @@ fn hover_stmt(s: &Stmt, locals: &[Local], info: &Rc<ProgramInfo>, offset: u32) -
             .or_else(|| hover_expr(value, locals, info, offset)),
         StmtKind::If { cond, then, els } => hover_expr(cond, locals, info, offset)
             .or_else(|| hover_block(then, locals, info, offset))
-            .or_else(|| els.as_ref().and_then(|e| hover_block(e, locals, info, offset))),
-        StmtKind::While { cond, body } => {
-            hover_expr(cond, locals, info, offset).or_else(|| hover_block(body, locals, info, offset))
-        }
-        StmtKind::For { iter, body, .. } => {
-            hover_expr(iter, locals, info, offset).or_else(|| hover_block(body, locals, info, offset))
-        }
+            .or_else(|| {
+                els.as_ref()
+                    .and_then(|e| hover_block(e, locals, info, offset))
+            }),
+        StmtKind::While { cond, body } => hover_expr(cond, locals, info, offset)
+            .or_else(|| hover_block(body, locals, info, offset)),
+        StmtKind::For { iter, body, .. } => hover_expr(iter, locals, info, offset)
+            .or_else(|| hover_block(body, locals, info, offset)),
         StmtKind::Return(e) => e.as_ref().and_then(|e| hover_expr(e, locals, info, offset)),
         StmtKind::Try { body, handler, .. } => hover_block(body, locals, info, offset)
             .or_else(|| hover_block(handler, locals, info, offset)),
@@ -191,7 +206,12 @@ fn hover_stmt(s: &Stmt, locals: &[Local], info: &Rc<ProgramInfo>, offset: u32) -
     }
 }
 
-fn hover_place(place: &Place, locals: &[Local], info: &Rc<ProgramInfo>, offset: u32) -> Option<HoverResult> {
+fn hover_place(
+    place: &Place,
+    locals: &[Local],
+    info: &Rc<ProgramInfo>,
+    offset: u32,
+) -> Option<HoverResult> {
     match place {
         Place::Local(id) => {
             let l = &locals[*id as usize];
@@ -206,46 +226,59 @@ fn hover_place(place: &Place, locals: &[Local], info: &Rc<ProgramInfo>, offset: 
             // covers hover for the assignment as a whole.
             None
         }
-        Place::Index { base, index, .. } => {
-            hover_place(base, locals, info, offset).or_else(|| hover_expr(index, locals, info, offset))
-        }
+        Place::Index { base, index, .. } => hover_place(base, locals, info, offset)
+            .or_else(|| hover_expr(index, locals, info, offset)),
     }
 }
 
-fn hover_expr(e: &Expr, locals: &[Local], info: &Rc<ProgramInfo>, offset: u32) -> Option<HoverResult> {
+fn hover_expr(
+    e: &Expr,
+    locals: &[Local],
+    info: &Rc<ProgramInfo>,
+    offset: u32,
+) -> Option<HoverResult> {
     if !in_span(e.span, offset) {
         return None;
     }
     // Recurse into children first: the innermost containing span wins.
-    let child = match &e.kind {
-        ExprKind::Interp(parts) => parts.iter().find_map(|p| match p {
-            InterpPart::Lit(_) => None,
-            InterpPart::Expr(e) => hover_expr(e, locals, info, offset),
-        }),
-        ExprKind::Array(xs) => xs.iter().find_map(|x| hover_expr(x, locals, info, offset)),
-        ExprKind::Map(kvs) => kvs.iter().find_map(|(k, v)| {
-            hover_expr(k, locals, info, offset).or_else(|| hover_expr(v, locals, info, offset))
-        }),
-        ExprKind::Closure(f, _) => hover_block(&f.body, &f.locals, info, offset),
-        ExprKind::Index { base, index, .. } => {
-            hover_expr(base, locals, info, offset).or_else(|| hover_expr(index, locals, info, offset))
-        }
-        ExprKind::Unary { expr, .. } => hover_expr(expr, locals, info, offset),
-        ExprKind::Binary { lhs, rhs, .. } => {
-            hover_expr(lhs, locals, info, offset).or_else(|| hover_expr(rhs, locals, info, offset))
-        }
-        ExprKind::And(a, b) | ExprKind::Or(a, b) | ExprKind::Coalesce(a, b) => {
-            hover_expr(a, locals, info, offset).or_else(|| hover_expr(b, locals, info, offset))
-        }
-        ExprKind::Call { args, .. } => args.iter().find_map(|a| hover_expr(a, locals, info, offset)),
-        ExprKind::CallValue { callee, args } => hover_expr(callee, locals, info, offset)
-            .or_else(|| args.iter().find_map(|a| hover_expr(a, locals, info, offset))),
-        ExprKind::CallEfun { args, .. } => args.iter().find_map(|a| hover_expr(a, locals, info, offset)),
-        ExprKind::CallOther { recv, args, .. } => hover_expr(recv, locals, info, offset)
-            .or_else(|| args.iter().find_map(|a| hover_expr(a, locals, info, offset))),
-        ExprKind::Cast(inner) => hover_expr(inner, locals, info, offset),
-        _ => None,
-    };
+    let child =
+        match &e.kind {
+            ExprKind::Interp(parts) => parts.iter().find_map(|p| match p {
+                InterpPart::Lit(_) => None,
+                InterpPart::Expr(e) => hover_expr(e, locals, info, offset),
+            }),
+            ExprKind::Array(xs) => xs.iter().find_map(|x| hover_expr(x, locals, info, offset)),
+            ExprKind::Map(kvs) => kvs.iter().find_map(|(k, v)| {
+                hover_expr(k, locals, info, offset).or_else(|| hover_expr(v, locals, info, offset))
+            }),
+            ExprKind::Closure(f, _) => hover_block(&f.body, &f.locals, info, offset),
+            ExprKind::Index { base, index, .. } => hover_expr(base, locals, info, offset)
+                .or_else(|| hover_expr(index, locals, info, offset)),
+            ExprKind::Unary { expr, .. } => hover_expr(expr, locals, info, offset),
+            ExprKind::Binary { lhs, rhs, .. } => hover_expr(lhs, locals, info, offset)
+                .or_else(|| hover_expr(rhs, locals, info, offset)),
+            ExprKind::And(a, b) | ExprKind::Or(a, b) | ExprKind::Coalesce(a, b) => {
+                hover_expr(a, locals, info, offset).or_else(|| hover_expr(b, locals, info, offset))
+            }
+            ExprKind::Call { args, .. } => args
+                .iter()
+                .find_map(|a| hover_expr(a, locals, info, offset)),
+            ExprKind::CallValue { callee, args } => hover_expr(callee, locals, info, offset)
+                .or_else(|| {
+                    args.iter()
+                        .find_map(|a| hover_expr(a, locals, info, offset))
+                }),
+            ExprKind::CallEfun { args, .. } => args
+                .iter()
+                .find_map(|a| hover_expr(a, locals, info, offset)),
+            ExprKind::CallOther { recv, args, .. } => hover_expr(recv, locals, info, offset)
+                .or_else(|| {
+                    args.iter()
+                        .find_map(|a| hover_expr(a, locals, info, offset))
+                }),
+            ExprKind::Cast(inner) => hover_expr(inner, locals, info, offset),
+            _ => None,
+        };
     if child.is_some() {
         return child;
     }
@@ -263,16 +296,16 @@ fn expr_text(e: &Expr, locals: &[Local], info: &Rc<ProgramInfo>) -> String {
         }
         ExprKind::Global(g) => format!("var `{}` (from {}): {}", g.name, g.owner, e.ty),
         ExprKind::SelfObj => format!("self: {}", e.ty),
-        ExprKind::FnRef(callee) => fn_ref_text(callee, info).unwrap_or_else(|| format!(": {}", e.ty)),
+        ExprKind::FnRef(callee) => {
+            fn_ref_text(callee, info).unwrap_or_else(|| format!(": {}", e.ty))
+        }
         ExprKind::Call { callee, .. } => {
             fn_ref_text(callee, info).unwrap_or_else(|| format!("call -> {}", e.ty))
         }
-        ExprKind::CallEfun { name, privilege, .. } => match efuns::lookup(name) {
-            Some(sig) => format!(
-                "efun `{name}` -> {} ({:?})",
-                ret_text(&sig.ret),
-                privilege
-            ),
+        ExprKind::CallEfun {
+            name, privilege, ..
+        } => match efuns::lookup(name) {
+            Some(sig) => format!("efun `{name}` -> {} ({:?})", ret_text(&sig.ret), privilege),
             None => format!("efun `{name}` -> {}", e.ty),
         },
         ExprKind::CallOther { name, safe, .. } => {

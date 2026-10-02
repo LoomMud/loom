@@ -26,7 +26,10 @@ fn message_to_text(msg: &Message) -> serde_json::Result<String> {
         #[serde(flatten)]
         msg: &'a Message,
     }
-    serde_json::to_string(&JsonRpc { jsonrpc: "2.0", msg })
+    serde_json::to_string(&JsonRpc {
+        jsonrpc: "2.0",
+        msg,
+    })
 }
 
 /// Accept connections on `addr` until the process exits; each one runs an

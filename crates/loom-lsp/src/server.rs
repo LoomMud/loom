@@ -3,13 +3,28 @@
 
 //! The transport-agnostic protocol core: one [`run`] loop over any
 //! [`Connection`] (stdio, in-memory-bridged WebSocket, or a test harness).
+//!
+//! Spec `docs/threat-model-phase2.md` \u00a76.3 **M-LSP-4**: every request runs
+//! on a bounded worker pool (never the main loop thread, so the server
+//! keeps reading `$/cancelRequest`/`didChange`/etc. while a slow compile
+//! is in flight), with a 5 s deadline and cancellation honoured. The
+//! worker itself cannot be force-stopped (Rust has no safe thread-kill),
+//! so "cancellation honoured" means what most synchronous LSP servers
+//! mean by it: the *response* is cancelled/timed-out immediately and the
+//! stray in-flight compile's result, if it ever finishes, is discarded --
+//! not that the CPU work inside `loom-compiler` stops early. Documented
+//! limitation, not a silent gap.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use loom_compiler::Checked;
 use loom_compiler::mudlib::{Outcome, Session};
 use loom_syntax::ast;
-use lsp_server::{Connection, Message, Notification, Request, Response};
+use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CompletionItem, CompletionOptions, CompletionParams, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, GotoDefinitionParams,
@@ -19,8 +34,13 @@ use lsp_types::{
 };
 
 use crate::position::{position_to_byte_offset, span_to_range};
-use crate::workspace::Workspace;
+use crate::workspace::{LimitExceeded, Workspace};
 use crate::{completion, definition, hover};
+
+/// Spec M-LSP-4: "a bounded blocking pool ... with a 5 s per-request
+/// deadline".
+const MAX_CONCURRENT_REQUESTS: usize = 4;
+const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Parse (and, if it parses clean, type-check) `path`'s current buffer.
 /// Returns `None` only if the buffer/file itself cannot be read at all
@@ -62,16 +82,37 @@ fn server_capabilities() -> ServerCapabilities {
     }
 }
 
+/// One in-flight request: whether it has already been answered (by its
+/// worker finishing, by the deadline firing, or by a `$/cancelRequest`),
+/// so whichever of those three happens first "wins" and the other two
+/// become no-ops.
+type Inflight = Arc<Mutex<HashMap<RequestId, Arc<AtomicBool>>>>;
+
 /// Run the server against `connection` until the client shuts it down.
 /// `root` is the warp/mudlib checkout this server serves (one server
 /// instance per root; a multi-root client needs one server per folder,
 /// same as most language servers without a project-system layer).
-pub fn run(connection: Connection, root: PathBuf) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+pub fn run(
+    connection: Connection,
+    root: PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    run_with_workspace(connection, Workspace::new(root))
+}
+
+/// As [`run`], but with an already-constructed [`Workspace`] -- the entry
+/// point the per-session/Vfs mode (web IDE bridge) uses, since it needs a
+/// [`crate::file_provider::GatedProvider`] in place of a plain directory
+/// (spec M-LSP-2/M-LSP-3).
+pub fn run_with_workspace(
+    connection: Connection,
+    mut ws: Workspace,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let (id, params) = connection.initialize_start()?;
     let init_params: InitializeParams = serde_json::from_value(params)?;
     // Prefer a client-given workspace folder, falling back to the
-    // deprecated single `rootUri` for older clients, then the CLI/WS-query
-    // root (e.g. a test harness with no client root at all).
+    // deprecated single `rootUri` for older clients. Only meaningful in
+    // `Local` mode; a `Vfs`-mode workspace ignores it (there is no
+    // filesystem root to override -- M-LSP-3).
     let client_root = init_params
         .workspace_folders
         .as_ref()
@@ -83,25 +124,35 @@ pub fn run(connection: Connection, root: PathBuf) -> Result<(), Box<dyn std::err
         })
         .and_then(crate::workspace::uri_to_fs_path)
         .filter(|p| p.is_dir());
-    let root = client_root.unwrap_or(root);
+    if let Some(root) = client_root {
+        ws = Workspace::new(root);
+    }
     let init_result = serde_json::json!({
         "capabilities": server_capabilities(),
         "serverInfo": { "name": "loom-lsp", "version": env!("CARGO_PKG_VERSION") },
     });
     connection.initialize_finish(id, init_result)?;
 
-    let mut ws = Workspace::new(root);
+    let permits = crossbeam_channel::bounded::<()>(MAX_CONCURRENT_REQUESTS);
+    for _ in 0..MAX_CONCURRENT_REQUESTS {
+        permits.0.send(()).ok();
+    }
+    let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
+
     for msg in &connection.receiver {
         match msg {
             Message::Request(req) => {
                 if connection.handle_shutdown(&req)? {
                     break;
                 }
-                let resp = dispatch_request(&mut ws, req);
-                connection.sender.send(Message::Response(resp))?;
+                spawn_request(&connection, &ws, &permits, &inflight, req);
             }
             Message::Notification(not) => {
-                handle_notification(&connection, &mut ws, not)?;
+                if not.method == "$/cancelRequest" {
+                    handle_cancel(&connection, &inflight, not)?;
+                } else {
+                    handle_notification(&connection, &mut ws, not)?;
+                }
             }
             Message::Response(_) => {}
         }
@@ -109,14 +160,109 @@ pub fn run(connection: Connection, root: PathBuf) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn dispatch_request(ws: &mut Workspace, req: Request) -> Response {
+/// Hand `req` to a worker thread (spec M-LSP-4): acquires one of
+/// `MAX_CONCURRENT_REQUESTS` permits (blocking further dispatch, not the
+/// receive loop, if the pool is full), runs the handler on a second,
+/// disposable thread so the deadline can be enforced even if the handler
+/// never returns, and sends exactly one response -- whichever of
+/// "finished", "timed out", or "cancelled" happens first.
+fn spawn_request(
+    connection: &Connection,
+    ws: &Workspace,
+    permits: &(
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<()>,
+    ),
+    inflight: &Inflight,
+    req: Request,
+) {
+    let id = req.id.clone();
+    let answered = Arc::new(AtomicBool::new(false));
+    inflight
+        .lock()
+        .unwrap()
+        .insert(id.clone(), answered.clone());
+
+    let ws = ws.clone();
+    let sender = connection.sender.clone();
+    let permit_tx = permits.0.clone();
+    let permit_rx = permits.1.clone();
+    let inflight = inflight.clone();
+
+    std::thread::spawn(move || {
+        // Block *this* dispatch thread (not the receive loop above) until
+        // a pool slot frees up.
+        let _ = permit_rx.recv();
+
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        {
+            let ws = ws.clone();
+            let req = req.clone();
+            std::thread::spawn(move || {
+                let resp = dispatch_request(&ws, req);
+                let _ = done_tx.send(resp);
+            });
+            // The inner worker is intentionally detached: see module docs
+            // on why a timed-out compile cannot be force-stopped.
+        }
+        let resp = match done_rx.recv_timeout(REQUEST_DEADLINE) {
+            Ok(resp) => resp,
+            Err(_) => Response::new_err(
+                id.clone(),
+                ErrorCode::RequestFailed as i32,
+                format!(
+                    "exceeded the {:?} analysis deadline (M-LSP-4)",
+                    REQUEST_DEADLINE
+                ),
+            ),
+        };
+        if !answered.swap(true, Ordering::SeqCst) {
+            let _ = sender.send(Message::Response(resp));
+        }
+        inflight.lock().unwrap().remove(&id);
+        let _ = permit_tx.send(());
+    });
+}
+
+fn handle_cancel(
+    connection: &Connection,
+    inflight: &Inflight,
+    not: Notification,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    #[derive(serde::Deserialize)]
+    struct CancelParams {
+        id: lsp_types::NumberOrString,
+    }
+    let p: CancelParams = serde_json::from_value(not.params)?;
+    let id: RequestId = match p.id {
+        lsp_types::NumberOrString::Number(n) => RequestId::from(n),
+        lsp_types::NumberOrString::String(s) => RequestId::from(s),
+    };
+    if let Some(answered) = inflight.lock().unwrap().get(&id).cloned()
+        && !answered.swap(true, Ordering::SeqCst)
+    {
+        let resp = Response::new_err(
+            id,
+            ErrorCode::RequestCanceled as i32,
+            "cancelled by the client".to_string(),
+        );
+        connection.sender.send(Message::Response(resp))?;
+    }
+    Ok(())
+}
+
+fn dispatch_request(ws: &Workspace, req: Request) -> Response {
     match req.method.as_str() {
         "textDocument/hover" => reply::<HoverParams, _>(req, |p| handle_hover(ws, p)),
-        "textDocument/definition" => reply::<GotoDefinitionParams, _>(req, |p| handle_definition(ws, p)),
-        "textDocument/completion" => reply::<CompletionParams, _>(req, |p| handle_completion(ws, p)),
+        "textDocument/definition" => {
+            reply::<GotoDefinitionParams, _>(req, |p| handle_definition(ws, p))
+        }
+        "textDocument/completion" => {
+            reply::<CompletionParams, _>(req, |p| handle_completion(ws, p))
+        }
         _ => Response::new_err(
             req.id,
-            lsp_server::ErrorCode::MethodNotFound as i32,
+            ErrorCode::MethodNotFound as i32,
             format!("unhandled method {}", req.method),
         ),
     }
@@ -133,7 +279,7 @@ where
     let id = req.id.clone();
     match serde_json::from_value::<P>(req.params) {
         Ok(params) => Response::new_ok(id, f(params)),
-        Err(e) => Response::new_err(id, lsp_server::ErrorCode::InvalidParams as i32, e.to_string()),
+        Err(e) => Response::new_err(id, ErrorCode::InvalidParams as i32, e.to_string()),
     }
 }
 
@@ -146,8 +292,10 @@ fn handle_notification(
         "textDocument/didOpen" => {
             let p: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
             if let Some(path) = ws.program_path(&p.text_document.uri) {
-                ws.open(path.clone(), p.text_document.text);
-                publish(connection, ws, &path)?;
+                match ws.open(path.clone(), p.text_document.text) {
+                    Ok(()) => publish(connection, ws, &path)?,
+                    Err(e) => publish_limit_exceeded(connection, ws, &path, e)?,
+                }
             }
         }
         "textDocument/didChange" => {
@@ -157,8 +305,10 @@ fn handle_notification(
             {
                 // Full sync (`TextDocumentSyncKind::FULL`): the last (and
                 // only) change event is the whole new document text.
-                ws.change(&path, last.text);
-                publish(connection, ws, &path)?;
+                match ws.change(&path, last.text) {
+                    Ok(()) => publish(connection, ws, &path)?,
+                    Err(e) => publish_limit_exceeded(connection, ws, &path, e)?,
+                }
             }
         }
         "textDocument/didClose" => {
@@ -187,6 +337,47 @@ fn publish(
     Ok(())
 }
 
+/// Spec M-LSP-4: a refused buffer (over the size cap, or the open-document
+/// cap) gets a single explanatory diagnostic instead of silently vanishing.
+fn publish_limit_exceeded(
+    connection: &Connection,
+    ws: &Workspace,
+    path: &str,
+    e: LimitExceeded,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    let message = match e {
+        LimitExceeded::DocumentTooLarge { bytes } => format!(
+            "document is {bytes} bytes, over loom-lsp's {}-byte limit (M-LSP-4); not analyzed",
+            crate::workspace::MAX_DOCUMENT_BYTES
+        ),
+        LimitExceeded::TooManyOpenDocuments => format!(
+            "this session already has {} open documents, loom-lsp's limit (M-LSP-4); close one first",
+            crate::workspace::MAX_OPEN_DOCUMENTS
+        ),
+    };
+    let params = lsp_types::PublishDiagnosticsParams {
+        uri: ws.uri_for_path(path),
+        diagnostics: vec![lsp_types::Diagnostic {
+            range: zero_range(),
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            code: None,
+            code_description: None,
+            source: Some("loom-lsp".to_string()),
+            message,
+            related_information: None,
+            tags: None,
+            data: None,
+        }],
+        version: None,
+    };
+    let not = Notification {
+        method: "textDocument/publishDiagnostics".to_string(),
+        params: serde_json::to_value(params)?,
+    };
+    connection.sender.send(Message::Notification(not))?;
+    Ok(())
+}
+
 fn handle_hover(ws: &Workspace, p: HoverParams) -> Option<Hover> {
     let uri = p.text_document_position_params.text_document.uri;
     let path = ws.program_path(&uri)?;
@@ -200,6 +391,9 @@ fn handle_hover(ws: &Workspace, p: HoverParams) -> Option<Hover> {
     })
 }
 
+/// Spec M-LSP-2/T-LSP-2: a go-to-definition target the caller cannot read
+/// gets **no** `Location` at all -- not a zero-range one, which would
+/// still leak the target's existence and normalised path.
 fn handle_definition(ws: &Workspace, p: GotoDefinitionParams) -> Option<GotoDefinitionResponse> {
     let uri = p.text_document_position_params.text_document.uri;
     let path = ws.program_path(&uri)?;
@@ -207,10 +401,16 @@ fn handle_definition(ws: &Workspace, p: GotoDefinitionParams) -> Option<GotoDefi
     let offset = position_to_byte_offset(&src, p.text_document_position_params.position) as u32;
 
     if let Some(t) = definition::definition_for_path(&ast_prog, offset) {
+        if !ws.can_read(&t.path) {
+            return None;
+        }
         return Some(single(ws.uri_for_path(&t.path), zero_range()));
     }
     let checked = checked?;
     let t = definition::definition_for_identifier(&checked.hir, &checked.info, offset)?;
+    if !ws.can_read(&t.path) {
+        return None;
+    }
     let range = t
         .name
         .as_deref()
@@ -234,4 +434,3 @@ fn handle_completion(ws: &Workspace, p: CompletionParams) -> Option<Vec<Completi
     let (_, _, checked) = compile_for(ws, &path)?;
     Some(completion::all_items(checked.as_ref().map(|c| &c.info)))
 }
-
