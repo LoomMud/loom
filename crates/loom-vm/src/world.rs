@@ -903,6 +903,10 @@ impl World {
     /// fails several frames deep inside something the caller could never
     /// read directly. The grouping key's `program` (and the redaction
     /// rule below) must both be keyed on the real origin.
+    ///
+    /// Grouped by `(program, line, message)` per spec §8.3 (OBI-231):
+    /// `line` comes from the same innermost frame as `program`
+    /// (`e.trace_lines`, parallel to `e.trace_programs`).
     fn note_error(&mut self, acting: ObjectId, e: &RtError) {
         let program = e.trace_programs.first().cloned().unwrap_or_else(|| {
             self.registry
@@ -911,6 +915,7 @@ impl World {
                 .unwrap_or_else(|| "?".to_string())
         });
         let function = crate::errors::function_of(e);
+        let line = crate::errors::line_of(e);
         let now_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -919,6 +924,7 @@ impl World {
         self.errors.record(
             &program,
             &function,
+            line,
             &e.message,
             &e.trace,
             now_unix_ms,

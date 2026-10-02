@@ -231,7 +231,7 @@ impl<L: SourceLoader> Session<L> {
             self.raw_diags.insert(path.to_string(), diags.clone());
             return Outcome::Failed(render(path, &src, &diags));
         }
-        match check_program(path, &ast, parents, imports) {
+        match check_program(path, &src, &ast, parents, imports) {
             Ok(c) => Outcome::Ok(c),
             Err(d) => {
                 self.raw_diags.insert(path.to_string(), d.clone());

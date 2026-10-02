@@ -43,9 +43,9 @@ fn seed_module() -> Module {
     "#;
     let (ast, diags) = loom_syntax::parse(src);
     assert!(diags.is_empty(), "{diags:?}");
-    let checked =
-        loom_compiler::check_program("/std/room", &ast, Vec::new(), Vec::new()).expect("checks");
-    let module = loom_compiler::codegen::compile(&checked.hir).expect("codegen");
+    let checked = loom_compiler::check_program("/std/room", src, &ast, Vec::new(), Vec::new())
+        .expect("checks");
+    let module = loom_compiler::codegen::compile(&checked.hir, &checked.src).expect("codegen");
     verify(&module).expect("seed must verify");
     module
 }
@@ -310,6 +310,7 @@ proptest! {
                 reg_types,
                 entry_points: vec![0],
                 code: code.into(),
+                lines: Vec::new(),
                 capture_targets: Vec::new(),
             }],
         };

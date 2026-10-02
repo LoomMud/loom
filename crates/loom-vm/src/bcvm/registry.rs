@@ -311,7 +311,10 @@ pub(crate) struct CompiledUnit {
 /// `$init` function (see [`synth_init_function`]) that lets
 /// [`Registry::instantiate`] run var initialisers on the bytecode VM
 /// instead of needing a separate tree-walking evaluator for them.
-pub(crate) fn compile_hir_unit(hir: &hir::Program) -> Result<CompiledUnit, CompileError> {
+pub(crate) fn compile_hir_unit(
+    hir: &hir::Program,
+    src: &str,
+) -> Result<CompiledUnit, CompileError> {
     let var_specs: Vec<VarSpec> = hir
         .vars
         .iter()
@@ -325,9 +328,9 @@ pub(crate) fn compile_hir_unit(hir: &hir::Program) -> Result<CompiledUnit, Compi
     let module = if let Some(init_fn) = synth_init_function(hir) {
         let mut augmented = hir.clone();
         augmented.fns.push(init_fn);
-        compile_and_verify(&augmented)?
+        compile_and_verify(&augmented, src)?
     } else {
-        compile_and_verify(hir)?
+        compile_and_verify(hir, src)?
     };
     // `ob.f()` may only reach `pub` functions (spec §5.3; the deleted
     // tree-walker enforced this in `call_other` too). The synthetic
@@ -351,10 +354,11 @@ pub(crate) fn compile_hir_unit(hir: &hir::Program) -> Result<CompiledUnit, Compi
 /// See [`compile_hir_unit`] for the codegen+verify itself.
 pub fn compile_hir_program(
     hir: &hir::Program,
+    src: &str,
     version: u32,
     parent: Option<Rc<CompiledProgram>>,
 ) -> Result<CompiledProgram, CompileError> {
-    let unit = compile_hir_unit(hir)?;
+    let unit = compile_hir_unit(hir, src)?;
     let mut prog = CompiledProgram::new(unit.module, version, parent, unit.var_specs);
     prog.non_public = unit.non_public;
     Ok(prog)
@@ -433,8 +437,8 @@ impl Compiler {
             if registry.program(anc).is_some() {
                 continue;
             }
-            let anc_hir = match self.session.outcomes().get(&**anc) {
-                Some(Outcome::Ok(c)) => c.hir.clone(),
+            let (anc_hir, anc_src) = match self.session.outcomes().get(&**anc) {
+                Some(Outcome::Ok(c)) => (c.hir.clone(), c.src.clone()),
                 _ => {
                     return Err(format!(
                         "internal: {anc} missing from the compile session after compiling {path}"
@@ -448,8 +452,8 @@ impl Compiler {
                 .inherits
                 .first()
                 .and_then(|inh| registry.program(&inh.path));
-            let mut compiled =
-                compile_hir_program(&anc_hir, 1, parent).map_err(|e| format!("{anc}: {e}"))?;
+            let mut compiled = compile_hir_program(&anc_hir, &anc_src, 1, parent)
+                .map_err(|e| format!("{anc}: {e}"))?;
             compiled.source_hash = compile_worker::source_hash(&self.root, anc).unwrap_or(0);
             registry.register_program(Rc::new(compiled));
         }
@@ -552,6 +556,10 @@ impl Compiler {
                 Some(Outcome::Ok(c)) => c.hir.clone(),
                 _ => return Err(format!("internal: {p} missing from the compile session")),
             };
+            let anc_src = match self.session.outcomes().get(p) {
+                Some(Outcome::Ok(c)) => c.src.clone(),
+                _ => return Err(format!("internal: {p} missing from the compile session")),
+            };
             // Same Phase 0 restriction as `ensure_program`: only the first
             // `inherit` becomes this program's parent link.
             let parent = anc_hir.inherits.first().and_then(|inh| {
@@ -561,8 +569,8 @@ impl Compiler {
                     .or_else(|| registry.program(&inh.path))
             });
             let version = registry.program(p).map_or(1, |old| old.version + 1);
-            let mut compiled =
-                compile_hir_program(&anc_hir, version, parent).map_err(|e| format!("{p}: {e}"))?;
+            let mut compiled = compile_hir_program(&anc_hir, &anc_src, version, parent)
+                .map_err(|e| format!("{p}: {e}"))?;
             compiled.source_hash = compile_worker::source_hash(&self.root, p).unwrap_or(0);
             new_set.insert(p.clone(), Rc::new(compiled));
         }
@@ -720,8 +728,8 @@ impl Compiler {
 
         let mut new_set: HashMap<String, Rc<CompiledProgram>> = HashMap::new();
         for p in &to_compile {
-            let anc_hir = match self.session.outcomes().get(p) {
-                Some(Outcome::Ok(c)) => c.hir.clone(),
+            let (anc_hir, anc_src) = match self.session.outcomes().get(p) {
+                Some(Outcome::Ok(c)) => (c.hir.clone(), c.src.clone()),
                 _ => {
                     failures.push((
                         p.clone(),
@@ -739,7 +747,7 @@ impl Compiler {
                     .or_else(|| registry.program(&inh.path))
             });
             let version = registry.program(p).map_or(1, |old| old.version + 1);
-            match compile_hir_program(&anc_hir, version, parent) {
+            match compile_hir_program(&anc_hir, &anc_src, version, parent) {
                 Ok(mut compiled) => {
                     compiled.source_hash = compile_worker::source_hash(&self.root, p).unwrap_or(0);
                     new_set.insert(p.clone(), Rc::new(compiled));
@@ -4879,6 +4887,14 @@ impl<'a> RegistryHost<'a> {
             let mut m = heap::MapData::default();
             m.insert(Value::str("program"), Value::str(&row.program));
             m.insert(Value::str("function"), Value::str(&row.function));
+            m.insert(
+                Value::str("line"),
+                if row.line == 0 {
+                    Value::Null
+                } else {
+                    Value::Int(row.line as i64)
+                },
+            );
             m.insert(Value::str("message"), Value::str(&message));
             m.insert(Value::str("redacted"), Value::Bool(row.redacted));
             m.insert(Value::str("count"), Value::Int(row.count as i64));
@@ -5048,6 +5064,7 @@ impl<'a> RegistryHost<'a> {
             );
             e.trace.push(format!("in {func_name}()"));
             e.trace_programs.push(target.path.to_string());
+            e.trace_lines.push(0);
             return Err(e);
         }
         self.push_self(on);
@@ -6277,9 +6294,8 @@ pub fn go() -> int {
             .collect();
         let mut session = Session::new(map);
         match session.compile(path) {
-            Outcome::Ok(checked) => {
-                crate::bcvm::compile_and_verify(&checked.hir).expect("codegen + verify")
-            }
+            Outcome::Ok(checked) => crate::bcvm::compile_and_verify(&checked.hir, &checked.src)
+                .expect("codegen + verify"),
             Outcome::Failed(report) => panic!("check failed:\n{report}"),
             Outcome::Missing(msg) => panic!("{msg}"),
         }
@@ -6298,7 +6314,8 @@ pub fn go() -> int {
         let mut session = Session::new(map);
         match session.compile(path) {
             Outcome::Ok(checked) => {
-                compile_hir_program(&checked.hir, version, parent).expect("codegen + verify")
+                compile_hir_program(&checked.hir, &checked.src, version, parent)
+                    .expect("codegen + verify")
             }
             Outcome::Failed(report) => panic!("check failed:\n{report}"),
             Outcome::Missing(msg) => panic!("{msg}"),
