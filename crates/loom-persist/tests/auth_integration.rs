@@ -356,3 +356,345 @@ fn rand_github_id() -> i64 {
     static COUNTER: AtomicI64 = AtomicI64::new(1_000_000);
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
+
+// -----------------------------------------------------------------------
+// OBI-198 (D-TM2, M-AUTH-5, M-AUTH-6): `staff_sessions` (renamed from
+// `refresh_tokens`), atomic rotation (`session_rotate`), family-scoped
+// revocation (`session_revoke_family_by_token`), idle expiry, and the
+// revoke-all-for-uid triggers on tier/TOTP/password/GitHub-unlink/staff
+// removal (migration 0006_staff_sessions.sql).
+// -----------------------------------------------------------------------
+
+async fn session_is_revoked(owner: &sqlx::PgPool, token_hash: &str) -> bool {
+    let revoked_at: Option<OffsetDateTime> =
+        sqlx::query_scalar("SELECT revoked_at FROM staff_sessions WHERE token_hash = $1")
+            .bind(token_hash)
+            .fetch_one(owner)
+            .await
+            .expect("session row must exist");
+    revoked_at.is_some()
+}
+
+#[tokio::test]
+async fn session_rotate_consumes_atomically_and_preserves_family_context() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("pippin3");
+    let account = seed_account(&fx.owner, &unique_uid("pippin3-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let old_hash = "rot-old-".to_string() + &"a".repeat(8);
+    let new_hash = "rot-new-".to_string() + &"b".repeat(8);
+    let amr = vec!["pwd".to_string(), "otp".to_string()];
+    let mfa_at = OffsetDateTime::now_utc();
+    fx.app
+        .refresh_token_insert(
+            &uid,
+            &old_hash,
+            expires_at,
+            "sid-rotate",
+            &amr,
+            Some(mfa_at),
+        )
+        .await
+        .unwrap();
+
+    let far_past_cutoff = OffsetDateTime::now_utc() - Duration::days(1);
+    let outcome = fx
+        .app
+        .session_rotate(&old_hash, &new_hash, far_past_cutoff)
+        .await
+        .unwrap();
+    match outcome {
+        loom_persist::SessionRotateOutcome::Rotated {
+            staff_uid,
+            sid,
+            amr: got_amr,
+            mfa_at: got_mfa_at,
+            expires_at: got_expires_at,
+        } => {
+            assert_eq!(staff_uid, uid);
+            assert_eq!(sid, "sid-rotate");
+            assert_eq!(got_amr, amr);
+            assert!(got_mfa_at.is_some());
+            // Must-fix 1: the new row's absolute expiry is the *old*
+            // row's, not a freshly-computed now()+14d (compare at
+            // microsecond resolution -- Postgres' `timestamptz` storage
+            // truncates the nanosecond-precision value this test
+            // constructed in Rust).
+            assert_eq!(
+                got_expires_at.unix_timestamp_nanos() / 1000,
+                expires_at.unix_timestamp_nanos() / 1000
+            );
+        }
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+
+    assert!(session_is_revoked(&fx.owner, &old_hash).await);
+    assert!(!session_is_revoked(&fx.owner, &new_hash).await);
+
+    // Replaying the old (now-revoked) token is a reuse: the whole family
+    // (including the just-rotated-in new row) dies.
+    let newer_hash = "rot-newer".to_string() + &"c".repeat(8);
+    let outcome = fx
+        .app
+        .session_rotate(&old_hash, &newer_hash, far_past_cutoff)
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        loom_persist::SessionRotateOutcome::Reused { .. }
+    ));
+    assert!(session_is_revoked(&fx.owner, &new_hash).await);
+}
+
+/// Acceptance: "idle expiry enforced".
+#[tokio::test]
+async fn session_rotate_refuses_an_idle_expired_session() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("sam3");
+    let account = seed_account(&fx.owner, &unique_uid("sam3-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let old_hash = "idle-old-".to_string() + &"d".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &old_hash, expires_at, "sid-idle", &[], None)
+        .await
+        .unwrap();
+
+    // The idle cutoff is "now" -- a freshly-inserted row's `last_used_at`
+    // defaults to insert time, at or before "now", so this exercises the
+    // idle branch without sleeping 24 real hours.
+    let idle_cutoff = OffsetDateTime::now_utc();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let new_hash = "idle-new-".to_string() + &"e".repeat(8);
+    let outcome = fx
+        .app
+        .session_rotate(&old_hash, &new_hash, idle_cutoff)
+        .await
+        .unwrap();
+    assert_eq!(outcome, loom_persist::SessionRotateOutcome::Invalid);
+    // Not revoked by the idle check (stale, not malicious) -- a
+    // subsequent rotate with a permissive cutoff still succeeds.
+    assert!(!session_is_revoked(&fx.owner, &old_hash).await);
+    let far_past_cutoff = OffsetDateTime::now_utc() - Duration::days(1);
+    let outcome = fx
+        .app
+        .session_rotate(&old_hash, &new_hash, far_past_cutoff)
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        loom_persist::SessionRotateOutcome::Rotated { .. }
+    ));
+}
+
+#[tokio::test]
+async fn session_revoke_family_by_token_only_touches_that_family() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("merry3");
+    let account = seed_account(&fx.owner, &unique_uid("merry3-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash_a = "fam-a1-".to_string() + &"f".repeat(8);
+    let hash_a2 = "fam-a2-".to_string() + &"g".repeat(8);
+    let hash_b = "fam-b1-".to_string() + &"h".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &hash_a, expires_at, "family-a", &[], None)
+        .await
+        .unwrap();
+    fx.app
+        .refresh_token_insert(&uid, &hash_a2, expires_at, "family-a", &[], None)
+        .await
+        .unwrap();
+    fx.app
+        .refresh_token_insert(&uid, &hash_b, expires_at, "family-b", &[], None)
+        .await
+        .unwrap();
+
+    fx.app
+        .session_revoke_family_by_token(&hash_a)
+        .await
+        .unwrap();
+
+    assert!(session_is_revoked(&fx.owner, &hash_a).await);
+    assert!(
+        session_is_revoked(&fx.owner, &hash_a2).await,
+        "family-a's other session must be revoked, not just hash_a's row"
+    );
+    assert!(!session_is_revoked(&fx.owner, &hash_b).await);
+}
+
+/// Acceptance: "tier change kills sessions" (M-AUTH-5), enforced by the
+/// `staff_sessions_revoke_on_staff_change` trigger -- driven through the
+/// real `roles_set_tier` security-definer function, not a direct
+/// owner-connection shortcut.
+#[tokio::test]
+async fn tier_change_revokes_every_session_for_the_uid() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let lead_uid = unique_uid("elrond3");
+    let lead_account = seed_account(&fx.owner, &unique_uid("elrond3-acct")).await;
+    seed_staff(&fx.owner, &lead_uid, lead_account, 4).await;
+
+    let uid = unique_uid("boromir3");
+    let account = seed_account(&fx.owner, &unique_uid("boromir3-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash = "tier-chg-".to_string() + &"i".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &hash, expires_at, "sid-tier", &[], None)
+        .await
+        .unwrap();
+
+    fx.app
+        .roles_set_tier(&lead_uid, &uid, 2, "promotion, OBI-198 test")
+        .await
+        .unwrap();
+
+    assert!(session_is_revoked(&fx.owner, &hash).await);
+}
+
+/// Acceptance (M-AUTH-5): a TOTP re-enrolment (reset) revokes every
+/// session for that uid.
+#[tokio::test]
+async fn totp_reenrollment_revokes_every_session_for_the_uid() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("gimli3");
+    let account = seed_account(&fx.owner, &unique_uid("gimli3-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash = "totp-chg-".to_string() + &"j".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &hash, expires_at, "sid-totp", &[], None)
+        .await
+        .unwrap();
+
+    fx.app.totp_enroll(&uid, "JBSWY3DPEHPK3PXP").await.unwrap();
+
+    assert!(session_is_revoked(&fx.owner, &hash).await);
+}
+
+/// Acceptance (M-AUTH-5): a GitHub unlink revokes every session for that
+/// uid too, via the same trigger mechanism, driven through the real
+/// `auth_github_unlink` security-definer function.
+#[tokio::test]
+async fn github_unlink_revokes_every_session_for_the_uid() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let t4_uid = unique_uid("elrond4");
+    let t4_account = seed_account(&fx.owner, &unique_uid("elrond4-acct")).await;
+    seed_staff(&fx.owner, &t4_uid, t4_account, 4).await;
+
+    let uid = unique_uid("samwise4");
+    let account = seed_account(&fx.owner, &unique_uid("samwise4-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let github_id = rand_github_id();
+    fx.app
+        .github_link(&t4_uid, &uid, github_id, "test")
+        .await
+        .unwrap();
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash = "unlink-".to_string() + &"k".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &hash, expires_at, "sid-unlink", &[], None)
+        .await
+        .unwrap();
+
+    fx.app
+        .github_unlink(&t4_uid, &uid, "test-unlink")
+        .await
+        .unwrap();
+
+    assert!(session_is_revoked(&fx.owner, &hash).await);
+}
+
+/// Acceptance (M-AUTH-5): a password change revokes every session for
+/// that uid (a harmless no-op for a player account with no staff row).
+#[tokio::test]
+async fn password_change_revokes_every_session_for_the_uid() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("aragorn3");
+    let account = seed_account(&fx.owner, &unique_uid("aragorn3-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash = "pwchg-".to_string() + &"l".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &hash, expires_at, "sid-pwchg", &[], None)
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE accounts SET password_hash = $1 WHERE id = $2")
+        .bind("a-new-hash-not-a-real-one")
+        .bind(account)
+        .execute(&fx.owner)
+        .await
+        .unwrap();
+
+    assert!(session_is_revoked(&fx.owner, &hash).await);
+}
+
+/// Acceptance (M-AUTH-5): removal of the staff row revokes every session
+/// for that uid -- `ON DELETE CASCADE` (migration 0006) means the row is
+/// gone outright rather than merely `revoked_at`-stamped, which is
+/// stronger than revocation (nothing is left to replay against at all).
+#[tokio::test]
+async fn staff_row_removal_revokes_every_session_for_the_uid() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("legolas3");
+    let account = seed_account(&fx.owner, &unique_uid("legolas3-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash = "remove-".to_string() + &"m".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &hash, expires_at, "sid-remove", &[], None)
+        .await
+        .unwrap();
+
+    sqlx::query("DELETE FROM staff WHERE uid = $1")
+        .bind(&uid)
+        .execute(&fx.owner)
+        .await
+        .unwrap();
+
+    let remaining: Option<String> =
+        sqlx::query_scalar("SELECT token_hash FROM staff_sessions WHERE token_hash = $1")
+            .bind(&hash)
+            .fetch_optional(&fx.owner)
+            .await
+            .unwrap();
+    assert!(
+        remaining.is_none(),
+        "the session row must be gone (cascaded), not just left unrevoked"
+    );
+}

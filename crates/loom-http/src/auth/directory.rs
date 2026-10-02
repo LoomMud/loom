@@ -53,6 +53,25 @@ pub struct RefreshRecord {
     pub mfa_at: Option<OffsetDateTime>,
 }
 
+/// Mirrors `loom_persist::SessionRotateOutcome` (OBI-198) -- kept as a
+/// separate type so `loom-http`'s `auth` module never has to depend on
+/// `loom_persist` types directly outside this file's `impl StaffDirectory
+/// for loom_persist::Persist`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRotateOutcome {
+    Rotated {
+        staff_uid: String,
+        sid: String,
+        amr: Vec<String>,
+        mfa_at: Option<OffsetDateTime>,
+        expires_at: OffsetDateTime,
+    },
+    Reused {
+        staff_uid: String,
+    },
+    Invalid,
+}
+
 /// Opaque directory failure: callers only ever see
 /// [`crate::auth::AuthError::DirectoryUnavailable`] once this crosses the
 /// `auth` module boundary (see `impl From<DirectoryError> for AuthError`),
@@ -94,6 +113,20 @@ pub trait StaffDirectory: Send + Sync {
     ) -> Result<Option<RefreshRecord>, DirectoryError>;
     async fn refresh_token_revoke(&self, token_hash: &str) -> Result<(), DirectoryError>;
     async fn refresh_token_revoke_all(&self, uid: &str) -> Result<(), DirectoryError>;
+
+    /// Revoke every unrevoked session sharing `token_hash`'s family
+    /// (OBI-198: logout revokes the family).
+    async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<(), DirectoryError>;
+
+    /// Atomically rotate the session for `old_token_hash` to
+    /// `new_token_hash` (OBI-198 re-review, must-fix 1/2) -- see
+    /// `loom_persist::Persist::session_rotate`.
+    async fn session_rotate(
+        &self,
+        old_token_hash: &str,
+        new_token_hash: &str,
+        idle_cutoff: OffsetDateTime,
+    ) -> Result<SessionRotateOutcome, DirectoryError>;
 
     /// `None` means unlinked: GitHub login must refuse, never create staff.
     async fn github_lookup(&self, github_id: i64) -> Result<Option<String>, DirectoryError>;
@@ -194,6 +227,47 @@ impl StaffDirectory for loom_persist::Persist {
         loom_persist::Persist::refresh_token_revoke_all(self, uid)
             .await
             .map_err(|_| DirectoryError)
+    }
+
+    async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<(), DirectoryError> {
+        loom_persist::Persist::session_revoke_family_by_token(self, token_hash)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn session_rotate(
+        &self,
+        old_token_hash: &str,
+        new_token_hash: &str,
+        idle_cutoff: OffsetDateTime,
+    ) -> Result<SessionRotateOutcome, DirectoryError> {
+        let outcome = loom_persist::Persist::session_rotate(
+            self,
+            old_token_hash,
+            new_token_hash,
+            idle_cutoff,
+        )
+        .await
+        .map_err(|_| DirectoryError)?;
+        Ok(match outcome {
+            loom_persist::SessionRotateOutcome::Rotated {
+                staff_uid,
+                sid,
+                amr,
+                mfa_at,
+                expires_at,
+            } => SessionRotateOutcome::Rotated {
+                staff_uid,
+                sid,
+                amr,
+                mfa_at,
+                expires_at,
+            },
+            loom_persist::SessionRotateOutcome::Reused { staff_uid } => {
+                SessionRotateOutcome::Reused { staff_uid }
+            }
+            loom_persist::SessionRotateOutcome::Invalid => SessionRotateOutcome::Invalid,
+        })
     }
 
     async fn github_lookup(&self, github_id: i64) -> Result<Option<String>, DirectoryError> {
