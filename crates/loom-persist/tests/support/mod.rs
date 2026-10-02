@@ -3,6 +3,11 @@
 
 //! Shared test fixtures for `loom-persist` integration tests.
 //!
+//! `mod support` is recompiled fresh for each integration-test binary
+//! (`persist_integration`, `roles_s2_integration`, `auth_integration`,
+//! ...), and no single binary uses every helper here -- `dead_code` is
+//! expected and not a signal of anything real.
+//!
 //! Tests connect on **two** logins, matching production (D-27.4):
 //! - `owner_pool()` -- `loom_owner`, used only to run migrations and to seed
 //!   fixtures that a real bootstrap process would write directly (T4/T5
@@ -11,6 +16,8 @@
 //!   world-runtime login under test. All `roles_*` calls in these tests go
 //!   through this login, so a passing test proves the security-definer
 //!   functions work for the login that will actually call them.
+
+#![allow(dead_code)]
 
 use loom_persist::Persist;
 use sqlx::postgres::{PgPool, PgPoolOptions};

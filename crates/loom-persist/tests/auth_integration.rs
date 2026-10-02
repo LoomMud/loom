@@ -1,0 +1,516 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// OBI-174: integration tests for migration 0003 (TOTP, refresh tokens,
+// GitHub identity linking) against a real Postgres, exercising the exact
+// `loom_app` login the HTTP layer uses.
+
+mod support;
+
+use support::{seed_account, seed_staff, unique_uid};
+use time::{Duration, OffsetDateTime};
+
+#[tokio::test]
+async fn staff_login_resolves_by_account_id_not_uid_and_verifies_password() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    // staff.uid deliberately differs from accounts.username (D-S2.6 case):
+    // login happens by account username/password, resolved to the staff
+    // row via account_id, never by treating the username as the uid.
+    let username = unique_uid("sam");
+    let uid = unique_uid("sam-uid");
+    let account = fx.app.create_account(&username, "gaffer").await.unwrap();
+    seed_staff(&fx.owner, &uid, account.id, 2).await;
+
+    let record = fx
+        .app
+        .staff_login(&username, "gaffer")
+        .await
+        .expect("query")
+        .expect("login should succeed");
+    assert_eq!(record.uid, uid);
+    assert_eq!(record.tier, 2);
+    assert_eq!(record.totp_secret, None);
+    assert!(!record.totp_confirmed);
+
+    // Wrong password.
+    assert!(
+        fx.app
+            .staff_login(&username, "wrong")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A plain player (account with no staff row) never resolves here.
+    let player_username = unique_uid("player");
+    fx.app
+        .create_account(&player_username, "whatever")
+        .await
+        .unwrap();
+    assert!(
+        fx.app
+            .staff_login(&player_username, "whatever")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn totp_enroll_is_self_service_only() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("gandalf");
+    let account = seed_account(&fx.owner, &unique_uid("gandalf-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 3).await;
+
+    fx.app
+        .totp_enroll(&uid, "JBSWY3DPEHPK3PXP")
+        .await
+        .expect("self-service enroll succeeds");
+
+    let secret = fx.app.totp_secret_for(&uid).await.unwrap();
+    assert_eq!(secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
+
+    // Not yet confirmed.
+    let record = fx.app.staff_login(&unique_uid("nonexistent"), "x").await;
+    assert!(record.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn totp_confirm_requires_a_prior_enrollment() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("aragorn");
+    let account = seed_account(&fx.owner, &unique_uid("aragorn-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 4).await;
+
+    // No secret enrolled yet: confirm fails.
+    assert!(fx.app.totp_confirm(&uid).await.is_err());
+
+    fx.app.totp_enroll(&uid, "SECRETBASE32").await.unwrap();
+    fx.app.totp_confirm(&uid).await.unwrap();
+
+    let username = unique_uid("aragorn-login");
+    let account2 = fx.app.create_account(&username, "strider").await.unwrap();
+    seed_staff(&fx.owner, &unique_uid("aragorn2"), account2.id, 4).await;
+    // (separate uid just to prove totp_confirmed reads back true for the
+    // uid we actually confirmed, not some other row)
+    let record = fx.app.staff_login(&username, "strider").await.unwrap();
+    assert!(record.is_some());
+    assert!(!record.unwrap().totp_confirmed); // this is aragorn2, unrelated
+
+    // OBI-195 review fix 3: re-enrolling over an already-*confirmed*
+    // secret is refused by the SQL function itself (defense in depth --
+    // `loom-http::auth::AuthService::totp_enroll` already refuses this at
+    // the app layer too). A real reset needs a dedicated, step-up-gated
+    // flow (OBI-199 follow-up), not a bare re-enrol.
+    assert!(fx.app.totp_enroll(&uid, "ANOTHERBASE32").await.is_err());
+    let secret = fx.app.totp_secret_for(&uid).await.unwrap();
+    assert_eq!(secret.as_deref(), Some("SECRETBASE32"));
+}
+
+/// OBI-195 review fix 4: anti-replay -- the same RFC 6238 step can never
+/// be consumed twice for a uid, and a strictly later step is always
+/// accepted.
+#[tokio::test]
+async fn totp_consume_step_is_monotonic_per_uid() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("frodo");
+    let account = seed_account(&fx.owner, &unique_uid("frodo-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    assert!(fx.app.totp_consume_step(&uid, 1000).await.unwrap());
+    // Same step again: refused.
+    assert!(!fx.app.totp_consume_step(&uid, 1000).await.unwrap());
+    // An earlier step: refused.
+    assert!(!fx.app.totp_consume_step(&uid, 999).await.unwrap());
+    // A later step: accepted.
+    assert!(fx.app.totp_consume_step(&uid, 1001).await.unwrap());
+}
+
+/// OBI-195 review fix 5: a uid with no `staff` row at all gets `None`,
+/// never a tier defaulted to 0.
+#[tokio::test]
+async fn staff_auth_status_is_none_for_a_uid_with_no_staff_row() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let status = fx
+        .app
+        .staff_auth_status(&unique_uid("nobody-at-all"))
+        .await
+        .unwrap();
+    assert!(status.is_none());
+}
+
+#[tokio::test]
+async fn staff_auth_status_reads_tier_and_totp_state() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("samwise2");
+    let account = seed_account(&fx.owner, &unique_uid("samwise2-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 2).await;
+
+    let status = fx.app.staff_auth_status(&uid).await.unwrap().unwrap();
+    assert_eq!(status.tier, 2);
+    assert_eq!(status.totp_secret, None);
+    assert!(!status.totp_confirmed);
+
+    fx.app.totp_enroll(&uid, "SECRETBASE32").await.unwrap();
+    fx.app.totp_confirm(&uid).await.unwrap();
+
+    let status = fx.app.staff_auth_status(&uid).await.unwrap().unwrap();
+    assert_eq!(status.totp_secret.as_deref(), Some("SECRETBASE32"));
+    assert!(status.totp_confirmed);
+}
+
+#[tokio::test]
+async fn refresh_token_insert_lookup_and_revoke_round_trip() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("pippin");
+    let account = seed_account(&fx.owner, &unique_uid("pippin-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash = "deadbeef".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &hash, expires_at)
+        .await
+        .unwrap();
+
+    let record = fx
+        .app
+        .refresh_token_lookup(&hash)
+        .await
+        .unwrap()
+        .expect("inserted token is found");
+    assert_eq!(record.staff_uid, uid);
+    assert!(record.revoked_at.is_none());
+
+    fx.app.refresh_token_revoke(&hash).await.unwrap();
+    let revoked = fx.app.refresh_token_lookup(&hash).await.unwrap().unwrap();
+    assert!(revoked.revoked_at.is_some());
+
+    // Unknown hash: None, not an error.
+    assert!(
+        fx.app
+            .refresh_token_lookup("never-issued")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// OBI-195 review fix 1: a single atomic `UPDATE ... RETURNING` means
+/// the token's first-ever rotation returns `Rotated`, and every
+/// subsequent presentation -- however many -- returns `Reused`, never a
+/// second `Rotated`.
+#[tokio::test]
+async fn refresh_token_rotate_is_atomic() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("sam3");
+    let account = seed_account(&fx.owner, &unique_uid("sam3-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash = "c3".repeat(16);
+    fx.app
+        .refresh_token_insert(&uid, &hash, expires_at)
+        .await
+        .unwrap();
+
+    match fx.app.refresh_token_rotate(&hash).await.unwrap() {
+        loom_persist::RefreshTokenRotation::Rotated { staff_uid } => {
+            assert_eq!(staff_uid, uid);
+        }
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+
+    match fx.app.refresh_token_rotate(&hash).await.unwrap() {
+        loom_persist::RefreshTokenRotation::Reused { staff_uid } => {
+            assert_eq!(staff_uid, uid);
+        }
+        other => panic!("expected Reused, got {other:?}"),
+    }
+
+    // A third presentation is still Reused, not NotFound -- the row still
+    // exists, just revoked.
+    match fx.app.refresh_token_rotate(&hash).await.unwrap() {
+        loom_persist::RefreshTokenRotation::Reused { .. } => {}
+        other => panic!("expected Reused, got {other:?}"),
+    }
+
+    assert!(matches!(
+        fx.app.refresh_token_rotate("never-issued").await.unwrap(),
+        loom_persist::RefreshTokenRotation::NotFound
+    ));
+}
+
+/// OBI-195 review fix 1 (the actual bug): many concurrent presentations
+/// of the *same* refresh token against a real Postgres must yield exactly
+/// one `Rotated` and the rest `Reused` -- a lookup-then-revoke
+/// implementation can let two or more of these race past the "not yet
+/// revoked" check and all succeed, which defeats reuse detection.
+#[tokio::test]
+async fn concurrent_refresh_token_rotation_only_succeeds_once() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("sam4");
+    let account = seed_account(&fx.owner, &unique_uid("sam4-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash = "c4".repeat(16);
+    fx.app
+        .refresh_token_insert(&uid, &hash, expires_at)
+        .await
+        .unwrap();
+
+    const CONCURRENT_ATTEMPTS: usize = 16;
+    let mut handles = Vec::with_capacity(CONCURRENT_ATTEMPTS);
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CONCURRENT_ATTEMPTS));
+    for _ in 0..CONCURRENT_ATTEMPTS {
+        let app = fx.app.clone();
+        let hash = hash.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            app.refresh_token_rotate(&hash).await.unwrap()
+        }));
+    }
+
+    let mut rotated_count = 0;
+    let mut reused_count = 0;
+    for handle in handles {
+        match handle.await.unwrap() {
+            loom_persist::RefreshTokenRotation::Rotated { .. } => rotated_count += 1,
+            loom_persist::RefreshTokenRotation::Reused { .. } => reused_count += 1,
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+    assert_eq!(
+        rotated_count, 1,
+        "exactly one concurrent caller must rotate"
+    );
+    assert_eq!(reused_count, CONCURRENT_ATTEMPTS - 1);
+}
+
+#[tokio::test]
+async fn refresh_token_revoke_all_only_touches_the_named_uid() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid_a = unique_uid("merry");
+    let uid_b = unique_uid("pippin2");
+    let account_a = seed_account(&fx.owner, &unique_uid("merry-acct")).await;
+    let account_b = seed_account(&fx.owner, &unique_uid("pippin2-acct")).await;
+    seed_staff(&fx.owner, &uid_a, account_a, 1).await;
+    seed_staff(&fx.owner, &uid_b, account_b, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash_a = "a1".repeat(16);
+    let hash_b = "b2".repeat(16);
+    fx.app
+        .refresh_token_insert(&uid_a, &hash_a, expires_at)
+        .await
+        .unwrap();
+    fx.app
+        .refresh_token_insert(&uid_b, &hash_b, expires_at)
+        .await
+        .unwrap();
+
+    fx.app.refresh_token_revoke_all(&uid_a).await.unwrap();
+
+    assert!(
+        fx.app
+            .refresh_token_lookup(&hash_a)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_some()
+    );
+    assert!(
+        fx.app
+            .refresh_token_lookup(&hash_b)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn github_link_requires_t4_and_an_existing_staff_row() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let t1_uid = unique_uid("boromir");
+    let t1_account = seed_account(&fx.owner, &unique_uid("boromir-acct")).await;
+    seed_staff(&fx.owner, &t1_uid, t1_account, 1).await;
+
+    let t4_uid = unique_uid("elrond");
+    let t4_account = seed_account(&fx.owner, &unique_uid("elrond-acct")).await;
+    seed_staff(&fx.owner, &t4_uid, t4_account, 4).await;
+
+    let target_uid = unique_uid("samwise");
+    let target_account = seed_account(&fx.owner, &unique_uid("samwise-acct")).await;
+    seed_staff(&fx.owner, &target_uid, target_account, 1).await;
+
+    // T1 may not link.
+    let github_id: i64 = rand_github_id();
+    let err = fx
+        .app
+        .github_link(&t1_uid, &target_uid, github_id, "test")
+        .await;
+    assert!(err.is_err());
+    assert!(fx.app.github_lookup(github_id).await.unwrap().is_none());
+
+    // T4 may link an existing staff uid.
+    fx.app
+        .github_link(&t4_uid, &target_uid, github_id, "vouched for in #staff")
+        .await
+        .expect("t4 may link");
+    assert_eq!(
+        fx.app.github_lookup(github_id).await.unwrap().as_deref(),
+        Some(target_uid.as_str())
+    );
+
+    // Never creates staff: linking a uid with no staff row fails.
+    let never_staff_uid = unique_uid("nobody");
+    let other_github_id = rand_github_id();
+    let err = fx
+        .app
+        .github_link(&t4_uid, &never_staff_uid, other_github_id, "test")
+        .await;
+    assert!(err.is_err());
+    assert!(
+        fx.app
+            .github_lookup(other_github_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn github_lookup_is_none_for_an_unlinked_id() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+    assert!(fx.app.github_lookup(999_999_999).await.unwrap().is_none());
+}
+
+/// OBI-200: `auth_github_unlink` is the missing counterpart to
+/// `auth_github_link` -- same T4+ floor, and it actually removes the row.
+#[tokio::test]
+async fn github_unlink_requires_t4_and_removes_the_link() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let t1_uid = unique_uid("boromir-unlink");
+    let t1_account = seed_account(&fx.owner, &unique_uid("boromir-unlink-acct")).await;
+    seed_staff(&fx.owner, &t1_uid, t1_account, 1).await;
+
+    let t4_uid = unique_uid("elrond-unlink");
+    let t4_account = seed_account(&fx.owner, &unique_uid("elrond-unlink-acct")).await;
+    seed_staff(&fx.owner, &t4_uid, t4_account, 4).await;
+
+    let target_uid = unique_uid("samwise-unlink");
+    let target_account = seed_account(&fx.owner, &unique_uid("samwise-unlink-acct")).await;
+    seed_staff(&fx.owner, &target_uid, target_account, 1).await;
+
+    let github_id = rand_github_id();
+    fx.app
+        .github_link(&t4_uid, &target_uid, github_id, "test")
+        .await
+        .expect("t4 may link");
+
+    // T1 may not unlink.
+    let err = fx.app.github_unlink(&t1_uid, &target_uid, "test").await;
+    assert!(err.is_err());
+    assert!(fx.app.github_lookup(github_id).await.unwrap().is_some());
+
+    // T4 may unlink, and the link is actually gone afterward.
+    fx.app
+        .github_unlink(&t4_uid, &target_uid, "device lost")
+        .await
+        .expect("t4 may unlink");
+    assert!(fx.app.github_lookup(github_id).await.unwrap().is_none());
+}
+
+/// Acceptance (OBI-200): "audit rows written for each event" --
+/// `github_link`/`github_unlink` land `auth.github.link`/`auth.github.unlink`
+/// rows in `audit_log` with the actor and target.
+#[tokio::test]
+async fn github_link_and_unlink_write_audit_log_rows() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let t4_uid = unique_uid("elrond-audit");
+    let t4_account = seed_account(&fx.owner, &unique_uid("elrond-audit-acct")).await;
+    seed_staff(&fx.owner, &t4_uid, t4_account, 4).await;
+
+    let target_uid = unique_uid("samwise-audit");
+    let target_account = seed_account(&fx.owner, &unique_uid("samwise-audit-acct")).await;
+    seed_staff(&fx.owner, &target_uid, target_account, 1).await;
+
+    let github_id = rand_github_id();
+    fx.app
+        .github_link(&t4_uid, &target_uid, github_id, "test-link")
+        .await
+        .expect("link");
+    fx.app
+        .github_unlink(&t4_uid, &target_uid, "test-unlink")
+        .await
+        .expect("unlink");
+
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT kind, caller, effective_principal FROM audit_log \
+         WHERE kind IN ('auth.github.link', 'auth.github.unlink') \
+         AND effective_principal = $1 ORDER BY id",
+    )
+    .bind(&target_uid)
+    .fetch_all(&fx.owner)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 2, "expected one link row and one unlink row");
+    assert_eq!(rows[0].0, "auth.github.link");
+    assert_eq!(rows[0].1.as_deref(), Some(t4_uid.as_str()));
+    assert_eq!(rows[1].0, "auth.github.unlink");
+    assert_eq!(rows[1].1.as_deref(), Some(t4_uid.as_str()));
+}
+
+fn rand_github_id() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static COUNTER: AtomicI64 = AtomicI64::new(1_000_000);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
