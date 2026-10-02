@@ -44,6 +44,9 @@ use uuid::Uuid;
 const ARGON_M_COST_KIB: u32 = 19 * 1024;
 const ARGON_T_COST: u32 = 2;
 const ARGON_P_COST: u32 = 1;
+/// Never a real credential -- only ever hashed once (at [`Persist::from_pool`])
+/// and verified against for its CPU cost (OBI-200, M-AUTH-2).
+const DUMMY_PASSWORD: &str = "loom-dummy-verify-constant-time-padding";
 
 pub type Result<T> = std::result::Result<T, PersistError>;
 
@@ -67,6 +70,13 @@ pub enum PersistError {
 pub struct Persist {
     pool: PgPool,
     argon2: Argon2<'static>,
+    /// A precomputed Argon2id hash of a fixed, never-used password,
+    /// verified against on every lookup of an unknown account/staff
+    /// username (OBI-200, M-AUTH-2). Running a real Argon2 verify against
+    /// *some* hash for a nonexistent user spends the same CPU time a real
+    /// user's wrong-password attempt would, so response timing never
+    /// reveals whether a username exists.
+    dummy_password_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +163,55 @@ pub struct TierPolicyRow {
     pub max_callouts_uid: Option<i32>,
     pub disk_quota_mb: Option<i32>,
     pub efun_classes: Vec<i16>,
+}
+
+/// A staff row resolved by username/password for the web auth layer
+/// (OBI-174, design §9/D-P2.5): the staff uid, its current tier, and
+/// whatever TOTP state it has (both read fresh from Postgres -- the tier
+/// here is never cached past the single query that produced it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaffAuthRecord {
+    pub uid: String,
+    pub account_id: Uuid,
+    pub tier: i16,
+    pub totp_secret: Option<String>,
+    pub totp_confirmed: bool,
+}
+
+/// A `refresh_tokens` row (OBI-174). Only ever looked up by
+/// [`Persist::refresh_token_lookup`]'s SHA-256 hash of the bearer token --
+/// the plaintext token itself is never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshTokenRecord {
+    pub id: Uuid,
+    pub staff_uid: String,
+    pub expires_at: OffsetDateTime,
+    pub revoked_at: Option<OffsetDateTime>,
+}
+
+/// Fresh tier + TOTP enrolment state for a uid (OBI-174/OBI-195 review fix
+/// 5): `None` from [`Persist::staff_auth_status`] means no `staff` row at
+/// all, which callers must refuse outright rather than treat as tier 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaffTierStatus {
+    pub tier: i16,
+    pub totp_secret: Option<String>,
+    pub totp_confirmed: bool,
+}
+
+/// The outcome of [`Persist::refresh_token_rotate`] (OBI-195 review fix 1):
+/// lookup-then-revoke used to be two statements, letting two concurrent
+/// presentations of the same refresh token both see "not yet revoked" and
+/// both succeed, which defeats reuse detection. A single
+/// `UPDATE ... WHERE revoked_at IS NULL AND expires_at > NOW() RETURNING`
+/// makes at most one caller ever observe [`RefreshTokenRotation::Rotated`]
+/// for a given token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshTokenRotation {
+    Rotated { staff_uid: String },
+    Reused { staff_uid: String },
+    Expired,
+    NotFound,
 }
 
 /// A row from the `active_grants` view (already excludes expired grants).
@@ -443,10 +502,30 @@ impl Persist {
     pub fn from_pool(pool: PgPool) -> Result<Self> {
         let params = Params::new(ARGON_M_COST_KIB, ARGON_T_COST, ARGON_P_COST, None)
             .map_err(|_| PersistError::ArgonParams)?;
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let dummy_password_hash = {
+            let salt = SaltString::generate(&mut OsRng);
+            argon2
+                .hash_password(DUMMY_PASSWORD.as_bytes(), &salt)
+                .map_err(|e| PersistError::PasswordHash(e.to_string()))?
+                .to_string()
+        };
         Ok(Self {
             pool,
-            argon2: Argon2::new(Algorithm::Argon2id, Version::V0x13, params),
+            argon2,
+            dummy_password_hash,
         })
+    }
+
+    /// Run a real Argon2id verify against the fixed dummy hash so a
+    /// lookup miss (unknown account/staff username) costs the same CPU
+    /// time as a wrong-password attempt against a real one (OBI-200,
+    /// M-AUTH-2). The result is always discarded -- this exists purely
+    /// for its timing, never its outcome.
+    fn dummy_verify(&self, password: &str) {
+        let parsed = PasswordHash::new(&self.dummy_password_hash)
+            .expect("the dummy hash computed in from_pool is always a valid PHC string");
+        let _ = self.argon2.verify_password(password.as_bytes(), &parsed);
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -488,6 +567,9 @@ impl Persist {
         .await?;
 
         let Some(row) = row else {
+            // OBI-200, M-AUTH-2: dummy verify so timing doesn't reveal that
+            // this username doesn't exist.
+            self.dummy_verify(password);
             return Ok(None);
         };
 
@@ -505,6 +587,341 @@ impl Persist {
             id: row.id,
             username: row.username,
         }))
+    }
+
+    /// Resolve a staff login by account username/password (OBI-174): joins
+    /// `accounts` to `staff` by `account_id` (never by `uid = username` --
+    /// see `roles_resolve_account`'s doc comment on why those can diverge),
+    /// verifies the Argon2id hash the same way [`Persist::verify_login`]
+    /// does, and returns `None` for either a bad password or an account
+    /// that has no `staff` row (a player, not staff).
+    pub async fn staff_login(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<StaffAuthRecord>> {
+        let row = sqlx::query(
+            "SELECT a.id as account_id, a.password_hash, s.uid, s.tier, s.totp_secret, \
+                    s.totp_confirmed_at
+             FROM accounts a
+             JOIN staff s ON s.account_id = a.id
+             WHERE a.username = $1",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            // OBI-200, M-AUTH-2: dummy verify so timing doesn't reveal that
+            // this username doesn't exist (or isn't staff).
+            self.dummy_verify(password);
+            return Ok(None);
+        };
+        use sqlx::Row;
+        let password_hash: String = row.try_get("password_hash")?;
+
+        let parsed = PasswordHash::new(&password_hash)
+            .map_err(|error| PersistError::PasswordHash(error.to_string()))?;
+        if self
+            .argon2
+            .verify_password(password.as_bytes(), &parsed)
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(StaffAuthRecord {
+            uid: row.try_get("uid")?,
+            account_id: row.try_get("account_id")?,
+            tier: row.try_get("tier")?,
+            totp_secret: row.try_get("totp_secret")?,
+            totp_confirmed: row
+                .try_get::<Option<OffsetDateTime>, _>("totp_confirmed_at")?
+                .is_some(),
+        }))
+    }
+
+    /// Enrol (or re-enrol) `uid`'s TOTP secret via the `auth_totp_enroll`
+    /// re-checks `actor == uid` in SQL. Re-enrolling always clears any
+    /// prior confirmation, so [`Persist::staff_login`]'s `totp_confirmed`
+    /// never reports true for a secret nobody has proven.
+    pub async fn totp_enroll(&self, uid: &str, secret_base32: &str) -> Result<()> {
+        sqlx::query("SELECT auth_totp_enroll($1, $2, $3)")
+            .bind(uid)
+            .bind(uid)
+            .bind(secret_base32)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Mark `uid`'s pending TOTP secret confirmed via `auth_totp_confirm`.
+    /// Callers must have already verified a code against the pending
+    /// secret (loom-http does this before calling); this function only
+    /// records that fact.
+    pub async fn totp_confirm(&self, uid: &str) -> Result<()> {
+        sqlx::query("SELECT auth_totp_confirm($1, $2)")
+            .bind(uid)
+            .bind(uid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The uid's currently enrolled TOTP secret (confirmed or not), for
+    /// the verify step to check a submitted code against. `loom_app` has
+    /// plain `SELECT` on `staff` already (0001_init.sql); no
+    /// security-definer wrapper needed for a read.
+    pub async fn totp_secret_for(&self, uid: &str) -> Result<Option<String>> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT totp_secret FROM staff WHERE uid = $1")
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(row) => row.try_get("totp_secret")?,
+            None => None,
+        })
+    }
+
+    /// Anti-replay (OBI-174, OBI-195 review fix 4): atomically accept
+    /// `step` for `uid` only if it is strictly greater than the last step
+    /// ever accepted for that uid, recording it if so -- via the
+    /// `auth_totp_consume_step` security-definer function, since `loom_app`
+    /// only has `SELECT` on `staff` (0001_init.sql), same reason every
+    /// other `staff` write goes through a function. A code that is RFC
+    /// 6238-valid but already consumed (replayed, or racing against
+    /// itself) is refused even though its *signature* still checks out
+    /// within the skew window.
+    pub async fn totp_consume_step(&self, uid: &str, step: i64) -> Result<bool> {
+        let accepted: bool = sqlx::query_scalar("SELECT auth_totp_consume_step($1, $2)")
+            .bind(uid)
+            .bind(step)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(accepted)
+    }
+
+    /// Record a newly-issued refresh token. Only `token_hash` (SHA-256 of
+    /// the bearer token, computed by loom-http) is ever stored.
+    pub async fn refresh_token_insert(
+        &self,
+        staff_uid: &str,
+        token_hash: &str,
+        expires_at: OffsetDateTime,
+    ) -> Result<Uuid> {
+        use sqlx::Row;
+        let row = sqlx::query(
+            "INSERT INTO refresh_tokens (staff_uid, token_hash, expires_at)
+             VALUES ($1, $2, $3)
+             RETURNING id",
+        )
+        .bind(staff_uid)
+        .bind(token_hash)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get("id")?)
+    }
+
+    /// Look up a refresh token by the SHA-256 hash of its bearer value.
+    /// Callers must check both `expires_at` and `revoked_at` themselves --
+    /// this returns whatever row matches the hash, expired or not, so a
+    /// caller can tell "expired" apart from "never existed" if it ever
+    /// needs to (it currently doesn't, but the distinction costs nothing).
+    pub async fn refresh_token_lookup(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<RefreshTokenRecord>> {
+        use sqlx::Row;
+        let row = sqlx::query(
+            "SELECT id, staff_uid, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(RefreshTokenRecord {
+            id: row.try_get("id")?,
+            staff_uid: row.try_get("staff_uid")?,
+            expires_at: row.try_get("expires_at")?,
+            revoked_at: row.try_get("revoked_at")?,
+        }))
+    }
+
+    /// Atomically rotate a refresh token (OBI-174, OBI-195 review fix 1):
+    /// a single `UPDATE ... WHERE revoked_at IS NULL AND expires_at > NOW()
+    /// RETURNING` replaces the old lookup-then-revoke pair, so at most one
+    /// concurrent caller ever sees [`RefreshTokenRotation::Rotated`] for a
+    /// given token -- a second, racing presentation of the same bearer
+    /// value (the classic replay-of-a-stolen-token shape) always lands on
+    /// [`RefreshTokenRotation::Reused`], never on a second success.
+    pub async fn refresh_token_rotate(&self, token_hash: &str) -> Result<RefreshTokenRotation> {
+        use sqlx::Row;
+        let updated = sqlx::query(
+            "UPDATE refresh_tokens
+             SET revoked_at = NOW()
+             WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()
+             RETURNING staff_uid",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        if let Some(row) = updated {
+            return Ok(RefreshTokenRotation::Rotated {
+                staff_uid: row.try_get("staff_uid")?,
+            });
+        }
+
+        // The UPDATE matched nothing: find out why, purely to classify the
+        // refusal (a reused/already-dead token is a stronger signal than a
+        // hash that was never issued) -- this second, read-only query does
+        // not reopen the race the UPDATE above closed, since nothing here
+        // changes state.
+        let existing = sqlx::query(
+            "SELECT staff_uid, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match existing {
+            Some(row) => {
+                let revoked_at: Option<OffsetDateTime> = row.try_get("revoked_at")?;
+                if revoked_at.is_some() {
+                    RefreshTokenRotation::Reused {
+                        staff_uid: row.try_get("staff_uid")?,
+                    }
+                } else {
+                    RefreshTokenRotation::Expired
+                }
+            }
+            None => RefreshTokenRotation::NotFound,
+        })
+    }
+
+    /// Revoke a single refresh token by its bearer-value hash (logout, or
+    /// rotating it out after a single use).
+    pub async fn refresh_token_revoke(&self, token_hash: &str) -> Result<()> {
+        sqlx::query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Revoke every outstanding refresh token for `uid` (reuse-detection
+    /// response: a revoked or expired token being replayed looks like a
+    /// stolen refresh token, so the whole session family is killed, not
+    /// just the one token).
+    pub async fn refresh_token_revoke_all(&self, uid: &str) -> Result<()> {
+        sqlx::query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE staff_uid = $1 AND revoked_at IS NULL")
+            .bind(uid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Resolve a numeric GitHub user id to a linked staff uid
+    /// (`github_identities`, OBI-174). `None` means unlinked -- GitHub
+    /// login must never create a staff row, only ever authenticate as a
+    /// uid an arch has already linked via `auth_github_link`.
+    pub async fn github_lookup(&self, github_id: i64) -> Result<Option<String>> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT staff_uid FROM github_identities WHERE github_id = $1")
+            .bind(github_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(row) => Some(row.try_get("staff_uid")?),
+            None => None,
+        })
+    }
+
+    /// Link a GitHub numeric user id to an existing staff uid via
+    /// `auth_github_link`. `actor` MUST be the driver/app's authenticated
+    /// principal (an arch or root, T4+); the function re-checks this in SQL
+    /// and never creates a staff row for an unrecognised uid. Audited as
+    /// `auth.github.link` (OBI-200, M-AUTH-9).
+    pub async fn github_link(
+        &self,
+        actor: &str,
+        uid: &str,
+        github_id: i64,
+        reason: &str,
+    ) -> Result<()> {
+        sqlx::query("SELECT auth_github_link($1, $2, $3, $4)")
+            .bind(actor)
+            .bind(uid)
+            .bind(github_id)
+            .bind(reason)
+            .execute(&self.pool)
+            .await?;
+        if let Err(err) = self
+            .record_auth_audit(
+                "auth.github.link",
+                Some(actor),
+                Some(uid),
+                Some(format!("github_id={github_id} reason={reason}")),
+            )
+            .await
+        {
+            tracing::warn!(%err, "failed to audit auth.github.link");
+        }
+        Ok(())
+    }
+
+    /// Unlink a staff uid's GitHub identity via `auth_github_unlink`.
+    /// Same actor-tier floor as [`Self::github_link`] (T4+). Audited as
+    /// `auth.github.unlink` (OBI-200, M-AUTH-9).
+    pub async fn github_unlink(&self, actor: &str, uid: &str, reason: &str) -> Result<()> {
+        sqlx::query("SELECT auth_github_unlink($1, $2, $3)")
+            .bind(actor)
+            .bind(uid)
+            .bind(reason)
+            .execute(&self.pool)
+            .await?;
+        if let Err(err) = self
+            .record_auth_audit(
+                "auth.github.unlink",
+                Some(actor),
+                Some(uid),
+                Some(reason.to_string()),
+            )
+            .await
+        {
+            tracing::warn!(%err, "failed to audit auth.github.unlink");
+        }
+        Ok(())
+    }
+
+    /// Append one `audit_log` row for an auth event that isn't already
+    /// covered by [`Self::insert_audit_batch`]'s callers in `loom-http`
+    /// (OBI-200, M-AUTH-9). `verdict` is always `"allow"` here -- the
+    /// callers of this helper ([`Self::github_link`]/`github_unlink`)
+    /// only run after their SQL function already succeeded.
+    async fn record_auth_audit(
+        &self,
+        kind: &str,
+        caller: Option<&str>,
+        target: Option<&str>,
+        detail: Option<String>,
+    ) -> Result<()> {
+        let row = AuditRow {
+            at: OffsetDateTime::now_utc(),
+            kind: kind.to_string(),
+            caller: caller.map(|s| s.to_string()),
+            effective_principal: target.map(|s| s.to_string()),
+            apply: None,
+            class: None,
+            argument: None,
+            guard_set: Vec::new(),
+            verdict: "allow".to_string(),
+            detail,
+        };
+        self.insert_audit_batch(&[row]).await
     }
 
     pub async fn save_object_state(&self, object: &ObjectState) -> Result<()> {
@@ -677,12 +1094,39 @@ impl Persist {
     }
 
     /// Read `uid`'s current tier (0 if `uid` has no `staff` row, i.e. it is
-    /// a player).
+    /// a player). Kept separate from [`Persist::staff_auth_status`] for
+    /// non-auth callers (e.g. `roles_*` plumbing) that only need the tier
+    /// and have no TOTP gate to enforce.
     pub async fn tier_of(&self, uid: &str) -> Result<i16> {
         let row = sqlx::query!("SELECT tier FROM staff WHERE uid = $1", uid)
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|r| r.tier).unwrap_or(0))
+    }
+
+    /// Fresh tier + TOTP enrolment state for `uid` (OBI-174, OBI-195 review
+    /// fix 5): `None` means no `staff` row at all. The web auth layer
+    /// (`loom-http::auth`) uses this instead of [`Persist::tier_of`] at
+    /// every token issue/refresh/GitHub login specifically so a removed
+    /// staff uid is refused outright rather than silently minting a
+    /// tier-0 token the way a `tier_of`-based check used to.
+    pub async fn staff_auth_status(&self, uid: &str) -> Result<Option<StaffTierStatus>> {
+        use sqlx::Row;
+        let row =
+            sqlx::query("SELECT tier, totp_secret, totp_confirmed_at FROM staff WHERE uid = $1")
+                .bind(uid)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(match row {
+            Some(row) => Some(StaffTierStatus {
+                tier: row.try_get("tier")?,
+                totp_secret: row.try_get("totp_secret")?,
+                totp_confirmed: row
+                    .try_get::<Option<OffsetDateTime>, _>("totp_confirmed_at")?
+                    .is_some(),
+            }),
+            None => None,
+        })
     }
 
     /// List `uid`'s unexpired grants via the `active_grants` view, ignoring

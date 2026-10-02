@@ -90,14 +90,27 @@ players / 60 s against a real `loom serve` on every push/PR, using
 `LoomMud/warp`'s `loadbot/mix.tsv`, and uploads its report as a build
 artifact (`results/ci-smoke.*` is `.gitignore`d, not committed).
 
+## CI regression gate: `loadtest-e1-1` (OBI-177)
+
+The same workflow's `loadtest-e1-1` job is a **required** status check: the
+full E1.1 run (150 players, 90 s, `--fail-on-sla-miss`) against a real
+`loom serve` on every push/PR, scraping `loom-http`'s `/metrics` into the
+report. A PR that regresses p99 past the 50 ms SLA fails this check and
+cannot merge (branch protection lists it alongside `rust`/`deny`/`dco`/
+`hygiene`). Its report is uploaded as a build artifact
+(`results/ci-e1-1.*`, also `.gitignore`d — CI runners vary in CPU/host
+noise from the reference host above, so this job proves "no regression
+*on this runner*", not the headline number; the committed reports above
+remain the reference-host record). As of this gate landing, the scraped
+`/metrics` body is typically empty in CI runs: `loom-net`/the world
+thread don't yet record any `metrics::counter!`/`histogram!` values on
+the connection/command path, so there's nothing for `loom-obs`'s
+recorder to render. That's a separate instrumentation gap, not a bug in
+the scrape itself -- `--metrics-url` will start carrying real server-side
+histograms once that lands.
+
 ## Limitations
 
-- **R3 server-side metrics are not included.** `loom-http`/`loom-obs`
-  (OBI-28, Prometheus `/metrics`) are not yet on `main`; that work needs to
-  be re-landed (see the OBI-40 issue comment) before a run can report
-  server-side histograms alongside bot-side latency. `loom-loadtest`'s
-  report format has room for this (`RunReport`); wiring an optional
-  `--metrics-url` scrape is the natural follow-up once loom-http exists.
 - **Negotiated telnet options (R1a/OBI-26)** are exercised from the bot side
   (`loom-loadtest`'s `telnet` module offers NAWS/TTYPE/CHARSET/GMCP/MSSP on
   connect and answers subnegotiation), but the driver's Phase-0 stub still

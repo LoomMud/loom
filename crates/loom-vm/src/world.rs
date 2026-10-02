@@ -16,7 +16,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use crate::bcvm::Value;
-use crate::bcvm::compile_worker::RecompileJob;
+use crate::bcvm::compile_worker::{RecompileJob, RecompileSetJob};
 use crate::bcvm::registry::{Compiler, Registry, RegistryHost};
 use crate::bcvm::vm::{Limits as VmLimits, RtError};
 use crate::host::{Host, NullHost};
@@ -322,6 +322,13 @@ pub struct World {
     /// installed (or failed to) since the last `take_finished_recompiles`.
     finished_recompiles: Vec<(RecompileToken, Result<(), String>)>,
     next_recompile_token: u64,
+    /// `recompile_set`'s background compile stage (D-B3.14, OBI-207
+    /// P2-B3.1b): the multi-root generalisation of `pending_recompiles`/
+    /// `finished_recompiles`, same "tick installs as soon as it finishes"
+    /// contract.
+    pending_recompile_sets: Vec<(RecompileSetToken, RecompileSetJob)>,
+    finished_recompile_sets: Vec<(RecompileSetToken, crate::bcvm::RecompileReport)>,
+    next_recompile_set_token: u64,
     /// `account_create`/`account_login` (OBI-85): see `AccountsCtx`.
     account_auth: Box<dyn AccountAuth>,
     account_next_id: u64,
@@ -368,6 +375,14 @@ pub struct World {
 /// caller that asked for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RecompileToken(u64);
+
+/// Identifies one [`World::begin_recompile_set`] call (D-B3.14, OBI-207
+/// P2-B3.1b), so its eventual [`crate::bcvm::RecompileReport`] (in
+/// [`World::take_finished_recompile_sets`]) can be matched back to the
+/// caller that asked for it -- the multi-root generalisation of
+/// [`RecompileToken`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RecompileSetToken(u64);
 
 /// `tick_share_per_min`'s per-uid sliding-window tick usage (OBI-121 S2c
 /// §3, OBI-137 S2). A true 60-slot sliding window (design note: "for
@@ -475,6 +490,9 @@ impl World {
             pending_recompiles: Vec::new(),
             finished_recompiles: Vec::new(),
             next_recompile_token: 0,
+            pending_recompile_sets: Vec::new(),
+            finished_recompile_sets: Vec::new(),
+            next_recompile_set_token: 0,
             account_auth: Box::new(NullAccountAuth),
             account_next_id: 0,
             account_pending: HashMap::new(),
@@ -989,6 +1007,7 @@ impl World {
     /// (AC 3: "its execution reports quota uid = the apprentice's").
     pub fn tick(&mut self, host: &mut dyn Host) {
         self.poll_recompiles(host);
+        self.poll_recompile_sets(host);
         let due = self.scheduler.advance();
         let world_tick = self.scheduler.tick();
         let interval = self.limits.heartbeat_interval_ticks.max(1);
@@ -1412,6 +1431,150 @@ impl World {
     /// there is no exporter wired up yet.
     pub fn cow_copies_total(&self, program: &str) -> u64 {
         self.registry.cow_metrics.get(program)
+    }
+
+    /// `loom_mudlib_sync_total{result=ok|compile_failed}` (D-B3.14): see
+    /// `bcvm::registry::SyncMetrics` for where/how this is collected and
+    /// why there is no exporter wired up yet (same posture as
+    /// `cow_copies_total`).
+    pub fn mudlib_sync_total(&self, result: &str) -> u64 {
+        self.registry.sync_metrics.get(result)
+    }
+
+    /// spec §7.2 D-B3.14 (P2-B3.1): recompile the changed, already-loaded
+    /// programs in `change_set` (plus their reverse-inherit dependents) as
+    /// one dependency-ordered, all-or-nothing batch. The world-thread
+    /// entry point B3.2's `GitWorker` calls after a merge to `main` is
+    /// pulled onto staging and `live` is fast-forwarded -- see
+    /// `bcvm::registry::RegistryHost::recompile_set` for the install-stage
+    /// semantics (master-first cache flush, all-or-nothing) and
+    /// `bcvm::registry::Compiler::recompile_set` for the compile stage.
+    ///
+    /// **OBI-207 (P2-B3.1b):** the compile stage (parse/check/codegen/
+    /// verify of the whole batch) now runs off the world thread -- see
+    /// [`Self::begin_recompile_set`]/[`Self::poll_recompile_sets`] for the
+    /// non-blocking entry point `GitWorker` should actually use. This
+    /// synchronous wrapper stays source-compatible with every existing
+    /// caller/test: it kicks off the same background compile and polls (1 ms sleep)
+    /// it to completion (no `tick`, no heartbeat/call_out side effect --
+    /// just the one background OS thread doing the compile work, same as
+    /// `begin_recompile_set` would, just waited out here instead of
+    /// returned as a token).
+    pub fn recompile_set(
+        &mut self,
+        change_set: &crate::bcvm::ChangeSet,
+        host: &mut dyn Host,
+    ) -> crate::bcvm::RecompileReport {
+        let token = self.begin_recompile_set(change_set);
+        loop {
+            self.poll_recompile_sets(host);
+            if let Some(pos) = self
+                .finished_recompile_sets
+                .iter()
+                .position(|(t, _)| *t == token)
+            {
+                return self.finished_recompile_sets.remove(pos).1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// `recompile_set`'s compile stage, off the world thread (D-B3.14,
+    /// OBI-207 P2-B3.1b) -- the multi-root generalisation of
+    /// [`Self::begin_recompile`]: returns immediately, nothing about this
+    /// call touches `self.registry`, so `tick`/`input`/`connect` in the
+    /// meantime are unaffected. `World::tick` (via [`Self::
+    /// poll_recompile_sets`]) installs the result -- registry mutation +
+    /// per-object migration, all-or-nothing, including the drift check --
+    /// on the world thread as soon as the background thread finishes; poll
+    /// [`Self::take_finished_recompile_sets`] for the
+    /// [`crate::bcvm::RecompileReport`], or [`Self::recompile_set_pending`]
+    /// to check without draining it.
+    pub fn begin_recompile_set(
+        &mut self,
+        change_set: &crate::bcvm::ChangeSet,
+    ) -> RecompileSetToken {
+        self.begin_recompile_set_after(change_set, std::time::Duration::ZERO)
+    }
+
+    /// [`Self::begin_recompile_set`], but the background thread sleeps for
+    /// `delay` before it starts compiling -- test/tooling support, same as
+    /// [`Self::begin_recompile_after`].
+    #[doc(hidden)]
+    pub fn begin_recompile_set_after(
+        &mut self,
+        change_set: &crate::bcvm::ChangeSet,
+        delay: std::time::Duration,
+    ) -> RecompileSetToken {
+        let token = RecompileSetToken(self.next_recompile_set_token);
+        self.next_recompile_set_token += 1;
+        let job = self.compiler.begin_recompile_set_after(
+            &self.root,
+            &self.registry,
+            &change_set.changed,
+            &change_set.deleted,
+            delay,
+        );
+        self.pending_recompile_sets.push((token, job));
+        token
+    }
+
+    /// Non-blocking: install every background batch compile that has
+    /// finished since the last call. `World::tick` calls this
+    /// automatically; also exposed directly, same as [`Self::
+    /// poll_recompiles`].
+    pub fn poll_recompile_sets(&mut self, host: &mut dyn Host) {
+        if self.pending_recompile_sets.is_empty() {
+            return;
+        }
+        let jobs = std::mem::take(&mut self.pending_recompile_sets);
+        let mut still_pending = Vec::new();
+        for (token, job) in jobs {
+            match job.poll() {
+                None => still_pending.push((token, job)),
+                Some(outcome) => {
+                    let changed = job.changed().to_vec();
+                    let deleted = job.deleted().to_vec();
+                    let begin_snapshot = job.begin_snapshot().clone();
+                    let master = self.master_or_sentinel();
+                    let report = self
+                        .exec(host, master, None, None, None, None, None, |h| {
+                            Ok(
+                                h.finish_recompile_set(
+                                    &changed,
+                                    &deleted,
+                                    &begin_snapshot,
+                                    outcome,
+                                ),
+                            )
+                        })
+                        .unwrap_or_else(|e| crate::bcvm::RecompileReport {
+                            recompiled: Vec::new(),
+                            upgraded_instances: 0,
+                            skipped_unloaded: Vec::new(),
+                            deleted_loaded: Vec::new(),
+                            failures: vec![("<world>".to_string(), e.report())],
+                        });
+                    self.finished_recompile_sets.push((token, report));
+                }
+            }
+        }
+        self.pending_recompile_sets = still_pending;
+    }
+
+    /// Every background batch compile that has finished (successfully
+    /// installed, or reported failures) since the last call, oldest first.
+    /// Draining is destructive: call it once per token you care about.
+    pub fn take_finished_recompile_sets(
+        &mut self,
+    ) -> Vec<(RecompileSetToken, crate::bcvm::RecompileReport)> {
+        std::mem::take(&mut self.finished_recompile_sets)
+    }
+
+    /// True while `token`'s background batch compile is still running (not
+    /// yet picked up by `poll_recompile_sets`/`tick`).
+    pub fn recompile_set_pending(&self, token: RecompileSetToken) -> bool {
+        self.pending_recompile_sets.iter().any(|(t, _)| *t == token)
     }
 
     /// `loom_tier_quota_breaches_total{tier,quota}` (OBI-121 S2c): see
