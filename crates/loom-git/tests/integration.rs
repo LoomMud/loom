@@ -114,26 +114,33 @@ impl Fixture {
         &self.work_tree
     }
 
-    /// Read `path` (work-tree relative) from a fresh clone of the bare
-    /// remote's `live/<env>` branch, so assertions never depend on the
-    /// driver's own work tree having been fast-forwarded yet.
+    /// Read `path` (work-tree relative) from the bare remote's
+    /// `live/<env>` branch, so assertions never depend on the driver's own
+    /// work tree having been fast-forwarded yet.
+    ///
+    /// OBI-222: this used to spin up a brand-new `git clone` (new temp
+    /// dir, full checkout) on *every* `wait_for` poll -- cheap on an idle
+    /// box, but on a loaded self-hosted runner each clone can itself take
+    /// much longer than the 20ms poll interval, so the polling loop's own
+    /// cost dominates the `wait_for` budget instead of the thing it's
+    /// actually waiting on (the push). `git show <ref>:<path>` reads the
+    /// blob straight out of the bare repo's object store -- no temp dir,
+    /// no working tree, no index -- so polling stays cheap regardless of
+    /// runner load.
     fn remote_live_file(&self, env: &str, path: &str) -> Option<String> {
-        let clone = self.tmp.path().join(format!("peek-{}", rand_suffix()));
         let out = Command::new("git")
             .args([
-                "clone",
-                "--quiet",
-                "-b",
-                &format!("live/{env}"),
+                "--git-dir",
                 &self.bare.to_string_lossy(),
-                &clone.to_string_lossy(),
+                "show",
+                &format!("live/{env}:{path}"),
             ])
             .output()
             .ok()?;
         if !out.status.success() {
             return None;
         }
-        std::fs::read_to_string(clone.join(path)).ok()
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     fn remote_has_ref(&self, ref_name: &str) -> bool {
@@ -150,16 +157,6 @@ impl Fixture {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-}
-
-fn rand_suffix() -> String {
-    format!(
-        "{:x}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    )
 }
 
 fn setup() -> Fixture {
@@ -288,10 +285,20 @@ fn spawn_worker_no_token(
     (handle, calls)
 }
 
+// OBI-222: was 10s. The worker's own debounce/coalesce/tick budget in
+// `spawn_worker` adds up to well under 100ms on an idle box, so 10s
+// looked like a generous margin -- but on a loaded self-hosted ARC
+// runner (other workflow jobs sharing the node, cgroup CPU throttling)
+// every `git` subprocess call in the polling predicate can itself stall
+// for seconds, and the two observed flakes (OBI-222) both happened
+// during exactly that kind of contention. 30s gives real headroom
+// without the fixture ever being expected to actually need it in the
+// unloaded case. See also the `remote_live_file` fix in this same patch,
+// which removed the main source of per-poll cost.
 fn wait_for<F: FnMut() -> bool>(mut pred: F, what: &str) {
     let start = Instant::now();
     while !pred() {
-        if start.elapsed() > Duration::from_secs(10) {
+        if start.elapsed() > Duration::from_secs(30) {
             panic!("timed out waiting for: {what}");
         }
         std::thread::sleep(Duration::from_millis(20));
