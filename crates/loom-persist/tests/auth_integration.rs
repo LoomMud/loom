@@ -698,3 +698,163 @@ async fn staff_row_removal_revokes_every_session_for_the_uid() {
         "the session row must be gone (cascaded), not just left unrevoked"
     );
 }
+
+// -----------------------------------------------------------------------
+// OBI-198 must-fix 2: a rotation and a revoke-all for the same uid must
+// serialize on the `staff` row lock, so no interleaving leaves an
+// unrevoked session behind. Both orderings are forced deterministically
+// with a held transaction on a second connection.
+// -----------------------------------------------------------------------
+
+async fn unrevoked_sessions_for(owner: &sqlx::PgPool, uid: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM staff_sessions WHERE staff_uid = $1 AND revoked_at IS NULL",
+    )
+    .bind(uid)
+    .fetch_one(owner)
+    .await
+    .unwrap()
+}
+
+/// Revoke-all first: a tier change is in flight (its transaction holds
+/// the `staff` row lock and has already revoked every session). A
+/// concurrent `session_rotate` must block until it commits, then refuse
+/// to rotate, so it cannot insert a fresh session the revoke never saw.
+/// (The revoke's row lock on the old session row also serializes this
+/// ordering; the test pins the observable behaviour, not which lock.)
+#[tokio::test]
+async fn session_rotate_blocks_behind_an_in_flight_revoke_all_and_then_refuses() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("merry4");
+    let account = seed_account(&fx.owner, &unique_uid("merry4-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let old_hash = "race-b-old".to_string() + &"n".repeat(8);
+    let new_hash = "race-b-new".to_string() + &"o".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &old_hash, expires_at, "sid-race-b", &[], None)
+        .await
+        .unwrap();
+
+    // Tier change, left uncommitted: the AFTER UPDATE trigger has run and
+    // this transaction now holds the staff row's lock.
+    let mut revoke_tx = fx.owner.begin().await.unwrap();
+    sqlx::query("UPDATE staff SET tier = 2 WHERE uid = $1")
+        .bind(&uid)
+        .execute(&mut *revoke_tx)
+        .await
+        .unwrap();
+
+    let rotate_done = std::sync::atomic::AtomicBool::new(false);
+    let cutoff = OffsetDateTime::now_utc() - Duration::days(1);
+    let rotate = async {
+        let outcome = fx.app.session_rotate(&old_hash, &new_hash, cutoff).await;
+        rotate_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        outcome
+    };
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !rotate_done.load(std::sync::atomic::Ordering::SeqCst),
+            "session_rotate must block on the staff row lock held by the in-flight revoke"
+        );
+        revoke_tx.commit().await.unwrap();
+    };
+    let (outcome, ()) = tokio::join!(rotate, release);
+
+    assert!(
+        !matches!(
+            outcome.unwrap(),
+            loom_persist::SessionRotateOutcome::Rotated { .. }
+        ),
+        "a rotation serialized after a revoke-all must not succeed"
+    );
+    assert_eq!(unrevoked_sessions_for(&fx.owner, &uid).await, 0);
+}
+
+/// Rotation first: a rotation has taken the `staff` row lock and
+/// inserted its new session but not committed yet. A concurrent password
+/// change must block on that lock, and once it proceeds its revoke must
+/// see (and revoke) the newly inserted session.
+///
+/// Password change (the `accounts` trigger) rather than a tier change on
+/// purpose: an `UPDATE staff` conflicts with the rotation's `FOR SHARE`
+/// on its own, so only the `accounts`/`github_identities` triggers
+/// depend on the explicit `FOR UPDATE` in `staff_sessions_revoke_for_uid`.
+/// Without it, this test fails with the new row left unrevoked.
+///
+/// The in-flight rotation is driven by hand on a second connection using
+/// the same lock function and statements as `Persist::session_rotate`,
+/// so the test can hold it open across the race window.
+#[tokio::test]
+async fn revoke_all_blocks_behind_an_in_flight_rotation_and_still_revokes_its_new_row() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("eowyn4");
+    let account = seed_account(&fx.owner, &unique_uid("eowyn4-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let old_hash = "race-a-old".to_string() + &"p".repeat(8);
+    let new_hash = "race-a-new".to_string() + &"q".repeat(8);
+    fx.app
+        .refresh_token_insert(&uid, &old_hash, expires_at, "sid-race-a", &[], None)
+        .await
+        .unwrap();
+
+    let mut rotate_tx = fx.owner.begin().await.unwrap();
+    sqlx::query("SELECT staff_sessions_lock_for_rotate($1)")
+        .bind(&uid)
+        .execute(&mut *rotate_tx)
+        .await
+        .unwrap();
+    let consumed = sqlx::query(
+        "UPDATE staff_sessions SET revoked_at = NOW()
+         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()
+         RETURNING staff_uid",
+    )
+    .bind(&old_hash)
+    .fetch_optional(&mut *rotate_tx)
+    .await
+    .unwrap();
+    assert!(consumed.is_some());
+    sqlx::query(
+        "INSERT INTO staff_sessions (staff_uid, token_hash, expires_at, sid, amr, mfa_at, last_used_at)
+         VALUES ($1, $2, $3, 'sid-race-a', '{}', NULL, NOW())",
+    )
+    .bind(&uid)
+    .bind(&new_hash)
+    .bind(expires_at)
+    .execute(&mut *rotate_tx)
+    .await
+    .unwrap();
+
+    let revoke_done = std::sync::atomic::AtomicBool::new(false);
+    let revoke = async {
+        let result = sqlx::query("UPDATE accounts SET password_hash = 'rotated-pw' WHERE id = $1")
+            .bind(account)
+            .execute(&fx.owner)
+            .await;
+        revoke_done.store(true, std::sync::atomic::Ordering::SeqCst);
+        result
+    };
+    let release = async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !revoke_done.load(std::sync::atomic::Ordering::SeqCst),
+            "the password change must block on the staff row lock held by the in-flight rotation"
+        );
+        rotate_tx.commit().await.unwrap();
+    };
+    let (result, ()) = tokio::join!(revoke, release);
+    result.unwrap();
+
+    assert!(session_is_revoked(&fx.owner, &new_hash).await);
+    assert_eq!(unrevoked_sessions_for(&fx.owner, &uid).await, 0);
+}
