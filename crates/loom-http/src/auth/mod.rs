@@ -179,10 +179,20 @@ impl std::error::Error for AuthError {}
 /// (T3) may act (within `roles_set_tier`'s own, narrower SQL rules), but
 /// nothing below that.
 pub const ADMIN_ROLE_CHANGE_MIN_TIER: i16 = 3;
+/// Tier floor for the server-wide staff broadcast (OBI-233, M-ADM-2):
+/// strictly higher than role changes -- a domain lead (T3) can promote
+/// within their own narrower SQL rules, but every connected session
+/// seeing a message is a bigger blast radius, so this wants an
+/// arch/root-equivalent tier.
+pub const ADMIN_BROADCAST_MIN_TIER: i16 = 4;
 /// Step-up MFA freshness window for role changes, grants, another user's
 /// TOTP reset, and broadcast (M-ADM-2): `mfa_at` must be within this many
 /// seconds of "now".
 pub const STEP_UP_WINDOW_SECS: i64 = 5 * 60;
+/// Hard cap on a broadcast body, in bytes (OBI-233, M-ADM-5): measured
+/// *before* sanitization, on the UTF-8 byte length of the request's
+/// `text` field.
+pub const BROADCAST_MAX_BYTES: usize = 1024;
 
 /// A failure from one of the admin (OBI-185) actions on [`AuthService`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +216,8 @@ pub enum AdminError {
     Rejected(String),
     /// The directory (Postgres) failed outright.
     DirectoryUnavailable,
+    /// The broadcast body was over [`BROADCAST_MAX_BYTES`] (M-ADM-5).
+    BodyTooLarge,
 }
 
 impl From<AdminDirectoryError> for AdminError {
@@ -912,6 +924,71 @@ impl AuthService {
         Ok(rows)
     }
 
+    /// Server-wide staff broadcast (OBI-233, M-ADM-2/4/5): tier >=
+    /// [`ADMIN_BROADCAST_MIN_TIER`] and step-up fresh, exactly like
+    /// [`Self::admin_set_tier`]'s checks, but gated at a higher tier
+    /// floor given the blast radius (every connected session). The size
+    /// cap (M-ADM-5) is enforced here, on the *raw* body, before
+    /// sanitization -- rejecting an oversized body rather than silently
+    /// truncating it. On success, returns the sanitized text
+    /// ([`sanitize_broadcast_text`]) for the caller (`admin.rs`) to hand
+    /// to `loom-net`'s `NetCommand::Broadcast`; this method never talks
+    /// to `loom-net` itself; it only decides and audits. Every outcome --
+    /// forbidden, step-up required, too large, or allowed -- is audited.
+    pub async fn admin_broadcast(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        text: &str,
+    ) -> Result<String, AdminError> {
+        if claims.tier < ADMIN_BROADCAST_MIN_TIER {
+            self.audit(
+                "admin.broadcast",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some("reason=forbidden".to_string()),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        if !self.has_fresh_step_up(claims) {
+            self.audit(
+                "admin.broadcast",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some("reason=step_up_required".to_string()),
+            )
+            .await;
+            return Err(AdminError::StepUpRequired);
+        }
+        if text.len() > BROADCAST_MAX_BYTES {
+            self.audit(
+                "admin.broadcast",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!("reason=body_too_large bytes={}", text.len())),
+            )
+            .await;
+            return Err(AdminError::BodyTooLarge);
+        }
+        let sanitized = sanitize_broadcast_text(text);
+        // M-IDE-2/M-ADM-4: the audited `detail` is the same plain-text
+        // string delivered to sessions -- never raw, unsanitized input,
+        // and never rendered as HTML by the admin UI.
+        self.audit(
+            "admin.broadcast",
+            Some(claims.sub.clone()),
+            ctx,
+            "allow",
+            Some(format!("text={sanitized}")),
+        )
+        .await;
+        Ok(sanitized)
+    }
+
     /// M-ADM-2: a session is "stepped up" if its `mfa_at` is within the
     /// last 5 minutes. A session that never completed a second factor
     /// (`mfa_at: None`, e.g. a sub-T3 password-only login) is never
@@ -958,6 +1035,31 @@ fn totp_gate_detail(error: &AuthError) -> &'static str {
         AuthError::InvalidCredentials => "staff_row_missing",
         _ => "totp_gate_failed",
     }
+}
+
+/// M-ADM-5: strip every C0 (`U+0000..=U+001F`) and C1 (`U+0080..=U+009F`)
+/// control character except `\n`, plus DEL (`U+007F`) -- not strictly C0/C1,
+/// but still a control character with no safe plain-text rendering, and
+/// the same category the design note's "strip control characters" is
+/// guarding against (M-IDE-2: plain-text only, no escape-sequence or
+/// terminal-control smuggling through the admin UI or any client's
+/// terminal). `\r` is deliberately stripped too (not excepted like
+/// `\n`): the only line terminator a broadcast body needs is `\n`, and
+/// `loom-net`'s own wire framing (`to_wire`) already turns every `\n`
+/// into `\r\n` for telnet -- letting a client-supplied `\r` through
+/// would risk a raw, unescaped carriage return reaching the wire via the
+/// WebSocket path (which does not go through `to_wire`).
+fn sanitize_broadcast_text(input: &str) -> String {
+    input
+        .chars()
+        .filter(|&c| {
+            if c == '\n' {
+                return true;
+            }
+            let code = c as u32;
+            !(code <= 0x1F || code == 0x7F || (0x80..=0x9F).contains(&code))
+        })
+        .collect()
 }
 
 /// The rate limiter's account key for a resolved staff uid (OBI-204): the

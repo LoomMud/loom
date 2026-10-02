@@ -54,6 +54,7 @@ pub struct HttpState {
     auth: Option<auth::AuthService>,
     github: Option<std::sync::Arc<dyn auth::GithubIdentityProvider>>,
     github_webhook: Option<webhook::GithubWebhookConfig>,
+    net_commands: Option<mpsc::Sender<loom_net::NetCommand>>,
 }
 
 impl HttpState {
@@ -70,6 +71,7 @@ impl HttpState {
             auth: None,
             github: None,
             github_webhook: None,
+            net_commands: None,
         }
     }
 
@@ -109,6 +111,24 @@ impl HttpState {
     pub fn with_github_webhook(mut self, config: webhook::GithubWebhookConfig) -> Self {
         self.github_webhook = Some(config);
         self
+    }
+
+    /// Wire `POST /api/v1/admin/broadcast` (OBI-233) to the world/net
+    /// thread's own `NetCommand` channel -- the same one `loom-cli`
+    /// passes to `loom_net::run_server_with_ws` -- so a broadcast is
+    /// delivered through the normal output path (`NetCommand::Broadcast`),
+    /// never a side channel. Unset by default: without it, `admin.rs`
+    /// answers `503` for the broadcast route, same "optional" shape as
+    /// `with_auth`.
+    pub fn with_net_commands(mut self, net_commands: mpsc::Sender<loom_net::NetCommand>) -> Self {
+        self.net_commands = Some(net_commands);
+        self
+    }
+
+    /// `Some` iff [`Self::with_net_commands`] was called -- used by
+    /// `admin.rs` to deliver a sanitized broadcast.
+    pub(crate) fn net_commands(&self) -> Option<&mpsc::Sender<loom_net::NetCommand>> {
+        self.net_commands.as_ref()
     }
 }
 
