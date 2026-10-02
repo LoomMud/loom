@@ -101,7 +101,13 @@ cannot merge (branch protection lists it alongside `rust`/`deny`/`dco`/
 (`results/ci-e1-1.*`, also `.gitignore`d — CI runners vary in CPU/host
 noise from the reference host above, so this job proves "no regression
 *on this runner*", not the headline number; the committed reports above
-remain the reference-host record).
+remain the reference-host record). As of this gate landing, the scraped
+`/metrics` body is typically empty in CI runs: `loom-net`/the world
+thread don't yet record any `metrics::counter!`/`histogram!` values on
+the connection/command path, so there's nothing for `loom-obs`'s
+recorder to render. That's a separate instrumentation gap, not a bug in
+the scrape itself -- `--metrics-url` will start carrying real server-side
+histograms once that lands.
 
 ## Limitations
 
