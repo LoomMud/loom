@@ -93,6 +93,8 @@ const NAMES: &[&str] = &[
     "seteuid",
     "read_file",
     "write_file",
+    "save_object",
+    "restore_object",
     "unguarded",
     "roles_tier",
     "roles_is_member",
@@ -244,6 +246,16 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
             2,
             Ret::Ty(Ty::Bool),
             P1,
+        ),
+        // OBI-171 (spec §8.1): see `loom_vm::efuns` for the authoritative
+        // arity/privilege/tick cost.
+        "save_object" => ("save_object", vec![P(s.clone())], 1, Ret::Ty(Ty::Bool), P1),
+        "restore_object" => (
+            "restore_object",
+            vec![P(s.clone())],
+            1,
+            Ret::Ty(Ty::Bool),
+            P0,
         ),
         "unguarded" => (
             "unguarded",
