@@ -90,6 +90,13 @@ pub struct RunReport {
     pub login_latency: Option<LatencyReport>,
     pub e1_1_pass: bool,
     pub notes: Vec<String>,
+    /// Raw `/metrics` scrape from `loom-http` at the end of the run
+    /// (OBI-177), if `--metrics-url` was given. Not parsed/aggregated here
+    /// -- bot-side latency remains the E1.1 source of truth -- this is
+    /// just carried through so a report has the server's own counters
+    /// alongside the bot's view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_metrics: Option<String>,
 }
 
 impl RunReport {
@@ -150,6 +157,12 @@ impl RunReport {
             for n in &self.notes {
                 out.push_str(&format!("- {n}\n"));
             }
+            out.push('\n');
+        }
+        if let Some(m) = &self.server_metrics {
+            out.push_str(&format!(
+                "## Server-side metrics (`/metrics` scrape, OBI-177)\n\n```\n{m}\n```\n"
+            ));
         }
         out
     }
@@ -206,6 +219,7 @@ mod tests {
             login_latency: None,
             e1_1_pass: true,
             notes: vec![],
+            server_metrics: None,
         };
         let md = report.to_markdown();
         assert!(md.contains("PASS"));
