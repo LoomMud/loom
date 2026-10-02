@@ -142,17 +142,111 @@ the efun returns `false`. There is no `runtime_error` apply wired up yet
 to report this to (tracked separately); the detail goes to stderr in
 the meantime.
 
+## Authorization: the master's save-path contract (CTO review, PR #75)
+
+`save_object`/`restore_object` go through the ordinary `valid_write`/
+`valid_read` applies (P1/P0 respectively), same as `write_file`/
+`read_file` — but the path they hand the master is **not** a mudlib VFS
+path. It is the save-namespace path (the efun's own `path` argument,
+without the trailing `.o`), with `op = "save_object"` / `"restore_object"`
+so a master can tell the two efuns apart from `write_file`/`read_file`
+in the same apply.
+
+**A master that treats this like an ordinary `valid_write`/`valid_read`
+VFS-path check is a privilege-escalation bug, not a hardening gap.**
+Concretely:
+
+- If a master grants a builder tier write access to `/players` (or, worse,
+  to `/` as a catch-all), that same rule now lets that builder
+  `save_object("/players/anyone")` and overwrite **any other player's**
+  save — `valid_write`'s path argument looks exactly like a normal VFS
+  write target, but the effect is clobbering someone else's persistent
+  state, not writing a file under their own tree.
+- `restore_object` is **P0** (every object may call it on itself — see
+  `RegistryHost::dispatch_efun`'s `Privilege::P0` on the `"restore_object"`
+  arm). Any object whose program chain happens to declare the same
+  `persistent` vars (by `(declaring program, name)`, not by path) can
+  `restore_object` another player's save path into *itself* and read
+  that player's persistent state into its own vars — `valid_read`
+  returning `true` for a path that merely looks like "this player's own
+  file" is not enough; it must check that the path *is* the calling
+  object's own save path.
+
+The master **must** confine both efuns' `op == "save_object" ||
+op == "restore_object"` cases to the caller's own save path (e.g. derived
+from the connected account/player's own identity, never from a
+caller-suppliable path alone) — a blanket `/players/**` or `/` write/read
+grant that is otherwise fine for `write_file`/`read_file` is **not** fine
+here. `loom-vm`'s own fixtures (`tests/fixtures/*/secure/master.wf`) are
+intentionally permissive (`valid_write`/`valid_read` always `true`) —
+that is a test-only stance for exercising the efuns' own mechanics, not a
+model for a real mudlib's master. Warp's own master enforces this
+confinement on the live path (OBI-172, warp autosave).
+
+## `disk_quota_mb` (OBI-137 S1, CTO review on PR #75, must-fix 2)
+
+`save_object` is charged against `disk_quota_mb` the same way
+`write_file` is, through the same `crate::disk_usage::DiskUsage`
+seeded-once/`O(1)`-after counter and the same non-raising-`Ok(false)`-on-
+breach shape — but keyed differently, because a save path carries no uid
+in its text the way `/builders/<u>/**` does:
+
+- `write_file`'s `check_disk_quota` attributes a write to the `<u>`
+  *named in the path* (the directory's owner, not the caller).
+- `save_object`'s `check_save_disk_quota` instead attributes the save to
+  the **writing object's own uid** (`principal_of(self_object()).uid`) —
+  the same uid the authorization contract above is responsible for
+  keeping confined to its own save path in the first place.
+- The counter is seeded from `World::save_root()`
+  (`DiskUsage::seeded_save_total`), a single `metadata()` stat on the
+  uid's own save file rather than a directory walk — the authorization
+  contract above means there is nothing to recursively walk (one uid,
+  one save path), unlike `/builders/<u>/**`'s whole subtree.
+- Both pools share one counter per `<u>`: `disk_quota_mb` is one number
+  covering everything `<u>` has on disk, builder-authored source and the
+  uid's own save file alike.
+
+An over-quota save returns `false` (never raises) and never touches
+disk, same as an over-quota `write_file`. Unit/integration-tested at
+`crates/loom-vm/tests/quotas.rs`'s
+`disk_quota_mb_row_denies_a_save_object_that_would_exceed_the_quota`.
+
 ## Atomicity: crash during write leaves the old save intact
 
 `save_object` writes through `crate::fileio::write_file_atomic`:
 content is written to a sibling temp file in the same directory,
-`fsync`ed, then atomically `rename`d over the target. A crash (process
-kill, power loss, OOM-kill) at any point before the rename leaves
-whatever was already saved completely untouched — there is no window
-where a reader observes a half-written save. Unit-tested directly at
+`fsync`ed, then atomically `rename`d over the target, then the **parent
+directory itself is `fsync`ed** (CTO review, PR #75, must-fix 4). A
+crash (process kill, power loss, OOM-kill) at any point before the
+rename leaves whatever was already saved completely untouched — there
+is no window where a reader observes a half-written save. The parent-
+directory `fsync` closes a second, subtler window: a `rename()` syscall
+returning success only makes the new directory entry *visible*, not
+necessarily *durable* — without fsyncing the directory, a power loss
+shortly after a successful `rename()` can roll the directory entry back
+on the next boot even though `save_object` already returned `true`
+(the old save would still be intact, same as the first window, but the
+new one the caller was told succeeded could vanish). Unit-tested
+directly at
 `loom-vm::fileio::tests::crash_before_rename_leaves_the_previous_save_intact`,
-which drives exactly that window (temp file staged, rename never
+which drives the pre-rename window (temp file staged, rename never
 called) without needing to actually kill a process mid-write.
+
+The temp file itself is created with `OpenOptions::new().write(true)
+.create_new(true)` (O_EXCL), not `File::create` (CTO review, PR #75,
+must-fix 3): `File::create` truncates-or-creates and **follows** a
+symlink already planted at the tmp-file's exact name, so a symlink
+planted there pointing outside `save_root` would have the write go
+through it. `create_new` fails outright on anything already at that
+path instead of following it. A stale tmp file from an earlier crashed
+attempt in the *same still-running process* (same pid, so the same tmp
+name) is cleared with a plain `remove_file` immediately before
+`create_new` — `unlink`/`remove_file` always targets the link/file entry
+itself, never what a symlink there points to, so this clears a stale tmp
+file without ever writing through a symlink planted in its place.
+Tested at `loom-vm::fileio::tests::
+stage_write_clears_a_stale_tmp_file_from_an_earlier_crashed_attempt`
+and `::stage_write_does_not_follow_a_symlink_planted_at_the_tmp_name`.
 
 ## Driver-side autosave hooks
 

@@ -415,6 +415,67 @@ fn disk_quota_mb_counter_stays_correct_across_overwrite_shrink_and_a_later_write
     );
 }
 
+// -- disk_quota_mb on save_object into the save root (OBI-171) --------------
+
+/// CTO review on PR #75, must-fix 2: `save_object` must go through
+/// `disk_quota_mb` the same way `write_file` does -- charged to the
+/// *writing object's own uid* (`appr`, since a save path carries no uid
+/// in its text the way `/builders/<u>/**` does), seeded from the save
+/// root instead of the mudlib root.
+#[test]
+fn disk_quota_mb_row_denies_a_save_object_that_would_exceed_the_quota() {
+    let (mut world, mut host) = boot();
+    world.set_save_root(common::scratch("quotas-save-root"));
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"disk_quota_mb": 1}"#)));
+
+    // Within quota: comfortably under 1 MB including the JSON envelope's
+    // own overhead.
+    let small = "a".repeat(700_000);
+    world
+        .call(workroom, "set_blob", vec![Value::str(&small)], &mut host)
+        .expect("set_blob");
+    let ok = world
+        .call(
+            workroom,
+            "save_disk",
+            vec![Value::str("/appr-save")],
+            &mut host,
+        )
+        .expect("a save within quota must not raise");
+    assert!(matches!(ok, Value::Bool(true)), "{ok:?}");
+
+    // Over quota: a second, larger save to a *different* path must be
+    // rejected -- `false`, not an error -- and must not land on disk.
+    let big = "a".repeat(900_000);
+    world
+        .call(workroom, "set_blob", vec![Value::str(&big)], &mut host)
+        .expect("set_blob");
+    let audit_before = world.audit_log().len();
+    let result = world
+        .call(
+            workroom,
+            "save_disk",
+            vec![Value::str("/appr-save-2")],
+            &mut host,
+        )
+        .expect("an over-quota save_object must not raise");
+    assert!(matches!(result, Value::Bool(false)), "{result:?}");
+    let new_entries = &world.audit_log()[audit_before..];
+    assert!(
+        new_entries
+            .iter()
+            .any(|e| e.apply == "quota" && e.efun == "disk_quota_mb" && !e.allowed),
+        "expected a disk_quota_mb audit entry, got {new_entries:?}"
+    );
+    assert!(
+        !world.save_root().join("appr-save-2.o").exists(),
+        "a rejected save must not land on disk"
+    );
+}
+
 // -- move_to confinement (spec ยง7) -------------------------------------------
 
 #[test]

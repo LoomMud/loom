@@ -630,6 +630,7 @@ impl World {
             pending_recompile_sets: Vec::new(),
             finished_recompile_sets: Vec::new(),
             next_recompile_set_token: 0,
+            save_root: default_save_root(mudlib_root),
             account_auth: Box::new(NullAccountAuth),
             account_next_id: 0,
             account_pending: HashMap::new(),
