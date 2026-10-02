@@ -5,6 +5,11 @@
 // `max_mem_exec_mb`) or on whatever `/daemons/thing` R1 confines its
 // clone's owner to -- none of them depend on who is calling.
 var data: [int] = []
+persistent var blob: string = ""
+
+pub fn set_blob(s: string) {
+    blob = s
+}
 
 pub fn grow(n: int) {
     // Double the array by self-concatenation (O(log n) concats, each
@@ -29,6 +34,14 @@ pub fn spawn_daemon() -> object {
 
 pub fn write_disk(p: string, text: string) -> bool {
     return write_file(p, text)
+}
+
+// OBI-171 (CTO review on PR #75, must-fix 2): `save_object`'s own
+// `disk_quota_mb` charge, keyed on *this object's own uid* (`appr`) --
+// unlike `write_disk` above, the save path carries no uid in its text at
+// all, so there is nothing here for the quota check to parse out of `p`.
+pub fn save_disk(p: string) -> bool {
+    return save_object(p)
 }
 
 // CTO review N4 fixture: calls through a mudlib-owned `/std` helper

@@ -1058,6 +1058,7 @@ impl Compiler {
                             ty: loom_compiler::bytecode::decode_ty(&v.ty_bytes)
                                 .map_err(|e| format!("{}: corrupt var type: {e}", wp.path))?,
                             has_init: v.has_init,
+                            persistent: v.persistent,
                         })
                     })
                     .collect::<Result<_, String>>()?;
@@ -3186,6 +3187,60 @@ impl<'a> RegistryHost<'a> {
         Ok(true)
     }
 
+    /// `disk_quota_mb` for `save_object` (OBI-171, CTO review on PR #75,
+    /// must-fix 2): `check_disk_quota` attributes a write to the `<u>`
+    /// named *in the path* (`/builders/<u>/**`), but a save path carries
+    /// no uid in its text at all -- so without this, any P1 object could
+    /// fill the disk by calling `save_object` against arbitrarily many
+    /// paths, entirely outside `disk_quota_mb`. Instead this charges the
+    /// *writing* object's own uid (`principal_of(self_object()).uid`),
+    /// the same principal the master's save-path authorization contract
+    /// (`docs/save-objects.md`) is responsible for confining each save to
+    /// in the first place. Same seeded-once/`O(1)`-after contract and the
+    /// same non-raising `Ok(false)`-on-breach shape as `check_disk_quota`;
+    /// see [`crate::disk_usage::DiskUsage::seeded_save_total`] for why the
+    /// seed here is one `metadata()` stat instead of a directory walk.
+    fn check_save_disk_quota(&mut self, save_file_rel: &str, new_bytes: u64) -> R<bool> {
+        let Some(driver) = self.driver.as_ref() else {
+            return Ok(true);
+        };
+        let uid = principal_of(self.registry, self.self_object()).uid;
+        let u = self.registry.syms.name(uid).to_string();
+        if crate::quota::is_unlimited_uid(&u) {
+            return Ok(true);
+        }
+        let tier = driver.roles.tier(&u);
+        let Some(max_mb) =
+            crate::quota::resolve(&driver.roles, &u, self.quota_defaults()).disk_quota_mb
+        else {
+            return Ok(true);
+        };
+        let save_root = driver.save_root.clone();
+        let old_bytes = crate::fileio::file_size_bytes(&save_root, save_file_rel).unwrap_or(0);
+        let max_bytes = max_mb.saturating_mul(crate::quota::MB);
+        let driver = self.driver.as_mut().expect("checked above");
+        let seeded = driver
+            .disk_usage
+            .seeded_save_total(&save_root, &u, save_file_rel);
+        let projected = seeded.saturating_sub(old_bytes).saturating_add(new_bytes);
+        if projected > max_bytes {
+            self.registry
+                .quota_breaches
+                .record(tier, crate::quota::DISK_QUOTA_MB);
+            self.audit_quota_denial(
+                crate::quota::DISK_QUOTA_MB,
+                format!(
+                    "disk_quota_mb quota exceeded for `{u}` ({projected} bytes would be in \
+                     use for save_object(\"{save_file_rel}\"), quota is {max_bytes} bytes)"
+                ),
+            );
+            return Ok(false);
+        }
+        let driver = self.driver.as_mut().expect("checked above");
+        driver.disk_usage.note_write(&u, old_bytes, new_bytes);
+        Ok(true)
+    }
+
     /// Run apply `name` on `on` from a **cut** (an empty guard stack
     /// entry, D-S1.2 rule 5) with its own [`APPLY_TICKS`] budget, not
     /// charged to the caller. `evaluating` is the euid
@@ -5078,6 +5133,9 @@ impl<'a> RegistryHost<'a> {
             skipped_unloaded: set.skipped_unloaded,
             deleted_loaded: set.deleted_loaded,
             failures: Vec::new(),
+        }
+    }
+
     /// `<path>` normalised to the on-disk save-file name `save_object`/
     /// `restore_object` use under the save root: `.o` appended unless
     /// already present (classic LPMud convention: `save_object("bob")`
@@ -5134,13 +5192,22 @@ impl<'a> RegistryHost<'a> {
         });
         let text =
             serde_json::to_string(&doc).map_err(|e| RtError::new(format!("save_object(): {e}")))?;
+        let save_file = Self::save_file_name(raw_path);
+        if !self.check_save_disk_quota(&save_file, text.len() as u64)? {
+            // Same shape as `write_file`'s own `disk_quota_mb` breach
+            // (OBI-137 S1): over quota is not an error, so `upgrade()`'s
+            // caller-visible contract (never silently mutating on a
+            // rejected save) still holds -- this runs before the write,
+            // not after.
+            return Ok(false);
+        }
         let save_root = self
             .driver
             .as_ref()
             .expect("checked above")
             .save_root
             .clone();
-        crate::fileio::write_file_atomic(&save_root, &Self::save_file_name(raw_path), &text)
+        crate::fileio::write_file_atomic(&save_root, &save_file, &text)
             .map_err(|e| RtError::new(format!("save_object(\"{raw_path}\") failed: {e}")))
     }
 

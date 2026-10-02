@@ -781,6 +781,7 @@ fn run_recompile_set(
                 name: v.name.to_string(),
                 ty_bytes: bytecode::encode_ty(&v.ty),
                 has_init: v.has_init,
+                persistent: v.persistent,
             })
             .collect();
         programs.push(WireProgram {
