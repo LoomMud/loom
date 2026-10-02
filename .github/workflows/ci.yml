@@ -260,6 +260,7 @@ jobs:
             --slow-reader-fraction 0.1 \
             --metrics-url http://127.0.0.1:4001/metrics \
             --out results/ci-e1-1 \
+            --sla-p99-ms 0.001 \
             --fail-on-sla-miss
           status=$?
           kill "$(cat /tmp/loom-serve.pid)" || true
