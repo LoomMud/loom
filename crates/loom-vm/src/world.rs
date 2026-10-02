@@ -968,6 +968,65 @@ impl World {
         }
     }
 
+    /// Copyover handoff, new-process side (design §7.5 step 3, OBI-221):
+    /// call once per connection the driver has just re-adopted (its raw
+    /// fd handed over by the supervisor via `loom-supervise`'s
+    /// `SCM_RIGHTS` fd-passing and turned into a live `loom-net` session
+    /// bound to this same `conn` id) after loading a world from
+    /// [`World::load_snapshot`]. Unlike [`World::connect`], the
+    /// conn->object binding already exists -- restored verbatim from the
+    /// snapshot's connection table (`registry.conns`/`bind_seq`, OBI-173)
+    /// -- so this does *not* call master's `connect()`/`logon()` again;
+    /// it only gives the bound object a hook to re-bind any local state
+    /// (e.g. re-subscribe GMCP, print a reconnect banner) to its new
+    /// connection. A missing `reconnect()` apply is not an error: not
+    /// every interactive type needs one, and a snapshot taken before this
+    /// apply existed in the mudlib must still load and run.
+    ///
+    /// Does nothing if `conn` is not a connection the loaded snapshot
+    /// actually bound (the caller is expected to drive this once per
+    /// entry of the connection table it got back from the snapshot, but
+    /// an unknown/already-handled id here is a caller bug, not a panic).
+    pub fn reconnect(&mut self, conn: u64, host: &mut dyn Host) {
+        let Some(&ob) = self.registry.conns.get(&conn) else {
+            return;
+        };
+        let r = self.exec(host, ob, Some(ob), Some(conn), None, None, None, |h| {
+            h.call_apply(ob, "reconnect", Vec::new())
+        });
+        if let Err(e) = r {
+            World::report(host, conn, &e);
+        }
+    }
+
+    /// Drive [`World::reconnect`] over every connection the loaded
+    /// snapshot bound, in ascending `conn` id order (deterministic, and
+    /// matching the order the connection table was written in -- see
+    /// `crate::snapshot`'s module docs). The copyover driver calls this
+    /// once, after it has finished re-adopting every handed-off socket
+    /// into `loom-net`'s session table under the same `conn` ids the
+    /// snapshot recorded, not before (a `reconnect()` apply that tries to
+    /// write to its connection before the session exists has nothing to
+    /// write to).
+    pub fn reconnect_all(&mut self, host: &mut dyn Host) {
+        let mut conns: Vec<u64> = self.registry.conns.keys().copied().collect();
+        conns.sort_unstable();
+        for conn in conns {
+            self.reconnect(conn, host);
+        }
+    }
+
+    /// The live connection ids a loaded snapshot bound, in ascending
+    /// order -- the exact order/identity the copyover driver must adopt
+    /// handed-off fds under (see `crate::snapshot`'s connection-table
+    /// docs and `loom-supervise::fdpass`'s fixed-order handoff) before
+    /// calling [`World::reconnect_all`].
+    pub fn live_connections(&self) -> Vec<u64> {
+        let mut conns: Vec<u64> = self.registry.conns.keys().copied().collect();
+        conns.sort_unstable();
+        conns
+    }
+
     /// The connection went away: unbind, then `net_dead()` on the object.
     pub fn disconnect(&mut self, conn: u64, host: &mut dyn Host) {
         let Some(ob) = self.registry.conns.remove(&conn) else {
