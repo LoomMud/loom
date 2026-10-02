@@ -15,7 +15,8 @@ loom-loadtest --addr 127.0.0.1:4000 --mix /path/to/warp/loadbot/mix.tsv \
 
 Run `loom-loadtest --help` for the full flag list (ramp rate, slow-reader
 cohort size/delay, think-time range, SLA threshold, `--fail-on-sla-miss`
-for CI/scripted gating).
+for CI/scripted gating, `--metrics-url` to scrape `loom-http`'s `/metrics`
+into the committed report, OBI-177).
 
 ## Design notes
 
@@ -36,7 +37,5 @@ for CI/scripted gating).
 
 ## Known gaps (tracked, not blocking this issue)
 
-- No server-side (R3 / `loom-http` `/metrics`) scrape yet: that crate isn't
-  on `main` (OBI-28 needs re-landing). `RunReport` has room for it.
 - 500-player run is a stretch target with findings, not a second SLA gate;
   see `../../results/README.md`.

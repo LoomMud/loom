@@ -13,6 +13,7 @@
 //! See `--help` for the full flag list.
 
 mod bot;
+mod metrics_scrape;
 mod mix;
 mod names;
 mod report;
@@ -48,6 +49,7 @@ struct Args {
     password: String,
     class: String,
     seed: u64,
+    metrics_url: Option<String>,
 }
 
 impl Args {
@@ -67,6 +69,7 @@ impl Args {
         let mut password = "loadtest-pass".to_string();
         let mut class = "warrior".to_string();
         let mut seed = 0_u64;
+        let mut metrics_url = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -105,6 +108,7 @@ impl Args {
                 "--password" => password = val!(),
                 "--class" => class = val!(),
                 "--seed" => seed = val!().parse().map_err(|_| "bad --seed")?,
+                "--metrics-url" => metrics_url = Some(val!()),
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -131,6 +135,7 @@ impl Args {
             password,
             class,
             seed,
+            metrics_url,
         })
     }
 }
@@ -154,7 +159,8 @@ fn print_help() {
          \x20 --fail-on-sla-miss            Exit 1 if p99 exceeds the SLA\n\
          \x20 --password <s>                 Account password for every bot\n\
          \x20 --class warrior               Character class on creation\n\
-         \x20 --seed 0                        RNG seed (0 = time-based)\n"
+         \x20 --seed 0                        RNG seed (0 = time-based)\n\
+         \x20 --metrics-url <url>           Scrape this loom-http /metrics URL into the report (OBI-177)\n"
     );
 }
 
@@ -269,12 +275,18 @@ async fn run(args: Args) -> Result<(), String> {
             "{disconnects} disconnect(s) observed (expected for the slow-reader cohort)"
         ));
     }
-    notes.push(
-        "R3 server-side metrics (loom-http /metrics) are not scraped by this run: \
-         loom-http/loom-obs are not yet on main (OBI-28); this report is bot-side \
-         latency only."
-            .to_string(),
-    );
+
+    let server_metrics = if let Some(url) = &args.metrics_url {
+        match metrics_scrape::scrape(url).await {
+            Ok(text) => Some(text),
+            Err(e) => {
+                notes.push(format!("failed to scrape --metrics-url {url}: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let report = RunReport {
         players: args.players,
@@ -290,6 +302,7 @@ async fn run(args: Args) -> Result<(), String> {
         login_latency: LatencyReport::from_samples(&login_latency),
         e1_1_pass,
         notes,
+        server_metrics,
     };
 
     if let Some(parent) = args.out_prefix.parent()
