@@ -95,10 +95,7 @@ fn ticks_keep_advancing_during_a_slow_background_batch_compile() {
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(
             report.recompiled,
-            vec![
-                "/std/room".to_string(),
-                "/domains/start/hall".to_string()
-            ],
+            vec!["/std/room".to_string(), "/domains/start/hall".to_string()],
             "parents before children, across the background batch too"
         );
         assert_eq!(world.program_version("/std/room"), Some(2));

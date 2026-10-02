@@ -1366,7 +1366,7 @@ impl World {
     /// [`Self::begin_recompile_set`]/[`Self::poll_recompile_sets`] for the
     /// non-blocking entry point `GitWorker` should actually use. This
     /// synchronous wrapper stays source-compatible with every existing
-    /// caller/test: it kicks off the same background compile and busy-polls
+    /// caller/test: it kicks off the same background compile and polls (1 ms sleep)
     /// it to completion (no `tick`, no heartbeat/call_out side effect --
     /// just the one background OS thread doing the compile work, same as
     /// `begin_recompile_set` would, just waited out here instead of
@@ -1386,7 +1386,7 @@ impl World {
             {
                 return self.finished_recompile_sets.remove(pos).1;
             }
-            std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -1401,7 +1401,10 @@ impl World {
     /// [`Self::take_finished_recompile_sets`] for the
     /// [`crate::bcvm::RecompileReport`], or [`Self::recompile_set_pending`]
     /// to check without draining it.
-    pub fn begin_recompile_set(&mut self, change_set: &crate::bcvm::ChangeSet) -> RecompileSetToken {
+    pub fn begin_recompile_set(
+        &mut self,
+        change_set: &crate::bcvm::ChangeSet,
+    ) -> RecompileSetToken {
         self.begin_recompile_set_after(change_set, std::time::Duration::ZERO)
     }
 
@@ -1447,7 +1450,14 @@ impl World {
                     let master = self.master_or_sentinel();
                     let report = self
                         .exec(host, master, None, None, None, None, None, |h| {
-                            Ok(h.finish_recompile_set(&changed, &deleted, &begin_snapshot, outcome))
+                            Ok(
+                                h.finish_recompile_set(
+                                    &changed,
+                                    &deleted,
+                                    &begin_snapshot,
+                                    outcome,
+                                ),
+                            )
                         })
                         .unwrap_or_else(|e| crate::bcvm::RecompileReport {
                             recompiled: Vec::new(),

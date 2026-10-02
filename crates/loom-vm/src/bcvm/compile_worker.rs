@@ -566,8 +566,7 @@ pub(crate) fn classify_targets(
 
     let mut targets: BTreeSet<String> = roots.iter().cloned().collect();
     for p in snapshot.entries.keys() {
-        if !deleted_loaded.iter().any(|d| d == p) && roots.iter().any(|r| snapshot.inherits(p, r))
-        {
+        if !deleted_loaded.iter().any(|d| d == p) && roots.iter().any(|r| snapshot.inherits(p, r)) {
             targets.insert(p.clone());
         }
     }
@@ -745,9 +744,7 @@ fn run_recompile_set(
     for p in &to_compile {
         match session.compile(p) {
             Outcome::Ok(_) => {}
-            Outcome::Failed(msg) | Outcome::Missing(msg) => {
-                failures.push((p.clone(), msg.clone()))
-            }
+            Outcome::Failed(msg) | Outcome::Missing(msg) => failures.push((p.clone(), msg.clone())),
         }
     }
     if !failures.is_empty() {
