@@ -1166,6 +1166,10 @@ impl ProgramCode for CompiledProgram {
     fn version(&self) -> u32 {
         self.version
     }
+
+    fn program_path(&self) -> Option<&str> {
+        Some(&self.path)
+    }
 }
 
 impl CompiledProgram {
@@ -4468,6 +4472,11 @@ impl<'a> RegistryHost<'a> {
             .expect("checked above")
             .errors
             .snapshot(prefix.as_deref());
+        let caller_euid = self
+            .registry
+            .syms
+            .name(principal_of(self.registry, self.self_object()).euid)
+            .to_string();
         let mut decided: HashMap<String, bool> = HashMap::new();
         let mut out = Vec::new();
         for row in rows {
@@ -4491,10 +4500,23 @@ impl<'a> RegistryHost<'a> {
             if !allowed {
                 continue;
             }
+            // M-ERR-1 (CTO review on PR #72, must-fix 2): a `/secure/**`
+            // origin's message is only ever shown to T5 (`root`), even
+            // though the program-level `valid_read` gate above may well
+            // already have let a lower tier through (a master could, in
+            // principle, grant `/secure/foo` read access to someone
+            // below T5 -- this redaction is a driver-enforced floor, not
+            // conditioned on the master's own policy).
+            let message = if row.redacted && self.euid_tier(&caller_euid) < 5 {
+                "<redacted>".to_string()
+            } else {
+                row.message.clone()
+            };
             let mut m = heap::MapData::default();
             m.insert(Value::str("program"), Value::str(&row.program));
             m.insert(Value::str("function"), Value::str(&row.function));
-            m.insert(Value::str("message"), Value::str(&row.message));
+            m.insert(Value::str("message"), Value::str(&message));
+            m.insert(Value::str("redacted"), Value::Bool(row.redacted));
             m.insert(Value::str("count"), Value::Int(row.count as i64));
             m.insert(
                 Value::str("first_seen_unix_ms"),
@@ -4535,6 +4557,7 @@ impl<'a> RegistryHost<'a> {
                 "Too deep recursion (call depth limit or native stack budget exceeded)",
             );
             e.trace.push(format!("in {func_name}()"));
+            e.trace_programs.push(target.path.to_string());
             return Err(e);
         }
         self.push_self(on);
@@ -4542,7 +4565,8 @@ impl<'a> RegistryHost<'a> {
         let limits = self.limits;
         let mut ticks = self.ticks_left;
         let result = {
-            let mut interp = Interpreter::new(&target.module, self, &limits, &mut ticks);
+            let mut interp = Interpreter::new(&target.module, self, &limits, &mut ticks)
+                .with_base_program(target.path.clone());
             interp.call(&func_name, args)
         };
         self.ticks_left = ticks;

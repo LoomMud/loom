@@ -1,0 +1,11 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// CTO review fixture (OBI-169, PR #72, must-fix 2): a `/secure/**`
+// program `secure/master.wf`'s `valid_read` deliberately *allows*
+// (unlike `/secure/leak`), so `tests/obi_169_error_inbox.rs` can check
+// the `redacted`/T5-only message rule on an entry that is otherwise
+// visible, independent of the program-level permission filter.
+pub fn boom() {
+    random(0)
+}

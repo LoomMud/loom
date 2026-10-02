@@ -1,0 +1,14 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// CTO review fixture (OBI-169, PR #72, must-fix 1): a program
+// `secure/master.wf`'s `valid_read` denies outright, called into from
+// `/std/player` (`triggerleak`). Proves the attribution fix: the error
+// raised by `boom()` here must be recorded against `/secure/leak` (the
+// program that actually raised it), not `/std/player` (the entry object
+// that merely called into it) -- otherwise a `/std` caller could read
+// its own, permitted `/std/player` entry and see a message that actually
+// originated inside a program it has no `valid_read` access to at all.
+pub fn boom() {
+    random(0)
+}
