@@ -1,0 +1,27 @@
+// Test-only master (P2-B3.1 recompile_set): no connect() needed, these
+// tests only ever drive the world through World::load_object/call/
+// recompile_set, never a real connection.
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}
+
+// `program_flags`'s own vocabulary for `/std/widget` only -- everything
+// else defaults to `NONE` (0). Edited in place by
+// `master_in_the_set_flushes_the_whole_program_flags_cache` to flip
+// `/std/widget` from `NONE` to `LIVE` (2) without changing its schema
+// (so the master's own recompile is the cheap unchanged-schema-hash
+// pointer swap, not a migration).
+fn program_flags(path: string) -> int {
+    if path == "/std/widget" {
+        return 0
+    }
+    return 0
+}
