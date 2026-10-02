@@ -60,3 +60,5 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `roles_propose_tier` | `roles_propose_tier(String, Int, String) -> Int` | P3 | 50 |
 | `roles_approve` | `roles_approve(Int) -> Int` | P3 | 50 |
 | `errors` | `errors(String?) -> Array(Map(String, Any))` | P1 | 20 |
+| `profile_start` | `profile_start(String) -> Void` | P1 | 10 |
+| `profile_stop` | `profile_stop() -> String` | P1 | 10 |

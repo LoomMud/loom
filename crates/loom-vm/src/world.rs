@@ -1900,6 +1900,30 @@ impl World {
         self.registry.quota_breaches.get(tier, quota)
     }
 
+    /// `profile <program>` (spec Phase 2 B5, OBI-170): open a sampling
+    /// window on `program` (normalized, same rule as `compile_object`'s
+    /// path argument), discarding any window already open -- mirrors the
+    /// `profile_start` efun, for a host-side (test/admin-command) caller
+    /// that doesn't want to go through a Weft call to use it.
+    pub fn profile_start(&mut self, program: &str) -> Result<(), String> {
+        let path = loom_compiler::mudlib::normalize_path(program)?;
+        self.registry.profiler = Some(crate::profiler::Profiler::new(path));
+        Ok(())
+    }
+
+    /// Close the window `profile_start` opened and render its report
+    /// (see `crate::profiler::ProfileReport::render`) -- mirrors the
+    /// `profile_stop` efun. `None` if no window was open.
+    pub fn profile_stop(&mut self) -> Option<String> {
+        self.registry.profiler.take().map(|p| p.report().render())
+    }
+
+    /// The program path a `profile` window is currently sampling, if one
+    /// is open.
+    pub fn profiling_program(&self) -> Option<&str> {
+        self.registry.profiler.as_ref().map(|p| p.program())
+    }
+
     /// `ob`'s owner uid (OBI-121 S2c: immutable, set at creation --
     /// `BcObject::uid`), resolved to its name.
     /// `ob`'s owner uid (OBI-121 S2c: immutable, set at creation --

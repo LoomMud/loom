@@ -176,6 +176,14 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     // same pattern as `read_file`'s VFS gate, just applied once per
     // program instead of once per call).
     ("errors", 0, 1, Privilege::P1, 20),
+    // Spec Phase 2 B5 (OBI-170): `profile <program>` sampling. Same
+    // privilege class as `compile_object`/`upgrade_all` (introspection
+    // into another program's running cost, not just the caller's own) --
+    // gated by the generic P1 `valid_efun` pre-check in
+    // `RegistryHost::driver_efun`, no path-specific `valid_*` apply (it
+    // mutates no world state, only a profiling counter).
+    ("profile_start", 1, 1, Privilege::P1, 10),
+    ("profile_stop", 0, 0, Privilege::P1, 10),
 ];
 
 /// `(min args, max args)` of efun `name`, if it exists.

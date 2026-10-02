@@ -17,6 +17,7 @@ pub mod errors;
 pub mod fileio;
 pub mod host;
 pub mod object;
+pub mod profiler;
 pub mod quota;
 pub mod rng;
 pub mod roles;

@@ -1550,6 +1550,13 @@ pub struct Registry {
     /// `loom_tier_quota_breaches_total{tier,quota}` (OBI-121 S2c); see
     /// `crate::quota::QuotaBreachMetrics`.
     pub quota_breaches: crate::quota::QuotaBreachMetrics,
+    /// `profile <program>`'s currently open sampling window (spec Phase
+    /// 2 B5, OBI-170), `None` the overwhelming rest of the time --
+    /// started by `World::profile_start`/the `profile_start` efun,
+    /// consumed by `World::profile_stop`/`profile_stop`. See
+    /// `crate::profiler`'s module doc for the "unmeasurable overhead
+    /// when off" cost argument this field's `Option` is central to.
+    pub profiler: Option<crate::profiler::Profiler>,
     /// Canary updates in flight (P2-B7, OBI-182, spec §7.4), keyed by
     /// program path. At most one per path: starting a new one for a path
     /// that already has one active is refused by `RegistryHost::
@@ -3897,6 +3904,37 @@ impl<'a> RegistryHost<'a> {
                 }
                 Ok(Value::Int(queued))
             }
+            // Spec Phase 2 B5 (OBI-170): open a per-function tick/time
+            // sampling window on `path` -- replaces any window already
+            // open (the previous one's samples are simply discarded,
+            // same "last write wins" shape as `set_heartbeat`). The
+            // generic P1 `valid_efun` pre-check above already gated this
+            // call; no path-specific apply (it reads nothing it couldn't
+            // already see by calling into `path` itself, and writes only
+            // the profiler's own counters).
+            "profile_start" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("profile_start(): expected string"))?;
+                let path = mudlib::normalize_path(p).map_err(RtError::new)?;
+                self.registry.profiler = Some(crate::profiler::Profiler::new(path));
+                Ok(Value::Null)
+            }
+            // Close the window opened by `profile_start` and return its
+            // report, already rendered as the in-game-readable text
+            // `crate::profiler::ProfileReport::render` produces (OBI-170
+            // acceptance: "output is readable in-game"). A string, not a
+            // struct, because Weft has no `profile`-shaped record type to
+            // hand one back as yet -- a builder command wraps this in a
+            // single `send(this_player(), profile_stop())`.
+            "profile_stop" => {
+                let text = match self.registry.profiler.take() {
+                    Some(p) => p.report().render(),
+                    None => "profile: no sampling window is open (call profile_start() first)\n"
+                        .to_string(),
+                };
+                Ok(Value::str(&text))
+            }
             // P2-B7 (OBI-182, spec §7.4): `update --canary N%` --
             // recompile `path` same as `compile_object`, but only route
             // `pct`% of accessed instances (by object id hash) to the new
@@ -6041,6 +6079,30 @@ impl Host for RegistryHost<'_> {
 
     fn record_cow_copy(&mut self, program: &str) {
         self.registry.cow_metrics.record(program);
+    }
+
+    /// Spec Phase 2 B5 (OBI-170): called on every Weft function call,
+    /// whether or not a `profile` window is open -- see
+    /// `crate::profiler`'s module doc for why `Registry::profiler` being
+    /// `None` (the default, and the rest of the time) makes this a
+    /// single cheap `is_some_and` and nothing else.
+    fn profiling_active(&self, program: &str) -> bool {
+        self.registry
+            .profiler
+            .as_ref()
+            .is_some_and(|p| p.wants(program))
+    }
+
+    fn profile_record(
+        &mut self,
+        _program: &str,
+        function: &str,
+        ticks: u64,
+        wall: std::time::Duration,
+    ) {
+        if let Some(p) = self.registry.profiler.as_mut() {
+            p.record(function, ticks, wall);
+        }
     }
 
     fn begin_atomic(&mut self) -> u64 {
