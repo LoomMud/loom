@@ -3186,6 +3186,25 @@ impl<'a> RegistryHost<'a> {
                 }
                 Ok(Value::Null)
             }
+            "set_echo" => {
+                let Value::Bool(enabled) = a1 else {
+                    return Err(RtError::new("set_echo(): expected bool"));
+                };
+                if let Value::Object(id) = a0 {
+                    let conn = self.registry.get(id).and_then(|o| o.conn);
+                    if let Some(conn) = conn
+                        && let Some(d) = self.driver.as_mut()
+                    {
+                        d.net.set_echo(conn, enabled);
+                    }
+                } else if !matches!(a0, Value::Null) {
+                    return Err(RtError::new(format!(
+                        "set_echo(): expected object, got {}",
+                        a0.type_name()
+                    )));
+                }
+                Ok(Value::Null)
+            }
             "bind_connection" => {
                 let me = self.self_object();
                 let master = self.driver.as_ref().and_then(|d| d.master);
