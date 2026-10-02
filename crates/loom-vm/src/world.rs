@@ -29,6 +29,22 @@ use std::sync::Arc;
 /// Path of the master object.
 pub const MASTER_PATH: &str = "/secure/master";
 
+/// Default player-save root (spec §8.1, OBI-171): a `saves` directory
+/// *beside* the mudlib root, not inside it -- deliberately outside
+/// whatever directory `compile_object`/the Git-backed VFS (§8.5) treats
+/// as the mudlib's own working tree, so player save files are never
+/// candidates for `git add`, a `revert <file>`, or a recompile sweep.
+/// Falls back to a `saves` subdirectory of `mudlib_root` itself only if
+/// it has no parent at all (e.g. booted at a filesystem root, which
+/// real deployments never do -- `loom-cli`'s `--save-dir` is there for
+/// anyone who needs a different layout).
+fn default_save_root(mudlib_root: &Path) -> PathBuf {
+    match mudlib_root.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join("saves"),
+        _ => mudlib_root.join("saves"),
+    }
+}
+
 /// One [`AuditEntry`], resolved to owned strings, ready for a driver-side
 /// Postgres sink (OBI-36 D-S2.5; see [`World::drain_audit_since`]).
 /// `kind` and `apply` name the decision (`"unguarded"`,
@@ -243,6 +259,13 @@ pub struct AccountsCtx<'a> {
 /// so tests (and eventually builder config) can dial it down.
 pub const DEFAULT_HEARTBEAT_INTERVAL_TICKS: u64 = 20;
 
+/// Player autosave cadence (spec §8.1: "players autosave every 5 min",
+/// OBI-171): at the same 100 ms world-tick granularity, 5 minutes is
+/// 3,000 world ticks. A `Limits` field for the same reason
+/// `heartbeat_interval_ticks` is -- tests dial it down instead of
+/// waiting out a real 5 minutes of simulated ticks.
+pub const DEFAULT_AUTOSAVE_INTERVAL_TICKS: u64 = 3_000;
+
 /// Per-execution guard rails (§5.8).
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -261,6 +284,12 @@ pub struct Limits {
     /// many `World::tick()` calls (world ticks), not every tick (OBI-82).
     /// `call_out` delays remain in world ticks and are unaffected by this.
     pub heartbeat_interval_ticks: u64,
+    /// Every currently-connected (interactive) object gets an
+    /// `autosave()` apply once every this many world ticks (spec §8.1,
+    /// OBI-171) -- the driver-side half of "players autosave every 5
+    /// min"; see `World::tick`'s doc comment for the other two triggers
+    /// (quit, net-dead), both routed through `World::disconnect`.
+    pub autosave_interval_ticks: u64,
 }
 
 impl Default for Limits {
@@ -271,6 +300,7 @@ impl Default for Limits {
             mem_quota_bytes: VmLimits::default().mem_quota_bytes,
             eager_upgrade_batch: 200,
             heartbeat_interval_ticks: DEFAULT_HEARTBEAT_INTERVAL_TICKS,
+            autosave_interval_ticks: DEFAULT_AUTOSAVE_INTERVAL_TICKS,
         }
     }
 }
@@ -307,6 +337,13 @@ impl std::error::Error for BootError {}
 /// The game world. Driven by exactly one thread (the world thread, §3.3).
 pub struct World {
     root: PathBuf,
+    /// Player-save root for `save_object`/`restore_object` (spec §8.1,
+    /// OBI-171). Defaults to a `saves` directory *next to* (not inside)
+    /// the mudlib root -- see [`default_save_root`] -- so player save
+    /// data never lands inside the Git-backed `.wf` tree a `revert`/
+    /// recompile or `git pull` operates on; overridable with
+    /// [`World::set_save_root`] (`loom-cli`'s `--save-dir`).
+    save_root: PathBuf,
     registry: Registry,
     compiler: Compiler,
     master: Option<ObjectId>,
@@ -485,6 +522,7 @@ impl World {
         }
         let mut w = World {
             root: mudlib_root.to_path_buf(),
+            save_root: default_save_root(mudlib_root),
             registry: Registry::default(),
             compiler: Compiler::new(mudlib_root.to_path_buf()),
             master: None,
@@ -732,6 +770,19 @@ impl World {
         &self.root
     }
 
+    /// The player-save root (spec §8.1, OBI-171) `save_object`/
+    /// `restore_object` read and write under.
+    pub fn save_root(&self) -> &Path {
+        &self.save_root
+    }
+
+    /// Override the player-save root (`loom-cli`'s `--save-dir`); defaults
+    /// to [`default_save_root`] of the mudlib root this world was booted
+    /// from. Takes effect for every save/restore from this call on.
+    pub fn set_save_root(&mut self, dir: PathBuf) {
+        self.save_root = dir;
+    }
+
     /// Run `body` against a fresh [`RegistryHost`] with driver context
     /// wired up (network host, `this_player`, bound connection, master).
     /// `acting` is the object whose own euid seeds this execution's guard
@@ -812,6 +863,7 @@ impl World {
             input_actor,
             &mut self.disk_usage,
             &mut self.errors,
+            self.save_root.clone(),
         );
         let result = body(&mut rh);
         // OBI-121 S2c `tick_share_per_min`: charge whatever ticks this
@@ -1120,15 +1172,24 @@ impl World {
         conns
     }
 
-    /// The connection went away: unbind, then `net_dead()` on the object.
+    /// The connection went away: `autosave()` (spec §8.1, OBI-171: both
+    /// an explicit `quit` -- the mudlib's `quit` command calls the
+    /// `disconnect()` efun, which closes the connection and lands here
+    /// once the transport reports it closed -- and a real net-dead drop
+    /// end up on this exact path, so one hook covers both triggers), then
+    /// unbind, then `net_dead()` on the object. Each runs as its own
+    /// `exec` so an `autosave()` failure can never suppress `net_dead()`.
     pub fn disconnect(&mut self, conn: u64, host: &mut dyn Host) {
         let Some(ob) = self.registry.conns.remove(&conn) else {
             return;
         };
+        // Errors have nowhere to go (the connection is gone).
+        let _ = self.exec(host, ob, Some(ob), None, None, None, None, |h| {
+            h.call_apply(ob, "autosave", Vec::new())
+        });
         if let Some(o) = self.registry.get_mut(ob) {
             o.conn = None;
         }
-        // Errors have nowhere to go (the connection is gone).
         let _ = self.exec(host, ob, Some(ob), None, None, None, None, |h| {
             h.call_apply(ob, "net_dead", Vec::new())
         });
@@ -1202,6 +1263,45 @@ impl World {
                     None,
                     Some(heartbeat_quota_uid),
                     |h| h.call_apply(ob, "heartbeat", Vec::new()),
+                );
+            }
+        }
+        // Player autosave (spec §8.1, OBI-171): every currently-connected
+        // object gets an `autosave()` apply once every
+        // `Limits::autosave_interval_ticks` world ticks (default 5 min).
+        // Collected into a `Vec` first -- `conns` borrows `self.registry`
+        // and `exec` needs `&mut self` -- sorted by connection id for a
+        // stable, reproducible order instead of whatever a `HashMap`
+        // iteration happens to produce.
+        let autosave_interval = self.limits.autosave_interval_ticks.max(1);
+        if world_tick.is_multiple_of(autosave_interval) {
+            let mut targets: Vec<(u64, ObjectId)> = self
+                .registry
+                .conns
+                .iter()
+                .map(|(&c, &ob)| (c, ob))
+                .collect();
+            targets.sort_by_key(|(c, _)| *c);
+            for (_, ob) in targets {
+                if self.registry.get(ob).is_none() {
+                    continue; // destructed since it connected
+                }
+                let autosave_quota_uid = self
+                    .registry
+                    .get(ob)
+                    .map_or(crate::security::ROOT, |o| o.owner);
+                if self.tick_share_breached(autosave_quota_uid) {
+                    continue;
+                }
+                let _ = self.exec(
+                    host,
+                    ob,
+                    Some(ob),
+                    None,
+                    None,
+                    None,
+                    Some(autosave_quota_uid),
+                    |h| h.call_apply(ob, "autosave", Vec::new()),
                 );
             }
         }

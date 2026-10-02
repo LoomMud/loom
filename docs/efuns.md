@@ -42,6 +42,8 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `seteuid` | `seteuid(String) -> Void` | P3 | 10 |
 | `read_file` | `read_file(String) -> Optional(String)` | P0 | 20 |
 | `write_file` | `write_file(String, String) -> Bool` | P1 | 50 |
+| `save_object` | `save_object(String) -> Bool` | P1 | 100 |
+| `restore_object` | `restore_object(String) -> Bool` | P0 | 50 |
 | `unguarded` | `unguarded(String, Array(Any)?) -> Any` | P4 | 10 |
 | `roles_tier` | `roles_tier(String) -> Int` | P0 | 2 |
 | `roles_is_member` | `roles_is_member(String, String) -> Bool` | P0 | 2 |

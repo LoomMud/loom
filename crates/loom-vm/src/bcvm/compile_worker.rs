@@ -128,6 +128,7 @@ pub struct WireVarSpec {
     /// `loom_compiler::bytecode::encode_ty`.
     pub ty_bytes: Vec<u8>,
     pub has_init: bool,
+    pub persistent: bool,
 }
 
 /// A finished, not-yet-applied background recompile.
@@ -461,6 +462,7 @@ fn run_recompile(root: &Path, path: &str, snapshot: &ProgramSnapshot) -> Compile
                 name: v.name.to_string(),
                 ty_bytes: bytecode::encode_ty(&v.ty),
                 has_init: v.has_init,
+                persistent: v.persistent,
             })
             .collect();
         out.push(WireProgram {
