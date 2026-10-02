@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "loom-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The `git` CLI is the only thing this crate shells out to (D-B3.1); no
+# gix/libgit2 dependency. `metrics` matches `loom-net`'s pattern (a direct
+# dependency, no `loom-obs`/`loom-vm` coupling -- the exporter is wired up
+# wherever the global recorder is installed).
+metrics = "0.24.6"
+tracing = "0.1.41"
+
+[dev-dependencies]
+tempfile = "3.14"

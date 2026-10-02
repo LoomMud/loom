@@ -1142,6 +1142,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-git"
+version = "0.0.1"
+dependencies = [
+ "metrics",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "loom-http"
 version = "0.0.1"
 dependencies = [
