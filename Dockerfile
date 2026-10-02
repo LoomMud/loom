@@ -25,8 +25,12 @@ COPY . .
 RUN cargo build --release --locked -p loom-cli && install -Dm755 target/release/loom-cli /out/loom
 
 FROM debian:bookworm-slim
+# git (B3.5/OBI-192, D-B3.1): the driver's one git client, loom-git, shells
+# out to the `git` CLI on a dedicated GitWorker thread rather than linking a
+# Git library. No recommends -- loom-git's own tests are the only thing
+# that needs more than a bare `git` binary (no gnupg, no editor, no email).
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates libmimalloc2.0 \
+    && apt-get install --yes --no-install-recommends ca-certificates libmimalloc2.0 git \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --create-home --home-dir /srv/loom loom
 WORKDIR /srv/loom
