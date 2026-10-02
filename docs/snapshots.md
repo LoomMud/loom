@@ -162,3 +162,44 @@ steps 1-2-4 and step 3's session-table wiring respectively (with a stub
 socket pair standing in for `loom-supervise::fdpass`'s real recv_fds, so
 neither test needs the supervisor itself, matching the issue's
 acceptance).
+
+## Getting a live connection's socket *out* of the old process (OBI-184)
+
+The four steps above are the new-process side. The missing piece on the
+*old* process's side -- how a live client socket gets from "a `loom-net`
+connection task owns it, mid-session" to "a raw fd `loom-supervise`'s
+`fdpass::send_fds` can hand to the standby" -- is `loom-net`'s
+`ReclaimRequest` channel (`run_server_full`'s new `reclaim_rx` parameter,
+alongside `adopt_rx`):
+
+- `(ConnId, oneshot::Sender<Option<TcpStream>>)` sent on `reclaim_rx`
+  asks `run_server_full` to hand a live connection back as a plain
+  `TcpStream` instead of tearing it down.
+- `run_server_full` removes the connection's `ConnEntry` immediately (so
+  nothing else in this process routes further `NetCommand`s at that id)
+  and forwards a `ConnControl::Reclaim` to the connection's own task.
+- That task stops its read/write loop *without* sending
+  `NetEvent::Disconnected` (a real disconnect would trigger `net_dead()`
+  on the bound object -- wrong here, the object is not going away, its
+  socket is just moving to a new process), reunites the split
+  `TcpStream` halves, and replies on the `oneshot::Sender`.
+- A WebSocket connection's `Reclaim` is answered `None` -- pulling a raw
+  fd back out of an upgraded `axum` `WebSocket` is unimplemented (not
+  needed yet: E2.2-docker's bots are telnet).
+
+**Not yet wired end to end** (this is `loom-supervise`'s/`loom-cli`'s
+remaining OBI-184 work, not `loom-net`'s): something has to (a) decide
+*when* to reclaim -- stop the old process's listener from accepting new
+connections and reclaim every live one, in the same ascending-`conn_id`
+order `World::live_connections()` will report on the new side; (b)
+convert each reclaimed `TcpStream` to a raw fd (`into_std()` +
+`IntoRawFd`) and hand it to the supervisor over the control socket via
+`fdpass::send_fds`, alongside the encoded snapshot bytes; (c) the
+supervisor relays both to the waiting standby. None of that needs
+further `loom-net` surface -- `ReclaimRequest` is the complete contract
+this crate owes the rest of the hand-off.
+
+Test: `reclaimed_connection_is_a_live_stream_with_no_disconnect_event`
+(`loom-net`) -- a real client/server `TcpStream` pair, reclaimed mid-session
+and proven live (write through the reclaimed handle, read on the
+original client) with no `Disconnected` event for that id.
