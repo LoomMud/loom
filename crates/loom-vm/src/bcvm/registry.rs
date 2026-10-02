@@ -645,9 +645,15 @@ impl Compiler {
         // every currently-registered program that (directly or
         // transitively) inherits *any* changed, loaded path joins the
         // batch alongside its root(s).
+        // A deleted-but-loaded dependent is *not* a target: it has no
+        // source left to recompile from, so pulling it in would fail the
+        // whole batch (e.g. a merge that deletes a subclass and edits its
+        // base). It keeps running on its last-compiled program, reported
+        // in `deleted_loaded` (CTO review).
         let mut targets: std::collections::BTreeSet<String> = roots.iter().cloned().collect();
         for p in registry.programs.values() {
-            if roots.iter().any(|r| p.inherits(r)) {
+            if !deleted_loaded.iter().any(|d| **d == *p.path) && roots.iter().any(|r| p.inherits(r))
+            {
                 targets.insert(p.path.to_string());
             }
         }
