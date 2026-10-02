@@ -1,0 +1,38 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Master object for the OBI-237 admin-query fixture: like
+// `errors_inbox`'s master (every efun/path allowed) except `valid_read`
+// denies `/std/vault` specifically, so `tests/obi_237_admin_query.rs` can
+// exercise `World::admin_list_objects`/`admin_object_vars`'s real
+// `valid_read` filtering against a caller euid that is not `root` --
+// `root`'s guard set is always empty (D-S1.2), so it is allowed without
+// ever asking this apply at all; every other euid actually goes through
+// this `valid_read` body.
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return path != "/std/vault"
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_seteuid(ob: object, e: string) -> bool {
+    return true
+}

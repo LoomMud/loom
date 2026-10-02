@@ -36,8 +36,8 @@ pub use object::ObjectId;
 pub use roles::{DomainRole, Grant, RolesSnapshot};
 pub use snapshot::{SnapshotError, SnapshotJob};
 pub use world::{
-    AccountAuth, AuditRow, BootError, Limits, NullAccountAuth, NullRolesMutations, RolesMutations,
-    World,
+    AccountAuth, AdminObjectSummary, AdminObjectVars, AdminVarEntry, AuditRow, BootError, Limits,
+    NullAccountAuth, NullRolesMutations, RolesMutations, SessionSummary, World,
 };
 
 /// Parse and link every `.wf` file under `root` without running any code
