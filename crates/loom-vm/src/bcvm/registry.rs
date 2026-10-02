@@ -1024,7 +1024,9 @@ impl Compiler {
             if now.source_hash_of(path) != Some(*hash) {
                 return bail(vec![(
                     path.clone(),
-                    format!("ancestor {path} changed on disk since it was installed; update it first"),
+                    format!(
+                        "ancestor {path} changed on disk since it was installed; update it first"
+                    ),
                 )]);
             }
         }
@@ -4637,9 +4639,13 @@ impl<'a> RegistryHost<'a> {
                 .driver
                 .as_mut()
                 .expect("finish_recompile_set needs a driver context");
-            driver
-                .compiler
-                .finish_recompile_set(self.registry, changed, deleted, begin_snapshot, outcome)
+            driver.compiler.finish_recompile_set(
+                self.registry,
+                changed,
+                deleted,
+                begin_snapshot,
+                outcome,
+            )
         };
         self.finish_set_outcome(set)
     }
