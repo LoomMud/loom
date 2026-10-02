@@ -12,6 +12,7 @@ use totp_rs::{Algorithm, Builder, Secret, Totp};
 /// A freshly generated, not-yet-confirmed TOTP secret plus the `otpauth://`
 /// URI an authenticator app's "scan a QR code" flow expects. `secret_base32`
 /// is what gets handed to [`crate::auth::StaffDirectory::totp_enroll`].
+#[derive(Debug)]
 pub struct TotpEnrollment {
     pub secret_base32: String,
     pub otpauth_url: String,
@@ -50,15 +51,28 @@ pub fn totp_for_secret(secret_base32: &str, account_name: &str) -> Option<Totp> 
     build_totp(secret_base32, account_name).ok()
 }
 
-/// Verify a user-submitted 6-digit code against an enrolled base32 secret.
-/// `false` for any parse failure (malformed secret, non-numeric code, ...),
-/// never a panic -- this runs on every login attempt, including ones an
-/// attacker controls the input to.
+/// Verify a user-submitted 6-digit code against an enrolled base32 secret
+/// and return the RFC 6238 time-step it matched (the skew window means
+/// more than one step can validate the *signature*, but only one is ever
+/// returned -- `totp-rs`'s own doc on [`totp_rs::Totp::check`] is explicit
+/// that replay prevention across repeated use of the same step is the
+/// caller's job, which is what [`crate::auth::StaffDirectory::totp_consume_step`]
+/// does (OBI-195 review fix 4)). `None` for any parse failure (malformed
+/// secret, non-numeric code, ...) or a code that matches no step in the
+/// skew window -- never a panic, since this runs on every login attempt,
+/// including ones an attacker controls the input to.
+pub fn totp_step_for_code(secret_base32: &str, code: &str) -> Option<u64> {
+    let totp = totp_for_secret(secret_base32, "")?;
+    totp.check_current(code)
+}
+
+/// Verify a user-submitted 6-digit code against an enrolled base32 secret,
+/// ignoring which step matched. Used only where there is no uid to track
+/// anti-replay state against (i.e. nowhere in the auth service itself --
+/// see [`totp_step_for_code`] -- but kept for tests and any future
+/// call site that only cares about RFC 6238 validity).
 pub fn verify_totp_code(secret_base32: &str, code: &str) -> bool {
-    let Some(totp) = totp_for_secret(secret_base32, "") else {
-        return false;
-    };
-    totp.check_current(code).is_some()
+    totp_step_for_code(secret_base32, code).is_some()
 }
 
 #[cfg(test)]

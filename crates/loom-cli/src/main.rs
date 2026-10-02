@@ -393,8 +393,11 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
     // OBI-174: `/auth/*` only mounted when both Postgres and a JWT secret
     // are configured -- staff web auth has nothing to authenticate against
     // otherwise (no `staff` table without Postgres) and must never sign a
-    // token with a guessable default secret.
-    if let (Some(p), Some(secret)) = (persist.clone(), jwt_secret_from_env()) {
+    // token with a guessable default secret. A *present but too-short*
+    // secret is a misconfiguration, not "disabled" -- fail startup closed
+    // (OBI-195 review fix 6) rather than silently run with a weak key.
+    let jwt_secret = jwt_secret_from_env()?;
+    if let (Some(p), Some(secret)) = (persist.clone(), jwt_secret) {
         let directory: std::sync::Arc<dyn loom_http::auth::StaffDirectory> = std::sync::Arc::new(p);
         let keys = loom_http::auth::JwtKeys::from_secret(&secret);
         http_state = http_state.with_auth(loom_http::auth::AuthService::new(directory, keys));
@@ -506,10 +509,55 @@ fn web_root_from_env() -> Option<PathBuf> {
 /// `LOOM_WEB_ROOT`. There is no insecure default: an operator who wants
 /// staff auth must generate and set a real secret (at least 32 bytes of
 /// CSPRNG output, e.g. `openssl rand -hex 32`) themselves.
-fn jwt_secret_from_env() -> Option<Vec<u8>> {
-    std::env::var("LOOM_JWT_SECRET")
-        .ok()
-        .map(String::into_bytes)
+///
+/// `Ok(None)` means unset (auth stays disabled, same as before). `Err`
+/// means it *is* set but is under the 32-byte floor -- OBI-195 review fix
+/// 6: that is a misconfiguration serious enough to fail the whole process
+/// closed at startup, not something to quietly degrade past (an operator
+/// who thinks they enabled staff auth with a weak secret must find out
+/// immediately, not have it silently run short-keyed or silently stay
+/// disabled).
+const MIN_JWT_SECRET_BYTES: usize = 32;
+
+fn jwt_secret_from_env() -> Result<Option<Vec<u8>>, String> {
+    match std::env::var("LOOM_JWT_SECRET") {
+        Ok(value) => validate_jwt_secret(value.into_bytes()).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The length check itself, split out from [`jwt_secret_from_env`] so it's
+/// testable without touching process environment state.
+fn validate_jwt_secret(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if bytes.len() < MIN_JWT_SECRET_BYTES {
+        return Err(format!(
+            "LOOM_JWT_SECRET is {} bytes, below the {MIN_JWT_SECRET_BYTES}-byte floor -- \
+             refusing to start rather than sign tokens with a weak key \
+             (generate one with `openssl rand -hex 32`)",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod jwt_secret_tests {
+    use super::*;
+
+    #[test]
+    fn short_secret_is_rejected() {
+        assert!(validate_jwt_secret(vec![b'a'; 16]).is_err());
+    }
+
+    #[test]
+    fn exactly_min_length_secret_is_accepted() {
+        assert!(validate_jwt_secret(vec![b'a'; MIN_JWT_SECRET_BYTES]).is_ok());
+    }
+
+    #[test]
+    fn empty_secret_is_rejected() {
+        assert!(validate_jwt_secret(Vec::new()).is_err());
+    }
 }
 
 /// The `serve()` world-tick timer (spec r5 N2, OBI-82): every `interval`

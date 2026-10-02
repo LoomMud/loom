@@ -107,10 +107,75 @@ async fn totp_confirm_requires_a_prior_enrollment() {
     assert!(record.is_some());
     assert!(!record.unwrap().totp_confirmed); // this is aragorn2, unrelated
 
-    // Re-enrolling clears the confirmation.
-    fx.app.totp_enroll(&uid, "ANOTHERBASE32").await.unwrap();
+    // OBI-195 review fix 3: re-enrolling over an already-*confirmed*
+    // secret is refused by the SQL function itself (defense in depth --
+    // `loom-http::auth::AuthService::totp_enroll` already refuses this at
+    // the app layer too). A real reset needs a dedicated, step-up-gated
+    // flow (OBI-199 follow-up), not a bare re-enrol.
+    assert!(fx.app.totp_enroll(&uid, "ANOTHERBASE32").await.is_err());
     let secret = fx.app.totp_secret_for(&uid).await.unwrap();
-    assert_eq!(secret.as_deref(), Some("ANOTHERBASE32"));
+    assert_eq!(secret.as_deref(), Some("SECRETBASE32"));
+}
+
+/// OBI-195 review fix 4: anti-replay -- the same RFC 6238 step can never
+/// be consumed twice for a uid, and a strictly later step is always
+/// accepted.
+#[tokio::test]
+async fn totp_consume_step_is_monotonic_per_uid() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("frodo");
+    let account = seed_account(&fx.owner, &unique_uid("frodo-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    assert!(fx.app.totp_consume_step(&uid, 1000).await.unwrap());
+    // Same step again: refused.
+    assert!(!fx.app.totp_consume_step(&uid, 1000).await.unwrap());
+    // An earlier step: refused.
+    assert!(!fx.app.totp_consume_step(&uid, 999).await.unwrap());
+    // A later step: accepted.
+    assert!(fx.app.totp_consume_step(&uid, 1001).await.unwrap());
+}
+
+/// OBI-195 review fix 5: a uid with no `staff` row at all gets `None`,
+/// never a tier defaulted to 0.
+#[tokio::test]
+async fn staff_auth_status_is_none_for_a_uid_with_no_staff_row() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let status = fx
+        .app
+        .staff_auth_status(&unique_uid("nobody-at-all"))
+        .await
+        .unwrap();
+    assert!(status.is_none());
+}
+
+#[tokio::test]
+async fn staff_auth_status_reads_tier_and_totp_state() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("samwise2");
+    let account = seed_account(&fx.owner, &unique_uid("samwise2-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 2).await;
+
+    let status = fx.app.staff_auth_status(&uid).await.unwrap().unwrap();
+    assert_eq!(status.tier, 2);
+    assert_eq!(status.totp_secret, None);
+    assert!(!status.totp_confirmed);
+
+    fx.app.totp_enroll(&uid, "SECRETBASE32").await.unwrap();
+    fx.app.totp_confirm(&uid).await.unwrap();
+
+    let status = fx.app.staff_auth_status(&uid).await.unwrap().unwrap();
+    assert_eq!(status.totp_secret.as_deref(), Some("SECRETBASE32"));
+    assert!(status.totp_confirmed);
 }
 
 #[tokio::test]
@@ -151,6 +216,105 @@ async fn refresh_token_insert_lookup_and_revoke_round_trip() {
             .unwrap()
             .is_none()
     );
+}
+
+/// OBI-195 review fix 1: a single atomic `UPDATE ... RETURNING` means
+/// the token's first-ever rotation returns `Rotated`, and every
+/// subsequent presentation -- however many -- returns `Reused`, never a
+/// second `Rotated`.
+#[tokio::test]
+async fn refresh_token_rotate_is_atomic() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("sam3");
+    let account = seed_account(&fx.owner, &unique_uid("sam3-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash = "c3".repeat(16);
+    fx.app
+        .refresh_token_insert(&uid, &hash, expires_at)
+        .await
+        .unwrap();
+
+    match fx.app.refresh_token_rotate(&hash).await.unwrap() {
+        loom_persist::RefreshTokenRotation::Rotated { staff_uid } => {
+            assert_eq!(staff_uid, uid);
+        }
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+
+    match fx.app.refresh_token_rotate(&hash).await.unwrap() {
+        loom_persist::RefreshTokenRotation::Reused { staff_uid } => {
+            assert_eq!(staff_uid, uid);
+        }
+        other => panic!("expected Reused, got {other:?}"),
+    }
+
+    // A third presentation is still Reused, not NotFound -- the row still
+    // exists, just revoked.
+    match fx.app.refresh_token_rotate(&hash).await.unwrap() {
+        loom_persist::RefreshTokenRotation::Reused { .. } => {}
+        other => panic!("expected Reused, got {other:?}"),
+    }
+
+    assert!(matches!(
+        fx.app.refresh_token_rotate("never-issued").await.unwrap(),
+        loom_persist::RefreshTokenRotation::NotFound
+    ));
+}
+
+/// OBI-195 review fix 1 (the actual bug): many concurrent presentations
+/// of the *same* refresh token against a real Postgres must yield exactly
+/// one `Rotated` and the rest `Reused` -- a lookup-then-revoke
+/// implementation can let two or more of these race past the "not yet
+/// revoked" check and all succeed, which defeats reuse detection.
+#[tokio::test]
+async fn concurrent_refresh_token_rotation_only_succeeds_once() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let uid = unique_uid("sam4");
+    let account = seed_account(&fx.owner, &unique_uid("sam4-acct")).await;
+    seed_staff(&fx.owner, &uid, account, 1).await;
+
+    let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
+    let hash = "c4".repeat(16);
+    fx.app
+        .refresh_token_insert(&uid, &hash, expires_at)
+        .await
+        .unwrap();
+
+    const CONCURRENT_ATTEMPTS: usize = 16;
+    let mut handles = Vec::with_capacity(CONCURRENT_ATTEMPTS);
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(CONCURRENT_ATTEMPTS));
+    for _ in 0..CONCURRENT_ATTEMPTS {
+        let app = fx.app.clone();
+        let hash = hash.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            app.refresh_token_rotate(&hash).await.unwrap()
+        }));
+    }
+
+    let mut rotated_count = 0;
+    let mut reused_count = 0;
+    for handle in handles {
+        match handle.await.unwrap() {
+            loom_persist::RefreshTokenRotation::Rotated { .. } => rotated_count += 1,
+            loom_persist::RefreshTokenRotation::Reused { .. } => reused_count += 1,
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+    assert_eq!(
+        rotated_count, 1,
+        "exactly one concurrent caller must rotate"
+    );
+    assert_eq!(reused_count, CONCURRENT_ATTEMPTS - 1);
 }
 
 #[tokio::test]
