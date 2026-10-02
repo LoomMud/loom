@@ -179,6 +179,19 @@ impl std::error::Error for AuthError {}
 /// (T3) may act (within `roles_set_tier`'s own, narrower SQL rules), but
 /// nothing below that.
 pub const ADMIN_ROLE_CHANGE_MIN_TIER: i16 = 3;
+/// Tier floor to list objects at all (OBI-234, P2-O2 scope: "T3+ to list
+/// at all"). The actual *filtering* within that is `valid_read`, done on
+/// the world side -- this is just the HTTP edge's cheap floor, same role
+/// as [`ADMIN_ROLE_CHANGE_MIN_TIER`] for role changes (UX, not the
+/// security boundary).
+pub const OBJECT_LIST_MIN_TIER: i16 = 3;
+/// Tier floor for `GET /api/v1/admin/objects/:path/vars` (OBI-234 scope:
+/// "T4, audited per access").
+pub const OBJECT_VARS_MIN_TIER: i16 = 4;
+/// Additional tier floor for variable inspection of anything under
+/// `/secure/` (OBI-234 scope: "`/secure` objects T5 only") -- on top of,
+/// not instead of, [`OBJECT_VARS_MIN_TIER`].
+pub const SECURE_VARS_MIN_TIER: i16 = 5;
 /// Step-up MFA freshness window for role changes, grants, another user's
 /// TOTP reset, and broadcast (M-ADM-2): `mfa_at` must be within this many
 /// seconds of "now".
@@ -206,6 +219,16 @@ pub enum AdminError {
     Rejected(String),
     /// The directory (Postgres) failed outright.
     DirectoryUnavailable,
+    /// The world-thread query channel failed outright (busy, timed out,
+    /// or closed -- see `admin_query::WorldQueryError`): distinct from
+    /// [`AdminError::DirectoryUnavailable`] since this is a different
+    /// backend (the live world, not Postgres).
+    WorldUnavailable,
+    /// `object_vars` for a path that isn't a live object (or that
+    /// `valid_read` refused -- the two are indistinguishable on purpose,
+    /// see [`crate::admin_query::WorldAdminQuery::object_vars`]'s doc
+    /// comment).
+    NotFound,
 }
 
 impl From<AdminDirectoryError> for AdminError {
@@ -213,6 +236,18 @@ impl From<AdminDirectoryError> for AdminError {
         match err {
             AdminDirectoryError::Rejected(message) => AdminError::Rejected(message),
             AdminDirectoryError::Unavailable => AdminError::DirectoryUnavailable,
+        }
+    }
+}
+
+impl From<crate::admin_query::WorldQueryError> for AdminError {
+    fn from(err: crate::admin_query::WorldQueryError) -> Self {
+        use crate::admin_query::WorldQueryError;
+        match err {
+            WorldQueryError::NotFound => AdminError::NotFound,
+            WorldQueryError::Busy | WorldQueryError::Timeout | WorldQueryError::Closed => {
+                AdminError::WorldUnavailable
+            }
         }
     }
 }
@@ -910,6 +945,155 @@ impl AuthService {
         )
         .await;
         Ok(rows)
+    }
+
+    /// `GET /api/v1/admin/who` (OBI-234): no tier floor beyond "is a
+    /// staff bearer token at all" -- the scope note doesn't gate `who`
+    /// behind a tier, only behind M-ADM-3's response-shape rule (no
+    /// email/IP, enforced by [`crate::admin_query::WhoEntry`] simply not
+    /// having those fields). Still audited either way (M-ADM-4).
+    pub async fn admin_who(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        query: &dyn crate::admin_query::WorldAdminQuery,
+    ) -> Result<Vec<crate::admin_query::WhoEntry>, AdminError> {
+        match query.who().await {
+            Ok(rows) => {
+                self.audit(
+                    "admin.who",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(format!("count={}", rows.len())),
+                )
+                .await;
+                Ok(rows)
+            }
+            Err(err) => {
+                self.audit(
+                    "admin.who",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(format!("reason={err:?}")),
+                )
+                .await;
+                Err(err.into())
+            }
+        }
+    }
+
+    /// `GET /api/v1/admin/objects` (OBI-234, M-ADM-4): tier >= 3
+    /// ([`OBJECT_LIST_MIN_TIER`]) to list at all; the listing itself is
+    /// `valid_read`-filtered on the world side (`query.list_objects`),
+    /// never re-filtered or re-derived here (design note: "do not invent
+    /// a parallel rule set").
+    pub async fn admin_list_objects(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        query: &dyn crate::admin_query::WorldAdminQuery,
+    ) -> Result<Vec<crate::admin_query::ObjectSummary>, AdminError> {
+        if claims.tier < OBJECT_LIST_MIN_TIER {
+            self.audit(
+                "admin.objects.list",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some("reason=forbidden".to_string()),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        match query.list_objects(&claims.sub, claims.tier).await {
+            Ok(rows) => {
+                self.audit(
+                    "admin.objects.list",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(format!("count={}", rows.len())),
+                )
+                .await;
+                Ok(rows)
+            }
+            Err(err) => {
+                self.audit(
+                    "admin.objects.list",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(format!("reason={err:?}")),
+                )
+                .await;
+                Err(err.into())
+            }
+        }
+    }
+
+    /// `GET /api/v1/admin/objects/:path/vars` (OBI-234, M-ADM-4): tier >=
+    /// 4 ([`OBJECT_VARS_MIN_TIER`]) to inspect any object's variables,
+    /// and tier >= 5 ([`SECURE_VARS_MIN_TIER`]) specifically for anything
+    /// under `/secure/` -- both floors are on top of, not instead of,
+    /// `valid_read` itself (`query.object_vars`), which is the real
+    /// boundary on the world side. Every call is audited, allow or deny,
+    /// per access (M-ADM-4's "audited per access" for this endpoint
+    /// specifically).
+    pub async fn admin_object_vars(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        query: &dyn crate::admin_query::WorldAdminQuery,
+        path: &str,
+    ) -> Result<crate::admin_query::ObjectVars, AdminError> {
+        let detail = format!("path={path}");
+        if claims.tier < OBJECT_VARS_MIN_TIER {
+            self.audit(
+                "admin.objects.vars",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!("{detail} reason=forbidden")),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        if path.starts_with("/secure/") && claims.tier < SECURE_VARS_MIN_TIER {
+            self.audit(
+                "admin.objects.vars",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!("{detail} reason=forbidden_secure")),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        match query.object_vars(&claims.sub, claims.tier, path).await {
+            Ok(vars) => {
+                self.audit(
+                    "admin.objects.vars",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(detail),
+                )
+                .await;
+                Ok(vars)
+            }
+            Err(err) => {
+                self.audit(
+                    "admin.objects.vars",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(format!("{detail} reason={err:?}")),
+                )
+                .await;
+                Err(err.into())
+            }
+        }
     }
 
     /// M-ADM-2: a session is "stepped up" if its `mfa_at` is within the
