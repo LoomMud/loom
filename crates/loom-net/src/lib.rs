@@ -144,13 +144,15 @@ pub async fn run_server(
     // never sees a closed channel (which would otherwise short-circuit
     // `tokio::select!`'s `else` branch); nothing ever sends on it.
     let (_ws_accept_tx, ws_accept_rx) = mpsc::channel(1);
-    run_server_with_ws(
+    let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+    run_server_full(
         listener,
         config,
         event_tx,
         command_rx,
         shutdown_rx,
         ws_accept_rx,
+        adopt_rx,
     )
     .await
 }
@@ -166,9 +168,64 @@ pub async fn run_server_with_ws(
     listener: TcpListener,
     config: NetConfig,
     event_tx: mpsc::Sender<NetEvent>,
+    command_rx: mpsc::Receiver<NetCommand>,
+    shutdown_rx: watch::Receiver<bool>,
+    ws_accept_rx: mpsc::Receiver<axum::extract::ws::WebSocket>,
+) -> io::Result<()> {
+    // See `run_server`'s own comment: nothing sends on this one either,
+    // it just has to stay open for `run_server_full`'s select arm.
+    let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+    run_server_full(
+        listener,
+        config,
+        event_tx,
+        command_rx,
+        shutdown_rx,
+        ws_accept_rx,
+        adopt_rx,
+    )
+    .await
+}
+
+/// Copyover, new-process side (design §7.5 step 3, OBI-221): a connection
+/// `loom-supervise`'s `SCM_RIGHTS` fd-passing (`loom-supervise::fdpass`,
+/// OBI-184) handed this process as a raw, already-connected fd, now a
+/// `std::net::TcpStream` the caller has converted with
+/// [`std::os::fd::FromRawFd`] (this crate deliberately does not touch
+/// raw fds itself -- that conversion, and deciding the fd really is a
+/// `TcpStream` and not some other kind of socket, is the copyover driver's
+/// job, not `loom-net`'s) and put into non-blocking mode so
+/// [`tokio::net::TcpStream::from_std`] accepts it.
+///
+/// `conn` is the id to re-key this session under -- the copyover driver
+/// is expected to pass the *same* `conn` id
+/// [`loom_vm::World::live_connections`] recorded for this socket in the
+/// snapshot's connection table, in the same order
+/// `loom-supervise::fdpass::recv_fds` handed the fds back (see that
+/// module's docs: the wire format has no self-describing framing, so
+/// order is the only correlation the two sides share), so that once this
+/// session is live the driver's `World::reconnect_all` resolves the right
+/// object for the right socket. The caller, not `run_server_full`, is
+/// responsible for making sure `conn` does not collide with a live
+/// freshly-accepted connection's id -- in practice this means draining
+/// every adopted connection before the listener accepts anything new,
+/// which is exactly the copyover hand-off order already.
+pub type AdoptedConn = (ConnId, TcpStream);
+
+/// `run_server_with_ws` plus one more input source: already-connected
+/// sockets pushed in by the copyover driver (see [`AdoptedConn`]'s docs),
+/// each re-keyed under its own caller-chosen `ConnId` instead of this
+/// function's auto-incrementing counter. Both `run_server`/
+/// `run_server_with_ws` are thin wrappers over this with an `adopt_rx`
+/// nothing ever sends on.
+pub async fn run_server_full(
+    listener: TcpListener,
+    config: NetConfig,
+    event_tx: mpsc::Sender<NetEvent>,
     mut command_rx: mpsc::Receiver<NetCommand>,
     mut shutdown_rx: watch::Receiver<bool>,
     mut ws_accept_rx: mpsc::Receiver<axum::extract::ws::WebSocket>,
+    mut adopt_rx: mpsc::Receiver<AdoptedConn>,
 ) -> io::Result<()> {
     let mut next_conn_id: ConnId = 1;
     let mut conns: HashMap<ConnId, ConnEntry> = HashMap::new();
@@ -182,6 +239,31 @@ pub async fn run_server_with_ws(
             }
             Some(conn_id) = closed_rx.recv() => {
                 conns.remove(&conn_id);
+            }
+            Some((conn_id, stream)) = adopt_rx.recv() => {
+                if let Err(err) = stream.set_nodelay(true) {
+                    debug!(conn_id, %err, "set_nodelay failed on adopted connection");
+                }
+                debug!(conn_id, "adopted a pre-connected (copyover) connection");
+                // Keep the auto-increment counter clear of every adopted
+                // id, so a connection accepted off the listener right
+                // after a batch of adoptions can never collide with one.
+                if conn_id >= next_conn_id {
+                    next_conn_id = conn_id + 1;
+                }
+                if event_tx.send(NetEvent::Connected(conn_id)).await.is_err() {
+                    break;
+                }
+
+                let (tx, rx) = mpsc::channel(config.output_queue_depth);
+                let conn_event_tx = event_tx.clone();
+                let conn_closed_tx = closed_tx.clone();
+                let conn_config = config.clone();
+                let task = tokio::spawn(async move {
+                    run_connection(conn_id, stream, conn_config, rx, conn_event_tx, conn_closed_tx).await;
+                });
+
+                conns.insert(conn_id, ConnEntry { tx, task });
             }
             Some(socket) = ws_accept_rx.recv() => {
                 let conn_id = next_conn_id;
@@ -1805,6 +1887,78 @@ mod tests {
         assert_eq!(&fast_buf[..n], b"ok\r\n");
 
         let _ = slow.readable().await;
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    /// Copyover, new-process side (OBI-221): a connection pushed through
+    /// `run_server_full`'s `adopt_rx` under a caller-chosen `ConnId`
+    /// (standing in for one `loom-supervise::fdpass` handed over as a raw
+    /// fd, already converted to a `TcpStream` by the copyover driver --
+    /// see `run_server_full`'s doc comment for why that conversion isn't
+    /// this crate's job) shows up as `NetEvent::Connected` under *that*
+    /// id, not an auto-incremented one, and every `NetCommand` keyed by
+    /// it reaches the right socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adopted_connection_is_keyed_by_the_caller_chosen_conn_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_ws_tx, ws_rx) = mpsc::channel(1);
+        let (adopt_tx, adopt_rx) = mpsc::channel(4);
+
+        let server = tokio::spawn(run_server_full(
+            listener,
+            config,
+            event_tx,
+            cmd_rx,
+            shutdown_rx,
+            ws_rx,
+            adopt_rx,
+        ));
+
+        // Stand in for "a socket some other listener (pre-copyover) already
+        // accepted, and the supervisor handed this process as a raw fd":
+        // a plain TCP connection to a throwaway listener, nothing to do
+        // with `run_server_full`'s own listener above.
+        let stub_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stub_addr = stub_listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(stub_addr).await.unwrap();
+        let (server_side, _peer) = stub_listener.accept().unwrap();
+        server_side.set_nonblocking(true).unwrap();
+
+        const RECONNECTED_ID: ConnId = 4242;
+        adopt_tx
+            .send((RECONNECTED_ID, TcpStream::from_std(server_side).unwrap()))
+            .await
+            .unwrap();
+
+        let conn = loop {
+            match event_rx.recv().await.expect("event channel closed") {
+                NetEvent::Connected(id) => break id,
+                _ => continue,
+            }
+        };
+        assert_eq!(
+            conn, RECONNECTED_ID,
+            "adopted connection must keep its caller-chosen id"
+        );
+
+        // The adopted session is a real, live `loom-net` connection:
+        // `NetCommand::Send` keyed by its id reaches `client`'s socket.
+        cmd_tx
+            .send(NetCommand::Send(RECONNECTED_ID, "hi\n".to_string()))
+            .await
+            .unwrap();
+        drain_preamble(&mut client).await;
+        let mut buf = [0_u8; 8];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hi\r\n");
 
         shutdown_tx.send(true).unwrap();
         server.await.unwrap().unwrap();

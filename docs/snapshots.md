@@ -106,3 +106,59 @@ binding are all identical to the original.
 from an incompatible ABI fails cleanly" acceptance criterion directly:
 corrupted magic, a mismatched ABI version, and truncated bytes each
 produce a typed `SnapshotError`, never a panic.
+
+## Copyover (OBI-221): `reconnect()` and the fd hand-off
+
+The connection table above (`conn: u64 -> ObjectId`, round-tripped by
+`registry.conns`/`bind_seq`) is already everything the *old* process side
+needs to write (design §7.5 step 1): no separate file, it is part of the
+same binary snapshot.
+
+The *new* process side (step 3) is `World::reconnect`/`reconnect_all`
+(`crates/loom-vm/src/world.rs`) plus `World::live_connections`, and
+`loom-net`'s `run_server_full`/`AdoptedConn` (`crates/loom-net/src/lib.rs`).
+The landed interface, for `loom-supervise`'s state machine (OBI-184) to
+drive once it has staged the new process and is ready to hand off sockets:
+
+1. Load the snapshot: `World::load_snapshot(mudlib_root, limits, bytes)`
+   (unchanged from OBI-173) -- this alone restores every conn id's
+   binding, but the object's `conn` field has no live socket behind it
+   yet.
+2. Call `world.live_connections()` to get the bound conn ids in
+   ascending order. This is the order `loom-supervise::fdpass::send_fds`
+   on the *old* process side must send the corresponding client sockets
+   in (fdpass has no self-describing framing -- order is the only
+   correlation the two sides share, per that module's docs), and the
+   order `recv_fds` on the new process side hands them back.
+3. For each `(conn_id, fd)` pair (zipped from `live_connections()` and
+   `recv_fds`'s returned `OwnedFd`s, in order): convert the raw fd to a
+   `tokio::net::TcpStream` (`std::net::TcpStream::from_raw_fd` +
+   `set_nonblocking(true)` + `TcpStream::from_std`) and send
+   `(conn_id, stream)` down the channel `loom_net::run_server_full`'s
+   `adopt_rx` parameter is reading from. `loom-net` deliberately never
+   touches a raw fd itself (see `run_server_full`'s doc comment) --
+   that `unsafe` conversion belongs to whichever crate does the
+   fd-passing (`loom-supervise`, which already carries a CTO-reviewed
+   `unsafe_code` downgrade for exactly this class of code) or the
+   `loom-cli` glue between it and `loom-net`, not `loom-vm` or
+   `loom-net`.
+4. Once every adopted connection has produced a `NetEvent::Connected`
+   (so the session table really is live before mudlib code can write to
+   it), call `world.reconnect_all(host)`. This calls the `reconnect()`
+   apply (if the object defines one -- missing is not an error) first on
+   every bound object, with that object's connection active, so `send()`/
+   `set_echo()` etc. inside `reconnect()` reach the newly-adopted socket;
+   then on every other loaded object with no connection context. The
+   scheduler is not snapshotted (docs/copyover.md), so `reconnect()` is
+   where any object re-arms its heartbeat/`call_out`s.
+5. Only now does the new process's listener start accepting *new*
+   connections (spec's pause-target boundary: "new process loads
+   snapshot, re-adopts sockets, calls `reconnect()` ... target pause
+   < 5 s" ends here).
+
+`crates/loom-vm/tests/copyover.rs` and `loom-net`'s own
+`adopted_connection_is_keyed_by_the_caller_chosen_conn_id` test cover
+steps 1-2-4 and step 3's session-table wiring respectively (with a stub
+socket pair standing in for `loom-supervise::fdpass`'s real recv_fds, so
+neither test needs the supervisor itself, matching the issue's
+acceptance).
