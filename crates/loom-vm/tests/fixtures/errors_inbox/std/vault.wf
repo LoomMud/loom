@@ -1,0 +1,11 @@
+// A program `tests/fixtures/errors_inbox/secure/master.wf`'s `valid_read`
+// denies for `/std/player.wf`'s `errors()` filtering test: subscribes its
+// own heartbeat on `create()` and raises a runtime error every tick, so
+// `World::tick` records one error group attributed to this program.
+pub fn create() {
+    set_heartbeat(true)
+}
+
+pub fn heartbeat() {
+    random(0)
+}

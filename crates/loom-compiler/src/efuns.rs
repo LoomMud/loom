@@ -105,6 +105,7 @@ const NAMES: &[&str] = &[
     "roles_revoke_grant",
     "roles_propose_tier",
     "roles_approve",
+    "errors",
 ];
 
 /// All efun names known to the checker.
@@ -323,6 +324,23 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
             P3,
         ),
         "roles_approve" => ("roles_approve", vec![P(Ty::Int)], 1, Ret::Ty(Ty::Int), P3),
+        // OBI-169: `errors(program_prefix)` -- the grouped runtime-error
+        // inbox, filtered to groups whose `program` starts with
+        // `program_prefix` (or every group, for `""`) and further
+        // filtered by the caller's own `valid_read` permission on each
+        // distinct program covered (see `RegistryHost::driver_efun`'s
+        // `"errors"` arm). Each row is `{"program": string, "function":
+        // string, "message": string, "count": int, "first_seen_unix_ms":
+        // int, "last_seen_unix_ms": int, "sample_trace": [string]}` --
+        // `any`-valued (not a declared `struct`) since this is a
+        // driver-introspection efun, not mudlib data.
+        "errors" => (
+            "errors",
+            vec![P(Ty::String)],
+            0,
+            Ret::Ty(Ty::array(Ty::map(Ty::String, Ty::Any))),
+            P1,
+        ),
         _ => return None,
     };
     Some(EfunSig {

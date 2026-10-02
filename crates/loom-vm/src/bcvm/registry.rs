@@ -1579,6 +1579,13 @@ struct Driver<'a> {
     /// `disk_quota_mb`'s per-`<u>` byte counter (OBI-137 S1), owned by
     /// `World`; see `crate::disk_usage::DiskUsage`.
     disk_usage: &'a mut crate::disk_usage::DiskUsage,
+    /// Grouped runtime-error inbox (OBI-169), owned by `World`; the
+    /// `errors` efun reads it back (filtered by the caller's own
+    /// `valid_read` permission on each distinct program it covers).
+    /// `World::exec` itself is what *writes* to this (every `Err` an
+    /// execution returns is recorded there, uniformly, independent of
+    /// whether this efun is ever called) -- see `World::note_error`.
+    errors: &'a mut crate::errors::ErrorInbox,
 }
 
 /// Approximate current native stack position (mirrors the tree-walker's
@@ -1840,6 +1847,7 @@ impl<'a> RegistryHost<'a> {
         cut_guard: Option<GuardSet>,
         input_actor: Option<Sym>,
         disk_usage: &'a mut crate::disk_usage::DiskUsage,
+        errors: &'a mut crate::errors::ErrorInbox,
     ) -> Self {
         let base = cut_guard
             .unwrap_or_else(|| GuardSet::empty().with(principal_of(registry, self_object)));
@@ -1869,6 +1877,7 @@ impl<'a> RegistryHost<'a> {
                 input_actor,
                 root,
                 disk_usage,
+                errors,
             }),
             stack_base: stack_addr(),
             call_cache: HashMap::new(),
@@ -3285,6 +3294,7 @@ impl<'a> RegistryHost<'a> {
             "roles_revoke_grant" => self.roles_revoke_grant(&a0, &a1, &a2, &a3),
             "roles_propose_tier" => self.roles_propose_tier(&a0, &a1, &a2),
             "roles_approve" => self.roles_approve(&a0),
+            "errors" => self.errors_efun(&a0),
             _ => Err(RtError::new(format!(
                 "internal: efun `{name}` not implemented"
             ))),
@@ -3710,6 +3720,77 @@ impl<'a> RegistryHost<'a> {
             self.roles_request_unavailable(id, caller);
         }
         Ok(Value::Int(id as i64))
+    }
+
+    /// `errors(program_prefix)` (OBI-169): every grouped runtime-error row
+    /// whose program starts with `program_prefix` (`""`/`null`: every
+    /// program), further filtered to only the programs the caller can
+    /// `valid_read` -- exactly `read_file`'s VFS gate, applied once per
+    /// distinct program in the result rather than once per group (a
+    /// program can have many error groups; the decision is the same for
+    /// all of them and the security decision cache would dedupe the
+    /// `valid_read` apply calls anyway, but this skips even the cache
+    /// lookups). A denied program's groups are silently omitted, not an
+    /// error -- same as a `ls`-style listing a user has partial access
+    /// to, not a single all-or-nothing permission check.
+    fn errors_efun(&mut self, filter: &Value) -> R<Value> {
+        let prefix = match filter {
+            Value::Null => None,
+            v => match v.as_str() {
+                Some(s) if !s.is_empty() => Some(s.to_string()),
+                Some(_) => None,
+                None => return Err(RtError::new("errors(): expected string")),
+            },
+        };
+        let rows = self
+            .driver
+            .as_ref()
+            .expect("checked above")
+            .errors
+            .snapshot(prefix.as_deref());
+        let mut decided: HashMap<String, bool> = HashMap::new();
+        let mut out = Vec::new();
+        for row in rows {
+            let allowed = match decided.get(&row.program) {
+                Some(b) => *b,
+                None => {
+                    let ok = self
+                        .authorize(
+                            "errors",
+                            Privilege::P1,
+                            Operation::Read {
+                                path: &row.program,
+                                op: "errors",
+                            },
+                        )
+                        .is_ok();
+                    decided.insert(row.program.clone(), ok);
+                    ok
+                }
+            };
+            if !allowed {
+                continue;
+            }
+            let mut m = heap::MapData::default();
+            m.insert(Value::str("program"), Value::str(&row.program));
+            m.insert(Value::str("function"), Value::str(&row.function));
+            m.insert(Value::str("message"), Value::str(&row.message));
+            m.insert(Value::str("count"), Value::Int(row.count as i64));
+            m.insert(
+                Value::str("first_seen_unix_ms"),
+                Value::Int(row.first_seen_unix_ms as i64),
+            );
+            m.insert(
+                Value::str("last_seen_unix_ms"),
+                Value::Int(row.last_seen_unix_ms as i64),
+            );
+            m.insert(
+                Value::str("sample_trace"),
+                Value::array(row.sample_trace.iter().map(|s| Value::str(s)).collect()),
+            );
+            out.push(Value::map(m));
+        }
+        Ok(Value::array(out))
     }
 
     /// Run `name` declared in exactly `target` as `on` in a *fresh*

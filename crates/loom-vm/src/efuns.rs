@@ -144,6 +144,12 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     ("roles_revoke_grant", 4, 4, Privilege::P3, 50),
     ("roles_propose_tier", 3, 3, Privilege::P3, 50),
     ("roles_approve", 1, 1, Privilege::P3, 50),
+    // OBI-169: `errors(program_prefix)`, the grouped runtime-error inbox
+    // (filtered by the caller's own `valid_read` permission per distinct
+    // program, inside `RegistryHost::driver_efun`'s `"errors"` arm --
+    // same pattern as `read_file`'s VFS gate, just applied once per
+    // program instead of once per call).
+    ("errors", 0, 1, Privilege::P1, 20),
 ];
 
 /// `(min args, max args)` of efun `name`, if it exists.

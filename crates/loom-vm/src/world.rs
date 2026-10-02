@@ -361,6 +361,9 @@ pub struct World {
     /// `disk_quota_mb`'s per-`<u>` byte counter (OBI-137 S1): see
     /// `crate::disk_usage::DiskUsage`.
     disk_usage: crate::disk_usage::DiskUsage,
+    /// Grouped runtime-error inbox (OBI-169, spec §8.3): see
+    /// `crate::errors::ErrorInbox`. Fed uniformly by `World::exec`.
+    errors: crate::errors::ErrorInbox,
 }
 
 /// Identifies one [`World::begin_recompile`] call, so its eventual result
@@ -489,6 +492,7 @@ impl World {
             last_call_out_quota_uid: None,
             tick_share: HashMap::new(),
             disk_usage: crate::disk_usage::DiskUsage::default(),
+            errors: crate::errors::ErrorInbox::new(),
         };
         let mut null = NullHost;
         let sentinel = ObjectId {
@@ -705,6 +709,7 @@ impl World {
             cut_guard,
             input_actor,
             &mut self.disk_usage,
+            &mut self.errors,
         );
         let result = body(&mut rh);
         // OBI-121 S2c `tick_share_per_min`: charge whatever ticks this
@@ -716,7 +721,46 @@ impl World {
             self.record_tick_share_usage(uid, used);
         }
         self.registry.debug_assert_atomic_scope_closed();
+        // OBI-169: every execution's `Err` is recorded in the error inbox
+        // here, uniformly -- independent of whether the caller also
+        // reports it to a player (`World::report`) or silently drops it
+        // (a heartbeat, a `call_out`, `net_dead`, an eager upgrade
+        // migration, an `account_result`/`roles_result` drain).
+        if let Err(e) = &result {
+            self.note_error(acting, e);
+        }
         result
+    }
+
+    /// Record `e` in the error inbox (OBI-169), attributed to `acting`'s
+    /// leaf program at the time of the error. Not necessarily where the
+    /// error actually originated -- a cross-object/program call chain can
+    /// fail several frames deep -- see `crate::errors`'s module doc for
+    /// the flagged `(program, function, message)` grouping deviation from
+    /// the spec's `(program, line, message)`.
+    fn note_error(&mut self, acting: ObjectId, e: &RtError) {
+        let program = self
+            .registry
+            .get(acting)
+            .map(|o| o.program.path.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        let function = crate::errors::function_of(e);
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.errors
+            .record(&program, &function, &e.message, &e.trace, now_unix_ms);
+    }
+
+    /// The grouped runtime-error inbox (OBI-169), unfiltered by
+    /// permission: for tests/introspection and the driver's
+    /// `/api/v1/errors` HTTP handler, which has no in-game caller to
+    /// filter by (unlike the `errors` efun -- see `loom-http`'s doc
+    /// comment on that route for the admin-only rationale).
+    /// `program_prefix` matches [`crate::errors::ErrorInbox::snapshot`].
+    pub fn errors_snapshot(&self, program_prefix: Option<&str>) -> Vec<crate::errors::ErrorRecord> {
+        self.errors.snapshot(program_prefix)
     }
 
     /// `tick_share_per_min` (OBI-121 S2c §3, OBI-137 S2): does `uid`'s

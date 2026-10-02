@@ -54,3 +54,4 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `roles_revoke_grant` | `roles_revoke_grant(String, String, String, String) -> Int` | P3 | 50 |
 | `roles_propose_tier` | `roles_propose_tier(String, Int, String) -> Int` | P3 | 50 |
 | `roles_approve` | `roles_approve(Int) -> Int` | P3 | 50 |
+| `errors` | `errors(String?) -> Array(Map(String, Any))` | P1 | 20 |

@@ -1117,6 +1117,7 @@ version = "0.0.1"
 dependencies = [
  "loom-compiler",
  "loom-syntax",
+ "metrics",
  "proptest",
  "serde_json",
 ]
