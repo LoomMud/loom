@@ -10,40 +10,42 @@
 //!
 //! [`StaffDirectory::auth_status_for`] is the *only* source of truth for a
 //! staff uid's tier. [`AuthService::issue_tokens`] -- the single place
-//! shared by the password, refresh, and GitHub login paths -- calls it
-//! fresh every time: an access token's `tier`/`scopes` claims are a
-//! snapshot taken at issue time, never a value the client (or an upstream
-//! IdP) can set, and a promotion or demotion always takes effect at the
-//! access token's next refresh, which can be forced by revoking the
-//! caller's refresh tokens (see
+//! shared by the password, refresh, and GitHub login paths -- is always
+//! fed a status read fresh just beforehand: an access token's
+//! `tier`/`scopes` claims are a snapshot taken at issue time, never a
+//! value the client (or an upstream IdP) can set, and a promotion or
+//! demotion always takes effect at the access token's next refresh,
+//! which can be forced by revoking the caller's refresh tokens (see
 //! [`StaffDirectory::refresh_token_revoke_all`]). A uid with *no* `staff`
 //! row at all (e.g. removed staff) is refused outright rather than minting
 //! a tier-0 token (OBI-195 review fix 5).
 //!
-//! ## TOTP is mandatory for T3+, at issue *and* refresh
+//! ## TOTP is mandatory for T3+, at issue and at refresh
 //!
-//! [`AuthService::issue_tokens`] refuses a tier-3-or-above staff member's
-//! session with [`AuthError::TotpRequired`] unless their TOTP secret is
-//! both enrolled *and* confirmed (see `staff.totp_confirmed_at` in
-//! migration 0003), and refuses with [`AuthError::TotpInvalid`] unless
-//! `totp_code` verifies -- for every path that reaches it: password login,
-//! refresh, and GitHub login alike (OBI-195 review fix 2: the first cut of
-//! this PR only gated the password path, which meant a T3+ uid promoted
-//! after an earlier, sub-T3 login could keep refreshing T3+ tokens
-//! forever, and GitHub login skipped the gate entirely). There is no
-//! bypass: a T3+ row with no confirmed secret cannot get a session, only
-//! enrol one (via [`AuthService::totp_enroll`]/[`AuthService::totp_confirm`],
-//! which themselves require a password login having already succeeded up
-//! to the TOTP gate -- see `handlers.rs`). Every accepted code also
-//! consumes its RFC 6238 time-step via
-//! [`StaffDirectory::totp_consume_step`], so the same code can never be
-//! replayed even within the skew window (OBI-195 review fix 4).
+//! [`AuthService::login`]/[`AuthService::github_login`] refuse a
+//! tier-3-or-above staff member's session with [`AuthError::TotpRequired`]
+//! unless their TOTP secret is both enrolled *and* confirmed (see
+//! `staff.totp_confirmed_at` in migration 0003) and a correct `totp_code`
+//! is supplied (OBI-195 review fix 2: the first cut of this PR only gated
+//! the password path, which meant a T3+ uid promoted after an earlier,
+//! sub-T3 login could keep refreshing T3+ tokens forever, and GitHub login
+//! skipped the gate entirely). There is no bypass: a T3+ row with no
+//! confirmed secret cannot get a session, only enrol one (via
+//! [`AuthService::totp_enroll`]/[`AuthService::totp_confirm`], which
+//! themselves require a password login having already succeeded up to the
+//! TOTP gate -- see `handlers.rs`). Every accepted code also consumes its
+//! RFC 6238 time-step via [`StaffDirectory::totp_consume_step`], so the
+//! same code can never be replayed even within the skew window (OBI-195
+//! review fix 4).
 //!
-//! Requiring a fresh `totp_code` on every refresh call for a T3+ uid is a
-//! deliberate stopgap, not a final UX: it closes the immediate gap: the
-//! richer step-up/`mfa_at` design from the OBI-179 threat model (skip the
-//! code if the session authenticated with one recently) is tracked as a
-//! follow-up (OBI-197/OBI-198), not blocking this PR.
+//! [`AuthService::refresh`] enforces the *same* mandatory-TOTP floor, but
+//! against state rather than a fresh code (OBI-197/OBI-198 follow-up to
+//! OBI-195 review fix 2): a cookie-only refresh cannot carry a TOTP code,
+//! and step-up freshness is `mfa_at`'s job (M-ADM-2), not every refresh's.
+//! A refresh for a T3+ uid is refused if there is no staff row, if TOTP
+//! isn't confirmed, or if the token family's `amr` (fixed at login, never
+//! recomputed by a refresh -- see [`Self::issue_tokens`]) doesn't contain
+//! `"otp"`; any of those refusals revokes the whole family.
 //!
 //! ## GitHub login never creates staff
 //!
@@ -69,7 +71,7 @@
 mod claims;
 mod directory;
 mod github;
-mod jwt;
+pub mod jwt;
 pub mod ratelimit;
 mod totp;
 
@@ -79,7 +81,7 @@ pub use directory::{
     StaffDirectory,
 };
 pub use github::{GithubAuthError, GithubIdentityProvider, GithubUser};
-pub use jwt::{JwtKeys, TokenPair};
+pub use jwt::{AUDIENCE, JwtKeys, TokenPair};
 pub use ratelimit::{RateLimitDecision, RateLimiter};
 pub use totp::{
     TotpEnrollment, generate_totp_secret, totp_for_secret, totp_step_for_code, verify_totp_code,
@@ -128,7 +130,8 @@ pub enum AuthError {
     /// fix 5).
     InvalidCredentials,
     /// Correct password, but the account needs a TOTP code and none (or an
-    /// incorrect one) was supplied.
+    /// incorrect one) was supplied -- or, on refresh, the account's tier
+    /// now requires TOTP and the session family never completed it.
     TotpRequired,
     /// Correct password and tier is below the mandatory-TOTP floor, but the
     /// account somehow has no *confirmed* TOTP secret even though one was
@@ -222,8 +225,9 @@ impl AuthService {
     /// Username/password login (design §9). Refuses with
     /// [`AuthError::TotpRequired`]/[`AuthError::TotpInvalid`] for a T3+
     /// staff member unless `totp_code` verifies against their confirmed
-    /// secret -- enforced inside [`Self::issue_tokens`], the single gate
-    /// shared by every login method (OBI-195 review fix 2).
+    /// secret -- the only path, together with [`Self::github_login`],
+    /// that gates on a *code*; [`Self::refresh`] gates on state instead
+    /// (see the module docs).
     ///
     /// Rate limiting (OBI-200, M-AUTH-1): checked *before* any
     /// credential work. A throttled IP gets [`AuthError::RateLimited`]. A
@@ -309,24 +313,38 @@ impl AuthService {
             }
         };
 
-        // The TOTP gate and token mint both happen inside `issue_tokens`,
-        // which re-reads tier/TOTP state fresh rather than reusing
-        // `record` -- one enforcement point for every login method
-        // (OBI-195 review fix 2), and a login never trusts a `staff_login`
-        // row that could in principle be a moment stale.
-        match self.issue_tokens(&record.uid, totp_code).await {
-            Ok(pair) => {
-                self.rate_limiter.record_success(&account_key);
+        // Re-read tier/TOTP state fresh rather than trusting `record`,
+        // which could in principle be a moment stale, and so that a
+        // removed staff row (OBI-195 review fix 5) is refused here too.
+        let status = match self.require_staff_status(&record.uid).await {
+            Ok(status) => status,
+            Err(err) => {
+                // Not a guess (directory error or removed staff row):
+                // give the reservation back (OBI-204).
+                self.rate_limiter.release(&account_key);
                 self.audit(
-                    "auth.login.ok",
+                    "auth.login.fail",
                     Some(record.uid.clone()),
                     ctx,
-                    "allow",
-                    None,
+                    "deny",
+                    Some(totp_gate_detail(&err).to_string()),
                 )
                 .await;
-                Ok(pair)
+                return Err(err);
             }
+        };
+
+        let totp_verified = match self
+            .enforce_totp_gate_with_code(
+                &record.uid,
+                status.tier,
+                status.totp_secret.as_deref(),
+                status.totp_confirmed,
+                totp_code,
+            )
+            .await
+        {
+            Ok(verified) => verified,
             Err(err) => {
                 if err == AuthError::TotpInvalid {
                     self.rate_limiter.record_failure(&account_key);
@@ -344,9 +362,28 @@ impl AuthService {
                     Some(totp_gate_detail(&err).to_string()),
                 )
                 .await;
-                Err(err)
+                return Err(err);
             }
-        }
+        };
+        let (amr, mfa_at) = if totp_verified {
+            (vec!["pwd".to_string(), "otp".to_string()], Some(now()))
+        } else {
+            (vec!["pwd".to_string()], None)
+        };
+
+        self.rate_limiter.record_success(&account_key);
+        let pair = self
+            .issue_tokens(&record.uid, status.tier, generate_sid(), amr, mfa_at)
+            .await?;
+        self.audit(
+            "auth.login.ok",
+            Some(record.uid.clone()),
+            ctx,
+            "allow",
+            None,
+        )
+        .await;
+        Ok(pair)
     }
 
     /// GitHub login (design §9): `github_id` is the numeric id the caller
@@ -371,16 +408,47 @@ impl AuthService {
             .github_lookup(github_id)
             .await?
             .ok_or(AuthError::InvalidCredentials)?;
-        self.issue_tokens(&uid, totp_code).await
+        let status = self.require_staff_status(&uid).await?;
+        let totp_verified = self
+            .enforce_totp_gate_with_code(
+                &uid,
+                status.tier,
+                status.totp_secret.as_deref(),
+                status.totp_confirmed,
+                totp_code,
+            )
+            .await?;
+        let (amr, mfa_at) = if totp_verified {
+            (vec!["github".to_string(), "otp".to_string()], Some(now()))
+        } else {
+            (vec!["github".to_string()], None)
+        };
+        self.issue_tokens(&uid, status.tier, generate_sid(), amr, mfa_at)
+            .await
     }
 
     /// Rotate a refresh token: the presented token must be unexpired and
     /// unrevoked, else [`AuthError::InvalidRefreshToken`]. On success the
-    /// old token is revoked and a new (access, refresh) pair is issued,
-    /// with `tier`/`scopes` -- and the TOTP gate -- read fresh from
-    /// Postgres, never carried over from whatever the old access token
-    /// claimed (OBI-195 review fix 2: a T3+ uid must keep proving TOTP at
-    /// refresh, not just at the original login).
+    /// old token is revoked and a new (access, refresh) pair is issued in
+    /// the *same session family* -- `sid`/`amr`/`mfa_at` are carried
+    /// forward unchanged from the row the presented token rotated out of
+    /// (OBI-203: `sid` stays the token-family id M-AUTH-5 reuse detection
+    /// and family revocation are keyed off, and `amr`/`mfa_at` still
+    /// describe the *original* login's authentication context, so the
+    /// M-ADM-2 step-up freshness window is measured from the real
+    /// authentication event, never reset by a later refresh) -- while
+    /// `tier`/`scopes` are read fresh from Postgres, never carried over
+    /// from whatever the old access token claimed.
+    ///
+    /// The mandatory-TOTP floor is enforced here too (OBI-195 review fix
+    /// 2), but against *state*, not a fresh code (OBI-197/OBI-198
+    /// follow-up): a cookie-only refresh has nowhere to carry a TOTP code,
+    /// and the family's `amr` already records whether its login completed
+    /// one. A refresh for a tier at or above [`MANDATORY_TOTP_TIER`] is
+    /// refused -- revoking the whole family -- if there is no staff row,
+    /// if TOTP isn't confirmed, or if `amr` doesn't contain `"otp"` (e.g.
+    /// a T2 login later promoted to T3, which never had the chance to
+    /// prove TOTP in the first place).
     ///
     /// The rotation itself is a single atomic `UPDATE ... RETURNING` (see
     /// [`RefreshRotation`], OBI-195 review fix 1): two concurrent
@@ -394,13 +462,26 @@ impl AuthService {
     pub async fn refresh(
         &self,
         refresh_token: &str,
-        totp_code: Option<&str>,
         ctx: &AuthContext,
     ) -> Result<TokenPair, AuthError> {
         let token_hash = hash_token(refresh_token);
         match self.directory.refresh_token_rotate(&token_hash).await? {
-            RefreshRotation::Rotated { staff_uid } => {
-                self.issue_tokens(&staff_uid, totp_code).await
+            RefreshRotation::Rotated {
+                staff_uid,
+                sid,
+                amr,
+                mfa_at,
+            } => {
+                let status = match self.require_staff_status(&staff_uid).await {
+                    Ok(status) => status,
+                    Err(err) => return Err(err),
+                };
+                if let Err(err) = self.enforce_totp_gate_for_refresh(status.tier, &amr) {
+                    self.directory.refresh_token_revoke_all(&staff_uid).await?;
+                    return Err(err);
+                }
+                self.issue_tokens(&staff_uid, status.tier, sid, amr, mfa_at)
+                    .await
             }
             RefreshRotation::Reused { staff_uid } => {
                 self.directory.refresh_token_revoke_all(&staff_uid).await?;
@@ -465,12 +546,13 @@ impl AuthService {
 
     /// Verify `code` against `uid`'s just-enrolled (or previously
     /// enrolled) secret and, on success, mark it confirmed -- the gate
-    /// [`Self::issue_tokens`] checks for T3+ staff. Like every other TOTP
-    /// check in this service, the matched step is consumed atomically
-    /// (OBI-195 review fix 4): confirming with a code does not leave that
-    /// code valid for a subsequent login. TOTP attempts share the login
-    /// rate limiter (M-AUTH-1): a wrong code counts as a failure against
-    /// both the per-account and per-IP limits.
+    /// [`Self::login`]/[`Self::github_login`] check for T3+ staff. Like
+    /// every other TOTP check in this service, the matched step is
+    /// consumed atomically (OBI-195 review fix 4): confirming with a code
+    /// does not leave that code valid for a subsequent login. TOTP
+    /// attempts share the login rate limiter (M-AUTH-1): a wrong code
+    /// counts as a failure against both the per-account and per-IP
+    /// limits.
     pub async fn totp_confirm(
         &self,
         uid: &str,
@@ -524,36 +606,35 @@ impl AuthService {
             .map_err(|_| AuthError::InvalidRefreshToken)
     }
 
-    /// Issue a fresh (access, refresh) pair for `uid`, reading its tier and
-    /// TOTP state from Postgres right now and enforcing the mandatory-TOTP
-    /// gate against them. Shared by the password, GitHub, and refresh
-    /// paths so there is exactly one place that turns a tier into scopes,
-    /// enforces TOTP, and mints tokens (OBI-195 review fix 2).
-    async fn issue_tokens(
-        &self,
-        uid: &str,
-        totp_code: Option<&str>,
-    ) -> Result<TokenPair, AuthError> {
+    /// Read `uid`'s fresh tier/TOTP status, refusing outright (and
+    /// dropping any sessions it might still hold) if it has no `staff`
+    /// row at all (OBI-195 review fix 5): the old `tier_of`-based design
+    /// defaulted a missing row to tier 0 and minted a token anyway.
+    async fn require_staff_status(&self, uid: &str) -> Result<StaffAuthStatus, AuthError> {
         let Some(status) = self.directory.auth_status_for(uid).await? else {
-            // No `staff` row at all (OBI-195 review fix 5): removed staff,
-            // or any uid that otherwise reached this point without one.
-            // The old `tier_of`-based design defaulted this to tier 0 and
-            // minted a token anyway; refuse outright instead, and drop any
-            // sessions this uid might still hold.
             self.directory.refresh_token_revoke_all(uid).await?;
             return Err(AuthError::InvalidCredentials);
         };
+        Ok(status)
+    }
 
-        self.enforce_totp_gate(
-            uid,
-            status.tier,
-            status.totp_secret.as_deref(),
-            status.totp_confirmed,
-            totp_code,
-        )
-        .await?;
-
-        let tier = status.tier;
+    /// Issue a fresh (access, refresh) pair for `uid` at `tier` (read
+    /// fresh from Postgres by the caller just beforehand -- see
+    /// [`Self::require_staff_status`]). Shared by the password, GitHub,
+    /// and refresh paths so there is exactly one place that turns a tier
+    /// into scopes and mints tokens. `sid` is the token-family id (fresh
+    /// at login via [`generate_sid`]; carried forward unchanged on
+    /// refresh -- see [`Self::refresh`]), and `amr`/`mfa_at` describe
+    /// *the family's original* authentication context (D-TM3: identity,
+    /// never authority).
+    async fn issue_tokens(
+        &self,
+        uid: &str,
+        tier: i16,
+        sid: String,
+        amr: Vec<String>,
+        mfa_at: Option<OffsetDateTime>,
+    ) -> Result<TokenPair, AuthError> {
         let scopes = scopes_for_tier(tier);
         let issued_at = now();
         let access_expires_at = issued_at + self.access_ttl;
@@ -561,8 +642,14 @@ impl AuthService {
             sub: uid.to_string(),
             tier,
             scopes,
+            iss: self.keys.issuer().to_string(),
+            aud: self.keys.audience().to_string(),
             iat: issued_at.unix_timestamp(),
+            nbf: issued_at.unix_timestamp(),
             exp: access_expires_at.unix_timestamp(),
+            sid: sid.clone(),
+            amr: amr.clone(),
+            mfa_at: mfa_at.map(|t| t.unix_timestamp()),
         };
         let access_token = self
             .keys
@@ -572,7 +659,14 @@ impl AuthService {
         let refresh_token = generate_refresh_token();
         let refresh_expires_at = issued_at + self.refresh_ttl;
         self.directory
-            .refresh_token_insert(uid, &hash_token(&refresh_token), refresh_expires_at)
+            .refresh_token_insert(
+                uid,
+                &hash_token(&refresh_token),
+                refresh_expires_at,
+                &sid,
+                &amr,
+                mfa_at,
+            )
             .await?;
 
         Ok(TokenPair {
@@ -583,19 +677,24 @@ impl AuthService {
         })
     }
 
-    /// The mandatory-TOTP gate (design §9/D-P2.5: "mandatory for T3+"),
-    /// enforced identically for every path that reaches
-    /// [`Self::issue_tokens`] (OBI-195 review fix 2).
-    async fn enforce_totp_gate(
+    /// The mandatory-TOTP gate for [`Self::login`]/[`Self::github_login`]
+    /// (design §9/D-P2.5: "mandatory for T3+"), enforced identically for
+    /// both. Returns whether a TOTP code was presented and verified, so
+    /// callers can set `amr`/`mfa_at` accordingly (M-AUTH-3's "record
+    /// `amr` and `mfa_at`"). `Ok(false)` covers both "TOTP isn't mandatory
+    /// for this uid and none was supplied" and -- deliberately -- is never
+    /// reached for a mandatory-TOTP uid without a verified code, since
+    /// those return `Err` instead.
+    async fn enforce_totp_gate_with_code(
         &self,
         uid: &str,
         tier: i16,
         totp_secret: Option<&str>,
         totp_confirmed: bool,
         totp_code: Option<&str>,
-    ) -> Result<(), AuthError> {
+    ) -> Result<bool, AuthError> {
         if tier < MANDATORY_TOTP_TIER {
-            return Ok(());
+            return Ok(false);
         }
 
         let Some(secret) = totp_secret.filter(|_| totp_confirmed) else {
@@ -608,7 +707,22 @@ impl AuthService {
             return Err(AuthError::TotpRequired);
         };
 
-        self.verify_and_consume_totp(uid, secret, code).await
+        self.verify_and_consume_totp(uid, secret, code).await?;
+        Ok(true)
+    }
+
+    /// The mandatory-TOTP gate for [`Self::refresh`]: unlike the code-based
+    /// gate above, this checks *state* -- tier, confirmation, and whether
+    /// the session family's `amr` already contains `"otp"` -- since a
+    /// cookie-only refresh has no code to present (see the module docs).
+    fn enforce_totp_gate_for_refresh(&self, tier: i16, amr: &[String]) -> Result<(), AuthError> {
+        if tier < MANDATORY_TOTP_TIER {
+            return Ok(());
+        }
+        if !amr.iter().any(|m| m == "otp") {
+            return Err(AuthError::TotpRequired);
+        }
+        Ok(())
     }
 
     /// Verify `code` against `secret` and, only if it matches, atomically
@@ -693,6 +807,17 @@ fn account_rate_key(resolved_uid: Option<&str>, username: &str) -> String {
 
 fn now() -> OffsetDateTime {
     OffsetDateTime::now_utc()
+}
+
+/// A fresh token-family id (M-AUTH-4's `sid` claim): identity only, never
+/// looked up or revoked by itself (M-AUTH-5's revocation is keyed off the
+/// refresh token's hash) -- it exists so audit/log correlation
+/// (M-AUTH-9) can tie an access token back to the session that minted it
+/// without logging the token itself.
+fn generate_sid() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    hex_encode(&bytes)
 }
 
 /// A cryptographically random, URL-safe-ish opaque refresh token (32 bytes

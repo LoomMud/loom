@@ -195,15 +195,27 @@ pub struct StaffAuthRecord {
     pub totp_confirmed: bool,
 }
 
-/// A `refresh_tokens` row (OBI-174). Only ever looked up by
-/// [`Persist::refresh_token_lookup`]'s SHA-256 hash of the bearer token --
-/// the plaintext token itself is never stored.
+/// A `refresh_tokens` row (OBI-174, `sid`/`amr`/`mfa_at` added OBI-203).
+/// Only ever looked up by [`Persist::refresh_token_lookup`]'s SHA-256 hash
+/// of the bearer token -- the plaintext token itself is never stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshTokenRecord {
     pub id: Uuid,
     pub staff_uid: String,
     pub expires_at: OffsetDateTime,
     pub revoked_at: Option<OffsetDateTime>,
+    /// The token-family id established at login and carried forward on
+    /// every rotation of this family (OBI-203, M-AUTH-5): the key reuse
+    /// detection and family revocation are keyed off.
+    pub sid: String,
+    /// The authentication methods that produced the *login* that started
+    /// this family -- carried forward unchanged across rotation (OBI-203).
+    pub amr: Vec<String>,
+    /// The most recent MFA completion at the time this family's login
+    /// happened, if any -- carried forward unchanged across rotation so
+    /// the M-ADM-2 step-up freshness window is measured from the original
+    /// authentication, not reset by every refresh.
+    pub mfa_at: Option<OffsetDateTime>,
 }
 
 /// Fresh tier + TOTP enrolment state for a uid (OBI-174/OBI-195 review fix
@@ -225,8 +237,15 @@ pub struct StaffTierStatus {
 /// for a given token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshTokenRotation {
-    Rotated { staff_uid: String },
-    Reused { staff_uid: String },
+    Rotated {
+        staff_uid: String,
+        sid: String,
+        amr: Vec<String>,
+        mfa_at: Option<OffsetDateTime>,
+    },
+    Reused {
+        staff_uid: String,
+    },
     Expired,
     NotFound,
 }
@@ -767,22 +786,31 @@ impl Persist {
     }
 
     /// Record a newly-issued refresh token. Only `token_hash` (SHA-256 of
-    /// the bearer token, computed by loom-http) is ever stored.
+    /// the bearer token, computed by loom-http) is ever stored. `sid` is
+    /// the token-family id (fresh at login, carried forward on rotation --
+    /// see `loom-http`'s `AuthService::issue_tokens`), and `amr`/`mfa_at`
+    /// describe the family's *original* authentication context (OBI-203).
     pub async fn refresh_token_insert(
         &self,
         staff_uid: &str,
         token_hash: &str,
         expires_at: OffsetDateTime,
+        sid: &str,
+        amr: &[String],
+        mfa_at: Option<OffsetDateTime>,
     ) -> Result<Uuid> {
         use sqlx::Row;
         let row = sqlx::query(
-            "INSERT INTO refresh_tokens (staff_uid, token_hash, expires_at)
-             VALUES ($1, $2, $3)
+            "INSERT INTO refresh_tokens (staff_uid, token_hash, expires_at, sid, amr, mfa_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING id",
         )
         .bind(staff_uid)
         .bind(token_hash)
         .bind(expires_at)
+        .bind(sid)
+        .bind(amr)
+        .bind(mfa_at)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.try_get("id")?)
@@ -799,7 +827,8 @@ impl Persist {
     ) -> Result<Option<RefreshTokenRecord>> {
         use sqlx::Row;
         let row = sqlx::query(
-            "SELECT id, staff_uid, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
+            "SELECT id, staff_uid, expires_at, revoked_at, sid, amr, mfa_at \
+             FROM refresh_tokens WHERE token_hash = $1",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
@@ -812,6 +841,9 @@ impl Persist {
             staff_uid: row.try_get("staff_uid")?,
             expires_at: row.try_get("expires_at")?,
             revoked_at: row.try_get("revoked_at")?,
+            sid: row.try_get("sid")?,
+            amr: row.try_get("amr")?,
+            mfa_at: row.try_get("mfa_at")?,
         }))
     }
 
@@ -828,7 +860,7 @@ impl Persist {
             "UPDATE refresh_tokens
              SET revoked_at = NOW()
              WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()
-             RETURNING staff_uid",
+             RETURNING staff_uid, sid, amr, mfa_at",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
@@ -837,6 +869,9 @@ impl Persist {
         if let Some(row) = updated {
             return Ok(RefreshTokenRotation::Rotated {
                 staff_uid: row.try_get("staff_uid")?,
+                sid: row.try_get("sid")?,
+                amr: row.try_get("amr")?,
+                mfa_at: row.try_get("mfa_at")?,
             });
         }
 

@@ -60,8 +60,15 @@ pub struct StaffAuthStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshRotation {
     /// This caller won the race (or there was no race): the old token is
-    /// now revoked and a new pair should be issued for `staff_uid`.
-    Rotated { staff_uid: String },
+    /// now revoked and a new pair should be issued for `staff_uid`, in the
+    /// same token family -- `sid`/`amr`/`mfa_at` are the values carried
+    /// forward from the row that was just rotated out (OBI-203).
+    Rotated {
+        staff_uid: String,
+        sid: String,
+        amr: Vec<String>,
+        mfa_at: Option<OffsetDateTime>,
+    },
     /// The token exists but was already revoked -- either rotated out by
     /// an earlier, legitimate `refresh` call, or explicitly logged out.
     /// Either way, a *second* presentation of it is either a lost race
@@ -83,6 +90,17 @@ pub struct RefreshRecord {
     pub staff_uid: String,
     pub expires_at: OffsetDateTime,
     pub revoked_at: Option<OffsetDateTime>,
+    /// The token-family id (OBI-203, M-AUTH-5): set at login, carried
+    /// forward unchanged on every rotation of this family.
+    pub sid: String,
+    /// The authentication methods the *login* that started this family
+    /// used -- carried forward unchanged across rotation.
+    pub amr: Vec<String>,
+    /// The most recent MFA completion at the time this family's login
+    /// happened, if any -- carried forward unchanged across rotation (the
+    /// M-ADM-2 step-up freshness window is always measured from this, not
+    /// reset by a later refresh).
+    pub mfa_at: Option<OffsetDateTime>,
 }
 
 /// Opaque directory failure: callers only ever see
@@ -130,6 +148,9 @@ pub trait StaffDirectory: Send + Sync {
         uid: &str,
         token_hash: &str,
         expires_at: OffsetDateTime,
+        sid: &str,
+        amr: &[String],
+        mfa_at: Option<OffsetDateTime>,
     ) -> Result<(), DirectoryError>;
     async fn refresh_token_lookup(
         &self,
@@ -210,9 +231,17 @@ impl StaffDirectory for loom_persist::Persist {
             .await
             .map_err(|_| DirectoryError)?;
         Ok(match outcome {
-            loom_persist::RefreshTokenRotation::Rotated { staff_uid } => {
-                RefreshRotation::Rotated { staff_uid }
-            }
+            loom_persist::RefreshTokenRotation::Rotated {
+                staff_uid,
+                sid,
+                amr,
+                mfa_at,
+            } => RefreshRotation::Rotated {
+                staff_uid,
+                sid,
+                amr,
+                mfa_at,
+            },
             loom_persist::RefreshTokenRotation::Reused { staff_uid } => {
                 RefreshRotation::Reused { staff_uid }
             }
@@ -244,11 +273,16 @@ impl StaffDirectory for loom_persist::Persist {
         uid: &str,
         token_hash: &str,
         expires_at: OffsetDateTime,
+        sid: &str,
+        amr: &[String],
+        mfa_at: Option<OffsetDateTime>,
     ) -> Result<(), DirectoryError> {
-        loom_persist::Persist::refresh_token_insert(self, uid, token_hash, expires_at)
-            .await
-            .map(|_| ())
-            .map_err(|_| DirectoryError)
+        loom_persist::Persist::refresh_token_insert(
+            self, uid, token_hash, expires_at, sid, amr, mfa_at,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|_| DirectoryError)
     }
 
     async fn refresh_token_lookup(
@@ -262,6 +296,9 @@ impl StaffDirectory for loom_persist::Persist {
             staff_uid: r.staff_uid,
             expires_at: r.expires_at,
             revoked_at: r.revoked_at,
+            sid: r.sid,
+            amr: r.amr,
+            mfa_at: r.mfa_at,
         }))
     }
 

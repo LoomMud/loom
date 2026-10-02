@@ -39,8 +39,6 @@ struct LoginRequest {
 #[derive(Debug, Deserialize)]
 struct RefreshRequest {
     refresh_token: String,
-    #[serde(default)]
-    totp_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,10 +168,7 @@ async fn refresh(
             .into_response();
     };
     let ctx = auth_context(&headers, Some(peer));
-    match auth
-        .refresh(&request.refresh_token, request.totp_code.as_deref(), &ctx)
-        .await
-    {
+    match auth.refresh(&request.refresh_token, &ctx).await {
         Ok(pair) => (StatusCode::OK, Json(TokenResponse::from(pair))).into_response(),
         Err(error) => auth_error_response(error).into_response(),
     }
