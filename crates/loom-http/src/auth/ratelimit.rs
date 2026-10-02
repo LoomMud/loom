@@ -69,6 +69,13 @@ pub const MAX_TRACKED_IPS: usize = 20_000;
 /// eviction pass on almost every call once the map is full.
 const EVICT_TARGET_FRACTION: f64 = 0.9;
 
+/// How long an unresolved reservation from [`RateLimiter::check`] counts
+/// toward the lockout threshold. Far longer than any real login attempt
+/// (one DB lookup plus one Argon2id verify, bounded by the Argon2
+/// semaphore), short enough that a leaked reservation can't lock an
+/// account for long.
+pub const RESERVATION_TTL: Duration = Duration::from_secs(60);
+
 /// The namespace [`crate::auth::uid_rate_key`] uses for a *resolved*
 /// staff uid's account bucket. The hard-cap eviction in
 /// [`RateLimiter::maybe_sweep_accounts`] must never remove a `uid:`-keyed
@@ -95,12 +102,42 @@ struct AccountState {
     /// yet resolved to a confirmed failure/success -- counted toward the
     /// lockout threshold the same as a confirmed failure, so a burst of
     /// concurrent attempts can't all observe "not locked" before any of
-    /// them finishes.
-    reserved: u32,
+    /// them finishes. Stored as reservation timestamps so a reservation
+    /// whose request future was dropped (client disconnect) and never
+    /// resolved expires after [`RESERVATION_TTL`] instead of counting
+    /// forever. A reservation only ever *denies* concurrent attempts; it
+    /// never sets `locked_until` itself (only a confirmed failure does).
+    reserved: Vec<Instant>,
     locked_until: Option<Instant>,
     /// Last time this entry was touched by a check/record call, for the
     /// sweep's "oldest first" eviction order.
     last_touch: Instant,
+}
+
+impl AccountState {
+    fn new(now: Instant) -> Self {
+        Self {
+            failures: Vec::new(),
+            reserved: Vec::new(),
+            locked_until: None,
+            last_touch: now,
+        }
+    }
+
+    /// Drop failures outside the window and reservations past their TTL.
+    fn prune(&mut self, now: Instant, failure_window: Duration, reservation_ttl: Duration) {
+        self.failures
+            .retain(|at| now.saturating_duration_since(*at) < failure_window);
+        self.reserved
+            .retain(|at| now.saturating_duration_since(*at) < reservation_ttl);
+    }
+
+    /// Give back the oldest outstanding reservation, if any.
+    fn release_one(&mut self) {
+        if !self.reserved.is_empty() {
+            self.reserved.remove(0);
+        }
+    }
 }
 
 /// An IP bucket key: IPv4 is keyed per address, IPv6 is keyed by its /64
@@ -140,6 +177,7 @@ pub struct RateLimiter {
     ip_bucket_refill_interval: Duration,
     max_tracked_accounts: usize,
     max_tracked_ips: usize,
+    reservation_ttl: Duration,
 }
 
 impl Default for RateLimiter {
@@ -160,6 +198,7 @@ impl RateLimiter {
             ip_bucket_refill_interval: IP_BUCKET_REFILL_INTERVAL,
             max_tracked_accounts: MAX_TRACKED_ACCOUNTS,
             max_tracked_ips: MAX_TRACKED_IPS,
+            reservation_ttl: RESERVATION_TTL,
         }
     }
 
@@ -184,6 +223,7 @@ impl RateLimiter {
             ip_bucket_refill_interval,
             max_tracked_accounts: MAX_TRACKED_ACCOUNTS,
             max_tracked_ips: MAX_TRACKED_IPS,
+            reservation_ttl: RESERVATION_TTL,
         }
     }
 
@@ -193,6 +233,13 @@ impl RateLimiter {
     pub fn with_test_caps(mut self, max_tracked_accounts: usize, max_tracked_ips: usize) -> Self {
         self.max_tracked_accounts = max_tracked_accounts;
         self.max_tracked_ips = max_tracked_ips;
+        self
+    }
+
+    /// Shrink [`RESERVATION_TTL`] for a deterministic leaked-reservation test.
+    #[cfg(test)]
+    pub fn with_test_reservation_ttl(mut self, reservation_ttl: Duration) -> Self {
+        self.reservation_ttl = reservation_ttl;
         self
     }
 
@@ -246,8 +293,13 @@ impl RateLimiter {
         }
     }
 
-    /// Returns `true` if `account_key` is (or just became, via this
-    /// reservation) locked. Always creates/touches the map entry --
+    /// Returns `true` if `account_key` must be refused: locked out, or
+    /// confirmed failures plus in-flight reservations already reach the
+    /// limit. Otherwise reserves a slot and returns `false`. A reservation
+    /// never sets `locked_until` itself -- otherwise an attempt that
+    /// resolves to neither failure nor success (`TotpRequired`, a
+    /// directory error) would leave the account locked after
+    /// [`Self::release`]. Always creates/touches the map entry --
     /// [`Self::maybe_sweep_accounts`] (run *after* the insert, so an
     /// over-cap map is brought back down the same call that tipped it
     /// over) is what keeps that bounded.
@@ -257,42 +309,29 @@ impl RateLimiter {
         let locked = {
             let state = accounts
                 .entry(account_key.to_string())
-                .or_insert_with(|| AccountState {
-                    failures: Vec::new(),
-                    reserved: 0,
-                    locked_until: None,
-                    last_touch: now,
-                });
+                .or_insert_with(|| AccountState::new(now));
             state.last_touch = now;
-
-            state
-                .failures
-                .retain(|at| now.saturating_duration_since(*at) < self.account_failure_window);
+            state.prune(now, self.account_failure_window, self.reservation_ttl);
 
             match state.locked_until {
                 Some(until) if until > now => true,
-                Some(_) => {
-                    // Lockout expired: clear it and the failure history so
-                    // the account gets a fresh window, matching "locked for
-                    // 15 minutes" rather than "locked forever after 5
-                    // failures".
-                    state.locked_until = None;
-                    state.failures.clear();
-                    state.reserved = 0;
-                    state.reserved += 1;
-                    if (state.failures.len() as u32 + state.reserved) >= self.account_failure_limit
-                    {
-                        state.locked_until = Some(now + self.account_lockout_duration);
+                expired => {
+                    if expired.is_some() {
+                        // Lockout expired: clear it and the failure
+                        // history so the account gets a fresh window,
+                        // matching "locked for 15 minutes" rather than
+                        // "locked forever after 5 failures".
+                        state.locked_until = None;
+                        state.failures.clear();
                     }
-                    false
-                }
-                None => {
-                    state.reserved += 1;
-                    if (state.failures.len() as u32 + state.reserved) >= self.account_failure_limit
+                    if (state.failures.len() + state.reserved.len()) as u32
+                        >= self.account_failure_limit
                     {
-                        state.locked_until = Some(now + self.account_lockout_duration);
+                        true
+                    } else {
+                        state.reserved.push(now);
+                        false
                     }
-                    false
                 }
             }
         };
@@ -300,6 +339,7 @@ impl RateLimiter {
             &mut accounts,
             self.max_tracked_accounts,
             self.account_failure_window,
+            self.reservation_ttl,
         );
         locked
     }
@@ -348,21 +388,13 @@ impl RateLimiter {
         let now = Instant::now();
         let state = accounts
             .entry(account_key.to_string())
-            .or_insert_with(|| AccountState {
-                failures: Vec::new(),
-                reserved: 0,
-                locked_until: None,
-                last_touch: now,
-            });
+            .or_insert_with(|| AccountState::new(now));
         state.last_touch = now;
-        state.reserved = state.reserved.saturating_sub(1);
-
-        state
-            .failures
-            .retain(|at| now.saturating_duration_since(*at) < self.account_failure_window);
+        state.release_one();
+        state.prune(now, self.account_failure_window, self.reservation_ttl);
         state.failures.push(now);
 
-        if (state.failures.len() as u32 + state.reserved) >= self.account_failure_limit {
+        if state.failures.len() as u32 >= self.account_failure_limit {
             state.locked_until = Some(now + self.account_lockout_duration);
         }
     }
@@ -373,7 +405,7 @@ impl RateLimiter {
     /// attempt's reservation (if any).
     pub fn record_success(&self, account_key: &str) {
         if let Some(state) = self.accounts.lock().unwrap().get_mut(account_key) {
-            state.reserved = state.reserved.saturating_sub(1);
+            state.release_one();
             state.failures.clear();
             state.locked_until = None;
             state.last_touch = Instant::now();
@@ -386,7 +418,7 @@ impl RateLimiter {
     /// a permanently-counted "phantom failure" toward the lockout.
     pub fn release(&self, account_key: &str) {
         if let Some(state) = self.accounts.lock().unwrap().get_mut(account_key) {
-            state.reserved = state.reserved.saturating_sub(1);
+            state.release_one();
         }
     }
 
@@ -406,6 +438,7 @@ impl RateLimiter {
         accounts: &mut HashMap<String, AccountState>,
         cap: usize,
         failure_window: Duration,
+        reservation_ttl: Duration,
     ) {
         if accounts.len() <= cap {
             return;
@@ -415,11 +448,9 @@ impl RateLimiter {
             if key.starts_with(UID_KEY_PREFIX) {
                 return true;
             }
-            state
-                .failures
-                .retain(|at| now.saturating_duration_since(*at) < failure_window);
+            state.prune(now, failure_window, reservation_ttl);
             let locked = matches!(state.locked_until, Some(until) if until > now);
-            state.reserved > 0 || locked || !state.failures.is_empty()
+            !state.reserved.is_empty() || locked || !state.failures.is_empty()
         });
         if accounts.len() > cap {
             let target = Self::evict_target(cap);
@@ -500,7 +531,12 @@ impl RateLimiter {
     #[cfg(test)]
     pub fn sweep_for_test(&self) {
         let mut accounts = self.accounts.lock().unwrap();
-        Self::maybe_sweep_accounts(&mut accounts, 0, self.account_failure_window);
+        Self::maybe_sweep_accounts(
+            &mut accounts,
+            0,
+            self.account_failure_window,
+            self.reservation_ttl,
+        );
         let mut ips = self.ips.lock().unwrap();
         Self::maybe_sweep_ips(
             &mut ips,
@@ -524,6 +560,63 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OBI-204 CTO review: releasing a reservation must leave the account
+    /// exactly as it was -- a reservation alone never sets `locked_until`.
+    #[test]
+    fn releasing_a_reservation_never_leaves_the_account_locked() {
+        let limiter = RateLimiter::new();
+        for _ in 0..4 {
+            limiter.record_failure("merry");
+        }
+        assert_eq!(limiter.check("merry", None), RateLimitDecision::Allowed);
+        limiter.release("merry");
+        assert_eq!(limiter.check("merry", None), RateLimitDecision::Allowed);
+    }
+
+    /// OBI-204: in-flight reservations count toward the limit, so a
+    /// concurrent burst can't all slip past the 5th-failure boundary.
+    #[test]
+    fn in_flight_reservations_count_toward_the_limit() {
+        let limiter = RateLimiter::new();
+        for _ in 0..4 {
+            limiter.record_failure("merry");
+        }
+        assert_eq!(limiter.check("merry", None), RateLimitDecision::Allowed);
+        assert_eq!(
+            limiter.check("merry", None),
+            RateLimitDecision::AccountLocked
+        );
+        limiter.record_failure("merry");
+        assert_eq!(
+            limiter.check("merry", None),
+            RateLimitDecision::AccountLocked
+        );
+    }
+
+    /// OBI-204 CTO review: a reservation whose request future was dropped
+    /// (client disconnect, cancellation) is never released explicitly; it
+    /// must expire on its own rather than count toward the limit forever.
+    #[test]
+    fn a_leaked_reservation_expires() {
+        let limiter = RateLimiter::with_test_tuning(
+            2,
+            Duration::from_secs(900),
+            Duration::from_secs(900),
+            IP_BUCKET_CAPACITY,
+            IP_BUCKET_REFILL_INTERVAL,
+        )
+        .with_test_reservation_ttl(Duration::from_millis(20));
+        limiter.record_failure("bilbo");
+        assert_eq!(limiter.check("bilbo", None), RateLimitDecision::Allowed);
+        // Leak it: no record/release.
+        assert_eq!(
+            limiter.check("bilbo", None),
+            RateLimitDecision::AccountLocked
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(limiter.check("bilbo", None), RateLimitDecision::Allowed);
+    }
 
     #[test]
     fn sixth_failure_locks_the_account() {

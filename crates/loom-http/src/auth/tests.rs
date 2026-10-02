@@ -697,6 +697,36 @@ async fn a_missing_totp_code_does_not_count_as_a_failure() {
     );
 }
 
+/// OBI-204 CTO review: an in-flight reservation must never *itself* set
+/// the lockout. After 4 wrong passwords, a correct password with no TOTP
+/// code (`TotpRequired`, the normal two-step login flow) releases its
+/// reservation; it must not leave the account locked for 15 minutes.
+#[tokio::test]
+async fn totp_required_after_four_failures_does_not_lock_the_account() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory.clone());
+
+    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gandalf");
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+
+    for _ in 0..4 {
+        let result = service.login("gandalf", "wrong", None, &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+    }
+    let result = service.login("gandalf", "mithrandir", None, &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
+
+    let fresh_code = totp.generate_current().to_string();
+    assert!(
+        service
+            .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
+            .await
+            .is_ok()
+    );
+}
+
 /// Acceptance: "IP bucket" -- many login attempts against different
 /// (nonexistent) accounts from one IP run the per-IP token bucket dry,
 /// independent of any one account's own failure count.
