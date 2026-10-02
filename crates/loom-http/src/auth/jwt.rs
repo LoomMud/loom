@@ -39,7 +39,7 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -92,28 +92,98 @@ struct Header {
 
 /// The on-disk shape of the mounted key file: one *active* signing key
 /// (by `kid`) plus every key still in the verifier keyset (including the
-/// active one). Every value is the 32-byte Ed25519 seed, base64-encoded
-/// (standard alphabet, padded).
+/// active one). A signing-capable entry is the 32-byte Ed25519 seed,
+/// base64-encoded (standard alphabet, padded); a **verify-only** entry
+/// (M-AUTH-4/5 hardening) is `{"public": "<base64 32-byte pubkey>"}` --
+/// an operator rotating keys can destroy a retired kid's private seed
+/// immediately, swapping the file's entry for its public key for the rest
+/// of the overlap window, rather than keeping the private seed mounted
+/// until every token signed with it has expired. Only `active_kid` needs
+/// (and is required to have) a signing seed.
 ///
 /// ```json
 /// {
 ///   "active_kid": "2026-02",
 ///   "keys": {
 ///     "2026-02": "<base64 32-byte seed>",
-///     "2026-01": "<base64 32-byte seed -- kept only for the overlap window>"
+///     "2026-01": {"public": "<base64 32-byte pubkey -- seed already destroyed>"}
 ///   }
 /// }
 /// ```
 ///
-/// Rotation: add the new kid, flip `active_kid` to it, redeploy (no
-/// restart needed beyond the next read of this file -- see
-/// `loom-cli`'s `LOOM_JWT_KEY_FILE`), then once every token signed with
-/// the old kid has expired (at most `ACCESS_TOKEN_TTL` after the flip),
-/// remove the old entry.
+/// Duplicate `kid`s in `keys` are rejected outright at load time (rather
+/// than silently keeping serde's "last one wins" `HashMap` behaviour) --
+/// an operator who pastes a key file with a repeated `kid` almost always
+/// means two different keys, not one key overwriting another.
+///
+/// Rotation: add the new kid, flip `active_kid` to it, redeploy, **and
+/// restart this process** -- this file is only ever read once, at boot
+/// (there is no live reload / SIGHUP handler), so a key change alone
+/// does nothing until the next restart. Once every token signed with the
+/// old kid has expired (at most `ACCESS_TOKEN_TTL` after the flip),
+/// either remove the old entry or (to shrink the TCB immediately on
+/// rotation) replace it with a verify-only `{"public": ...}` entry, then
+/// remove it once the overlap window is over.
 #[derive(Deserialize)]
 struct KeyFile {
     active_kid: String,
-    keys: HashMap<String, String>,
+    #[serde(deserialize_with = "deserialize_unique_keys")]
+    keys: HashMap<String, KeyEntry>,
+}
+
+/// One `keys` entry in [`KeyFile`]: either the base64-encoded 32-byte
+/// signing seed (a plain JSON string), or a verify-only public key (an
+/// object with a `public` field) -- see [`KeyFile`]'s doc for the format
+/// and why a verify-only entry exists.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeyEntry {
+    Seed(String),
+    Public { public: String },
+}
+
+/// A single keyset entry, already decoded from base64: either a signing
+/// seed (verifiable, and if it belongs to `active_kid`, signing-capable)
+/// or a bare verify-only public key (M-AUTH-4/5 hardening -- see
+/// [`KeyEntry::Public`]). What [`JwtKeys::from_keyset`] takes, so tests
+/// can build a keyset directly without a key file.
+#[derive(Clone, Copy)]
+pub enum KeySource {
+    Seed([u8; 32]),
+    Public([u8; 32]),
+}
+
+/// A [`KeyFile`]'s `keys` map, deserialized so that a duplicate `kid`
+/// (which JSON permits and `serde`'s default `HashMap` deserialization
+/// would silently resolve by keeping the last value) is rejected instead.
+fn deserialize_unique_keys<'de, D>(deserializer: D) -> Result<HashMap<String, KeyEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = HashMap<String, KeyEntry>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a map of kid to key entry, with no repeated kid")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+            while let Some((kid, entry)) = map.next_entry::<String, KeyEntry>()? {
+                if out.insert(kid.clone(), entry).is_some() {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate kid {kid:?} in key file"
+                    )));
+                }
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_map(Visitor)
 }
 
 /// EdDSA signing/verification keys for staff access tokens (M-AUTH-4).
@@ -145,46 +215,80 @@ impl JwtKeys {
         let file: KeyFile = serde_json::from_str(&data)
             .map_err(|err| JwtKeyError(format!("parsing {}: {err}", path.display())))?;
 
-        let mut seeds = Vec::with_capacity(file.keys.len());
-        for (kid, encoded) in file.keys {
-            let bytes = STANDARD
-                .decode(&encoded)
-                .map_err(|err| JwtKeyError(format!("key {kid:?}: not valid base64: {err}")))?;
-            let seed: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
-                JwtKeyError(format!(
-                    "key {kid:?}: expected a 32-byte Ed25519 seed, got {} bytes",
-                    bytes.len()
-                ))
-            })?;
-            seeds.push((kid, seed));
+        let mut entries = Vec::with_capacity(file.keys.len());
+        for (kid, entry) in file.keys {
+            let source = match entry {
+                KeyEntry::Seed(encoded) => {
+                    let bytes = STANDARD.decode(&encoded).map_err(|err| {
+                        JwtKeyError(format!("key {kid:?}: not valid base64: {err}"))
+                    })?;
+                    let seed: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+                        JwtKeyError(format!(
+                            "key {kid:?}: expected a 32-byte Ed25519 seed, got {} bytes",
+                            bytes.len()
+                        ))
+                    })?;
+                    KeySource::Seed(seed)
+                }
+                KeyEntry::Public { public } => {
+                    let bytes = STANDARD.decode(&public).map_err(|err| {
+                        JwtKeyError(format!("key {kid:?}: not valid base64: {err}"))
+                    })?;
+                    let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {
+                        JwtKeyError(format!(
+                            "key {kid:?}: expected a 32-byte Ed25519 public key, got {} bytes",
+                            bytes.len()
+                        ))
+                    })?;
+                    KeySource::Public(bytes)
+                }
+            };
+            entries.push((kid, source));
         }
 
-        Self::from_keyset(file.active_kid, seeds, issuer, audience)
+        Self::from_keyset(file.active_kid, entries, issuer, audience)
     }
 
-    /// Build a keyset directly from `(kid, seed)` pairs -- the primitive
+    /// Build a keyset directly from `(kid, source)` pairs -- the primitive
     /// [`Self::from_key_file`] delegates to, and what tests use to set up
-    /// a rotation scenario without a temp file.
+    /// a rotation scenario without a temp file. `active_kid` must have a
+    /// [`KeySource::Seed`] entry (a verify-only [`KeySource::Public`]
+    /// entry can never be the active, signing key).
     pub fn from_keyset(
         active_kid: impl Into<String>,
-        seeds: impl IntoIterator<Item = (String, [u8; 32])>,
+        entries: impl IntoIterator<Item = (String, KeySource)>,
         issuer: impl Into<String>,
         audience: impl Into<String>,
     ) -> Result<Self, JwtKeyError> {
         let active_kid = active_kid.into();
         let mut verifying_keys = HashMap::new();
         let mut signing_key = None;
-        for (kid, seed) in seeds {
-            let sk = SigningKey::from_bytes(&seed);
-            let vk = sk.verifying_key();
-            if kid == active_kid {
-                signing_key = Some(sk);
+        for (kid, source) in entries {
+            match source {
+                KeySource::Seed(seed) => {
+                    let sk = SigningKey::from_bytes(&seed);
+                    let vk = sk.verifying_key();
+                    if kid == active_kid {
+                        signing_key = Some(sk);
+                    }
+                    verifying_keys.insert(kid, vk);
+                }
+                KeySource::Public(bytes) => {
+                    if kid == active_kid {
+                        return Err(JwtKeyError(format!(
+                            "active_kid {kid:?} is a verify-only public key; it needs a signing seed"
+                        )));
+                    }
+                    let vk = VerifyingKey::from_bytes(&bytes).map_err(|err| {
+                        JwtKeyError(format!("key {kid:?}: invalid Ed25519 public key: {err}"))
+                    })?;
+                    verifying_keys.insert(kid, vk);
+                }
             }
-            verifying_keys.insert(kid, vk);
         }
         let signing_key = signing_key.ok_or_else(|| {
             JwtKeyError(format!(
-                "active_kid {active_kid:?} has no matching entry in `keys`"
+                "active_kid {active_kid:?} has no matching signing entry in `keys`"
             ))
         })?;
 
@@ -208,8 +312,13 @@ impl JwtKeys {
         audience: impl Into<String>,
     ) -> Self {
         let kid = kid.into();
-        Self::from_keyset(kid.clone(), [(kid, seed)], issuer, audience)
-            .expect("a single well-formed seed can't fail keyset construction")
+        Self::from_keyset(
+            kid.clone(),
+            [(kid, KeySource::Seed(seed))],
+            issuer,
+            audience,
+        )
+        .expect("a single well-formed seed can't fail keyset construction")
     }
 
     pub fn issuer(&self) -> &str {
@@ -264,7 +373,7 @@ impl JwtKeys {
         let signature_bytes: [u8; 64] = signature_bytes.try_into().map_err(|_| JwtError)?;
         let signature = Signature::from_bytes(&signature_bytes);
         verifying_key
-            .verify(signing_input.as_bytes(), &signature)
+            .verify_strict(signing_input.as_bytes(), &signature)
             .map_err(|_| JwtError)?;
 
         let claims_bytes = URL_SAFE_NO_PAD.decode(claims_b64).map_err(|_| JwtError)?;
@@ -472,7 +581,7 @@ mod tests {
         // The old server: only the (soon-to-be-retired) key is active.
         let old_keys = JwtKeys::from_keyset(
             "2026-01",
-            [("2026-01".to_string(), seed(1))],
+            [("2026-01".to_string(), KeySource::Seed(seed(1)))],
             ISSUER,
             AUDIENCE,
         )
@@ -484,8 +593,8 @@ mod tests {
         let rotated_keys = JwtKeys::from_keyset(
             "2026-02",
             [
-                ("2026-02".to_string(), seed(2)),
-                ("2026-01".to_string(), seed(1)),
+                ("2026-02".to_string(), KeySource::Seed(seed(2))),
+                ("2026-01".to_string(), KeySource::Seed(seed(1))),
             ],
             ISSUER,
             AUDIENCE,
@@ -503,12 +612,64 @@ mod tests {
         // window over), the old token no longer verifies.
         let retired_keys = JwtKeys::from_keyset(
             "2026-02",
-            [("2026-02".to_string(), seed(2))],
+            [("2026-02".to_string(), KeySource::Seed(seed(2)))],
             ISSUER,
             AUDIENCE,
         )
         .unwrap();
         assert!(retired_keys.decode(&old_token).is_err());
+    }
+
+    /// Acceptance (OBI-203, M-AUTH-4/5 hardening): a retired kid can be
+    /// kept in the verifier keyset as a bare public key -- old tokens
+    /// still verify -- while there is no signing key for it anywhere in
+    /// this process, so it can never sign with that kid.
+    #[test]
+    fn a_verify_only_public_key_entry_verifies_old_tokens_but_cannot_sign() {
+        let retiring_sk = SigningKey::from_bytes(&seed(1));
+        let retiring_vk = retiring_sk.verifying_key();
+
+        // The old server, still holding the (soon to be destroyed) seed,
+        // signs a token that will outlive the key's seed on disk.
+        let old_keys = JwtKeys::from_keyset(
+            "2026-01",
+            [("2026-01".to_string(), KeySource::Seed(seed(1)))],
+            ISSUER,
+            AUDIENCE,
+        )
+        .unwrap();
+        let old_token = old_keys.encode(&sample_claims()).unwrap();
+
+        // The rotated server: the old kid's *seed* has been destroyed by
+        // the operator; only its public key remains in the key file.
+        let rotated_keys = JwtKeys::from_keyset(
+            "2026-02",
+            [
+                ("2026-02".to_string(), KeySource::Seed(seed(2))),
+                (
+                    "2026-01".to_string(),
+                    KeySource::Public(retiring_vk.to_bytes()),
+                ),
+            ],
+            ISSUER,
+            AUDIENCE,
+        )
+        .unwrap();
+
+        // The old token still verifies...
+        assert_eq!(rotated_keys.decode(&old_token).unwrap(), sample_claims());
+        // ...but a public-only kid can never be `active_kid` -- there is
+        // no seed in this process to sign with.
+        let cannot_sign = JwtKeys::from_keyset(
+            "2026-01",
+            [(
+                "2026-01".to_string(),
+                KeySource::Public(retiring_vk.to_bytes()),
+            )],
+            ISSUER,
+            AUDIENCE,
+        );
+        assert!(cannot_sign.is_err());
     }
 
     #[test]
@@ -527,6 +688,43 @@ mod tests {
         assert_eq!(keys.decode(&token).unwrap(), sample_claims());
     }
 
+    /// Acceptance: a key file with a public-only retired kid (the
+    /// `{"public": ...}` shape) loads, verifies old tokens, and never
+    /// signs with that kid.
+    #[test]
+    fn from_key_file_loads_a_public_only_verify_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jwt-keys.json");
+        let active_seed_b64 = STANDARD.encode(seed(2));
+        let retired_vk = SigningKey::from_bytes(&seed(1)).verifying_key();
+        let retired_pub_b64 = STANDARD.encode(retired_vk.to_bytes());
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"active_kid":"2026-02","keys":{{"2026-02":"{active_seed_b64}","2026-01":{{"public":"{retired_pub_b64}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let keys = JwtKeys::from_key_file(&path, ISSUER, AUDIENCE).unwrap();
+
+        // A token signed by the (no-longer-present-as-seed) retired key
+        // still verifies.
+        let old_keys = JwtKeys::from_keyset(
+            "2026-01",
+            [("2026-01".to_string(), KeySource::Seed(seed(1)))],
+            ISSUER,
+            AUDIENCE,
+        )
+        .unwrap();
+        let old_token = old_keys.encode(&sample_claims()).unwrap();
+        assert_eq!(keys.decode(&old_token).unwrap(), sample_claims());
+
+        // And this loaded keyset signs with the active (seed-backed) kid.
+        let token = keys.encode(&sample_claims()).unwrap();
+        assert_eq!(keys.decode(&token).unwrap(), sample_claims());
+    }
+
     #[test]
     fn from_key_file_rejects_an_active_kid_missing_from_keys() {
         let dir = tempfile::tempdir().unwrap();
@@ -535,6 +733,24 @@ mod tests {
         std::fs::write(
             &path,
             format!(r#"{{"active_kid":"missing","keys":{{"k1":"{seed_b64}"}}}}"#),
+        )
+        .unwrap();
+
+        assert!(JwtKeys::from_key_file(&path, ISSUER, AUDIENCE).is_err());
+    }
+
+    /// Acceptance: duplicate `kid`s in the key file are rejected, not
+    /// silently resolved to "last one wins" (serde's default `HashMap`
+    /// behaviour).
+    #[test]
+    fn from_key_file_rejects_a_duplicate_kid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jwt-keys.json");
+        let seed_a = STANDARD.encode(seed(1));
+        let seed_b = STANDARD.encode(seed(2));
+        std::fs::write(
+            &path,
+            format!(r#"{{"active_kid":"k1","keys":{{"k1":"{seed_a}","k1":"{seed_b}"}}}}"#),
         )
         .unwrap();
 

@@ -125,8 +125,10 @@ async fn refresh_token_insert_lookup_and_revoke_round_trip() {
 
     let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
     let hash = "deadbeef".repeat(8);
+    let amr = vec!["pwd".to_string(), "otp".to_string()];
+    let mfa_at = OffsetDateTime::now_utc();
     fx.app
-        .refresh_token_insert(&uid, &hash, expires_at)
+        .refresh_token_insert(&uid, &hash, expires_at, "sid-1", &amr, Some(mfa_at))
         .await
         .unwrap();
 
@@ -138,6 +140,9 @@ async fn refresh_token_insert_lookup_and_revoke_round_trip() {
         .expect("inserted token is found");
     assert_eq!(record.staff_uid, uid);
     assert!(record.revoked_at.is_none());
+    assert_eq!(record.sid, "sid-1");
+    assert_eq!(record.amr, amr);
+    assert!(record.mfa_at.is_some());
 
     fx.app.refresh_token_revoke(&hash).await.unwrap();
     let revoked = fx.app.refresh_token_lookup(&hash).await.unwrap().unwrap();
@@ -169,12 +174,13 @@ async fn refresh_token_revoke_all_only_touches_the_named_uid() {
     let expires_at = OffsetDateTime::now_utc() + Duration::days(14);
     let hash_a = "a1".repeat(16);
     let hash_b = "b2".repeat(16);
+    let amr: Vec<String> = vec!["pwd".to_string()];
     fx.app
-        .refresh_token_insert(&uid_a, &hash_a, expires_at)
+        .refresh_token_insert(&uid_a, &hash_a, expires_at, "sid-a", &amr, None)
         .await
         .unwrap();
     fx.app
-        .refresh_token_insert(&uid_b, &hash_b, expires_at)
+        .refresh_token_insert(&uid_b, &hash_b, expires_at, "sid-b", &amr, None)
         .await
         .unwrap();
 

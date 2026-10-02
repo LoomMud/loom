@@ -270,7 +270,9 @@ impl AuthService {
         };
 
         self.rate_limiter.record_success(username);
-        let pair = self.issue_tokens(&record.uid, amr, mfa_at).await?;
+        let pair = self
+            .issue_tokens(&record.uid, generate_sid(), amr, mfa_at)
+            .await?;
         self.audit(
             "auth.login.ok",
             Some(record.uid.clone()),
@@ -301,7 +303,7 @@ impl AuthService {
             .github_lookup(github_id)
             .await?
             .ok_or(AuthError::InvalidCredentials)?;
-        self.issue_tokens(&uid, vec!["github".to_string()], None)
+        self.issue_tokens(&uid, generate_sid(), vec!["github".to_string()], None)
             .await
     }
 
@@ -347,16 +349,20 @@ impl AuthService {
         }
 
         self.directory.refresh_token_revoke(&token_hash).await?;
-        // OBI-197: the original login's `amr`/`mfa_at` aren't persisted
-        // against the refresh-token row (that would need a
-        // `staff_sessions`/`refresh_tokens` schema change -- tracked
-        // separately), so a refreshed access token's `amr` is `["refresh"]`
-        // and carries no `mfa_at`. This only affects step-up-gated actions
-        // (which re-check `mfa_at` freshness, see M-ADM-2): a long-lived
-        // session that never re-authenticates with a password/TOTP simply
-        // never satisfies step-up, it doesn't get to skip it.
-        self.issue_tokens(&record.staff_uid, vec!["refresh".to_string()], None)
-            .await
+        // OBI-203: `sid`/`amr`/`mfa_at` are carried forward unchanged from
+        // the refresh-token row the presented token rotated out of --
+        // `sid` stays the token-family id M-AUTH-5 reuse detection and
+        // family revocation are keyed off, and `amr`/`mfa_at` still
+        // describe the *original* login's authentication context, so the
+        // M-ADM-2 step-up freshness window is measured from the real
+        // authentication event, never reset by a later refresh.
+        self.issue_tokens(
+            &record.staff_uid,
+            record.sid.clone(),
+            record.amr.clone(),
+            record.mfa_at,
+        )
+        .await
     }
 
     /// Revoke a single refresh token (logout).
@@ -439,11 +445,15 @@ impl AuthService {
     /// Issue a fresh (access, refresh) pair for `uid`, reading its tier
     /// from Postgres right now. Shared by the password, GitHub, and
     /// refresh paths so there is exactly one place that turns a tier into
-    /// scopes and mints tokens. `amr`/`mfa_at` describe *this* issuance's
-    /// authentication context (D-TM3: identity, never authority).
+    /// scopes and mints tokens. `sid` is the token-family id (fresh at
+    /// login via [`generate_sid`]; carried forward unchanged on refresh --
+    /// see the call site in [`Self::refresh`]), and `amr`/`mfa_at`
+    /// describe *the family's original* authentication context (D-TM3:
+    /// identity, never authority).
     async fn issue_tokens(
         &self,
         uid: &str,
+        sid: String,
         amr: Vec<String>,
         mfa_at: Option<OffsetDateTime>,
     ) -> Result<TokenPair, AuthError> {
@@ -460,8 +470,8 @@ impl AuthService {
             iat: issued_at.unix_timestamp(),
             nbf: issued_at.unix_timestamp(),
             exp: access_expires_at.unix_timestamp(),
-            sid: generate_sid(),
-            amr,
+            sid: sid.clone(),
+            amr: amr.clone(),
             mfa_at: mfa_at.map(|t| t.unix_timestamp()),
         };
         let access_token = self
@@ -472,7 +482,14 @@ impl AuthService {
         let refresh_token = generate_refresh_token();
         let refresh_expires_at = issued_at + self.refresh_ttl;
         self.directory
-            .refresh_token_insert(uid, &hash_token(&refresh_token), refresh_expires_at)
+            .refresh_token_insert(
+                uid,
+                &hash_token(&refresh_token),
+                refresh_expires_at,
+                &sid,
+                &amr,
+                mfa_at,
+            )
             .await?;
 
         Ok(TokenPair {

@@ -162,6 +162,9 @@ impl StaffDirectory for FakeDirectory {
         uid: &str,
         token_hash: &str,
         expires_at: OffsetDateTime,
+        sid: &str,
+        amr: &[String],
+        mfa_at: Option<OffsetDateTime>,
     ) -> Result<(), DirectoryError> {
         self.inner.lock().unwrap().refresh_tokens.insert(
             token_hash.to_string(),
@@ -169,6 +172,9 @@ impl StaffDirectory for FakeDirectory {
                 staff_uid: uid.to_string(),
                 expires_at,
                 revoked_at: None,
+                sid: sid.to_string(),
+                amr: amr.to_vec(),
+                mfa_at,
             },
         );
         Ok(())
@@ -452,6 +458,52 @@ async fn revoked_refresh_token_is_refused_and_replay_revokes_the_family() {
     // The legitimately-rotated token is now dead too.
     let result = service.refresh(&rotated.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
+}
+
+/// Acceptance (OBI-203): a refreshed token keeps the login's `sid`,
+/// `amr`, and `mfa_at` -- not a fresh `sid` per issuance and not
+/// `amr: ["refresh"]`/`mfa_at: None`.
+#[tokio::test]
+async fn refresh_carries_forward_the_logins_sid_amr_and_mfa_at() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gimli", "dwarf", 3);
+    let service = test_service(directory.clone());
+
+    let enrollment = service.totp_enroll("gimli", &ctx()).await.unwrap();
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gimli").unwrap();
+    let code = totp.generate_current().to_string();
+    service.totp_confirm("gimli", &code, &ctx()).await.unwrap();
+
+    let fresh_code = totp.generate_current().to_string();
+    let pair = service
+        .login("gimli", "dwarf", Some(&fresh_code), &ctx())
+        .await
+        .unwrap();
+    let claims = service.verify_access_token(&pair.access_token).unwrap();
+    assert_eq!(claims.amr, vec!["pwd".to_string(), "otp".to_string()]);
+    assert!(claims.mfa_at.is_some());
+
+    let refreshed = service.refresh(&pair.refresh_token, &ctx()).await.unwrap();
+    let refreshed_claims = service
+        .verify_access_token(&refreshed.access_token)
+        .unwrap();
+    // Same token family, not a fresh one.
+    assert_eq!(refreshed_claims.sid, claims.sid);
+    // The original login's authentication context, not "refresh".
+    assert_eq!(refreshed_claims.amr, claims.amr);
+    assert_eq!(refreshed_claims.mfa_at, claims.mfa_at);
+
+    // A second rotation still carries the same family/context forward.
+    let refreshed_again = service
+        .refresh(&refreshed.refresh_token, &ctx())
+        .await
+        .unwrap();
+    let claims_again = service
+        .verify_access_token(&refreshed_again.access_token)
+        .unwrap();
+    assert_eq!(claims_again.sid, claims.sid);
+    assert_eq!(claims_again.amr, claims.amr);
+    assert_eq!(claims_again.mfa_at, claims.mfa_at);
 }
 
 #[tokio::test]

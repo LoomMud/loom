@@ -40,6 +40,17 @@ pub struct RefreshRecord {
     pub staff_uid: String,
     pub expires_at: OffsetDateTime,
     pub revoked_at: Option<OffsetDateTime>,
+    /// The token-family id (OBI-203, M-AUTH-5): set at login, carried
+    /// forward unchanged on every rotation of this family.
+    pub sid: String,
+    /// The authentication methods the *login* that started this family
+    /// used -- carried forward unchanged across rotation.
+    pub amr: Vec<String>,
+    /// The most recent MFA completion at the time this family's login
+    /// happened, if any -- carried forward unchanged across rotation (the
+    /// M-ADM-2 step-up freshness window is always measured from this, not
+    /// reset by a later refresh).
+    pub mfa_at: Option<OffsetDateTime>,
 }
 
 /// Opaque directory failure: callers only ever see
@@ -73,6 +84,9 @@ pub trait StaffDirectory: Send + Sync {
         uid: &str,
         token_hash: &str,
         expires_at: OffsetDateTime,
+        sid: &str,
+        amr: &[String],
+        mfa_at: Option<OffsetDateTime>,
     ) -> Result<(), DirectoryError>;
     async fn refresh_token_lookup(
         &self,
@@ -141,11 +155,16 @@ impl StaffDirectory for loom_persist::Persist {
         uid: &str,
         token_hash: &str,
         expires_at: OffsetDateTime,
+        sid: &str,
+        amr: &[String],
+        mfa_at: Option<OffsetDateTime>,
     ) -> Result<(), DirectoryError> {
-        loom_persist::Persist::refresh_token_insert(self, uid, token_hash, expires_at)
-            .await
-            .map(|_| ())
-            .map_err(|_| DirectoryError)
+        loom_persist::Persist::refresh_token_insert(
+            self, uid, token_hash, expires_at, sid, amr, mfa_at,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|_| DirectoryError)
     }
 
     async fn refresh_token_lookup(
@@ -159,6 +178,9 @@ impl StaffDirectory for loom_persist::Persist {
             staff_uid: r.staff_uid,
             expires_at: r.expires_at,
             revoked_at: r.revoked_at,
+            sid: r.sid,
+            amr: r.amr,
+            mfa_at: r.mfa_at,
         }))
     }
 
