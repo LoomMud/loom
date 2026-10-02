@@ -22,6 +22,27 @@ pub trait TokenProvider: Send + Sync {
     fn token(&self) -> Result<String, String>;
 }
 
+/// A [`TokenProvider`] resolved once per sync/push attempt (R2, CTO
+/// review OBI-209): distinguishes "no provider configured" (push/fetch
+/// skipped, `"disabled"`) from "the provider errored" (also skipped, but
+/// logged and counted as `"failed"` rather than silently falling back to
+/// an unauthenticated remote call).
+enum TokenStatus {
+    Absent,
+    Ok(String),
+    Err(String),
+}
+
+fn resolve_token(provider: &Option<Box<dyn TokenProvider>>) -> TokenStatus {
+    match provider {
+        None => TokenStatus::Absent,
+        Some(p) => match p.token() {
+            Ok(t) => TokenStatus::Ok(t),
+            Err(e) => TokenStatus::Err(e),
+        },
+    }
+}
+
 /// What a merge-sized batch of changes needs on the other side of the
 /// `loom-git` / world-thread boundary (design doc §0 "B3.1 interface
 /// contract"). The caller that owns both a `World` and this worker is
@@ -41,14 +62,32 @@ pub struct RecompileOutcome {
 /// D-B3.8: what happens to a `live`-only commit that cannot be cherry
 /// picked onto the new `main` without conflict. The wiring caller decides
 /// how `audit_log` and author-notify actually work (persist/notify are
-/// not this crate's job).
+/// not this crate's job). `pushed` is whether the conflict ref actually
+/// reached the remote (R5a, CTO review OBI-209): a local
+/// `refs/loom/conflict/...` keep-ref is always written first regardless,
+/// so the commit is never lost even when `pushed` is `false`.
 pub trait AuditSink: Send + Sync {
-    fn conflict_skipped(&self, uid: &str, sha: &str, conflict_ref: &str, paths: &[String]);
+    fn conflict_skipped(
+        &self,
+        uid: &str,
+        sha: &str,
+        conflict_ref: &str,
+        paths: &[String],
+        pushed: bool,
+    );
 }
 
 pub struct NoopAudit;
 impl AuditSink for NoopAudit {
-    fn conflict_skipped(&self, _uid: &str, _sha: &str, _conflict_ref: &str, _paths: &[String]) {}
+    fn conflict_skipped(
+        &self,
+        _uid: &str,
+        _sha: &str,
+        _conflict_ref: &str,
+        _paths: &[String],
+        _pushed: bool,
+    ) {
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +109,14 @@ pub struct GitConfig {
     /// default; tests shrink it (and the durations above) to keep the
     /// suite fast.
     pub tick: Duration,
+    /// Test-only escape hatch (R2, CTO review OBI-209): with no
+    /// [`TokenProvider`] configured, push/fetch against `remote` are
+    /// skipped entirely by default (`"disabled"`), never silently falling
+    /// back to an unauthenticated call that could pick up an ambient
+    /// credential helper. Integration tests against a local path remote
+    /// (no auth needed at all) set this `true` explicitly; production
+    /// code must never set it.
+    pub allow_unauthenticated_remote: bool,
 }
 
 impl GitConfig {
@@ -88,6 +135,7 @@ impl GitConfig {
             push_debounce: Duration::from_secs(30),
             sync_poll: Duration::from_secs(300),
             tick: Duration::from_millis(100),
+            allow_unauthenticated_remote: false,
         }
     }
 }
@@ -309,23 +357,30 @@ fn run(
             last_sync = Instant::now();
             // D-B3.7: pending commits drain before the lock is taken.
             flush_all_commits(&repo, &mut pending, &mut push_dirty, &mut push_deadline);
-            let token = token_provider.as_ref().and_then(|p| p.token().ok());
-            run_sync_main(
+            let token_status = resolve_token(&token_provider);
+            let retry = run_sync_main(
                 &repo,
                 &config,
                 &tree_lock,
-                token.as_deref(),
+                &token_status,
                 &*recompile_host,
                 &*audit,
             );
+            if retry {
+                // R4: the tree wasn't clean (or `live` moved) right when
+                // we were about to fast-forward it -- try again next
+                // tick instead of ever force-overwriting a write that
+                // landed in that window.
+                sync_requested = true;
+            }
             // D-B3.5: push after every sync too.
             push_dirty = true;
             push_deadline = Some(Instant::now());
         }
 
         if push_dirty && push_deadline.is_some_and(|d| Instant::now() >= d) {
-            let token = token_provider.as_ref().and_then(|p| p.token().ok());
-            let result = push_live(&repo, &config, token.as_deref());
+            let token_status = resolve_token(&token_provider);
+            let result = push_live(&repo, &config, &token_status);
             crate::metrics::record_push(result);
             push_dirty = false;
             push_deadline = None;
@@ -405,23 +460,69 @@ fn commit_one(repo: &Repo, pc: &PendingCommit) {
     }
 }
 
-fn push_live(repo: &Repo, config: &GitConfig, token: Option<&str>) -> &'static str {
+fn push_live(repo: &Repo, config: &GitConfig, token_status: &TokenStatus) -> &'static str {
     let refspec = format!("live:refs/heads/live/{}", config.env_name);
     let args = ["push", "--force-with-lease", &config.remote, &refspec];
-    let result = match token {
-        Some(t) => repo.git_authed(&args, Some(t)),
-        None => repo.git(&args),
-    };
-    match result {
-        Ok(_) => "ok",
-        Err(GitError::NoToken) => "disabled",
-        Err(_) => "failed",
+    match token_status {
+        TokenStatus::Ok(t) => match repo.git_authed(&args, Some(t)) {
+            Ok(_) => "ok",
+            Err(_) => "failed",
+        },
+        TokenStatus::Err(e) => {
+            tracing::warn!(error = %e, "loom-git: token provider failed, push skipped");
+            "failed"
+        }
+        TokenStatus::Absent => {
+            // R2 (CTO review OBI-209): no provider configured means
+            // push is disabled, never a silent unauthenticated fallback
+            // that could pick up an ambient credential helper
+            // (D-B3.11). `allow_unauthenticated_remote` is a test-only
+            // escape hatch for a local path remote that needs no auth at
+            // all.
+            if config.allow_unauthenticated_remote {
+                match repo.git(&args) {
+                    Ok(_) => "ok",
+                    Err(_) => "failed",
+                }
+            } else {
+                "disabled"
+            }
+        }
+    }
+}
+
+/// Runs `fetch`/`push` with `token_status`'s credentials, or skips
+/// entirely (never an unauthenticated fallback, R2) unless
+/// `config.allow_unauthenticated_remote` is set.
+fn remote_git(
+    repo: &Repo,
+    config: &GitConfig,
+    token_status: &TokenStatus,
+    args: &[&str],
+) -> Option<Result<std::process::Output, GitError>> {
+    match token_status {
+        TokenStatus::Ok(t) => Some(repo.git_authed(args, Some(t))),
+        TokenStatus::Err(e) => {
+            tracing::warn!(error = %e, "loom-git: token provider failed");
+            None
+        }
+        TokenStatus::Absent => {
+            if config.allow_unauthenticated_remote {
+                Some(repo.git(args))
+            } else {
+                None
+            }
+        }
     }
 }
 
 /// D-B3.7/D-B3.8: fetch `main`, rebase `live` onto it in a scratch
 /// worktree, and either fast-forward the real work tree (clean rebase) or
-/// rebuild `live` as `main` + surviving cherry-picks (conflict).
+/// rebuild `live` as `main` + surviving cherry-picks (conflict). Returns
+/// `true` when the caller should retry on the next tick instead of
+/// treating this pass as settled (R4: the tree wasn't safely
+/// fast-forwardable this time).
+///
 /// Runs `git` either against the main repo's explicit `--git-dir`/
 /// `--work-tree`, or (for a `git worktree add`-created scratch/rebuild
 /// directory) via `current_dir` discovery of that worktree's own `.git`
@@ -445,20 +546,22 @@ fn run_sync_main(
     repo: &Repo,
     config: &GitConfig,
     tree_lock: &TreeLock,
-    token: Option<&str>,
+    token_status: &TokenStatus,
     recompile_host: &dyn RecompileHost,
     audit: &dyn AuditSink,
-) {
+) -> bool {
     let fetch_args = ["fetch", config.remote.as_str(), "main"];
-    let fetch_result = if token.is_some() {
-        repo.git_authed(&fetch_args, token)
-    } else {
-        repo.git(&fetch_args)
-    };
-    if let Err(e) = fetch_result {
-        tracing::warn!(error = %e, "loom-git: fetch main failed");
-        crate::metrics::record_sync("fetch_failed");
-        return;
+    match remote_git(repo, config, token_status, &fetch_args) {
+        Some(Ok(_)) => {}
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "loom-git: fetch main failed");
+            crate::metrics::record_sync("fetch_failed");
+            return false;
+        }
+        None => {
+            crate::metrics::record_sync("disabled");
+            return false;
+        }
     }
 
     let new_main = match rev_parse(repo, "FETCH_HEAD") {
@@ -466,20 +569,20 @@ fn run_sync_main(
         Err(e) => {
             tracing::warn!(error = %e, "loom-git: could not resolve FETCH_HEAD");
             crate::metrics::record_sync("fetch_failed");
-            return;
+            return false;
         }
     };
     let old_main = rev_parse(repo, "refs/loom/last-main").ok();
     if old_main.as_deref() == Some(new_main.as_str()) {
         crate::metrics::record_sync("no_change");
-        return;
+        return false;
     }
     let old_live = match rev_parse(repo, "live") {
         Ok(sha) => sha,
         Err(e) => {
             tracing::warn!(error = %e, "loom-git: no `live` ref");
             crate::metrics::record_sync("fetch_failed");
-            return;
+            return false;
         }
     };
 
@@ -495,7 +598,7 @@ fn run_sync_main(
     ]) {
         tracing::warn!(error = %e, "loom-git: worktree add failed");
         crate::metrics::record_sync("fetch_failed");
-        return;
+        return false;
     }
     let scratch_repo = WorktreeRepo::new(&scratch);
     let rebase_ok = scratch_repo.git(&["rebase", &new_main]).is_ok();
@@ -503,7 +606,15 @@ fn run_sync_main(
         rev_parse(&scratch_repo, "HEAD").unwrap_or_else(|_| old_live.clone())
     } else {
         let _ = scratch_repo.git(&["rebase", "--abort"]);
-        rebuild_live_skipping_conflicts(repo, &old_main, &old_live, &new_main, config, token, audit)
+        rebuild_live_skipping_conflicts(
+            repo,
+            &old_main,
+            &old_live,
+            &new_main,
+            config,
+            token_status,
+            audit,
+        )
     };
 
     let _ = repo.git(&["worktree", "remove", "--force", &scratch.to_string_lossy()]);
@@ -517,20 +628,44 @@ fn run_sync_main(
         } else {
             "conflict_resolved"
         });
-        return;
+        return false;
     }
 
     let (changed, deleted) = diff_name_status(repo, &old_live, &new_live);
 
+    // R4 (CTO review OBI-209): a write that lands after the
+    // `flush_all_commits` above but before this write-guard is taken is
+    // not blocked by the tree lock (it only guards the fast-forward
+    // itself). Checking the tree is clean and `live` hasn't moved *under
+    // the lock*, immediately before ever touching the work tree, closes
+    // that window: if either check fails, some other write raced us, so
+    // we abandon this fast-forward rather than silently discarding it
+    // with `checkout -f`/`clean -fd`, and ask the caller to retry.
+    let needs_retry;
     {
         let _guard = tree_lock.write_guard();
-        if let Err(e) = repo.git(&["update-ref", "refs/heads/live", &new_live]) {
-            tracing::warn!(error = %e, "loom-git: update-ref live failed");
+        let status_clean = repo
+            .git(&["status", "--porcelain"])
+            .ok()
+            .and_then(|o| stdout_string(&o).ok())
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(false);
+        let live_unchanged = rev_parse(repo, "live")
+            .map(|s| s == old_live)
+            .unwrap_or(false);
+        let tree_safe = status_clean && live_unchanged;
+        needs_retry = !tree_safe
+            || repo
+                .git(&["update-ref", "refs/heads/live", &new_live])
+                .is_err()
+            || repo.git(&["checkout", "-f", "live"]).is_err();
+        if !needs_retry {
+            let _ = repo.git(&["clean", "-fd"]);
         }
-        if let Err(e) = repo.git(&["checkout", "-f", "live"]) {
-            tracing::warn!(error = %e, "loom-git: work-tree checkout failed");
-        }
-        let _ = repo.git(&["clean", "-fd"]);
+    }
+    if needs_retry {
+        crate::metrics::record_sync("retry_dirty_tree");
+        return true;
     }
     let _ = repo.git(&["update-ref", "refs/loom/last-main", &new_main]);
 
@@ -539,8 +674,14 @@ fn run_sync_main(
     crate::metrics::record_sync(if rebase_ok { "ok" } else { "conflict_resolved" });
 
     if !changed.is_empty() || !deleted.is_empty() {
-        let _ = recompile_host.recompile_set(changed, deleted);
+        let outcome = recompile_host.recompile_set(changed, deleted);
+        crate::metrics::record_sync(if outcome.ok {
+            "recompiled"
+        } else {
+            "compile_failed"
+        });
     }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -550,7 +691,7 @@ fn rebuild_live_skipping_conflicts(
     old_live: &str,
     new_main: &str,
     config: &GitConfig,
-    token: Option<&str>,
+    token_status: &TokenStatus,
     audit: &dyn AuditSink,
 ) -> String {
     // live-only commits: everything on `old_live` that isn't on the base
@@ -590,7 +731,12 @@ fn rebuild_live_skipping_conflicts(
             .is_ok();
         if !ok {
             let _ = rebuild_repo.git(&["cherry-pick", "--abort"]);
-            let uid = commit_author_email(repo, sha).unwrap_or_else(|| "unknown".to_string());
+            // R5b (CTO review OBI-209): `%an` is the uid
+            // (`Identity::for_uid` sets the author *name* to the uid,
+            // not the email) -- `%ae` was the wrong field and also
+            // attacker-shaped, hence the sanitization below regardless.
+            let uid_raw = commit_author_name(repo, sha).unwrap_or_else(|| "unknown".to_string());
+            let uid = crate::cli::sanitize_ref_component(&uid_raw);
             let paths = commit_paths(repo, sha);
             // D-B3.8 names this `live/<env>/conflict/<uid>/<sha>`, but a
             // ref cannot have both `refs/heads/live/<env>` *and*
@@ -598,21 +744,26 @@ fn rebuild_live_skipping_conflicts(
             // hierarchy forbids a ref from being both a leaf and a
             // directory (D/F conflict), verified empirically here
             // against a real (loose *and* reftable-backend) bare remote.
-            // Flagged to Aragorn as a correction to D-B3.8; using a
+            // Confirmed with Aragorn as a correction to D-B3.8; using a
             // sibling namespace that preserves the same information
             // (env/uid/sha) without colliding with `live/<env>` itself.
             let conflict_ref = format!("conflict/live/{}/{}/{}", config.env_name, uid, sha);
+            // R5a: write a local keep-ref *before* attempting the push,
+            // so the skipped commit stays reachable (survives `gc`) even
+            // if the push fails, is disabled (no token), or the remote
+            // rejects it -- `live` itself no longer references it once
+            // rebuilt.
+            let local_keep_ref = format!("refs/loom/conflict/{}/{}/{}", config.env_name, uid, sha);
+            let _ = repo.git(&["update-ref", &local_keep_ref, sha]);
             let push_args = [
                 "push",
                 &config.remote,
                 &format!("{sha}:refs/heads/{conflict_ref}"),
             ];
-            let _ = if token.is_some() {
-                repo.git_authed(&push_args, token)
-            } else {
-                repo.git(&push_args)
-            };
-            audit.conflict_skipped(&uid, sha, &conflict_ref, &paths);
+            let pushed = remote_git(repo, config, token_status, &push_args)
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+            audit.conflict_skipped(&uid, sha, &conflict_ref, &paths, pushed);
         }
     }
     let result = rev_parse(&rebuild_repo, "HEAD").unwrap_or_else(|_| old_live.to_string());
@@ -661,8 +812,8 @@ fn rev_list_count(repo: &dyn GitRunner, from: &str, to: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn commit_author_email(repo: &dyn GitRunner, sha: &str) -> Option<String> {
-    repo.git(&["log", "-1", "--format=%ae", sha])
+fn commit_author_name(repo: &dyn GitRunner, sha: &str) -> Option<String> {
+    repo.git(&["log", "-1", "--format=%an", sha])
         .ok()
         .and_then(|o| stdout_string(&o).ok())
         .map(|s| s.trim().to_string())

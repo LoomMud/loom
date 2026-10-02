@@ -87,9 +87,26 @@ impl WorktreeRepo {
     pub fn git(&self, args: &[&str]) -> Result<Output, GitError> {
         let mut cmd = Command::new("git");
         cmd.current_dir(&self.dir);
+        harden(&mut cmd);
         cmd.args(args);
         run(cmd, args)
     }
+}
+
+/// R1/R2 hardening applied to **every** `git` child this crate spawns
+/// (CTO review OBI-209):
+/// - `GIT_LITERAL_PATHSPECS=1`: a mudlib path may legally contain `*`,
+///   `?`, `[` (`fileio::resolve` only forbids `..`, NUL and `.git`
+///   segments). Without this, `git add -- <path>` and friends treat such
+///   a path as a glob/`:(magic)` pathspec, which can stage *other*
+///   builders' still-uncommitted files into this commit under the wrong
+///   author and DCO sign-off (R1, verified empirically: `git add --
+///   'd/*.wf'` with a dirty `d/a.wf` stages both).
+/// - `GIT_TERMINAL_PROMPT=0`: never block the worker thread on an
+///   interactive credential prompt.
+fn harden(cmd: &mut Command) {
+    cmd.env("GIT_LITERAL_PATHSPECS", "1");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
 }
 
 impl Repo {
@@ -104,6 +121,7 @@ impl Repo {
         let mut cmd = Command::new("git");
         cmd.arg("--git-dir").arg(&self.git_dir);
         cmd.arg("--work-tree").arg(&self.work_tree);
+        harden(&mut cmd);
         cmd
     }
 
@@ -122,16 +140,14 @@ impl Repo {
         run(self.build(args), args)
     }
 
-    /// Run a `git` subcommand that talks to a remote, with credentials
-    /// (D-B3.11) injected **only** through the child's environment via
-    /// `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*`
-    /// (`http.extraHeader`), never in argv, the remote URL, or
-    /// `.git/config`. `token` is `None` when no [`crate::TokenProvider`]
-    /// is configured (push disabled, D-B3.5).
-    pub fn git_authed(&self, args: &[&str], token: Option<&str>) -> Result<Output, GitError> {
-        let Some(token) = token else {
-            return Err(GitError::NoToken);
-        };
+    /// Build (but do not run) the authenticated command for `args`
+    /// (CTO review R3, OBI-190/OBI-209): the one place that constructs
+    /// the credential-bearing `Command`, so a test can inspect its argv
+    /// and env without a network call. `token` is `None` when no
+    /// [`crate::TokenProvider`] is configured (push/fetch disabled,
+    /// D-B3.5) -- callers must not fall back to an unauthenticated
+    /// remote call in that case (R2).
+    pub fn build_authed(&self, args: &[&str], token: &str) -> Command {
         let mut cmd = self.base_command();
         cmd.args(args);
         // `x-access-token:<token>` is the scheme GitHub Apps document for
@@ -139,10 +155,38 @@ impl Repo {
         // `Authorization` header value through env-only git config so it
         // never lands in argv, the URL, or the repo's on-disk config.
         let header = format!("Authorization: Basic {}", basic_auth(token));
-        cmd.env("GIT_CONFIG_COUNT", "1");
+        cmd.env("GIT_CONFIG_COUNT", "2");
         cmd.env("GIT_CONFIG_KEY_0", "http.extraHeader");
         cmd.env("GIT_CONFIG_VALUE_0", header);
-        run(cmd, args)
+        // R2: an empty `credential.helper` plus `GIT_TERMINAL_PROMPT=0`
+        // (set globally by `harden`, repeated here for emphasis) means
+        // git can never silently fall back to an ambient credential
+        // helper or `~/.git-credentials` if the header above is ever
+        // wrong/missing -- it fails loudly instead of using some other
+        // identity (D-B3.11).
+        cmd.env("GIT_CONFIG_KEY_1", "credential.helper");
+        cmd.env("GIT_CONFIG_VALUE_1", "");
+        // Belt-and-braces (non-blocking CTO review note): never let an
+        // ambient trace env turn the header into a log line, and redact
+        // credentials from whatever trace git does emit.
+        cmd.env_remove("GIT_TRACE_CURL");
+        cmd.env_remove("GIT_CURL_VERBOSE");
+        cmd.env("GIT_TRACE_REDACT", "1");
+        cmd
+    }
+
+    /// Run a `git` subcommand that talks to a remote, with credentials
+    /// (D-B3.11) injected **only** through the child's environment via
+    /// `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*`
+    /// (`http.extraHeader`), never in argv, the remote URL, or
+    /// `.git/config`. `token` is `None` when no [`crate::TokenProvider`]
+    /// is configured; returns [`GitError::NoToken`] rather than ever
+    /// silently running `args` unauthenticated (R2, CTO review OBI-209).
+    pub fn git_authed(&self, args: &[&str], token: Option<&str>) -> Result<Output, GitError> {
+        let Some(token) = token else {
+            return Err(GitError::NoToken);
+        };
+        run(self.build_authed(args, token), args)
     }
 
     /// Whether this repo has already been seeded (D-B3.6: `mudlib-sync`
@@ -208,7 +252,43 @@ pub fn stdout_string(output: &Output) -> Result<String, GitError> {
 /// dependency on `loom-vm`, so both sides enforce it rather than share
 /// code across the crate boundary.
 pub fn rejects_git_segment(path: &str) -> bool {
-    path.split('/').any(|seg| seg == ".git")
+    path.split('/').any(|seg| seg.eq_ignore_ascii_case(".git"))
+}
+
+/// Make `input` safe as one `/`-separated component of a git ref name
+/// (R5b, CTO review OBI-209): a conflict ref embeds a uid, which is
+/// attacker-influenced (R5b names `%an`, the commit author name, as the
+/// source -- itself derived from a uid a builder chose at account
+/// creation). Conservative allow-list rather than shelling out to `git
+/// check-ref-format`: every character outside `[A-Za-z0-9._-]` becomes
+/// `_`, leading dots and a trailing `.lock` are defused, and an empty
+/// result falls back to a fixed placeholder so the ref is still
+/// constructible.
+pub fn sanitize_ref_component(input: &str) -> String {
+    let mut out: String = input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    while out.starts_with('.') {
+        out.remove(0);
+    }
+    while out.contains("..") {
+        out = out.replace("..", "_");
+    }
+    if out.ends_with(".lock") {
+        out.push('_');
+    }
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
 }
 
 /// Bootstrap-only helper for tests and B3.5's seeding step (D-B3.6): not
@@ -223,6 +303,51 @@ pub fn init_bare(dir: &Path) -> Result<(), GitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R1 (CTO review OBI-209): `git add -- 'd/*.wf'` must never stage
+    /// another file by glob/pathspec-magic expansion -- a mudlib path is
+    /// free to contain `*`/`?`/`[` (`fileio::resolve` only forbids `..`,
+    /// NUL and `.git`), so without `GIT_LITERAL_PATHSPECS=1` a builder
+    /// could name a file so that its own coalesced commit scoops up a
+    /// co-domain builder's still-uncommitted, unrelated write under the
+    /// wrong author and DCO sign-off.
+    #[test]
+    fn pathspec_is_literal_not_a_glob() {
+        let dir = std::env::temp_dir().join(format!(
+            "loom-git-literal-pathspec-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        let init = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        // A co-domain builder's unrelated, still-uncommitted file.
+        std::fs::write(dir.join("d/a.wf"), "object a;\n").unwrap();
+
+        let repo = Repo::new(dir.join(".git"), &dir);
+        // No file literally named `d/*.wf` exists -- with
+        // `GIT_LITERAL_PATHSPECS=1` this must fail to match anything,
+        // not silently glob-match (and stage) `d/a.wf`.
+        let result = repo.git(&["add", "--", "d/*.wf"]);
+        assert!(
+            result.is_err(),
+            "expected a literal-pathspec miss, got {result:?}"
+        );
+
+        let status = repo.git(&["status", "--porcelain"]).unwrap();
+        let text = stdout_string(&status).unwrap();
+        assert!(
+            text.trim().starts_with("??"),
+            "d/a.wf must still be untracked (`??`), not staged (`A `): {text:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn base64_matches_known_vectors() {
@@ -240,7 +365,19 @@ mod tests {
     fn git_segment_rejected_anywhere_in_path() {
         assert!(rejects_git_segment("/domains/x/.git/config"));
         assert!(rejects_git_segment(".git"));
+        assert!(rejects_git_segment("/domains/x/.GIT/config"));
         assert!(!rejects_git_segment("/domains/x/y.wf"));
+    }
+
+    #[test]
+    fn ref_component_sanitization_defuses_shell_and_ref_metacharacters() {
+        assert_eq!(sanitize_ref_component("glorfindel"), "glorfindel");
+        assert_eq!(sanitize_ref_component("../../etc"), "___etc");
+        assert_eq!(sanitize_ref_component("a b~c^d:e?f*g[h"), "a_b_c_d_e_f_g_h");
+        assert_eq!(sanitize_ref_component(".hidden"), "hidden");
+        assert_eq!(sanitize_ref_component("x.lock"), "x.lock_");
+        assert_eq!(sanitize_ref_component(""), "unknown");
+        assert_eq!(sanitize_ref_component("..."), "unknown");
     }
 
     #[test]
@@ -252,13 +389,79 @@ mod tests {
     #[test]
     fn authed_command_never_carries_the_token_in_argv() {
         let repo = Repo::new("/nonexistent.git", "/nonexistent");
-        // Build the plain command the same way `git_authed` would, and
-        // confirm nothing about the token ever reaches `args`.
-        let cmd = repo.build(&["push", "origin", "live:refs/heads/live/test"]);
+        let token = "super-secret-token";
+        let cmd = repo.build_authed(&["push", "origin", "live:refs/heads/live/test"], token);
         let argv: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert!(!argv.iter().any(|a| a.contains("super-secret-token")));
+        let encoded = basic_auth(token);
+        assert!(!argv.iter().any(|a| a.contains(token)), "argv: {argv:?}");
+        assert!(!argv.iter().any(|a| a.contains(&encoded)), "argv: {argv:?}");
+
+        // The token (base64'd) is exactly where D-B3.11 says it should
+        // be: one env var on this one `Command`, nothing else.
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        let header_value = envs
+            .iter()
+            .find(|(k, _)| k == "GIT_CONFIG_VALUE_0")
+            .and_then(|(_, v)| v.clone())
+            .expect("GIT_CONFIG_VALUE_0 must be set");
+        assert_eq!(header_value, format!("Authorization: Basic {encoded}"));
+        assert!(
+            !envs
+                .iter()
+                .any(|(k, v)| k != "GIT_CONFIG_VALUE_0" && v.as_deref() == Some(token)),
+            "token leaked into another env var: {envs:?}"
+        );
+        // R2: an empty credential helper so git can never fall back to
+        // an ambient one.
+        assert_eq!(
+            envs.iter()
+                .find(|(k, _)| k == "GIT_CONFIG_KEY_1")
+                .and_then(|(_, v)| v.clone()),
+            Some("credential.helper".to_string())
+        );
+        assert_eq!(
+            envs.iter()
+                .find(|(k, _)| k == "GIT_CONFIG_VALUE_1")
+                .and_then(|(_, v)| v.clone()),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn hardening_env_is_present_on_every_command() {
+        let repo = Repo::new("/nonexistent.git", "/nonexistent");
+        let cmd = repo.build(&["status"]);
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.iter()
+                .find(|(k, _)| k == "GIT_LITERAL_PATHSPECS")
+                .and_then(|(_, v)| v.clone()),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            envs.iter()
+                .find(|(k, _)| k == "GIT_TERMINAL_PROMPT")
+                .and_then(|(_, v)| v.clone()),
+            Some("0".to_string())
+        );
     }
 }
