@@ -92,6 +92,12 @@ pub enum NetCommand {
     /// one connection. Silently dropped if the connection never enabled
     /// GMCP or has since disconnected.
     SendGmcp(ConnId, String, serde_json::Value),
+    /// Turn local client echo on/off around a no-echo input (spec §9,
+    /// OBI-176): telnet gets `IAC WILL ECHO`/`IAC WONT ECHO`, WebSocket
+    /// gets an `{"type":"echo","enabled":...}` envelope the web client
+    /// uses to mask the field. `enabled = false` is the password-prompt
+    /// state.
+    SetEcho(ConnId, bool),
 }
 
 /// Output framing: the world sends text verbatim and owns its line breaks
@@ -115,6 +121,7 @@ enum ConnControl {
     Send(String),
     Close,
     SendGmcp(String, serde_json::Value),
+    SetEcho(bool),
 }
 
 #[derive(Debug)]
@@ -249,6 +256,25 @@ pub async fn run_server_with_ws(
                             }
                         }
                     }
+                    NetCommand::SetEcho(conn, enabled) => {
+                        let Some(entry) = conns.get(&conn) else {
+                            continue;
+                        };
+
+                        match entry.tx.try_send(ConnControl::SetEcho(enabled)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!(conn, "disconnecting slow client: output queue full");
+                                if let Some(entry) = conns.remove(&conn) {
+                                    entry.task.abort();
+                                }
+                                let _ = event_tx.send(NetEvent::Disconnected(conn)).await;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                conns.remove(&conn);
+                            }
+                        }
+                    }
                 }
             }
             accepted = listener.accept() => {
@@ -340,6 +366,12 @@ async fn run_connection(
                         }
                         ConnControl::Close => {
                             break;
+                        }
+                        ConnControl::SetEcho(enabled) => {
+                            let bytes = codec.set_echo(enabled);
+                            if !bytes.is_empty() && writer.write_all(&bytes).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -501,6 +533,12 @@ impl TelnetCodec {
     /// connection that never agreed to speak it.
     fn gmcp_enabled(&self) -> bool {
         self.options.is_enabled_us(telnet::OPT_GMCP)
+    }
+
+    /// Bytes to send to flip local client echo on/off (OBI-176): see
+    /// `TelnetOptionTable::set_echo`.
+    fn set_echo(&mut self, enabled: bool) -> Vec<u8> {
+        self.options.set_echo(enabled)
     }
 
     fn feed(&mut self, chunk: &[u8]) -> CodecOutcome {
@@ -989,6 +1027,40 @@ mod tests {
 
         let _ = codec.feed(&[IAC, DO, telnet::OPT_GMCP]); // client agrees
         assert!(codec.gmcp_enabled());
+    }
+
+    #[test]
+    fn set_echo_sends_will_then_wont_echo() {
+        // OBI-176: turning off local echo for a password prompt claims
+        // `IAC WILL ECHO` (the server will do the echoing, so a
+        // well-behaved client stops echoing locally); turning it back on
+        // gives `IAC WONT ECHO`.
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        assert_eq!(codec.set_echo(false), vec![IAC, WILL, telnet::OPT_ECHO]);
+        assert_eq!(codec.set_echo(true), vec![IAC, WONT, telnet::OPT_ECHO]);
+    }
+
+    #[test]
+    fn set_echo_is_idempotent_once_settled() {
+        // Calling `set_echo` again with the state already where it wants
+        // is a silent no-op (Q method, RFC 1143 §7): no repeated WILL/WONT
+        // spam on the wire for e.g. two consecutive password prompts with
+        // no echo-on in between.
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        assert_eq!(codec.set_echo(false), vec![IAC, WILL, telnet::OPT_ECHO]);
+        assert!(codec.set_echo(false).is_empty());
+
+        assert_eq!(codec.set_echo(true), vec![IAC, WONT, telnet::OPT_ECHO]);
+        assert!(codec.set_echo(true).is_empty());
+    }
+
+    #[test]
+    fn set_echo_on_with_echo_never_turned_off_is_a_silent_no_op() {
+        // A connection that never had its echo disabled (every ordinary
+        // line of input) must not get a stray `WONT ECHO` the first time
+        // something calls `set_echo(true)` just to be safe.
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        assert!(codec.set_echo(true).is_empty());
     }
 
     #[test]
@@ -1533,6 +1605,73 @@ mod tests {
         shutdown_tx.send(true).unwrap();
         server.await.unwrap().unwrap();
         echo.abort();
+    }
+
+    /// OBI-176 acceptance: "test with a raw telnet client transcript".
+    /// `NetCommand::SetEcho` sent around a line of input must put `IAC
+    /// WILL ECHO` on the wire before the no-echo prompt and `IAC WONT
+    /// ECHO` after the input line comes back, with the prompt/line text
+    /// untouched either side -- a raw socket never speaks telnet back, so
+    /// this is read byte-for-byte rather than through a telnet-aware
+    /// client library.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_echo_puts_will_then_wont_echo_on_the_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server = tokio::spawn(run_server(listener, config, event_tx, cmd_rx, shutdown_rx));
+
+        // Stands in for /secure/login.wf: on the connection's first line
+        // (the account name) turn echo off and send a "Password:" prompt;
+        // on the second line (the password) turn echo back on.
+        let driver = tokio::spawn(async move {
+            let mut turn = 0;
+            while let Some(event) = event_rx.recv().await {
+                if let NetEvent::Line(conn, _line) = event {
+                    turn += 1;
+                    if turn == 1 {
+                        let _ = cmd_tx.send(NetCommand::SetEcho(conn, false)).await;
+                        let _ = cmd_tx
+                            .send(NetCommand::Send(conn, "Password: ".to_string()))
+                            .await;
+                    } else {
+                        let _ = cmd_tx.send(NetCommand::SetEcho(conn, true)).await;
+                        let _ = cmd_tx
+                            .send(NetCommand::Send(conn, "Welcome.\n".to_string()))
+                            .await;
+                    }
+                }
+            }
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        drain_preamble(&mut client).await;
+
+        client.write_all(b"legolas\r\n").await.unwrap();
+        let mut buf = [0_u8; 64];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            [&[IAC, WILL, telnet::OPT_ECHO][..], b"Password: "].concat(),
+            "expected IAC WILL ECHO immediately before the password prompt"
+        );
+
+        client.write_all(b"hunter2\r\n").await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            [&[IAC, WONT, telnet::OPT_ECHO][..], b"Welcome.\r\n"].concat(),
+            "expected IAC WONT ECHO immediately after the password line"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+        driver.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

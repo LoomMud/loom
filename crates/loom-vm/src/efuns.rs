@@ -66,6 +66,11 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     // OBI-33). S1 may relax this to P0 when `ob` is the caller's own
     // connection.
     ("disconnect", 1, 1, Privilege::P2, 2),
+    // Spec §9, OBI-176: turns local client echo on/off around a no-echo
+    // prompt (telnet `IAC WILL/WONT ECHO`, WS equivalent). Cosmetic on the
+    // wire, not an action on another user's connection the way
+    // `disconnect`/`bind_connection` are, so it stays `P0` like `send`.
+    ("set_echo", 2, 2, Privilege::P0, 2),
     ("bind_connection", 1, 1, Privilege::P3, 2),
     ("compile_object", 1, 1, Privilege::P1, 500),
     // Spec §7.2/§7.3, OBI-89 (eager mode): migrates every live instance of

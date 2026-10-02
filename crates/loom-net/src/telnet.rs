@@ -27,6 +27,7 @@ pub const WILL: u8 = 251;
 pub const SB: u8 = 250;
 pub const SE: u8 = 240;
 
+pub const OPT_ECHO: u8 = 1;
 pub const OPT_TTYPE: u8 = 24;
 pub const OPT_NAWS: u8 = 31;
 pub const OPT_MSSP: u8 = 70;
@@ -321,6 +322,16 @@ pub struct TelnetOptionTable {
     /// here rather than in the VM per the CTO decision on OBI-26: it's
     /// connection/protocol bookkeeping, not world state.
     supports: std::collections::HashSet<String>,
+    /// Whether we have currently claimed `WILL ECHO` on the wire (OBI-176):
+    /// tracked outside the `OptionNego`/Q-method table deliberately. ECHO
+    /// here isn't negotiated once and left alone like the alpha options;
+    /// the world flips it on *every* password prompt on the same
+    /// connection, server-initiated both ways, and a client is not
+    /// required to (and in practice often doesn't) reply `DO`/`DONT ECHO`
+    /// to acknowledge it. Gating a later `WONT` on an acknowledgement that
+    /// may never come would leave local echo suppressed forever, so this
+    /// is a plain "what did we last put on the wire" flag instead.
+    echo_suppressed: bool,
 }
 
 /// Whether we (the server) are willing to enable our side of an option
@@ -342,6 +353,7 @@ impl TelnetOptionTable {
             ttype: TtypeCycle::default(),
             mssp_fields,
             supports: std::collections::HashSet::new(),
+            echo_suppressed: false,
         }
     }
 
@@ -365,6 +377,30 @@ impl TelnetOptionTable {
     /// negotiated it, rather than trusting the caller.
     pub fn is_enabled_us(&self, option: u8) -> bool {
         self.options.get(&option).map(|n| n.us) == Some(QState::Yes)
+    }
+
+    /// Turns local client echo on (`enabled = true`, normal typing) or off
+    /// (`enabled = false`, a password prompt) around a no-echo input (spec
+    /// §9, OBI-176). `enabled = false` claims `IAC WILL ECHO` -- a
+    /// well-behaved telnet client stops echoing typed characters locally
+    /// once the server says it will do the echoing itself (and it then
+    /// doesn't, so the password lands nowhere visible); `enabled = true`
+    /// gives `IAC WONT ECHO` back, so the client resumes its own local
+    /// echo. Driven by the world (`set_echo()` efun) around a password
+    /// prompt, never by the peer. Returns the bytes to send, empty if
+    /// echo is already in the requested state (no repeated WILL/WONT spam
+    /// across back-to-back password prompts).
+    pub fn set_echo(&mut self, enabled: bool) -> Vec<u8> {
+        let suppress = !enabled;
+        if suppress == self.echo_suppressed {
+            return Vec::new();
+        }
+        self.echo_suppressed = suppress;
+        if suppress {
+            vec![IAC, WILL, OPT_ECHO]
+        } else {
+            vec![IAC, WONT, OPT_ECHO]
+        }
     }
 
     /// Startup negotiation the server always offers: ask the client to do

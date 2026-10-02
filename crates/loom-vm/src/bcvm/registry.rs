@@ -97,6 +97,94 @@ pub struct UpgradeWarning {
     pub message: String,
 }
 
+/// spec §7.2 D-B3.14 / P2-B3.1's interface contract with B3.2 (Legolas):
+/// one GitHub-merge-sized batch of mudlib-tree changes, posted to the
+/// world thread after `live` is rebased onto `main` and the real work
+/// tree is fast-forwarded. `changed`/`deleted` are mudlib-rooted paths
+/// (`/domains/x/y`, no `.wf` suffix — same convention as every other path
+/// in this module). Kept in `loom-vm` (not `loom-git`) per that contract:
+/// `RegistryHost::recompile_set` is the only thing that needs to agree on
+/// its shape with whatever posts it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChangeSet {
+    pub changed: Vec<String>,
+    pub deleted: Vec<String>,
+    pub source_sha: String,
+}
+
+/// [`RegistryHost::recompile_set`]'s result (spec §7.2 D-B3.14): what
+/// B3.3 (Legolas) posts verbatim as the post-merge PR comment.
+///
+/// - `recompiled`: every path actually recompiled and installed (the
+///   changed, already-loaded roots plus their reverse-inherit dependents),
+///   parents-first. Empty whenever `failures` is non-empty — nothing was
+///   installed at all.
+/// - `upgraded_instances`: how many currently-live objects run one of
+///   `recompiled`'s programs, counted just before `install` (OBI-89:
+///   install itself is lazy, so this counts who *will* migrate on next
+///   access, not a synchronous migration that already happened).
+/// - `skipped_unloaded`: changed paths with no registered program —
+///   nothing to do, the next `ensure_program` compiles them fresh.
+/// - `deleted_loaded`: deleted paths that are still registered — they
+///   keep running on their last-compiled program; a warning, not a
+///   failure.
+/// - `failures`: every compile diagnostic collected across the whole
+///   batch. Non-empty means `recompiled`/`upgraded_instances` are empty
+///   and nothing was installed (all-or-nothing).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecompileReport {
+    pub recompiled: Vec<String>,
+    pub upgraded_instances: usize,
+    pub skipped_unloaded: Vec<String>,
+    pub deleted_loaded: Vec<String>,
+    pub failures: Vec<(String, String)>,
+}
+
+/// [`Compiler::recompile_set`]'s result: everything [`RegistryHost::
+/// recompile_set`] needs to either install `new_set` as a whole (when
+/// `failures` is empty) or report `failures` and install nothing.
+/// `new_set`/`recompiled` are kept distinct from the public
+/// [`RecompileReport`] because `new_set` must never leak out of
+/// `RegistryHost` un-installed -- a caller holding a `CompiledProgram`
+/// that was never registered could observe a program whose parent link
+/// silently changes underneath it on a later install.
+#[derive(Default)]
+pub struct RecompileSetOutcome {
+    pub new_set: HashMap<String, Rc<CompiledProgram>>,
+    pub recompiled: Vec<String>,
+    pub skipped_unloaded: Vec<String>,
+    pub deleted_loaded: Vec<String>,
+    pub failures: Vec<(String, String)>,
+}
+
+/// In-process `loom_mudlib_sync_total{result=ok|compile_failed}` counter
+/// (D-B3.14), same "no exporter wired up yet" posture as
+/// [`CowMetrics`]/`crate::quota::QuotaBreachMetrics`: owned by [`Registry`]
+/// and read back through `World::mudlib_sync_total`.
+#[derive(Default)]
+pub struct SyncMetrics {
+    ok: u64,
+    compile_failed: u64,
+}
+
+impl SyncMetrics {
+    fn record(&mut self, ok: bool) {
+        if ok {
+            self.ok += 1;
+        } else {
+            self.compile_failed += 1;
+        }
+    }
+
+    pub fn get(&self, result: &str) -> u64 {
+        match result {
+            "ok" => self.ok,
+            "compile_failed" => self.compile_failed,
+            _ => 0,
+        }
+    }
+}
+
 /// Build a synthetic, private function whose body conditionally assigns
 /// every declared `var`'s initialiser expression to that global — exactly
 /// the statements `crate::program::link`'s tree-walker equivalent
@@ -473,6 +561,197 @@ impl Compiler {
             new_set.insert(p.clone(), Rc::new(compiled));
         }
         Ok(new_set)
+    }
+
+    /// spec §7.2 D-B3.14 (P2-B3.1): the multi-root generalisation of
+    /// [`Self::recompile`] -- `changed`/`deleted` are a GitHub-merge-sized
+    /// batch of mudlib paths, not one `update`. Every *changed* path that
+    /// is currently registered becomes a root; every currently-registered
+    /// program that (directly or transitively) inherits any root is
+    /// pulled in too (the reverse-inherit expansion, unioned across every
+    /// root), sorted parents-first across the whole batch. A changed path
+    /// with no registered program needs nothing (lazy load from disk) and
+    /// is reported in [`RecompileSetOutcome::skipped_unloaded`] instead of
+    /// being compiled. A deleted path that is still registered keeps
+    /// running on its last-compiled program -- there is nothing on disk to
+    /// recompile it from -- and is reported in
+    /// [`RecompileSetOutcome::deleted_loaded`].
+    ///
+    /// **All-or-nothing (D-B3.14):** every target is compiled, collecting
+    /// *every* failure instead of stopping at the first one (a merge can
+    /// touch several unrelated programs, and the caller's report should
+    /// show every diagnostic at once) -- but [`RecompileSetOutcome::new_set`]
+    /// is only ever non-empty when [`RecompileSetOutcome::failures`] is
+    /// empty. The caller ([`RegistryHost::recompile_set`]) installs
+    /// `new_set` as a whole or not at all, exactly like [`Self::recompile`]/
+    /// [`RegistryHost::install`] already do for one root.
+    ///
+    /// **Known simplification, same as [`Self::recompile`]/[`Self::
+    /// finish_recompile`]:** this is the synchronous compile path, not yet
+    /// off the world thread (unlike OBI-90's single-root `begin_recompile`/
+    /// `finish_recompile`). Flagged, not hidden: batching an
+    /// arbitrary-size changed set onto the existing background-thread
+    /// machinery (`compile_worker::RecompileJob`, built for one root) is
+    /// real follow-up work, not done in this slice -- see the P2-B3.1 task
+    /// note. Nothing about `RecompileReport`'s shape depends on which
+    /// thread compiled it, so that follow-up is purely additive.
+    pub fn recompile_set(
+        &mut self,
+        registry: &Registry,
+        changed: &[String],
+        deleted: &[String],
+    ) -> RecompileSetOutcome {
+        let mut skipped_unloaded = Vec::new();
+        let mut failures: Vec<(String, String)> = Vec::new();
+        let mut roots: Vec<String> = Vec::new();
+        for raw in changed {
+            match mudlib::normalize_path(raw) {
+                Ok(path) => {
+                    if registry.program(&path).is_some() {
+                        roots.push(path);
+                    } else {
+                        skipped_unloaded.push(path);
+                    }
+                }
+                Err(e) => failures.push((raw.clone(), e)),
+            }
+        }
+        let mut deleted_loaded = Vec::new();
+        for raw in deleted {
+            if let Ok(path) = mudlib::normalize_path(raw)
+                && registry.program(&path).is_some()
+            {
+                deleted_loaded.push(path);
+            }
+        }
+
+        let bail = |skipped_unloaded: Vec<String>,
+                    deleted_loaded: Vec<String>,
+                    failures: Vec<(String, String)>| {
+            RecompileSetOutcome {
+                new_set: HashMap::new(),
+                recompiled: Vec::new(),
+                skipped_unloaded,
+                deleted_loaded,
+                failures,
+            }
+        };
+
+        if !failures.is_empty() || roots.is_empty() {
+            return bail(skipped_unloaded, deleted_loaded, failures);
+        }
+
+        // Reverse-inherit expansion (D-B3.14), unioned across every root:
+        // every currently-registered program that (directly or
+        // transitively) inherits *any* changed, loaded path joins the
+        // batch alongside its root(s).
+        // A deleted-but-loaded dependent is *not* a target: it has no
+        // source left to recompile from, so pulling it in would fail the
+        // whole batch (e.g. a merge that deletes a subclass and edits its
+        // base). It keeps running on its last-compiled program, reported
+        // in `deleted_loaded` (CTO review).
+        let mut targets: std::collections::BTreeSet<String> = roots.iter().cloned().collect();
+        for p in registry.programs.values() {
+            if !deleted_loaded.iter().any(|d| **d == *p.path) && roots.iter().any(|r| p.inherits(r))
+            {
+                targets.insert(p.path.to_string());
+            }
+        }
+        // Parents before children across the *whole* batch: chain length
+        // is still a valid topological key when roots share ancestors
+        // (single-inherit chains, same restriction `Self::recompile` has).
+        let mut ordered: Vec<String> = targets.into_iter().collect();
+        ordered.sort_by_key(|p| registry.program(p).map_or(0, |cp| cp.chain().len()));
+
+        for p in &ordered {
+            self.session.invalidate(p);
+        }
+
+        // OBI-156 (generalised to a batch): a root may inherit an ancestor
+        // that was never loaded/registered at all. Compiling each root
+        // through the session resolves its whole linearization; queue any
+        // member that isn't registered yet, ancestor-first, ahead of every
+        // target below.
+        let mut to_compile: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for root in &roots {
+            match self.session.compile(root) {
+                Outcome::Ok(checked) => {
+                    for anc in &checked.info.linearization {
+                        if **anc == *root.as_str() {
+                            continue;
+                        }
+                        if registry.program(anc).is_none() && seen.insert(anc.to_string()) {
+                            to_compile.push(anc.to_string());
+                        }
+                    }
+                }
+                Outcome::Failed(msg) | Outcome::Missing(msg) => {
+                    failures.push((root.clone(), msg.to_string()))
+                }
+            }
+        }
+        for p in &ordered {
+            if seen.insert(p.clone()) {
+                to_compile.push(p.clone());
+            }
+        }
+        if !failures.is_empty() {
+            return bail(skipped_unloaded, deleted_loaded, failures);
+        }
+
+        for p in &to_compile {
+            match self.session.compile(p) {
+                Outcome::Ok(_) => {}
+                Outcome::Failed(msg) | Outcome::Missing(msg) => {
+                    failures.push((p.clone(), msg.to_string()))
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return bail(skipped_unloaded, deleted_loaded, failures);
+        }
+
+        let mut new_set: HashMap<String, Rc<CompiledProgram>> = HashMap::new();
+        for p in &to_compile {
+            let anc_hir = match self.session.outcomes().get(p) {
+                Some(Outcome::Ok(c)) => c.hir.clone(),
+                _ => {
+                    failures.push((
+                        p.clone(),
+                        format!("internal: {p} missing from the compile session"),
+                    ));
+                    continue;
+                }
+            };
+            // Same Phase 0 restriction as `Self::recompile`: only the first
+            // `inherit` becomes this program's parent link.
+            let parent = anc_hir.inherits.first().and_then(|inh| {
+                new_set
+                    .get(&*inh.path)
+                    .cloned()
+                    .or_else(|| registry.program(&inh.path))
+            });
+            let version = registry.program(p).map_or(1, |old| old.version + 1);
+            match compile_hir_program(&anc_hir, version, parent) {
+                Ok(mut compiled) => {
+                    compiled.source_hash = compile_worker::source_hash(&self.root, p).unwrap_or(0);
+                    new_set.insert(p.clone(), Rc::new(compiled));
+                }
+                Err(e) => failures.push((p.clone(), format!("{p}: {e}"))),
+            }
+        }
+        if !failures.is_empty() {
+            return bail(skipped_unloaded, deleted_loaded, failures);
+        }
+
+        RecompileSetOutcome {
+            new_set,
+            recompiled: ordered,
+            skipped_unloaded,
+            deleted_loaded,
+            failures: Vec::new(),
+        }
     }
 
     /// Send-safe snapshot of `registry`'s current program topology (OBI-90/
@@ -1009,6 +1288,8 @@ pub struct Registry {
     /// `loom_cow_copies_total{program}` (spec r5 §5.2.1, D24); see
     /// [`CowMetrics`].
     pub cow_metrics: CowMetrics,
+    /// `loom_mudlib_sync_total{result}` (D-B3.14); see [`SyncMetrics`].
+    pub sync_metrics: SyncMetrics,
     /// `atomic fn` journal (spec r5 §5.2.1, OBI-32): every object-variable
     /// write and `clone_object` while [`Self::atomic_active`] is nonzero,
     /// oldest first, undoable back to any earlier mark by
@@ -1139,6 +1420,19 @@ impl Registry {
             .get(id.index as usize)
             .filter(|s| s.generation == id.generation)
             .and_then(|s| s.obj.as_ref())
+    }
+
+    /// [`RecompileReport::upgraded_instances`] (D-B3.14): how many
+    /// currently-live objects run one of `paths`' programs right now,
+    /// taken just before `RegistryHost::install` -- a point-in-time count,
+    /// not a guarantee every one of them is still live (or still on that
+    /// program) by the time a caller reads the report back.
+    pub(crate) fn live_instance_count(&self, paths: &std::collections::HashSet<&str>) -> usize {
+        self.slots
+            .iter()
+            .filter_map(|s| s.obj.as_ref())
+            .filter(|o| paths.contains(o.program.path.as_ref()))
+            .count()
     }
 
     pub fn get_mut(&mut self, id: ObjectId) -> Option<&mut BcObject> {
@@ -2892,6 +3186,25 @@ impl<'a> RegistryHost<'a> {
                 }
                 Ok(Value::Null)
             }
+            "set_echo" => {
+                let Value::Bool(enabled) = a1 else {
+                    return Err(RtError::new("set_echo(): expected bool"));
+                };
+                if let Value::Object(id) = a0 {
+                    let conn = self.registry.get(id).and_then(|o| o.conn);
+                    if let Some(conn) = conn
+                        && let Some(d) = self.driver.as_mut()
+                    {
+                        d.net.set_echo(conn, enabled);
+                    }
+                } else if !matches!(a0, Value::Null) {
+                    return Err(RtError::new(format!(
+                        "set_echo(): expected object, got {}",
+                        a0.type_name()
+                    )));
+                }
+                Ok(Value::Null)
+            }
             "bind_connection" => {
                 let me = self.self_object();
                 let master = self.driver.as_ref().and_then(|d| d.master);
@@ -4080,6 +4393,70 @@ impl<'a> RegistryHost<'a> {
         // address's reuse unsafe to ignore).
         self.call_cache.clear();
         Ok(Vec::new())
+    }
+
+    /// spec §7.2 D-B3.14 (P2-B3.1): recompile the changed set, expanded
+    /// with the reverse-inherit graph, as one dependency-ordered,
+    /// all-or-nothing batch -- the multi-root generalisation of
+    /// [`Self::recompile`] (see [`Compiler::recompile_set`] for the actual
+    /// compile-stage logic; this is the world-thread install stage, same
+    /// split as `Self::recompile`/`Compiler::recompile`).
+    ///
+    /// One compile failure anywhere in the batch means nothing is
+    /// installed at all: every old version keeps running, and every
+    /// diagnostic collected is returned in [`RecompileReport::failures`].
+    ///
+    /// If `/secure/master` or `/secure/roles` is in the recompiled set,
+    /// `self.install` (called below) already recomputes `program_flags`
+    /// for every recompiled path against the *new* master, and -- because
+    /// the master itself is in the batch -- drops the *whole*
+    /// `program_flags` cache rather than just the recompiled paths (see
+    /// `install`'s own doc comment). This additionally bumps the
+    /// security-decision epoch (D-S1.8), exactly like [`Self::recompile`]'s
+    /// `touches_secure` handling, so a cached privilege decision made
+    /// against the old master/roles code is never reused after this call.
+    pub fn recompile_set(&mut self, changed: &[String], deleted: &[String]) -> RecompileReport {
+        let set = {
+            let driver = self
+                .driver
+                .as_mut()
+                .expect("recompile_set needs a driver context");
+            driver
+                .compiler
+                .recompile_set(self.registry, changed, deleted)
+        };
+        if !set.failures.is_empty() {
+            self.registry.sync_metrics.record(false);
+            return RecompileReport {
+                recompiled: Vec::new(),
+                upgraded_instances: 0,
+                skipped_unloaded: set.skipped_unloaded,
+                deleted_loaded: set.deleted_loaded,
+                failures: set.failures,
+            };
+        }
+        // Same broader-than-D-B3.14's-letter rule `Self::recompile` already
+        // uses for its single-root `touches_secure`: anything under
+        // `/secure/` bumps the epoch, not only `/secure/master`/
+        // `/secure/roles` -- a strict superset is never less safe.
+        let touches_secure = set.new_set.keys().any(|k| k.starts_with("/secure/"));
+        let target_paths: std::collections::HashSet<&str> =
+            set.recompiled.iter().map(String::as_str).collect();
+        let upgraded_instances = self.registry.live_instance_count(&target_paths);
+        let _ = self.install(set.new_set);
+        if touches_secure && let Some(d) = self.driver.as_mut() {
+            // D-S1.8: a master/roles recompile invalidates every cached
+            // privilege decision.
+            d.security.bump_epoch();
+        }
+        self.registry.sync_metrics.record(true);
+        RecompileReport {
+            recompiled: set.recompiled,
+            upgraded_instances,
+            skipped_unloaded: set.skipped_unloaded,
+            deleted_loaded: set.deleted_loaded,
+            failures: Vec::new(),
+        }
     }
 }
 

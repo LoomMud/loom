@@ -1,0 +1,3 @@
+// Flagged LIVE by the master, same caveat as `/std/box`.
+fn create() {
+}

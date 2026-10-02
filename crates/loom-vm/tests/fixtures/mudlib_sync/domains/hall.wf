@@ -1,0 +1,5 @@
+inherit /std/room
+
+fn create() {
+    short_desc = "The Great Hall"
+}
