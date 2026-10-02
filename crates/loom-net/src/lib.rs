@@ -1734,20 +1734,32 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         drain_preamble(&mut client).await;
 
+        // OBI-222: `SetEcho` and `Send` are two separate `ConnCommand`s
+        // that `run_connection` writes to the socket with two separate
+        // `write_all` calls; the IAC bytes and the prompt text are *not*
+        // guaranteed to land in the same TCP read on the client side --
+        // under scheduling pressure (observed on the self-hosted CI
+        // runner pool) the connection task can be preempted between the
+        // two writes, so a single `client.read()` can return just the
+        // IAC sequence. Read exactly the expected number of bytes
+        // (looping internally via `read_exact`, same pattern as
+        // `drain_preamble` above) instead of asserting both writes
+        // coalesce into one `read()`.
         client.write_all(b"legolas\r\n").await.unwrap();
-        let mut buf = [0_u8; 64];
-        let n = client.read(&mut buf).await.unwrap();
+        let expected = [&[IAC, WILL, telnet::OPT_ECHO][..], b"Password: "].concat();
+        let mut buf = vec![0_u8; expected.len()];
+        client.read_exact(&mut buf).await.unwrap();
         assert_eq!(
-            &buf[..n],
-            [&[IAC, WILL, telnet::OPT_ECHO][..], b"Password: "].concat(),
+            buf, expected,
             "expected IAC WILL ECHO immediately before the password prompt"
         );
 
         client.write_all(b"hunter2\r\n").await.unwrap();
-        let n = client.read(&mut buf).await.unwrap();
+        let expected = [&[IAC, WONT, telnet::OPT_ECHO][..], b"Welcome.\r\n"].concat();
+        let mut buf = vec![0_u8; expected.len()];
+        client.read_exact(&mut buf).await.unwrap();
         assert_eq!(
-            &buf[..n],
-            [&[IAC, WONT, telnet::OPT_ECHO][..], b"Welcome.\r\n"].concat(),
+            buf, expected,
             "expected IAC WONT ECHO immediately after the password line"
         );
 
