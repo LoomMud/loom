@@ -25,23 +25,19 @@ use std::os::unix::net::UnixStream;
 /// `set_nonblocking`, so a caller handing the result straight to Tokio
 /// must do that first.
 ///
-/// # Errors
-/// Never fails on its own (`From<OwnedFd>` is infallible for
-/// `TcpListener`); the `Result` wrapper exists so call sites that chain
-/// this with other I/O (e.g. `set_nonblocking`) can use `?` uniformly.
-/// Kept as a named function rather than a bare `From` conversion so the
-/// "this fd had better actually be a listening socket -- there is no
-/// check here" assumption has a place to be documented once, not at
+/// Contains no `unsafe` (`OwnedFd -> TcpListener` via `From` is a safe
+/// conversion); kept as a named function rather than a bare `From` call
+/// so the "this fd had better actually be a listening socket -- there is
+/// no check here" assumption has a place to be documented once, not at
 /// every call site.
+///
+/// # Errors
+/// Never fails on its own today; the `Result` wrapper exists so call
+/// sites that chain this with other I/O (e.g. `set_nonblocking`) can use
+/// `?` uniformly, and so a future added check (e.g. `getsockopt(
+/// SO_ACCEPTCONN)` to confirm the fd is actually listening) doesn't need
+/// a signature change.
 pub fn adopt_tcp_listener(fd: OwnedFd) -> io::Result<std::net::TcpListener> {
-    // SAFETY: `fd` is an `OwnedFd` the caller received from `recv_fds`
-    // (itself validated against a kernel-delivered `SCM_RIGHTS` message,
-    // see fdpass's own safety notes) -- it is a real, open, owned
-    // descriptor. `From<OwnedFd>` for `TcpListener` is exactly this
-    // "trust me, it's a listening socket" wrapping; there is nothing
-    // additionally unsafe about the conversion itself, it is just gated
-    // by this crate's blanket `unsafe_code = "warn"` because `OwnedFd`'s
-    // own `From` impl is still conceptually "reinterpret this fd".
     Ok(std::net::TcpListener::from(fd))
 }
 
@@ -50,6 +46,16 @@ pub fn adopt_tcp_listener(fd: OwnedFd) -> io::Result<std::net::TcpListener> {
 /// right before `Command::spawn` -- every other fd the supervisor holds
 /// (its own listening sockets, the *other* end of the pair) keeps
 /// `FD_CLOEXEC` set and is correctly *not* inherited.
+///
+/// This is race-free only because nothing else in `loom supervise`
+/// spawns a process concurrently (CTO review, OBI-184/OBI-225): clearing
+/// `FD_CLOEXEC` is process-wide, so any other thread that happened to
+/// `fork`+`exec` between this call and the matching `Command::spawn`
+/// would also inherit this fd. If `supervise` ever grows a second thing
+/// that spawns processes, prefer clearing `FD_CLOEXEC` only in the
+/// child, via `Command::pre_exec` immediately before `execve` (ideally
+/// paired with `dup2` onto a fixed fd number, which also removes the
+/// need to pass the fd number down via argv).
 pub fn clear_cloexec(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fd` is a valid, open descriptor for the duration of this
     // call (the caller passes a `RawFd` borrowed from an `OwnedFd`/
@@ -72,20 +78,84 @@ pub fn clear_cloexec(fd: RawFd) -> io::Result<()> {
 
 /// Wrap an inherited control-socket fd (the number a standby child was
 /// told about, e.g. via a `--adopt-control-fd <n>` argument) as a
-/// `UnixStream`. The fd is assumed to already be open and valid --
-/// exactly the fd the supervisor's [`clear_cloexec`] + `spawn` handed
-/// down; there is no portable way to double-check "is this really a
-/// `AF_UNIX` socket and not, say, fd 2" from here, so a caller passing a
-/// wrong number gets whatever `read`/`write`/`sendmsg` on that fd number
-/// actually does (most likely a prompt I/O error, not silent corruption).
-pub fn control_stream_from_raw_fd(fd: RawFd) -> UnixStream {
-    // SAFETY: the contract is "the caller's own supervisor already
-    // `clear_cloexec`'d and handed down exactly this fd number as the
-    // standby's control socket" -- see the module/function doc above for
-    // what happens if that contract is violated (an I/O error on first
-    // use, not memory unsafety: `UnixStream` only ever issues normal
-    // socket syscalls against this fd).
-    unsafe { UnixStream::from_raw_fd(fd) }
+/// `UnixStream`.
+///
+/// Before wrapping, this rejects `fd <= 2` (stdin/stdout/stderr -- a
+/// caller that passed one of those by mistake must not get a
+/// `UnixStream` that closes, say, stderr on `Drop`) and confirms
+/// `fstat` reports a socket (`S_IFSOCK`). Neither check can prove the fd
+/// is *specifically* the control socket this process expects -- that
+/// part is still the caller's contract -- but both are cheap,
+/// unconditional defence in depth against the closest wrong-fd mistakes
+/// (CTO review, OBI-184/OBI-225).
+///
+/// After adopting, re-sets `FD_CLOEXEC` (cleared by the supervisor's
+/// [`clear_cloexec`] specifically so this process's own `exec` would
+/// inherit it): nothing *this* process spawns afterwards (e.g.
+/// `loom-git`'s `git` children) should also inherit the control socket.
+///
+/// # Safety
+/// The caller must guarantee `fd` is a valid, open file descriptor that
+/// this process uniquely owns -- no other `File`/`UnixStream`/etc.
+/// wrapper anywhere in the process already owns the same number. The
+/// returned `UnixStream` closes `fd` on `Drop`; a reused or still-aliased
+/// number here is a double-close/use-after-close bug, which the `fd <=
+/// 2`/`S_ISSOCK` checks above only narrow, not eliminate.
+pub unsafe fn control_stream_from_raw_fd(fd: RawFd) -> io::Result<UnixStream> {
+    if fd <= 2 {
+        return Err(io::Error::other(format!(
+            "control_stream_from_raw_fd: refusing fd {fd} (reserved for stdio)"
+        )));
+    }
+
+    // SAFETY: `fstat` only reads kernel metadata about `fd`; it neither
+    // takes ownership nor affects how `fd` may be used afterwards.
+    let is_socket = unsafe {
+        let mut stat: libc::stat = std::mem::zeroed();
+        if libc::fstat(fd, &mut stat) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        (stat.st_mode & libc::S_IFMT) == libc::S_IFSOCK
+    };
+    if !is_socket {
+        return Err(io::Error::other(format!(
+            "control_stream_from_raw_fd: fd {fd} is not a socket"
+        )));
+    }
+
+    // SAFETY: the two checks above narrow, but the real guarantee is the
+    // caller's contract documented on this function's own `# Safety`
+    // section -- `fd` is open, owned by this process, and not aliased by
+    // any other wrapper.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+
+    // Best-effort: if re-setting FD_CLOEXEC fails, the stream is still
+    // correctly constructed and usable -- not worth failing the whole
+    // adoption over a now-redundant hardening step (the window where
+    // this would matter, this process `exec`-ing again before setting
+    // it, does not happen on `serve`'s path).
+    let _ = set_cloexec(fd);
+
+    Ok(stream)
+}
+
+/// Re-establish `FD_CLOEXEC` on `fd` (the inverse of [`clear_cloexec`]),
+/// used by [`control_stream_from_raw_fd`] once it has adopted the fd.
+fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: same contract as `clear_cloexec` -- `fd` is a valid, open
+    // descriptor for the duration of this call, and this function
+    // neither transfers ownership of it nor closes it.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let rc = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// The raw fd number behind `stream`, for logging/passing to a spawned
@@ -96,6 +166,7 @@ pub fn raw_fd_of(stream: &UnixStream) -> RawFd {
 }
 
 #[cfg(test)]
+#[allow(clippy::undocumented_unsafe_blocks)] // test scaffolding; production unsafe above this module is fully documented, enforced by this lint
 mod tests {
     use super::*;
     use std::io::{Read, Write};
@@ -164,5 +235,50 @@ mod tests {
         parent_end.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"ok");
         drop(child_end);
+    }
+
+    /// `control_stream_from_raw_fd` refuses `fd <= 2` (CTO review,
+    /// OBI-225): stdio fds are always open in a test process, so this
+    /// doesn't even need a crafted fd -- fd 1 (stdout) is right there.
+    #[test]
+    fn control_stream_from_raw_fd_refuses_stdio() {
+        let err = unsafe { control_stream_from_raw_fd(1) }.unwrap_err();
+        assert!(err.to_string().contains("stdio"));
+    }
+
+    /// `control_stream_from_raw_fd` refuses a non-socket fd (a plain
+    /// pipe) via the `fstat`/`S_ISSOCK` check.
+    #[test]
+    fn control_stream_from_raw_fd_refuses_a_non_socket() {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0 as RawFd; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        // Keep both ends owned so they close on scope exit either way.
+        let _write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+
+        let err = unsafe { control_stream_from_raw_fd(read_end.as_raw_fd()) }.unwrap_err();
+        assert!(err.to_string().contains("not a socket"));
+    }
+
+    /// The real, happy-path use: a socket fd, not stdio, adopted
+    /// successfully and still independently usable afterwards.
+    #[test]
+    fn control_stream_from_raw_fd_adopts_a_real_socket() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let b_fd = b.as_raw_fd();
+        // `control_stream_from_raw_fd` takes ownership of the fd number;
+        // leak `b`'s Rust-level ownership (not the fd itself) so the
+        // adopted `UnixStream` is the only owner, matching the real
+        // "inherited fd, no other wrapper in this process" contract.
+        std::mem::forget(b);
+
+        let mut adopted = unsafe { control_stream_from_raw_fd(b_fd) }.unwrap();
+        let mut a = a;
+        a.write_all(b"hi").unwrap();
+        let mut buf = [0u8; 2];
+        adopted.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"hi");
     }
 }

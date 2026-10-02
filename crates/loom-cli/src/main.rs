@@ -366,7 +366,23 @@ async fn acquire_listeners(
             // something steady-state traffic ever waits on.
             let (std_telnet, std_http) = tokio::task::spawn_blocking(move || {
                 use std::io::Write;
-                let mut control = loom_supervise::listener::control_stream_from_raw_fd(fd);
+                // SAFETY: `fd` is the number `loom supervise` itself
+                // passed down via `--adopt-control-fd`, inherited at
+                // `exec` specifically because the supervisor cleared its
+                // `FD_CLOEXEC` for that purpose (`spawn_and_handoff`) --
+                // nothing else in this freshly-exec'd process has opened
+                // or wrapped this fd number yet.
+                //
+                // `loom-cli` otherwise denies `unsafe_code` workspace-wide;
+                // this is the one call site that needs the exception
+                // (CTO review, OBI-184/OBI-225: the safety argument above
+                // depends on *how this process was invoked*, which only
+                // this call site -- not `loom-supervise::listener` itself
+                // -- actually knows).
+                #[allow(unsafe_code)]
+                let mut control =
+                    unsafe { loom_supervise::listener::control_stream_from_raw_fd(fd) }
+                        .map_err(|err| format!("adopt-control-fd: adopt control socket: {err}"))?;
                 // Tell `loom supervise` we're ready to receive the
                 // listening sockets ...
                 control
@@ -377,6 +393,16 @@ async fn acquire_listeners(
                 // agreed order (see `loom_supervise::fdpass`'s module doc
                 // for why there's no self-describing framing on the
                 // wire).
+                //
+                // TODO(OBI-184 abort/fallback slice): neither this call
+                // nor the `read_exact` on the supervisor's side
+                // (`spawn_and_handoff`) has a timeout, so a standby/
+                // supervisor that hangs mid-handshake blocks the other
+                // side forever. Acceptable for this slice (no
+                // already-running-process copyover to abort out of yet);
+                // needs `set_read_timeout` on both ends before this
+                // becomes part of a real copyover against a live old
+                // process (CTO review, OBI-225).
                 let fds = loom_supervise::fdpass::recv_fds(&control)
                     .map_err(|err| format!("adopt-control-fd: recv_fds: {err}"))?;
                 let [telnet_fd, http_fd]: [std::os::fd::OwnedFd; 2] =
@@ -424,6 +450,18 @@ async fn acquire_listeners(
 /// running-process copyover, and no respawn-on-crash yet. Each of those
 /// is a separate, tracked follow-up; this function is not a stand-in
 /// implementation of them.
+///
+/// **Not yet safe as a container entrypoint** (CTO review, OBI-225),
+/// tracked on OBI-184: this process installs no signal handling of its
+/// own, so a `SIGTERM` (e.g. a pod shutdown) kills the supervisor
+/// immediately, the kernel then `SIGKILL`s the orphaned standby child
+/// (or leaves it running detached, depending on PID-namespace reaping
+/// behaviour), and `serve`'s own graceful `shutdown_signal` drain never
+/// runs -- a regression versus running `serve` directly. Before
+/// `supervise` replaces `serve` as the `Dockerfile`'s entrypoint, it
+/// needs to forward `SIGTERM`/`SIGINT` to the child and reap it, and the
+/// child should set `PR_SET_PDEATHSIG` so an unexpected supervisor exit
+/// doesn't orphan it either.
 async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     let bind_addr = loom_net::telnet_addr_from_env();
     let http_bind_addr = http_addr_from_env();
@@ -496,9 +534,21 @@ fn spawn_and_handoff(
 
     let mut ready = [0u8; 1];
     let mut supervisor_end_reader = &supervisor_end;
+    // TODO(OBI-184 abort/fallback slice): no read timeout here -- see
+    // the matching TODO on `acquire_listeners`'s adopt-control-fd path.
     supervisor_end_reader
         .read_exact(&mut ready)
         .map_err(|err| format!("supervise: waiting for standby ready signal: {err}"))?;
+    if ready != *b"R" {
+        // CTO review (OBI-225): a byte that isn't the expected marker
+        // means this isn't the handshake we think it is -- handing off
+        // the listening sockets anyway would be wrong (e.g. a corrupted
+        // or out-of-protocol-version child).
+        return Err(format!(
+            "supervise: unexpected standby ready byte {:?} (expected {:?})",
+            ready, b'R'
+        ));
+    }
 
     loom_supervise::fdpass::send_fds(
         &supervisor_end,

@@ -17,20 +17,33 @@
 //!   a `loom-release` ConfigMap key once K1/OBI-187 lands) and the
 //!   supervisor's reconcile loop, which never looks at either source
 //!   directly.
+//! - [`listener`]: turning a received fd back into a `TcpListener`
+//!   (`adopt_tcp_listener`) or an inherited control fd into a
+//!   `UnixStream` (`control_stream_from_raw_fd`), plus the `fcntl`
+//!   helpers (`clear_cloexec`) the handoff protocol needs.
+//! - `loom-cli`'s `supervise` subcommand and `serve --adopt-control-fd`
+//!   wire the above into a real, end-to-end first copyover slice (one
+//!   standby child, no replace-an-already-running-process handoff yet --
+//!   see `loom-cli`'s own doc comments on `supervise`/`spawn_and_handoff`
+//!   for exactly what that first slice does and doesn't do).
 //!
-//! Not yet implemented here (each is its own follow-up slice/issue, not
+//! Not yet implemented (each is its own follow-up slice/issue, not
 //! silently deferred -- see OBI-184's tracking comments):
 //! - Staging a cosign-verified driver artifact + `abi.json` from GHCR.
 //! - The standby-boot / snapshot hand-off / `reconnect()` orchestration
-//!   itself (the snapshot save/load and `reconnect()` apply are Gimli's
-//!   piece, a child of OBI-184; this crate's job is to call into that at
-//!   the right point in the state machine, not to reimplement it).
+//!   against an *already-running* old process (the snapshot save/load and
+//!   `reconnect()` apply themselves are OBI-221/Gimli's piece, merged;
+//!   this crate's remaining job is driving that interface from a live
+//!   copyover, not a fresh boot).
 //! - Abort/fallback paths (old driver keeps running on any standby
 //!   failure; a re-exec fallback if the *new* process fails after
 //!   takeover).
-//! - Wiring `loom-cli`'s `serve()` to accept pre-bound listening fds
-//!   (today it always calls `TcpListener::bind` itself) and a
-//!   corresponding `supervise` subcommand in `loom-cli`.
+//! - Version-watching (`VersionSource` exists but nothing polls it yet)
+//!   and respawn-on-crash.
+//! - Signal forwarding (SIGTERM/SIGINT to the child, `PR_SET_PDEATHSIG`)
+//!   -- required before `supervise` can become the container entrypoint
+//!   without regressing `serve`'s graceful-shutdown path (CTO review,
+//!   OBI-225).
 
 pub mod fdpass;
 pub mod listener;

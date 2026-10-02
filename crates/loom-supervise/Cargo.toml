@@ -33,6 +33,11 @@ unsafe_code = "allow"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+# CTO review (OBI-225): enforce "every unsafe block has a SAFETY comment"
+# mechanically rather than by review vigilance alone, given this crate's
+# whole reason for existing is to carry the workspace's `unsafe_code`
+# exception.
+undocumented_unsafe_blocks = "deny"
 
 [dependencies]
 libc = "0.2.177"
