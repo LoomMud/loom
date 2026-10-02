@@ -20,12 +20,12 @@
 //! ## TOTP is mandatory for T3+
 //!
 //! [`login`] refuses a tier-3-or-above staff member's password with
-//! [`AuthError::TotpRequired`] unless their TOTP secret is both enrolled
-//! *and* confirmed (see `staff.totp_confirmed_at` in migration 0003). There
-//! is no bypass: a T3+ row with no confirmed secret cannot get a session,
-//! only enrol one (via [`totp_enroll`]/[`totp_confirm`], which themselves
-//! require a password login having already succeeded up to the TOTP gate --
-//! see `handlers.rs`).
+//! [`AuthError::TotpRequired`]/[`AuthError::EnrolmentRequired`] unless
+//! their TOTP secret is both enrolled *and* confirmed (see
+//! `staff.totp_confirmed_at` in migration 0003). There is no bypass: a
+//! T3+ row with no confirmed secret cannot get a session, only enrol one
+//! (via [`totp_enroll`]/[`totp_confirm`]) -- see "T3+ bootstrap
+//! enrolment" below for how it reaches that endpoint in the first place.
 //!
 //! ## GitHub login never creates staff
 //!
@@ -44,15 +44,35 @@
 //! refresh-reuse, and TOTP enrol/reset is appended to `audit_log` via
 //! [`StaffDirectory::record_audit`] (M-AUTH-9); see
 //! `docs/threat-model-phase2.md` §6.1 (M-AUTH-1, M-AUTH-2, M-AUTH-9).
+//!
+//! ## TOTP at rest, recovery codes, step-up, and T3+ bootstrap (OBI-199)
+//!
+//! `staff.totp_secret_enc` is an XChaCha20-Poly1305 ciphertext blob
+//! ([`crypto::TotpCipher`]), never a plaintext secret past this module's
+//! own decrypt step (M-AUTH-8). Confirming a secret for the first time
+//! issues [`RECOVERY_CODE_COUNT`] single-use recovery codes, which
+//! [`login`] accepts as an alternate second factor. (Re-)enrolling always
+//! requires the password again, and -- for a *reset* of an
+//! already-confirmed secret specifically -- a valid code against the
+//! current secret plus a fresh step-up ([`require_step_up`]).
+//! [`AuthService::github_link`]/[`github_unlink`]/[`totp_admin_reset`]
+//! are all step-up-gated the same way (M-ADM-2). A T3+ account with *no*
+//! TOTP ever enrolled gets [`AuthError::EnrolmentRequired`] from
+//! [`login`] instead of a dead-end refusal: a narrowly-scoped,
+//! short-lived token (`aud: loom-staff-enrol`) usable only on
+//! `/auth/totp/enroll`/`/auth/totp/verify`, since this account cannot
+//! obtain an ordinary access token.
 
 mod claims;
+mod crypto;
 mod directory;
 mod github;
 mod jwt;
 pub mod ratelimit;
 mod totp;
 
-pub use claims::{AccessClaims, scopes_for_tier};
+pub use claims::{ACCESS_AUDIENCE, AccessClaims, ENROL_AUDIENCE, scopes_for_tier};
+pub use crypto::TotpCipher;
 pub use directory::{AuditEvent, DirectoryError, RefreshRecord, StaffAuthRecord, StaffDirectory};
 pub use github::{GithubAuthError, GithubIdentityProvider, GithubUser};
 pub use jwt::{JwtKeys, TokenPair};
@@ -91,9 +111,19 @@ impl AuthContext {
 pub const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
 /// Refresh tokens are long-lived but revocable and rotated on every use.
 pub const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// The T3+ bootstrap enrolment-only credential (OBI-199, M-AUTH-3): usable
+/// only on `/auth/totp/enroll`/`/auth/totp/verify`, nothing else.
+pub const ENROL_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
 /// Tiers at or above this one must have a confirmed TOTP secret to obtain a
 /// session (design §9/D-P2.5: "mandatory for T3+").
 pub const MANDATORY_TOTP_TIER: i16 = 3;
+/// Step-up window (design threat-model-phase2.md §6.1 M-ADM-2): a
+/// sensitive action (TOTP reset, GitHub link/unlink) needs `mfa_at` no
+/// older than this.
+pub const STEP_UP_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// How many single-use recovery codes are issued whenever a TOTP secret is
+/// confirmed (M-AUTH-8: "Issue 10 single-use recovery codes").
+pub const RECOVERY_CODE_COUNT: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
@@ -108,6 +138,17 @@ pub enum AuthError {
     /// callers can tell "you didn't send a code" apart from "your code was
     /// wrong".
     TotpInvalid,
+    /// Correct password, tier >= [`MANDATORY_TOTP_TIER`], and *no* TOTP
+    /// secret has ever been enrolled (not even unconfirmed): there is no
+    /// code this caller could supply. Carries a narrowly-scoped,
+    /// short-lived enrolment-only token (OBI-199) so the client can reach
+    /// `/auth/totp/enroll` without an ordinary access token, which this
+    /// account cannot obtain yet.
+    EnrolmentRequired(String),
+    /// A step-up-gated action (TOTP reset, GitHub link/unlink, ...) was
+    /// attempted without a fresh (`mfa_at` within [`STEP_UP_WINDOW`])
+    /// second-factor verification.
+    StepUpRequired,
     /// The refresh token is unknown, expired, or already revoked.
     InvalidRefreshToken,
     /// The backing directory (Postgres) failed.
@@ -126,6 +167,8 @@ impl std::fmt::Display for AuthError {
             AuthError::InvalidCredentials => "invalid credentials",
             AuthError::TotpRequired => "totp code required",
             AuthError::TotpInvalid => "totp code invalid",
+            AuthError::EnrolmentRequired(_) => "totp enrolment required",
+            AuthError::StepUpRequired => "step-up verification required",
             AuthError::InvalidRefreshToken => "invalid refresh token",
             AuthError::DirectoryUnavailable => "directory unavailable",
             AuthError::RateLimited => "rate limited",
@@ -143,22 +186,25 @@ impl From<DirectoryError> for AuthError {
 }
 
 /// Everything [`login`]/[`refresh`]/[`github_login`] need: the staff
-/// directory, the JWT signing keys, and the TTLs (fixed to the module
-/// constants above, exposed as fields only so tests can shrink them).
+/// directory, the JWT signing keys, the TOTP-at-rest cipher, the rate
+/// limiter, and the TTLs (fixed to the module constants above, exposed as
+/// fields only so tests can shrink/replace them).
 #[derive(Clone)]
 pub struct AuthService {
     directory: Arc<dyn StaffDirectory>,
     keys: JwtKeys,
+    totp_cipher: TotpCipher,
     access_ttl: Duration,
     refresh_ttl: Duration,
     rate_limiter: Arc<RateLimiter>,
 }
 
 impl AuthService {
-    pub fn new(directory: Arc<dyn StaffDirectory>, keys: JwtKeys) -> Self {
+    pub fn new(directory: Arc<dyn StaffDirectory>, keys: JwtKeys, totp_cipher: TotpCipher) -> Self {
         Self {
             directory,
             keys,
+            totp_cipher,
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_ttl: REFRESH_TOKEN_TTL,
             rate_limiter: Arc::new(RateLimiter::new()),
@@ -185,7 +231,10 @@ impl AuthService {
     /// Username/password login (design §9). Refuses with
     /// [`AuthError::TotpRequired`]/[`AuthError::TotpInvalid`] for a T3+
     /// staff member unless `totp_code` verifies against their confirmed
-    /// secret.
+    /// secret or against one of their unused recovery codes. A T3+ staff
+    /// member with *no* TOTP ever enrolled gets
+    /// [`AuthError::EnrolmentRequired`] instead, carrying a narrow
+    /// bootstrap token for `/auth/totp/enroll` (OBI-199).
     ///
     /// Rate limiting (OBI-200, M-AUTH-1): checked *before* any
     /// credential work. A throttled IP gets [`AuthError::RateLimited`]. A
@@ -194,8 +243,8 @@ impl AuthService {
     /// "this account is locked" from "that password is wrong" (which
     /// would otherwise leak account existence/activity). A wrong
     /// password or a wrong TOTP code both count as a failure toward the
-    /// account lockout; a *missing* TOTP code does not (it isn't a
-    /// guess). Every outcome is audited (M-AUTH-9).
+    /// account lockout; a *missing* TOTP code or an enrolment bootstrap
+    /// does not (neither is a guess). Every outcome is audited (M-AUTH-9).
     pub async fn login(
         &self,
         username: &str,
@@ -246,7 +295,7 @@ impl AuthService {
             Err(err) => return Err(err.into()),
         };
 
-        if let Err(err) = self.enforce_totp_gate(&record, totp_code) {
+        if let Err(err) = self.enforce_totp_gate(&record, totp_code).await {
             if err == AuthError::TotpInvalid {
                 self.rate_limiter.record_failure(username);
             }
@@ -281,12 +330,12 @@ impl AuthService {
     /// unlinked id is always refused; this never creates a staff row.
     ///
     /// TOTP is intentionally *not* re-checked here: linking a GitHub
-    /// identity to a T3+ uid is itself a T4+ action (`auth_github_link`),
-    /// so by the time a link exists an arch has already vouched for the
-    /// account, and the mandatory-TOTP gate was already enforced the first
-    /// time that uid logged in with a password. Revisiting this if GitHub
-    /// login becomes the *primary* path for T3+ accounts is tracked in the
-    /// OBI-174 PR description.
+    /// identity to a T3+ uid is itself a T4+, step-up-gated action
+    /// (`auth_github_link`), so by the time a link exists an arch has
+    /// already vouched for the account, and the mandatory-TOTP gate was
+    /// already enforced the first time that uid logged in with a
+    /// password. Revisiting this if GitHub login becomes the *primary*
+    /// path for T3+ accounts is tracked in the OBI-174 PR description.
     pub async fn github_login(&self, github_id: i64) -> Result<TokenPair, AuthError> {
         let uid = self
             .directory
@@ -348,24 +397,55 @@ impl AuthService {
         Ok(())
     }
 
-    /// Generate and store a fresh TOTP secret for `uid` (self-service --
-    /// the directory re-checks actor == uid in SQL). Returns the
-    /// enrolment payload (base32 secret + `otpauth://` URL) once; the
-    /// caller must show it to the user now, since only its hash-adjacent
-    /// state (not the plaintext) is ever returned again. Audited as
-    /// `auth.totp.enrol` the first time `uid` gets a secret, or
-    /// `auth.totp.reset` if one already existed (M-AUTH-9).
+    /// (Re-)enrol `uid`'s TOTP secret (OBI-199, M-AUTH-8: "Enrolment
+    /// requires the password again plus one valid code before
+    /// activation."). `password` must re-verify (password re-entry).
+    ///
+    /// If `uid` already has a *confirmed* secret, this is a reset, not a
+    /// first enrolment: it additionally requires `existing_code` to verify
+    /// against the *current* secret (proof the caller still controls the
+    /// device being replaced) and a fresh step-up (`mfa_at` within
+    /// [`STEP_UP_WINDOW`]) -- see [`Self::step_up`]. A first enrolment
+    /// (no confirmed secret yet) requires neither, since there is nothing
+    /// to prove continued possession of, and no prior MFA session to step
+    /// up from -- that is exactly the T3+ bootstrap case this module's
+    /// enrolment-only token exists for.
+    ///
+    /// Returns the enrolment payload (base32 secret + `otpauth://` URL)
+    /// once; the caller must show it to the user now, since only its
+    /// encrypted-at-rest state (never the plaintext) is ever retrievable
+    /// again. Recovery codes are **not** issued here -- they are
+    /// generated once the new secret is actually confirmed, by
+    /// [`Self::totp_confirm`]. Audited as `auth.totp.enrol` for a first
+    /// enrolment or `auth.totp.reset` for a reset (M-AUTH-9).
     pub async fn totp_enroll(
         &self,
         uid: &str,
+        password: &str,
+        existing_code: Option<&str>,
         ctx: &AuthContext,
     ) -> Result<totp::TotpEnrollment, AuthError> {
-        let had_prior_secret = self.directory.totp_secret_for(uid).await?.is_some();
+        if !self.directory.verify_password(uid, password).await? {
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        let is_reset = self.directory.totp_confirmed_for(uid).await?;
+        if is_reset {
+            self.require_step_up(uid).await?;
+            let current_secret = self.current_confirmed_secret(uid).await?;
+            let Some(code) = existing_code else {
+                return Err(AuthError::TotpRequired);
+            };
+            match current_secret {
+                Some(secret) if verify_totp_code(&secret, code) => {}
+                _ => return Err(AuthError::TotpInvalid),
+            }
+        }
+
         let enrollment = totp::generate_totp_secret(uid);
-        self.directory
-            .totp_enroll(uid, &enrollment.secret_base32)
-            .await?;
-        let kind = if had_prior_secret {
+        let ciphertext = self.totp_cipher.encrypt(uid, &enrollment.secret_base32);
+        self.directory.totp_enroll(uid, &ciphertext).await?;
+        let kind = if is_reset {
             "auth.totp.reset"
         } else {
             "auth.totp.enrol"
@@ -375,36 +455,121 @@ impl AuthService {
         Ok(enrollment)
     }
 
+    /// An admin (T4+, step-up-gated) clearing a *different* uid's TOTP
+    /// enrolment entirely -- lost-device recovery (OBI-199, M-ADM-2:
+    /// "TOTP reset ... (self and admin)"). `actor` must have its own
+    /// fresh `mfa_at`; the directory re-checks this in SQL regardless.
+    /// Audited as `auth.totp.reset` (M-AUTH-9).
+    pub async fn totp_admin_reset(
+        &self,
+        actor: &str,
+        uid: &str,
+        reason: &str,
+        ctx: &AuthContext,
+    ) -> Result<(), AuthError> {
+        self.require_step_up(actor).await?;
+        self.directory.totp_admin_reset(actor, uid, reason).await?;
+        self.audit(
+            "auth.totp.reset",
+            Some(uid.to_string()),
+            ctx,
+            "allow",
+            Some(format!("admin reset by {actor}: {reason}")),
+        )
+        .await;
+        Ok(())
+    }
+
     /// Verify `code` against `uid`'s just-enrolled (or previously
-    /// enrolled) secret and, on success, mark it confirmed -- the gate
-    /// [`Self::login`] checks for T3+ staff. TOTP attempts share the
-    /// login rate limiter (M-AUTH-1): a wrong code counts as a failure
-    /// against both the per-account and per-IP limits.
+    /// enrolled) secret and, on success, mark it confirmed and (if this is
+    /// the first time this secret is confirmed) issue
+    /// [`RECOVERY_CODE_COUNT`] single-use recovery codes -- the gate
+    /// [`Self::login`] checks for T3+ staff. Also touches `mfa_at`: a
+    /// successful confirmation is itself a fresh second-factor proof.
+    /// TOTP attempts share the login rate limiter (M-AUTH-1): a wrong
+    /// code counts as a failure against both the per-account and per-IP
+    /// limits.
     pub async fn totp_confirm(
         &self,
         uid: &str,
         code: &str,
         ctx: &AuthContext,
-    ) -> Result<(), AuthError> {
+    ) -> Result<Vec<String>, AuthError> {
         match self.rate_limiter.check(uid, ctx.ip) {
             RateLimitDecision::IpThrottled => return Err(AuthError::RateLimited),
             RateLimitDecision::AccountLocked => return Err(AuthError::TotpInvalid),
             RateLimitDecision::Allowed => {}
         }
 
-        let secret = self
+        let ciphertext = self
             .directory
             .totp_secret_for(uid)
             .await?
             .ok_or(AuthError::TotpInvalid)?;
-        if totp::verify_totp_code(&secret, code) {
-            self.directory.totp_confirm(uid).await?;
-            self.rate_limiter.record_success(uid);
+        let secret = self
+            .totp_cipher
+            .decrypt(uid, &ciphertext)
+            .ok_or(AuthError::TotpInvalid)?;
+        if !verify_totp_code(&secret, code) {
+            self.rate_limiter.record_failure(uid);
+            return Err(AuthError::TotpInvalid);
+        }
+        self.rate_limiter.record_success(uid);
+
+        self.directory.totp_confirm(uid).await?;
+        self.directory.mfa_touch(uid).await?;
+
+        let (codes, hashes) = generate_recovery_codes();
+        self.directory.recovery_codes_store(uid, &hashes).await?;
+        Ok(codes)
+    }
+
+    /// Re-verify a TOTP or recovery code for an already-authenticated
+    /// session (bearer token already presented and checked by the
+    /// caller), refreshing `mfa_at` -- the "UI re-prompts for TOTP" step-up
+    /// flow (design threat-model-phase2.md §6.1 M-ADM-2) that a client
+    /// drives right before a step-up-gated action (TOTP reset, GitHub
+    /// link/unlink, a role change).
+    pub async fn step_up(&self, uid: &str, code: &str) -> Result<(), AuthError> {
+        if self.verify_totp_or_recovery_code(uid, code).await? {
+            self.directory.mfa_touch(uid).await?;
             Ok(())
         } else {
-            self.rate_limiter.record_failure(uid);
             Err(AuthError::TotpInvalid)
         }
+    }
+
+    /// Link a GitHub numeric user id to `uid` (T4+, step-up-gated:
+    /// OBI-199, M-AUTH-7/M-ADM-2). `actor` must have its own fresh
+    /// `mfa_at`; the directory re-checks tier and freshness in SQL
+    /// regardless of this app-layer check. Auditing (`auth.github.link`)
+    /// happens inside `loom-persist`'s `github_link` (OBI-200).
+    pub async fn github_link(
+        &self,
+        actor: &str,
+        uid: &str,
+        github_id: i64,
+        reason: &str,
+    ) -> Result<(), AuthError> {
+        self.require_step_up(actor).await?;
+        self.directory
+            .github_link(actor, uid, github_id, reason)
+            .await?;
+        Ok(())
+    }
+
+    /// Unlink `uid`'s GitHub identity (T4+, step-up-gated: OBI-199).
+    /// Auditing (`auth.github.unlink`) happens inside `loom-persist`'s
+    /// `github_unlink` (OBI-200).
+    pub async fn github_unlink(
+        &self,
+        actor: &str,
+        uid: &str,
+        reason: &str,
+    ) -> Result<(), AuthError> {
+        self.require_step_up(actor).await?;
+        self.directory.github_unlink(actor, uid, reason).await?;
+        Ok(())
     }
 
     /// Verify an access token's signature/expiry and return its claims.
@@ -429,6 +594,7 @@ impl AuthService {
         let access_expires_at = issued_at + self.access_ttl;
         let claims = AccessClaims {
             sub: uid.to_string(),
+            aud: ACCESS_AUDIENCE.to_string(),
             tier,
             scopes,
             iat: issued_at.unix_timestamp(),
@@ -453,7 +619,7 @@ impl AuthService {
         })
     }
 
-    fn enforce_totp_gate(
+    async fn enforce_totp_gate(
         &self,
         record: &StaffAuthRecord,
         totp_code: Option<&str>,
@@ -462,25 +628,85 @@ impl AuthService {
             return Ok(());
         }
 
-        let Some(secret) = record
-            .totp_secret
-            .as_deref()
-            .filter(|_| record.totp_confirmed)
-        else {
+        if !record.totp_confirmed || record.totp_secret_enc.is_none() {
             // T3+ with no confirmed secret: refused outright, not just
-            // "code required" -- there is no code that would satisfy this.
-            return Err(AuthError::TotpRequired);
-        };
+            // "code required" -- there is no code that would satisfy
+            // this. Issue the narrow bootstrap enrolment token instead
+            // (OBI-199) so the client can reach `/auth/totp/enroll`.
+            let token = self.issue_enrolment_token(&record.uid)?;
+            return Err(AuthError::EnrolmentRequired(token));
+        }
 
         let Some(code) = totp_code else {
             return Err(AuthError::TotpRequired);
         };
 
-        if verify_totp_code(secret, code) {
+        if self.verify_totp_or_recovery_code(&record.uid, code).await? {
+            self.directory.mfa_touch(&record.uid).await?;
             Ok(())
         } else {
             Err(AuthError::TotpInvalid)
         }
+    }
+
+    /// Verify `code` against `uid`'s confirmed secret, falling back to an
+    /// unused recovery code (consumed atomically) if the TOTP check fails.
+    /// Used by both login and the explicit step-up re-verification.
+    async fn verify_totp_or_recovery_code(&self, uid: &str, code: &str) -> Result<bool, AuthError> {
+        if let Some(secret) = self.current_confirmed_secret(uid).await?
+            && verify_totp_code(&secret, code)
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .directory
+            .recovery_code_consume(uid, &hash_token(code))
+            .await?)
+    }
+
+    /// `uid`'s current secret, decrypted. `None` for no secret or a
+    /// ciphertext that fails to decrypt (wrong key/corrupt row -- treated
+    /// the same as "no secret"). Callers that must distinguish a
+    /// confirmed secret from a pending one (e.g. [`Self::totp_enroll`]'s
+    /// reset check) call [`StaffDirectory::totp_confirmed_for`] first.
+    async fn current_confirmed_secret(&self, uid: &str) -> Result<Option<String>, AuthError> {
+        let Some(ciphertext) = self.directory.totp_secret_for(uid).await? else {
+            return Ok(None);
+        };
+        Ok(self.totp_cipher.decrypt(uid, &ciphertext))
+    }
+
+    /// Require `uid`'s own `mfa_at` to be fresh (OBI-199, M-ADM-2); the
+    /// directory/SQL layer re-checks this independently for every
+    /// step-up-gated write, this is just the app-layer check that lets us
+    /// return a distinct, friendly [`AuthError::StepUpRequired`] instead of
+    /// a bare directory failure.
+    async fn require_step_up(&self, uid: &str) -> Result<(), AuthError> {
+        let mfa_at = self.directory.mfa_at_of(uid).await?;
+        match mfa_at {
+            Some(at) if now() - at <= time::Duration::try_from(STEP_UP_WINDOW).unwrap() => Ok(()),
+            _ => Err(AuthError::StepUpRequired),
+        }
+    }
+
+    /// Mint the T3+ bootstrap enrolment-only credential (OBI-199): `aud` =
+    /// [`ENROL_AUDIENCE`], `tier`/`scopes` empty, TTL
+    /// [`ENROL_TOKEN_TTL`] (~5 min). Usable only on `/auth/totp/enroll`
+    /// and `/auth/totp/verify` -- see `claims::AccessClaims::is_enrolment_only`
+    /// and the handlers that check it.
+    fn issue_enrolment_token(&self, uid: &str) -> Result<String, AuthError> {
+        let issued_at = now();
+        let claims = AccessClaims {
+            sub: uid.to_string(),
+            aud: ENROL_AUDIENCE.to_string(),
+            tier: 0,
+            scopes: Vec::new(),
+            iat: issued_at.unix_timestamp(),
+            exp: (issued_at + ENROL_TOKEN_TTL).unix_timestamp(),
+        };
+        self.keys
+            .encode(&claims)
+            .map_err(|_| AuthError::DirectoryUnavailable)
     }
 
     /// Append one audit row (M-AUTH-9), logging and swallowing any
@@ -514,6 +740,7 @@ fn totp_gate_detail(error: &AuthError) -> &'static str {
     match error {
         AuthError::TotpRequired => "totp_required",
         AuthError::TotpInvalid => "totp_invalid",
+        AuthError::EnrolmentRequired(_) => "enrolment_required",
         _ => "totp_gate_failed",
     }
 }
@@ -533,6 +760,26 @@ fn generate_refresh_token() -> String {
 fn hash_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     hex_encode(&digest)
+}
+
+/// Generate [`RECOVERY_CODE_COUNT`] fresh single-use recovery codes
+/// (M-AUTH-8): each one is 10 random bytes, hex-encoded and grouped for
+/// readability -- plenty of entropy for a code a human copies down once
+/// and uses at most once. Returns the plaintext codes (shown to the user
+/// exactly once) alongside their SHA-256 hashes (the only form ever
+/// persisted, same treatment as a refresh token).
+fn generate_recovery_codes() -> (Vec<String>, Vec<String>) {
+    let mut codes = Vec::with_capacity(RECOVERY_CODE_COUNT);
+    let mut hashes = Vec::with_capacity(RECOVERY_CODE_COUNT);
+    for _ in 0..RECOVERY_CODE_COUNT {
+        let mut bytes = [0u8; 10];
+        rand::rng().fill_bytes(&mut bytes);
+        let hex = hex_encode(&bytes);
+        let code = format!("{}-{}", &hex[0..10], &hex[10..20]);
+        hashes.push(hash_token(&code));
+        codes.push(code);
+    }
+    (codes, hashes)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

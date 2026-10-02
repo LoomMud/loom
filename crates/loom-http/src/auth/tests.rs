@@ -20,8 +20,9 @@ struct FakeStaff {
     uid: String,
     password: String,
     tier: i16,
-    totp_secret: Option<String>,
+    totp_secret_enc: Option<Vec<u8>>,
     totp_confirmed: bool,
+    mfa_at: Option<OffsetDateTime>,
 }
 
 #[derive(Default)]
@@ -29,6 +30,7 @@ struct FakeDirectoryInner {
     staff: HashMap<String, FakeStaff>, // keyed by username (== uid in these tests)
     refresh_tokens: HashMap<String, RefreshRecord>, // keyed by token_hash
     github_links: HashMap<i64, String>,
+    recovery_codes: HashMap<String, Vec<(String, bool)>>, // uid -> [(hash, used)]
     audit_events: Vec<AuditEvent>,
 }
 
@@ -49,8 +51,9 @@ impl FakeDirectory {
                 uid: uid.to_string(),
                 password: password.to_string(),
                 tier,
-                totp_secret: None,
+                totp_secret_enc: None,
                 totp_confirmed: false,
+                mfa_at: None,
             },
         );
     }
@@ -94,6 +97,37 @@ impl FakeDirectory {
     fn audit_events(&self) -> Vec<AuditEvent> {
         self.inner.lock().unwrap().audit_events.clone()
     }
+
+    /// Dump every `totp_secret_enc` blob as a lossy string, simulating a
+    /// raw DB dump an attacker (or an auditor) might grep -- acceptance:
+    /// "DB dump has no plaintext secret".
+    fn dump_totp_blobs(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .staff
+            .values()
+            .filter_map(|s| s.totp_secret_enc.as_ref())
+            .map(|blob| String::from_utf8_lossy(blob).to_string())
+            .collect()
+    }
+
+    fn set_mfa_at(&self, uid: &str, at: Option<OffsetDateTime>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .staff
+            .get_mut(uid)
+            .unwrap()
+            .mfa_at = at;
+    }
+}
+
+fn is_fresh(mfa_at: Option<OffsetDateTime>) -> bool {
+    match mfa_at {
+        Some(at) => now() - at <= time::Duration::try_from(STEP_UP_WINDOW).unwrap(),
+        None => false,
+    }
 }
 
 #[async_trait::async_trait]
@@ -113,9 +147,21 @@ impl StaffDirectory for FakeDirectory {
         Ok(Some(StaffAuthRecord {
             uid: staff.uid.clone(),
             tier: staff.tier,
-            totp_secret: staff.totp_secret.clone(),
+            totp_secret_enc: staff.totp_secret_enc.clone(),
             totp_confirmed: staff.totp_confirmed,
+            mfa_at: staff.mfa_at,
         }))
+    }
+
+    async fn verify_password(&self, uid: &str, password: &str) -> Result<bool, DirectoryError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .staff
+            .get(uid)
+            .map(|s| s.password == password)
+            .unwrap_or(false))
     }
 
     async fn tier_of(&self, uid: &str) -> Result<i16, DirectoryError> {
@@ -129,32 +175,113 @@ impl StaffDirectory for FakeDirectory {
             .unwrap_or(0))
     }
 
-    async fn totp_enroll(&self, uid: &str, secret_base32: &str) -> Result<(), DirectoryError> {
+    async fn totp_enroll(&self, uid: &str, secret_ciphertext: &[u8]) -> Result<(), DirectoryError> {
         let mut inner = self.inner.lock().unwrap();
         let staff = inner.staff.get_mut(uid).ok_or(DirectoryError)?;
-        staff.totp_secret = Some(secret_base32.to_string());
+        staff.totp_secret_enc = Some(secret_ciphertext.to_vec());
         staff.totp_confirmed = false;
+        inner.recovery_codes.remove(uid);
         Ok(())
     }
 
     async fn totp_confirm(&self, uid: &str) -> Result<(), DirectoryError> {
         let mut inner = self.inner.lock().unwrap();
         let staff = inner.staff.get_mut(uid).ok_or(DirectoryError)?;
-        if staff.totp_secret.is_none() {
+        if staff.totp_secret_enc.is_none() {
             return Err(DirectoryError);
         }
         staff.totp_confirmed = true;
         Ok(())
     }
 
-    async fn totp_secret_for(&self, uid: &str) -> Result<Option<String>, DirectoryError> {
+    async fn totp_secret_for(&self, uid: &str) -> Result<Option<Vec<u8>>, DirectoryError> {
         Ok(self
             .inner
             .lock()
             .unwrap()
             .staff
             .get(uid)
-            .and_then(|s| s.totp_secret.clone()))
+            .and_then(|s| s.totp_secret_enc.clone()))
+    }
+
+    async fn totp_confirmed_for(&self, uid: &str) -> Result<bool, DirectoryError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .staff
+            .get(uid)
+            .map(|s| s.totp_confirmed)
+            .unwrap_or(false))
+    }
+
+    async fn totp_admin_reset(
+        &self,
+        actor: &str,
+        uid: &str,
+        _reason: &str,
+    ) -> Result<(), DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let actor_fresh = inner
+            .staff
+            .get(actor)
+            .map(|a| a.tier >= 4 && is_fresh(a.mfa_at))
+            .unwrap_or(false);
+        if !actor_fresh {
+            return Err(DirectoryError);
+        }
+        let staff = inner.staff.get_mut(uid).ok_or(DirectoryError)?;
+        staff.totp_secret_enc = None;
+        staff.totp_confirmed = false;
+        inner.recovery_codes.remove(uid);
+        Ok(())
+    }
+
+    async fn mfa_touch(&self, uid: &str) -> Result<(), DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let staff = inner.staff.get_mut(uid).ok_or(DirectoryError)?;
+        staff.mfa_at = Some(now());
+        Ok(())
+    }
+
+    async fn mfa_at_of(&self, uid: &str) -> Result<Option<OffsetDateTime>, DirectoryError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .staff
+            .get(uid)
+            .and_then(|s| s.mfa_at))
+    }
+
+    async fn recovery_codes_store(
+        &self,
+        uid: &str,
+        code_hashes: &[String],
+    ) -> Result<(), DirectoryError> {
+        self.inner.lock().unwrap().recovery_codes.insert(
+            uid.to_string(),
+            code_hashes.iter().map(|h| (h.clone(), false)).collect(),
+        );
+        Ok(())
+    }
+
+    async fn recovery_code_consume(
+        &self,
+        uid: &str,
+        code_hash: &str,
+    ) -> Result<bool, DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(codes) = inner.recovery_codes.get_mut(uid) else {
+            return Ok(false);
+        };
+        for (hash, used) in codes.iter_mut() {
+            if hash == code_hash && !*used {
+                *used = true;
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn refresh_token_insert(
@@ -220,6 +347,63 @@ impl StaffDirectory for FakeDirectory {
             .cloned())
     }
 
+    async fn github_link(
+        &self,
+        actor: &str,
+        uid: &str,
+        github_id: i64,
+        _reason: &str,
+    ) -> Result<(), DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let actor_tier_ok = inner.staff.get(actor).map(|a| a.tier >= 4).unwrap_or(false);
+        let actor_fresh = inner
+            .staff
+            .get(actor)
+            .map(|a| is_fresh(a.mfa_at))
+            .unwrap_or(false);
+        if !actor_tier_ok {
+            return Err(DirectoryError);
+        }
+        if !actor_fresh {
+            return Err(DirectoryError);
+        }
+        if !inner.staff.contains_key(uid) {
+            return Err(DirectoryError);
+        }
+        inner.github_links.insert(github_id, uid.to_string());
+        Ok(())
+    }
+
+    async fn github_unlink(
+        &self,
+        actor: &str,
+        uid: &str,
+        _reason: &str,
+    ) -> Result<(), DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let actor_tier_ok = inner.staff.get(actor).map(|a| a.tier >= 4).unwrap_or(false);
+        let actor_fresh = inner
+            .staff
+            .get(actor)
+            .map(|a| is_fresh(a.mfa_at))
+            .unwrap_or(false);
+        if !actor_tier_ok || !actor_fresh {
+            return Err(DirectoryError);
+        }
+        let key = inner
+            .github_links
+            .iter()
+            .find(|(_, linked_uid)| *linked_uid == uid)
+            .map(|(id, _)| *id);
+        match key {
+            Some(id) => {
+                inner.github_links.remove(&id);
+                Ok(())
+            }
+            None => Err(DirectoryError),
+        }
+    }
+
     async fn record_audit(&self, event: AuditEvent) -> Result<(), DirectoryError> {
         self.inner.lock().unwrap().audit_events.push(event);
         Ok(())
@@ -230,6 +414,7 @@ fn test_service(directory: FakeDirectory) -> AuthService {
     AuthService::new(
         Arc::new(directory),
         JwtKeys::from_secret(b"test-only-secret-not-for-prod"),
+        TotpCipher::new(&[42u8; 32]),
     )
 }
 
@@ -270,7 +455,9 @@ async fn bad_password_is_refused() {
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
 }
 
-/// Acceptance: "T3 without TOTP refused".
+/// Acceptance: "T3 without TOTP refused" -- still true: it's refused,
+/// just with a bootstrap enrolment token to go enrol rather than a dead
+/// end (OBI-199).
 #[tokio::test]
 async fn t3_staff_without_confirmed_totp_is_refused_even_with_correct_password() {
     let directory = FakeDirectory::new();
@@ -278,14 +465,215 @@ async fn t3_staff_without_confirmed_totp_is_refused_even_with_correct_password()
     let service = test_service(directory);
 
     let result = service.login("gandalf", "mithrandir", None, &ctx()).await;
-    assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
+    assert!(matches!(result, Err(AuthError::EnrolmentRequired(_))));
 
     // Supplying *some* code still doesn't help -- there's no secret to
-    // check it against.
+    // check it against, only the enrolment path.
     let result = service
         .login("gandalf", "mithrandir", Some("123456"), &ctx())
         .await;
-    assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
+    assert!(matches!(result, Err(AuthError::EnrolmentRequired(_))));
+}
+
+/// Acceptance (OBI-199): "T3 bootstrap enrolment works end-to-end" -- a
+/// T3+ staff member with *no* TOTP ever enrolled gets a narrow enrolment
+/// token from `login` (not a bare refusal with nothing to do about it),
+/// and that token -- not a normal access token, which this account cannot
+/// obtain -- is enough to enrol, confirm, and then log in for real.
+#[tokio::test]
+async fn t3_bootstrap_enrolment_works_end_to_end() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory.clone());
+
+    let result = service.login("gandalf", "mithrandir", None, &ctx()).await;
+    let Err(AuthError::EnrolmentRequired(enrol_token)) = result else {
+        panic!("expected EnrolmentRequired, got {result:?}");
+    };
+
+    let enrol_claims = service.verify_access_token(&enrol_token).unwrap();
+    assert_eq!(enrol_claims.sub, "gandalf");
+    assert_eq!(enrol_claims.aud, ENROL_AUDIENCE);
+    assert!(enrol_claims.scopes.is_empty());
+    assert_eq!(
+        enrol_claims.tier, 0,
+        "the enrolment token itself authorizes nothing"
+    );
+
+    // The enrolment-only token's `sub` is what a real deployment's
+    // `/auth/totp/enroll` handler trusts (see handlers::totp_enroll) --
+    // exercise the same call the handler makes.
+    let enrollment = service
+        .totp_enroll(&enrol_claims.sub, "mithrandir", None, &ctx())
+        .await
+        .unwrap();
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+    let code = totp.generate_current().to_string();
+    let recovery_codes = service
+        .totp_confirm("gandalf", &code, &ctx())
+        .await
+        .unwrap();
+    assert_eq!(recovery_codes.len(), RECOVERY_CODE_COUNT);
+
+    // Now a real login succeeds with a fresh code.
+    let fresh_code = totp.generate_current().to_string();
+    let pair = service
+        .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
+        .await
+        .unwrap();
+    let claims = service.verify_access_token(&pair.access_token).unwrap();
+    assert_eq!(claims.aud, ACCESS_AUDIENCE);
+    assert_eq!(claims.tier, 3);
+}
+
+/// Acceptance (OBI-199): a wrong password at the enrolment step is
+/// refused even with a valid enrolment-only token -- the token alone is
+/// not sufficient, password re-entry is still required.
+#[tokio::test]
+async fn totp_enroll_requires_the_password_again() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory);
+
+    let result = service
+        .totp_enroll("gandalf", "wrong-password", None, &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
+/// Acceptance (OBI-199): "recovery code single-use" -- confirming TOTP
+/// issues 10 codes; each logs a user in exactly once, and a second
+/// attempt with the same code is refused.
+#[tokio::test]
+async fn recovery_code_is_single_use() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory);
+
+    let enrollment = service
+        .totp_enroll("gandalf", "mithrandir", None, &ctx())
+        .await
+        .unwrap();
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+    let code = totp.generate_current().to_string();
+    let recovery_codes = service
+        .totp_confirm("gandalf", &code, &ctx())
+        .await
+        .unwrap();
+    assert_eq!(recovery_codes.len(), RECOVERY_CODE_COUNT);
+
+    let recovery_code = &recovery_codes[0];
+
+    // First use succeeds (no TOTP code supplied -- the recovery code
+    // alone satisfies the gate).
+    let pair = service
+        .login("gandalf", "mithrandir", Some(recovery_code), &ctx())
+        .await
+        .unwrap();
+    let claims = service.verify_access_token(&pair.access_token).unwrap();
+    assert_eq!(claims.tier, 3);
+
+    // Second use of the *same* code is refused.
+    let result = service
+        .login("gandalf", "mithrandir", Some(recovery_code), &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpInvalid);
+
+    // A different, still-unused code still works.
+    let other_code = &recovery_codes[1];
+    let pair = service
+        .login("gandalf", "mithrandir", Some(other_code), &ctx())
+        .await
+        .unwrap();
+    assert_eq!(
+        service
+            .verify_access_token(&pair.access_token)
+            .unwrap()
+            .tier,
+        3
+    );
+}
+
+/// Acceptance (OBI-199): "DB dump has no plaintext secret" -- whatever
+/// `totp_secret_enc` blob ends up in the (fake) directory never contains
+/// the plaintext base32 secret as a substring.
+#[tokio::test]
+async fn totp_secret_is_never_stored_in_plaintext() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory.clone());
+
+    let enrollment = service
+        .totp_enroll("gandalf", "mithrandir", None, &ctx())
+        .await
+        .unwrap();
+
+    for blob in directory.dump_totp_blobs() {
+        assert!(
+            !blob.contains(&enrollment.secret_base32),
+            "the stored blob must never contain the plaintext secret"
+        );
+    }
+}
+
+/// Acceptance (OBI-199): "link without fresh mfa_at refused" -- an actor
+/// with the right tier (T4+) but a stale (or absent) `mfa_at` cannot link
+/// a GitHub identity; only a recent step-up succeeds.
+#[tokio::test]
+async fn github_link_without_fresh_step_up_is_refused() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("elrond", "vilya", 4); // T4 arch, no mfa_at yet
+    directory.add_staff("legolas", "mirkwood", 1);
+    let service = test_service(directory.clone());
+
+    // No step-up at all yet.
+    let result = service
+        .github_link("elrond", "legolas", 99, "onboarding")
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::StepUpRequired);
+    assert!(service.github_login(99).await.is_err());
+
+    // A stale mfa_at (older than the 5-minute window) still refuses.
+    directory.set_mfa_at("elrond", Some(now() - time::Duration::minutes(10)));
+    let result = service
+        .github_link("elrond", "legolas", 99, "onboarding")
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::StepUpRequired);
+
+    // A fresh step-up (simulating a just-verified TOTP code) allows it.
+    directory.set_mfa_at("elrond", Some(now()));
+    service
+        .github_link("elrond", "legolas", 99, "onboarding")
+        .await
+        .unwrap();
+    let pair = service.github_login(99).await.unwrap();
+    assert_eq!(
+        service.verify_access_token(&pair.access_token).unwrap().sub,
+        "legolas"
+    );
+}
+
+/// Acceptance (OBI-199): unlink is now possible at all, and is just as
+/// step-up-gated as link.
+#[tokio::test]
+async fn github_unlink_requires_step_up_and_then_removes_the_link() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("elrond", "vilya", 4);
+    directory.add_staff("legolas", "mirkwood", 1);
+    directory.link_github(99, "legolas");
+    let service = test_service(directory.clone());
+
+    let result = service
+        .github_unlink("elrond", "legolas", "offboarding")
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::StepUpRequired);
+
+    directory.set_mfa_at("elrond", Some(now()));
+    service
+        .github_unlink("elrond", "legolas", "offboarding")
+        .await
+        .unwrap();
+    assert!(service.github_login(99).await.is_err());
 }
 
 /// Acceptance: T3+ with an enrolled+confirmed secret and a correct code
@@ -297,7 +685,10 @@ async fn t3_staff_with_confirmed_totp_can_log_in_with_a_correct_code() {
     let service = test_service(directory.clone());
 
     // Enrol + confirm, same flow the HTTP handlers drive.
-    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    let enrollment = service
+        .totp_enroll("gandalf", "mithrandir", None, &ctx())
+        .await
+        .unwrap();
     let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
     let code = totp.generate_current().to_string();
     service
@@ -515,7 +906,10 @@ async fn wrong_totp_codes_count_toward_the_account_lockout() {
     directory.add_staff("gandalf", "mithrandir", 3);
     let service = test_service(directory);
 
-    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    let enrollment = service
+        .totp_enroll("gandalf", "mithrandir", None, &ctx())
+        .await
+        .unwrap();
     let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
     let code = totp.generate_current().to_string();
     service
@@ -547,7 +941,10 @@ async fn a_missing_totp_code_does_not_count_as_a_failure() {
     directory.add_staff("gandalf", "mithrandir", 3);
     let service = test_service(directory);
 
-    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    let enrollment = service
+        .totp_enroll("gandalf", "mithrandir", None, &ctx())
+        .await
+        .unwrap();
     let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
     let code = totp.generate_current().to_string();
     service
@@ -669,7 +1066,10 @@ async fn totp_enrol_and_reset_are_audited_distinctly() {
     let service = test_service(directory.clone());
     let from_ip = ctx_from("192.0.2.30");
 
-    let first = service.totp_enroll("gandalf", &from_ip).await.unwrap();
+    let first = service
+        .totp_enroll("gandalf", "mithrandir", None, &from_ip)
+        .await
+        .unwrap();
     let totp = totp::totp_for_secret(&first.secret_base32, "gandalf").unwrap();
     let code = totp.generate_current().to_string();
     service
@@ -677,8 +1077,14 @@ async fn totp_enrol_and_reset_are_audited_distinctly() {
         .await
         .unwrap();
 
-    // Re-enrolling over an already-confirmed secret is a reset.
-    let _ = service.totp_enroll("gandalf", &from_ip).await.unwrap();
+    // Re-enrolling over an already-confirmed secret is a reset: it has a
+    // fresh step-up already (totp_confirm just touched mfa_at), and needs
+    // a valid code against the current secret.
+    let reset_code = totp.generate_current().to_string();
+    let _ = service
+        .totp_enroll("gandalf", "mithrandir", Some(&reset_code), &from_ip)
+        .await
+        .unwrap();
 
     let events = directory.audit_events();
     assert!(events.iter().any(|e| e.kind == "auth.totp.enrol"));

@@ -12,6 +12,7 @@ use totp_rs::{Algorithm, Builder, Secret, Totp};
 /// A freshly generated, not-yet-confirmed TOTP secret plus the `otpauth://`
 /// URI an authenticator app's "scan a QR code" flow expects. `secret_base32`
 /// is what gets handed to [`crate::auth::StaffDirectory::totp_enroll`].
+#[derive(Debug)]
 pub struct TotpEnrollment {
     pub secret_base32: String,
     pub otpauth_url: String,

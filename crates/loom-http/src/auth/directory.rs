@@ -31,8 +31,13 @@ pub struct AuditEvent {
 pub struct StaffAuthRecord {
     pub uid: String,
     pub tier: i16,
-    pub totp_secret: Option<String>,
+    /// XChaCha20-Poly1305 ciphertext blob (OBI-199, M-AUTH-8) -- never a
+    /// plaintext secret past `loom-http`'s own decrypt step.
+    pub totp_secret_enc: Option<Vec<u8>>,
     pub totp_confirmed: bool,
+    /// Last successful second-factor verification (OBI-199): step-up-gated
+    /// actions require this to be no more than 5 minutes old.
+    pub mfa_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,16 +62,54 @@ pub trait StaffDirectory: Send + Sync {
         password: &str,
     ) -> Result<Option<StaffAuthRecord>, DirectoryError>;
 
+    /// Verify `uid`'s account password directly (OBI-199: the password
+    /// re-entry step for TOTP (re-)enrolment, where the caller already
+    /// has a bearer-authenticated `uid` rather than a username).
+    async fn verify_password(&self, uid: &str, password: &str) -> Result<bool, DirectoryError>;
+
     /// The *current* tier for `uid` (0 if it has no `staff` row). Always a
     /// fresh read; never cached by this trait's implementations.
     async fn tier_of(&self, uid: &str) -> Result<i16, DirectoryError>;
 
-    async fn totp_enroll(&self, uid: &str, secret_base32: &str) -> Result<(), DirectoryError>;
+    async fn totp_enroll(&self, uid: &str, secret_ciphertext: &[u8]) -> Result<(), DirectoryError>;
     async fn totp_confirm(&self, uid: &str) -> Result<(), DirectoryError>;
-    /// The uid's currently enrolled secret, confirmed or not -- used by
-    /// the TOTP-verify step, which needs to check a user-submitted code
-    /// against the secret [`Self::totp_enroll`] just stored.
-    async fn totp_secret_for(&self, uid: &str) -> Result<Option<String>, DirectoryError>;
+    /// The uid's currently enrolled secret ciphertext, confirmed or not --
+    /// used by the TOTP-verify step, which needs to decrypt and check a
+    /// user-submitted code against the secret [`Self::totp_enroll`] just
+    /// stored.
+    async fn totp_secret_for(&self, uid: &str) -> Result<Option<Vec<u8>>, DirectoryError>;
+    /// Whether `uid` has a *confirmed* TOTP secret right now, distinct
+    /// from merely having a pending/unconfirmed one (OBI-199).
+    async fn totp_confirmed_for(&self, uid: &str) -> Result<bool, DirectoryError>;
+    /// An admin (T4+, step-up-gated) clearing a *different* uid's TOTP
+    /// enrolment entirely (lost-device recovery). The target's next login
+    /// goes through the T3+ bootstrap enrolment path again.
+    async fn totp_admin_reset(
+        &self,
+        actor: &str,
+        uid: &str,
+        reason: &str,
+    ) -> Result<(), DirectoryError>;
+
+    /// Touch `uid`'s `mfa_at` to now (self-service): called right after a
+    /// login or step-up re-verification accepts a TOTP/recovery code.
+    async fn mfa_touch(&self, uid: &str) -> Result<(), DirectoryError>;
+    /// `uid`'s current `mfa_at`, for an app-layer step-up freshness check.
+    async fn mfa_at_of(&self, uid: &str) -> Result<Option<OffsetDateTime>, DirectoryError>;
+
+    /// Replace `uid`'s full set of recovery-code hashes (self-service).
+    async fn recovery_codes_store(
+        &self,
+        uid: &str,
+        code_hashes: &[String],
+    ) -> Result<(), DirectoryError>;
+    /// Atomically claim a single-use recovery code by its SHA-256 hash.
+    /// `true` iff this call is the one that claimed it.
+    async fn recovery_code_consume(
+        &self,
+        uid: &str,
+        code_hash: &str,
+    ) -> Result<bool, DirectoryError>;
 
     async fn refresh_token_insert(
         &self,
@@ -83,6 +126,21 @@ pub trait StaffDirectory: Send + Sync {
 
     /// `None` means unlinked: GitHub login must refuse, never create staff.
     async fn github_lookup(&self, github_id: i64) -> Result<Option<String>, DirectoryError>;
+    /// Link a GitHub numeric user id to `uid` (T4+, step-up-gated).
+    async fn github_link(
+        &self,
+        actor: &str,
+        uid: &str,
+        github_id: i64,
+        reason: &str,
+    ) -> Result<(), DirectoryError>;
+    /// Unlink `uid`'s GitHub identity (T4+, step-up-gated).
+    async fn github_unlink(
+        &self,
+        actor: &str,
+        uid: &str,
+        reason: &str,
+    ) -> Result<(), DirectoryError>;
 
     /// Append one `audit_log` row (OBI-200, M-AUTH-9). Best-effort from
     /// the caller's point of view -- a failure here must never stop a
@@ -107,9 +165,16 @@ impl StaffDirectory for loom_persist::Persist {
         Ok(record.map(|r| StaffAuthRecord {
             uid: r.uid,
             tier: r.tier,
-            totp_secret: r.totp_secret,
+            totp_secret_enc: r.totp_secret_enc,
             totp_confirmed: r.totp_confirmed,
+            mfa_at: r.mfa_at,
         }))
+    }
+
+    async fn verify_password(&self, uid: &str, password: &str) -> Result<bool, DirectoryError> {
+        loom_persist::Persist::verify_password_for_uid(self, uid, password)
+            .await
+            .map_err(|_| DirectoryError)
     }
 
     async fn tier_of(&self, uid: &str) -> Result<i16, DirectoryError> {
@@ -118,8 +183,8 @@ impl StaffDirectory for loom_persist::Persist {
             .map_err(|_| DirectoryError)
     }
 
-    async fn totp_enroll(&self, uid: &str, secret_base32: &str) -> Result<(), DirectoryError> {
-        loom_persist::Persist::totp_enroll(self, uid, secret_base32)
+    async fn totp_enroll(&self, uid: &str, secret_ciphertext: &[u8]) -> Result<(), DirectoryError> {
+        loom_persist::Persist::totp_enroll(self, uid, secret_ciphertext)
             .await
             .map_err(|_| DirectoryError)
     }
@@ -130,8 +195,57 @@ impl StaffDirectory for loom_persist::Persist {
             .map_err(|_| DirectoryError)
     }
 
-    async fn totp_secret_for(&self, uid: &str) -> Result<Option<String>, DirectoryError> {
+    async fn totp_secret_for(&self, uid: &str) -> Result<Option<Vec<u8>>, DirectoryError> {
         loom_persist::Persist::totp_secret_for(self, uid)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn totp_confirmed_for(&self, uid: &str) -> Result<bool, DirectoryError> {
+        loom_persist::Persist::totp_confirmed_for(self, uid)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn totp_admin_reset(
+        &self,
+        actor: &str,
+        uid: &str,
+        reason: &str,
+    ) -> Result<(), DirectoryError> {
+        loom_persist::Persist::totp_admin_reset(self, actor, uid, reason)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn mfa_touch(&self, uid: &str) -> Result<(), DirectoryError> {
+        loom_persist::Persist::mfa_touch(self, uid)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn mfa_at_of(&self, uid: &str) -> Result<Option<OffsetDateTime>, DirectoryError> {
+        loom_persist::Persist::mfa_at_of(self, uid)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn recovery_codes_store(
+        &self,
+        uid: &str,
+        code_hashes: &[String],
+    ) -> Result<(), DirectoryError> {
+        loom_persist::Persist::recovery_codes_store(self, uid, code_hashes)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn recovery_code_consume(
+        &self,
+        uid: &str,
+        code_hash: &str,
+    ) -> Result<bool, DirectoryError> {
+        loom_persist::Persist::recovery_code_consume(self, uid, code_hash)
             .await
             .map_err(|_| DirectoryError)
     }
@@ -176,6 +290,29 @@ impl StaffDirectory for loom_persist::Persist {
 
     async fn github_lookup(&self, github_id: i64) -> Result<Option<String>, DirectoryError> {
         loom_persist::Persist::github_lookup(self, github_id)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn github_link(
+        &self,
+        actor: &str,
+        uid: &str,
+        github_id: i64,
+        reason: &str,
+    ) -> Result<(), DirectoryError> {
+        loom_persist::Persist::github_link(self, actor, uid, github_id, reason)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn github_unlink(
+        &self,
+        actor: &str,
+        uid: &str,
+        reason: &str,
+    ) -> Result<(), DirectoryError> {
+        loom_persist::Persist::github_unlink(self, actor, uid, reason)
             .await
             .map_err(|_| DirectoryError)
     }

@@ -5,20 +5,50 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Claims carried by a signed access token. `tier`/`scopes` are a snapshot
-/// taken at issue/refresh time from Postgres -- never trust a client-
-/// supplied or stale copy of either for an authorization decision that
-/// matters; re-derive from [`crate::auth::StaffDirectory::tier_of`] instead.
+/// `aud` value for a normal access token (full session, tier/scopes
+/// populated). See [`ENROL_AUDIENCE`] for the narrower bootstrap-enrolment
+/// credential (OBI-199).
+pub const ACCESS_AUDIENCE: &str = "loom-staff-access";
+
+/// `aud` value for the T3+ first-enrolment credential (OBI-199,
+/// M-AUTH-3): issued only when a T3+ staff member authenticates
+/// correctly (username+password) but has no confirmed TOTP secret yet, so
+/// cannot obtain (and does not need) a real access token. Usable only on
+/// `/auth/totp/enroll` and `/auth/totp/verify` -- every other handler
+/// checks `aud == ACCESS_AUDIENCE` and refuses this outright, and its
+/// `tier`/`scopes` are always empty so even a handler that forgot the
+/// `aud` check would find nothing to authorize.
+pub const ENROL_AUDIENCE: &str = "loom-staff-enrol";
+
+/// Claims carried by a signed access/enrolment token. `tier`/`scopes` are
+/// a snapshot taken at issue/refresh time from Postgres -- never trust a
+/// client- supplied or stale copy of either for an authorization decision
+/// that matters; re-derive from [`crate::auth::StaffDirectory::tier_of`]
+/// instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessClaims {
     /// The staff uid (design §5.11.3), never an account username.
     pub sub: String,
+    /// [`ACCESS_AUDIENCE`] for a normal session, [`ENROL_AUDIENCE`] for the
+    /// narrow T3+ bootstrap-enrolment credential (OBI-199).
+    #[serde(default = "default_audience")]
+    pub aud: String,
     pub tier: i16,
     pub scopes: Vec<String>,
     /// Issued-at, Unix seconds.
     pub iat: i64,
     /// Expiry, Unix seconds.
     pub exp: i64,
+}
+
+fn default_audience() -> String {
+    ACCESS_AUDIENCE.to_string()
+}
+
+impl AccessClaims {
+    pub fn is_enrolment_only(&self) -> bool {
+        self.aud == ENROL_AUDIENCE
+    }
 }
 
 /// Derive the scope set an access token gets for `tier` (design §9).

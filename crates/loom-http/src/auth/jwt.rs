@@ -149,6 +149,7 @@ mod tests {
     fn sample_claims() -> AccessClaims {
         AccessClaims {
             sub: "legolas".to_string(),
+            aud: crate::auth::claims::ACCESS_AUDIENCE.to_string(),
             tier: 3,
             scopes: scopes_for_tier(3),
             iat: OffsetDateTime::now_utc().unix_timestamp(),

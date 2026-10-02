@@ -390,18 +390,29 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
     if let Some(web_root) = web_root_from_env() {
         http_state = http_state.with_web_root(web_root);
     }
-    // OBI-174: `/auth/*` only mounted when both Postgres and a JWT secret
-    // are configured -- staff web auth has nothing to authenticate against
-    // otherwise (no `staff` table without Postgres) and must never sign a
-    // token with a guessable default secret.
-    if let (Some(p), Some(secret)) = (persist.clone(), jwt_secret_from_env()) {
+    // OBI-174/OBI-199: `/auth/*` only mounted when Postgres, a JWT
+    // secret, and a TOTP-at-rest encryption key are all configured --
+    // staff web auth has nothing to authenticate against otherwise (no
+    // `staff` table without Postgres), must never sign a token with a
+    // guessable default secret, and must never fall back to storing a
+    // TOTP secret unencrypted (M-AUTH-8).
+    if let (Some(p), Some(secret), Some(totp_key)) = (
+        persist.clone(),
+        jwt_secret_from_env(),
+        totp_enc_key_from_env(),
+    ) {
         let directory: std::sync::Arc<dyn loom_http::auth::StaffDirectory> = std::sync::Arc::new(p);
         let keys = loom_http::auth::JwtKeys::from_secret(&secret);
-        http_state = http_state.with_auth(loom_http::auth::AuthService::new(directory, keys));
+        let totp_cipher = loom_http::auth::TotpCipher::new(&totp_key);
+        http_state = http_state.with_auth(loom_http::auth::AuthService::new(
+            directory,
+            keys,
+            totp_cipher,
+        ));
     } else {
         tracing::info!(
-            "staff web auth (/auth/*) disabled: set both LOOM_DATABASE_URL (or DATABASE_URL) \
-             and LOOM_JWT_SECRET to enable it"
+            "staff web auth (/auth/*) disabled: set LOOM_DATABASE_URL (or DATABASE_URL), \
+             LOOM_JWT_SECRET, and LOOM_TOTP_ENC_KEY to enable it"
         );
     }
     let mut http_server = tokio::spawn(async move {
@@ -510,6 +521,29 @@ fn jwt_secret_from_env() -> Option<Vec<u8>> {
     std::env::var("LOOM_JWT_SECRET")
         .ok()
         .map(String::into_bytes)
+}
+
+/// The TOTP-at-rest encryption key (OBI-199, design threat-model-
+/// phase2.md §6.1 M-AUTH-8: "Store the secret encrypted ... under a key
+/// from the secret file"). `/auth/*` is only mounted when this is set
+/// *and* `LOOM_JWT_SECRET` *and* Postgres are -- there is no fallback to
+/// storing a TOTP secret in plaintext. Must be exactly 64 hex characters
+/// (32 bytes of CSPRNG output, e.g. `openssl rand -hex 32`); anything
+/// else is treated as absent (never silently truncated/padded).
+fn totp_enc_key_from_env() -> Option<[u8; 32]> {
+    let hex = std::env::var("LOOM_TOTP_ENC_KEY").ok()?;
+    let bytes = hex_decode(hex.trim())?;
+    bytes.try_into().ok()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// The `serve()` world-tick timer (spec r5 N2, OBI-82): every `interval`

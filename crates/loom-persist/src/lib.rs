@@ -174,8 +174,16 @@ pub struct StaffAuthRecord {
     pub uid: String,
     pub account_id: Uuid,
     pub tier: i16,
-    pub totp_secret: Option<String>,
+    /// The XChaCha20-Poly1305 ciphertext blob (nonce || ciphertext || tag)
+    /// -- Postgres never holds a plaintext TOTP secret (OBI-199,
+    /// M-AUTH-8). `loom-http` decrypts this with the key it read from the
+    /// secret file at boot.
+    pub totp_secret_enc: Option<Vec<u8>>,
     pub totp_confirmed: bool,
+    /// The last time this uid's session proved possession of its second
+    /// factor (OBI-199, M-AUTH-3/M-ADM-2): step-up-gated actions require
+    /// this to be no more than 5 minutes old.
+    pub mfa_at: Option<OffsetDateTime>,
 }
 
 /// A `refresh_tokens` row (OBI-174). Only ever looked up by
@@ -576,8 +584,8 @@ impl Persist {
         password: &str,
     ) -> Result<Option<StaffAuthRecord>> {
         let row = sqlx::query(
-            "SELECT a.id as account_id, a.password_hash, s.uid, s.tier, s.totp_secret, \
-                    s.totp_confirmed_at
+            "SELECT a.id as account_id, a.password_hash, s.uid, s.tier, s.totp_secret_enc, \
+                    s.totp_confirmed_at, s.mfa_at
              FROM accounts a
              JOIN staff s ON s.account_id = a.id
              WHERE a.username = $1",
@@ -609,23 +617,70 @@ impl Persist {
             uid: row.try_get("uid")?,
             account_id: row.try_get("account_id")?,
             tier: row.try_get("tier")?,
-            totp_secret: row.try_get("totp_secret")?,
+            totp_secret_enc: row.try_get("totp_secret_enc")?,
             totp_confirmed: row
                 .try_get::<Option<OffsetDateTime>, _>("totp_confirmed_at")?
                 .is_some(),
+            mfa_at: row.try_get("mfa_at")?,
         }))
     }
 
+    /// Verify `uid`'s account password without a username lookup (OBI-199):
+    /// the re-entry step `loom-http` requires before (re-)enrolling TOTP,
+    /// where the caller already has an authenticated bearer token (and so
+    /// already knows `uid`) rather than a username. Runs the same
+    /// dummy-verify-on-miss path as [`Persist::staff_login`] (M-AUTH-2).
+    pub async fn verify_password_for_uid(&self, uid: &str, password: &str) -> Result<bool> {
+        use sqlx::Row;
+        let row = sqlx::query(
+            "SELECT a.password_hash
+             FROM accounts a
+             JOIN staff s ON s.account_id = a.id
+             WHERE s.uid = $1",
+        )
+        .bind(uid)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            self.dummy_verify(password);
+            return Ok(false);
+        };
+        let password_hash: String = row.try_get("password_hash")?;
+        let parsed = PasswordHash::new(&password_hash)
+            .map_err(|error| PersistError::PasswordHash(error.to_string()))?;
+        Ok(self
+            .argon2
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok())
+    }
+
     /// Enrol (or re-enrol) `uid`'s TOTP secret via the `auth_totp_enroll`
-    /// security-definer function. Self-service only -- the function itself
-    /// re-checks `actor == uid` in SQL. Re-enrolling always clears any
-    /// prior confirmation, so [`Persist::staff_login`]'s `totp_confirmed`
-    /// never reports true for a secret nobody has proven.
-    pub async fn totp_enroll(&self, uid: &str, secret_base32: &str) -> Result<()> {
+    /// security-definer function. `secret_ciphertext` is the
+    /// XChaCha20-Poly1305-encrypted blob `loom-http` produced -- this layer
+    /// never sees or needs the plaintext. Self-service only -- the function
+    /// itself re-checks `actor == uid` in SQL. Re-enrolling always clears
+    /// any prior confirmation and recovery codes, so
+    /// [`Persist::staff_login`]'s `totp_confirmed` never reports true for
+    /// a secret nobody has proven.
+    pub async fn totp_enroll(&self, uid: &str, secret_ciphertext: &[u8]) -> Result<()> {
         sqlx::query("SELECT auth_totp_enroll($1, $2, $3)")
             .bind(uid)
             .bind(uid)
-            .bind(secret_base32)
+            .bind(secret_ciphertext)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// An admin (T4+) clearing a *different* uid's TOTP enrolment via
+    /// `auth_totp_admin_reset` (lost-device recovery). Requires the
+    /// actor's own step-up (`mfa_at` fresh); the SQL function re-checks
+    /// this.
+    pub async fn totp_admin_reset(&self, actor: &str, uid: &str, reason: &str) -> Result<()> {
+        sqlx::query("SELECT auth_totp_admin_reset($1, $2, $3)")
+            .bind(actor)
+            .bind(uid)
+            .bind(reason)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -644,20 +699,93 @@ impl Persist {
         Ok(())
     }
 
-    /// The uid's currently enrolled TOTP secret (confirmed or not), for
-    /// the verify step to check a submitted code against. `loom_app` has
-    /// plain `SELECT` on `staff` already (0001_init.sql); no
-    /// security-definer wrapper needed for a read.
-    pub async fn totp_secret_for(&self, uid: &str) -> Result<Option<String>> {
+    /// The uid's currently enrolled TOTP secret ciphertext (confirmed or
+    /// not), for the verify step to decrypt and check a submitted code
+    /// against. `loom_app` has plain `SELECT` on `staff` already
+    /// (0001_init.sql); no security-definer wrapper needed for a read.
+    pub async fn totp_secret_for(&self, uid: &str) -> Result<Option<Vec<u8>>> {
         use sqlx::Row;
-        let row = sqlx::query("SELECT totp_secret FROM staff WHERE uid = $1")
+        let row = sqlx::query("SELECT totp_secret_enc FROM staff WHERE uid = $1")
             .bind(uid)
             .fetch_optional(&self.pool)
             .await?;
         Ok(match row {
-            Some(row) => row.try_get("totp_secret")?,
+            Some(row) => row.try_get("totp_secret_enc")?,
             None => None,
         })
+    }
+
+    /// Whether `uid` has a *confirmed* TOTP secret right now (OBI-199):
+    /// distinct from merely having a `totp_secret_enc` blob, which may be
+    /// a pending, never-confirmed enrolment. Used to tell a first
+    /// enrolment (no confirmed secret: no password-reentry-plus-code
+    /// reset gate) apart from a reset of an already-active one.
+    pub async fn totp_confirmed_for(&self, uid: &str) -> Result<bool> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT totp_confirmed_at FROM staff WHERE uid = $1")
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(row) => row
+                .try_get::<Option<OffsetDateTime>, _>("totp_confirmed_at")?
+                .is_some(),
+            None => false,
+        })
+    }
+
+    /// Touch `uid`'s `mfa_at` to now via `auth_mfa_touch` (self-service):
+    /// called right after a login or step-up re-verification accepts a
+    /// TOTP/recovery code.
+    pub async fn mfa_touch(&self, uid: &str) -> Result<()> {
+        sqlx::query("SELECT auth_mfa_touch($1, $2)")
+            .bind(uid)
+            .bind(uid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// `uid`'s current `mfa_at`, for an app-layer step-up freshness check
+    /// before even attempting a SQL call that would otherwise fail (the
+    /// SQL functions re-check this themselves regardless -- see 0005).
+    pub async fn mfa_at_of(&self, uid: &str) -> Result<Option<OffsetDateTime>> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT mfa_at FROM staff WHERE uid = $1")
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(row) => row.try_get("mfa_at")?,
+            None => None,
+        })
+    }
+
+    /// Replace `uid`'s full set of recovery-code hashes via
+    /// `auth_recovery_codes_store` (self-service). Called once, right
+    /// after a TOTP secret is first confirmed.
+    pub async fn recovery_codes_store(&self, uid: &str, code_hashes: &[String]) -> Result<()> {
+        sqlx::query("SELECT auth_recovery_codes_store($1, $2, $3)")
+            .bind(uid)
+            .bind(uid)
+            .bind(code_hashes)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Atomically claim a single-use recovery code by its SHA-256 hash via
+    /// `auth_recovery_code_consume`. `true` iff this call is the one that
+    /// claimed it (a second attempt with the same code, concurrent or
+    /// later, always sees `false`).
+    pub async fn recovery_code_consume(&self, uid: &str, code_hash: &str) -> Result<bool> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT auth_recovery_code_consume($1, $2) AS consumed")
+            .bind(uid)
+            .bind(code_hash)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("consumed")?)
     }
 
     /// Record a newly-issued refresh token. Only `token_hash` (SHA-256 of
