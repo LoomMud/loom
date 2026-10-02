@@ -25,7 +25,12 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     let (offset_bytes, rest) = data.split_at(4);
-    let raw_offset = u32::from_le_bytes([offset_bytes[0], offset_bytes[1], offset_bytes[2], offset_bytes[3]]);
+    let raw_offset = u32::from_le_bytes([
+        offset_bytes[0],
+        offset_bytes[1],
+        offset_bytes[2],
+        offset_bytes[3],
+    ]);
     let Ok(src) = std::str::from_utf8(rest) else {
         return;
     };
@@ -34,7 +39,7 @@ fuzz_target!(|data: &[u8]| {
     let offset = raw_offset % (src.len() as u32 + 1);
 
     let checked = if diags.is_empty() {
-        loom_compiler::check_program("/fuzz", &ast_prog, Vec::new(), Vec::new()).ok()
+        loom_compiler::check_program("/fuzz", src, &ast_prog, Vec::new(), Vec::new()).ok()
     } else {
         None
     };
