@@ -281,3 +281,43 @@ fn a_deleted_loaded_path_keeps_running_and_is_warned_about() {
         Some("alpha-v1")
     );
 }
+
+/// CTO review regression: a merge that deletes a loaded child *and*
+/// changes its parent must not fail the whole sync trying to recompile the
+/// deleted child from a source file that no longer exists. The parent
+/// upgrades; the deleted child keeps running and is reported.
+#[test]
+fn a_deleted_loaded_child_of_a_changed_parent_does_not_fail_the_batch() {
+    let mut world = boot();
+    let mut host = common::FakeHost::default();
+    let root = world.root().to_path_buf();
+
+    let hall = world.load_object("/domains/hall", &mut host).expect("load");
+    std::fs::write(
+        root.join("std/room.wf"),
+        "var short_desc: string = \"An empty room\"\n\npub fn short() -> string {\n    return short_desc\n}\n\npub fn long() -> string {\n    return short_desc\n}\n",
+    )
+    .unwrap();
+    std::fs::remove_file(root.join("domains/hall.wf")).unwrap();
+
+    let report = world.recompile_set(
+        &ChangeSet {
+            changed: vec!["/std/room".to_string()],
+            deleted: vec!["/domains/hall".to_string()],
+            source_sha: "deadbeef".to_string(),
+        },
+        &mut host,
+    );
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.recompiled, vec!["/std/room".to_string()]);
+    assert_eq!(report.deleted_loaded, vec!["/domains/hall".to_string()]);
+    assert_eq!(world.program_version("/std/room"), Some(2));
+    assert_eq!(world.program_version("/domains/hall"), Some(1));
+    assert_eq!(
+        world
+            .call(hall, "short", vec![], &mut host)
+            .unwrap()
+            .as_str(),
+        Some("The Great Hall")
+    );
+}
