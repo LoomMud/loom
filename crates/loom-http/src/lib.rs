@@ -39,6 +39,7 @@ use tracing::debug;
 pub mod auth;
 mod client_ip;
 mod handlers;
+pub mod webhook;
 
 pub use handlers::auth_router;
 
@@ -51,6 +52,7 @@ pub struct HttpState {
     web_root: Option<PathBuf>,
     auth: Option<auth::AuthService>,
     github: Option<std::sync::Arc<dyn auth::GithubIdentityProvider>>,
+    github_webhook: Option<webhook::GithubWebhookConfig>,
 }
 
 impl HttpState {
@@ -66,6 +68,7 @@ impl HttpState {
             web_root: None,
             auth: None,
             github: None,
+            github_webhook: None,
         }
     }
 
@@ -92,6 +95,14 @@ impl HttpState {
         self.github = Some(github);
         self
     }
+
+    /// Mount `POST /api/v1/hooks/github` (OBI-212, D-B3.12). Unset by
+    /// default -- answers `503` until `loom-cli` configures a webhook
+    /// secret and wires a `GitWorkerHandle`.
+    pub fn with_github_webhook(mut self, config: webhook::GithubWebhookConfig) -> Self {
+        self.github_webhook = Some(config);
+        self
+    }
 }
 
 pub fn app(state: HttpState) -> Router {
@@ -102,6 +113,7 @@ pub fn app(state: HttpState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .merge(handlers::auth_router())
+        .merge(webhook::webhook_router())
         .with_state(state);
     match web_root {
         Some(root) => router.fallback_service(ServeDir::new(root)),

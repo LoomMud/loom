@@ -28,15 +28,20 @@
 //!   to wire in: take a [`TreeLock::with_read`] guard around the
 //!   filesystem write, then call `record_write` to queue the commit.
 //! - `propose` (B3.3) and the GitHub App token exchange: [`TokenProvider`]
-//!   is the seam B3.3 implements.
+//!   is the seam B3.3 implements -- [`GitHubAppClient`] (`github` module)
+//!   is that implementation.
 
 mod cli;
+mod github;
 mod identity;
 mod lock;
 mod metrics;
 mod worker;
 
 pub use cli::{GitError, WorktreeRepo};
+pub use github::{
+    GitHubAppClient, GitHubAppError, HttpClient, HttpError, HttpResponse, UreqClient,
+};
 pub use identity::Identity;
 pub use lock::TreeLock;
 pub use worker::{

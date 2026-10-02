@@ -19,6 +19,25 @@ workspace = true
 # wherever the global recorder is installed).
 metrics = "0.24.6"
 tracing = "0.1.41"
+# B3.3 GitHub App client: RS256 JWT signing is pure Rust (RustCrypto `rsa`,
+# not OpenSSL/`ring`) on purpose -- this agent's sandbox has no system C
+# toolchain (see the repo-root zig-cc note) and `ring`'s pregenerated-asm
+# build does not cross the zig shim, so a `ring`-based stack cannot be
+# compiled or tested here. `rsa` needs no C compiler at all.
+rsa = "0.9.10"
+sha2 = { version = "0.10.9", features = ["oid"] }
+signature = "2.2.0"
+base64 = "0.23.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+# No TLS feature (see `github::transport` docs): the same `ring` constraint
+# applies to `ureq`'s default rustls backend. This crate's own tests only
+# ever talk to a loopback fake GitHub server over plain HTTP. The binary
+# that wires `loom-git` into production (`loom-cli`, D-B3.11 follow-up)
+# is responsible for a TLS-capable transport to reach `api.github.com`.
+ureq = { version = "2.12.1", default-features = false, features = ["json"] }
+time = { version = "0.3.55", features = ["parsing", "formatting"] }
 
 [dev-dependencies]
 tempfile = "3.14"
+rand = "0.8.5"
