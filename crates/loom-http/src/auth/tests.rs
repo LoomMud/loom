@@ -229,7 +229,12 @@ impl StaffDirectory for FakeDirectory {
 fn test_service(directory: FakeDirectory) -> AuthService {
     AuthService::new(
         Arc::new(directory),
-        JwtKeys::from_secret(b"test-only-secret-not-for-prod"),
+        JwtKeys::single(
+            [1u8; 32],
+            "test-kid",
+            "https://build.loommud.com/",
+            jwt::AUDIENCE,
+        ),
     )
 }
 
@@ -344,7 +349,12 @@ async fn forged_access_token_is_rejected() {
     // Attacker re-signs the *same* claims (tier escalated to 5) with a
     // different key -- simulating "I control the JSON, not the secret".
     let forged_claims = AccessClaims { tier: 5, ..claims };
-    let attacker_keys = JwtKeys::from_secret(b"attacker-controlled-key-not-the-servers");
+    let attacker_keys = JwtKeys::single(
+        [2u8; 32],
+        "test-kid",
+        "https://build.loommud.com/",
+        jwt::AUDIENCE,
+    );
     let forged = attacker_keys.encode(&forged_claims).unwrap();
 
     assert!(service.verify_access_token(&forged).is_err());

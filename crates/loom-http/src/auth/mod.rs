@@ -48,14 +48,14 @@
 mod claims;
 mod directory;
 mod github;
-mod jwt;
+pub mod jwt;
 pub mod ratelimit;
 mod totp;
 
 pub use claims::{AccessClaims, scopes_for_tier};
 pub use directory::{AuditEvent, DirectoryError, RefreshRecord, StaffAuthRecord, StaffDirectory};
 pub use github::{GithubAuthError, GithubIdentityProvider, GithubUser};
-pub use jwt::{JwtKeys, TokenPair};
+pub use jwt::{AUDIENCE, JwtKeys, TokenPair};
 pub use ratelimit::{RateLimitDecision, RateLimiter};
 pub use totp::{TotpEnrollment, generate_totp_secret, totp_for_secret, verify_totp_code};
 
@@ -246,23 +246,31 @@ impl AuthService {
             Err(err) => return Err(err.into()),
         };
 
-        if let Err(err) = self.enforce_totp_gate(&record, totp_code) {
-            if err == AuthError::TotpInvalid {
-                self.rate_limiter.record_failure(username);
+        let totp_verified = match self.enforce_totp_gate(&record, totp_code) {
+            Ok(verified) => verified,
+            Err(err) => {
+                if err == AuthError::TotpInvalid {
+                    self.rate_limiter.record_failure(username);
+                }
+                self.audit(
+                    "auth.login.fail",
+                    Some(record.uid.clone()),
+                    ctx,
+                    "deny",
+                    Some(totp_gate_detail(&err).to_string()),
+                )
+                .await;
+                return Err(err);
             }
-            self.audit(
-                "auth.login.fail",
-                Some(record.uid.clone()),
-                ctx,
-                "deny",
-                Some(totp_gate_detail(&err).to_string()),
-            )
-            .await;
-            return Err(err);
-        }
+        };
+        let (amr, mfa_at) = if totp_verified {
+            (vec!["pwd".to_string(), "otp".to_string()], Some(now()))
+        } else {
+            (vec!["pwd".to_string()], None)
+        };
 
         self.rate_limiter.record_success(username);
-        let pair = self.issue_tokens(&record.uid).await?;
+        let pair = self.issue_tokens(&record.uid, amr, mfa_at).await?;
         self.audit(
             "auth.login.ok",
             Some(record.uid.clone()),
@@ -293,7 +301,8 @@ impl AuthService {
             .github_lookup(github_id)
             .await?
             .ok_or(AuthError::InvalidCredentials)?;
-        self.issue_tokens(&uid).await
+        self.issue_tokens(&uid, vec!["github".to_string()], None)
+            .await
     }
 
     /// Rotate a refresh token: the presented token must be unexpired and
@@ -338,7 +347,16 @@ impl AuthService {
         }
 
         self.directory.refresh_token_revoke(&token_hash).await?;
-        self.issue_tokens(&record.staff_uid).await
+        // OBI-197: the original login's `amr`/`mfa_at` aren't persisted
+        // against the refresh-token row (that would need a
+        // `staff_sessions`/`refresh_tokens` schema change -- tracked
+        // separately), so a refreshed access token's `amr` is `["refresh"]`
+        // and carries no `mfa_at`. This only affects step-up-gated actions
+        // (which re-check `mfa_at` freshness, see M-ADM-2): a long-lived
+        // session that never re-authenticates with a password/TOTP simply
+        // never satisfies step-up, it doesn't get to skip it.
+        self.issue_tokens(&record.staff_uid, vec!["refresh".to_string()], None)
+            .await
     }
 
     /// Revoke a single refresh token (logout).
@@ -421,8 +439,14 @@ impl AuthService {
     /// Issue a fresh (access, refresh) pair for `uid`, reading its tier
     /// from Postgres right now. Shared by the password, GitHub, and
     /// refresh paths so there is exactly one place that turns a tier into
-    /// scopes and mints tokens.
-    async fn issue_tokens(&self, uid: &str) -> Result<TokenPair, AuthError> {
+    /// scopes and mints tokens. `amr`/`mfa_at` describe *this* issuance's
+    /// authentication context (D-TM3: identity, never authority).
+    async fn issue_tokens(
+        &self,
+        uid: &str,
+        amr: Vec<String>,
+        mfa_at: Option<OffsetDateTime>,
+    ) -> Result<TokenPair, AuthError> {
         let tier = self.directory.tier_of(uid).await?;
         let scopes = scopes_for_tier(tier);
         let issued_at = now();
@@ -431,8 +455,14 @@ impl AuthService {
             sub: uid.to_string(),
             tier,
             scopes,
+            iss: self.keys.issuer().to_string(),
+            aud: self.keys.audience().to_string(),
             iat: issued_at.unix_timestamp(),
+            nbf: issued_at.unix_timestamp(),
             exp: access_expires_at.unix_timestamp(),
+            sid: generate_sid(),
+            amr,
+            mfa_at: mfa_at.map(|t| t.unix_timestamp()),
         };
         let access_token = self
             .keys
@@ -453,13 +483,19 @@ impl AuthService {
         })
     }
 
+    /// Returns whether a TOTP code was presented and verified as part of
+    /// this login -- `login` uses that to set `amr`/`mfa_at` (M-AUTH-3's
+    /// "record `amr` and `mfa_at`"). `Ok(false)` covers both "TOTP isn't
+    /// mandatory for this uid and none was supplied" and -- deliberately
+    /// -- is never reached for a mandatory-TOTP uid without a verified
+    /// code, since those return `Err` instead.
     fn enforce_totp_gate(
         &self,
         record: &StaffAuthRecord,
         totp_code: Option<&str>,
-    ) -> Result<(), AuthError> {
+    ) -> Result<bool, AuthError> {
         if record.tier < MANDATORY_TOTP_TIER {
-            return Ok(());
+            return Ok(false);
         }
 
         let Some(secret) = record
@@ -477,7 +513,7 @@ impl AuthService {
         };
 
         if verify_totp_code(secret, code) {
-            Ok(())
+            Ok(true)
         } else {
             Err(AuthError::TotpInvalid)
         }
@@ -520,6 +556,17 @@ fn totp_gate_detail(error: &AuthError) -> &'static str {
 
 fn now() -> OffsetDateTime {
     OffsetDateTime::now_utc()
+}
+
+/// A fresh token-family id (M-AUTH-4's `sid` claim): identity only, never
+/// looked up or revoked by itself (M-AUTH-5's revocation is keyed off the
+/// refresh token's hash) -- it exists so audit/log correlation
+/// (M-AUTH-9) can tie an access token back to the session that minted it
+/// without logging the token itself.
+fn generate_sid() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    hex_encode(&bytes)
 }
 
 /// A cryptographically random, URL-safe-ish opaque refresh token (32 bytes

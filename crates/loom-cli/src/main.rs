@@ -390,18 +390,28 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
     if let Some(web_root) = web_root_from_env() {
         http_state = http_state.with_web_root(web_root);
     }
-    // OBI-174: `/auth/*` only mounted when both Postgres and a JWT secret
-    // are configured -- staff web auth has nothing to authenticate against
-    // otherwise (no `staff` table without Postgres) and must never sign a
-    // token with a guessable default secret.
-    if let (Some(p), Some(secret)) = (persist.clone(), jwt_secret_from_env()) {
+    // OBI-174/OBI-197: `/auth/*` only mounted when both Postgres and an
+    // EdDSA key file are configured -- staff web auth has nothing to
+    // authenticate against otherwise (no `staff` table without Postgres)
+    // and must never sign a token with a guessable or missing key.
+    //
+    // Deploy gate (OBI-195 follow-up tracking): `LOOM_JWT_SECRET` (the old
+    // HS256 shared-secret var) is intentionally **not read anywhere in
+    // this binary any more** -- setting it in any environment has no
+    // effect, by construction, not just by convention.
+    if let (Some(p), Some(key_file)) = (persist.clone(), jwt_key_file_from_env()) {
         let directory: std::sync::Arc<dyn loom_http::auth::StaffDirectory> = std::sync::Arc::new(p);
-        let keys = loom_http::auth::JwtKeys::from_secret(&secret);
+        let keys = loom_http::auth::JwtKeys::from_key_file(
+            &key_file,
+            jwt_issuer_from_env(),
+            loom_http::auth::AUDIENCE,
+        )
+        .unwrap_or_else(|err| panic!("LOOM_JWT_KEY_FILE ({}): {err}", key_file.display()));
         http_state = http_state.with_auth(loom_http::auth::AuthService::new(directory, keys));
     } else {
         tracing::info!(
             "staff web auth (/auth/*) disabled: set both LOOM_DATABASE_URL (or DATABASE_URL) \
-             and LOOM_JWT_SECRET to enable it"
+             and LOOM_JWT_KEY_FILE to enable it"
         );
     }
     let mut http_server = tokio::spawn(async move {
@@ -500,16 +510,27 @@ fn web_root_from_env() -> Option<PathBuf> {
     std::env::var_os("LOOM_WEB_ROOT").map(PathBuf::from)
 }
 
-/// Staff web auth's JWT signing secret (OBI-174, design §9/D-P2.5).
-/// `/auth/*` is only mounted when this is set *and* Postgres
+/// Staff web auth's JWT signing keyset (OBI-174, OBI-197/M-AUTH-4, design
+/// §9/D-P2.5). `/auth/*` is only mounted when this is set *and* Postgres
 /// (`connect_persist`) is configured -- same "absent by default" shape as
-/// `LOOM_WEB_ROOT`. There is no insecure default: an operator who wants
-/// staff auth must generate and set a real secret (at least 32 bytes of
-/// CSPRNG output, e.g. `openssl rand -hex 32`) themselves.
-fn jwt_secret_from_env() -> Option<Vec<u8>> {
-    std::env::var("LOOM_JWT_SECRET")
-        .ok()
-        .map(String::into_bytes)
+/// `LOOM_WEB_ROOT`. Points at a mounted secret file holding the EdDSA
+/// (Ed25519) keyset (active signing key + any still-being-rotated-out
+/// verification keys) -- see `loom_http::auth::JwtKeys::from_key_file`
+/// for its JSON shape. There is no insecure default: an operator who
+/// wants staff auth must generate and mount a real keyset themselves
+/// (e.g. `openssl genpkey -algorithm ed25519` plus a small script to emit
+/// the 32-byte seed as base64 -- see `secrets.env.example`).
+fn jwt_key_file_from_env() -> Option<PathBuf> {
+    std::env::var_os("LOOM_JWT_KEY_FILE").map(PathBuf::from)
+}
+
+/// The `iss` claim staff access tokens are signed/verified with
+/// (M-AUTH-4). Defaults to a fixed, documented value so a forgotten
+/// `LOOM_JWT_ISSUER` doesn't silently sign tokens whose `iss` varies
+/// between deploys (which would make outstanding tokens fail verification
+/// after a redeploy for no operational reason).
+fn jwt_issuer_from_env() -> String {
+    std::env::var("LOOM_JWT_ISSUER").unwrap_or_else(|_| "https://build.loommud.com/".to_string())
 }
 
 /// The `serve()` world-tick timer (spec r5 N2, OBI-82): every `interval`
