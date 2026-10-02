@@ -36,15 +36,21 @@ mod github;
 mod identity;
 mod lock;
 mod metrics;
+mod propose;
 mod worker;
 
 pub use cli::{GitError, WorktreeRepo};
+pub use github::pulls::{PullRequest, PullRequestOpener};
 pub use github::{
     GitHubAppClient, GitHubAppError, HttpClient, HttpError, HttpResponse, UreqClient,
 };
 pub use identity::Identity;
 pub use lock::TreeLock;
+pub use propose::{
+    AllowAllAuthorizer, DenyAllAuthorizer, InMemoryQuota, ProposeAuthorizer, ProposeError,
+    ProposeLimits, ProposeQuota, ProposeRequest, ProposeResult,
+};
 pub use worker::{
-    AuditSink, GitConfig, GitWorker, GitWorkerHandle, NoopAudit, RecompileHost, RecompileOutcome,
-    TokenProvider,
+    AuditSink, GitConfig, GitWorker, GitWorkerHandle, NoopAudit, ProposeConfig,
+    ProposeGitHubConfig, RecompileHost, RecompileOutcome, TokenProvider,
 };

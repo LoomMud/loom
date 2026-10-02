@@ -15,6 +15,7 @@
 //! `GitHubAppClient::from_pem_file`.
 
 pub mod jwt;
+pub mod pulls;
 pub mod transport;
 
 use std::sync::Mutex;
@@ -77,7 +78,7 @@ impl std::fmt::Display for GitHubAppError {
 /// couldn't hand back megabytes of HTML.
 const MAX_ERROR_BODY: usize = 2048;
 
-fn truncate_body(body: &[u8]) -> String {
+pub(super) fn truncate_body(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     if text.len() > MAX_ERROR_BODY {
         format!(
@@ -207,6 +208,10 @@ impl<C: HttpClient> GitHubAppClient<C> {
 
     pub fn api_base(&self) -> &str {
         &self.api_base
+    }
+
+    pub(super) fn transport(&self) -> &C {
+        &self.transport
     }
 }
 
