@@ -1325,6 +1325,40 @@ impl World {
         self.registry.cow_metrics.get(program)
     }
 
+    /// `loom_mudlib_sync_total{result=ok|compile_failed}` (D-B3.14): see
+    /// `bcvm::registry::SyncMetrics` for where/how this is collected and
+    /// why there is no exporter wired up yet (same posture as
+    /// `cow_copies_total`).
+    pub fn mudlib_sync_total(&self, result: &str) -> u64 {
+        self.registry.sync_metrics.get(result)
+    }
+
+    /// spec §7.2 D-B3.14 (P2-B3.1): recompile the changed, already-loaded
+    /// programs in `change_set` (plus their reverse-inherit dependents) as
+    /// one dependency-ordered, all-or-nothing batch. The world-thread
+    /// entry point B3.2's `GitWorker` calls after a merge to `main` is
+    /// pulled onto staging and `live` is fast-forwarded -- see
+    /// `bcvm::registry::RegistryHost::recompile_set` for the install-stage
+    /// semantics (master-first cache flush, all-or-nothing) and
+    /// `bcvm::registry::Compiler::recompile_set` for the compile stage.
+    pub fn recompile_set(
+        &mut self,
+        change_set: &crate::bcvm::ChangeSet,
+        host: &mut dyn Host,
+    ) -> crate::bcvm::RecompileReport {
+        let master = self.master_or_sentinel();
+        self.exec(host, master, None, None, None, None, None, |h| {
+            Ok(h.recompile_set(&change_set.changed, &change_set.deleted))
+        })
+        .unwrap_or_else(|e| crate::bcvm::RecompileReport {
+            recompiled: Vec::new(),
+            upgraded_instances: 0,
+            skipped_unloaded: Vec::new(),
+            deleted_loaded: Vec::new(),
+            failures: vec![("<world>".to_string(), e.report())],
+        })
+    }
+
     /// `loom_tier_quota_breaches_total{tier,quota}` (OBI-121 S2c): see
     /// `crate::quota::QuotaBreachMetrics` for where/how this is collected
     /// and why there is no exporter wired up yet (same reasoning as
