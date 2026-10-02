@@ -182,8 +182,15 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     // gated by the generic P1 `valid_efun` pre-check in
     // `RegistryHost::driver_efun`, no path-specific `valid_*` apply (it
     // mutates no world state, only a profiling counter).
+    //
+    // `profile_stop`'s optional second arg (should-fix 4, OBI-232):
+    // `force` (default false) to close a window owned by a *different*
+    // principal -- `driver_efun`'s `"profile_stop"` arm additionally
+    // requires its own ad hoc P3 `valid_efun` check (same mechanism
+    // `seteuid` uses) before honoring `force: true`; the static P1 class
+    // here only covers the ordinary (own-window) case.
     ("profile_start", 1, 1, Privilege::P1, 10),
-    ("profile_stop", 0, 0, Privilege::P1, 10),
+    ("profile_stop", 0, 1, Privilege::P1, 10),
 ];
 
 /// `(min args, max args)` of efun `name`, if it exists.
