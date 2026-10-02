@@ -66,7 +66,11 @@ struct ErrorEntry {
 /// One row of [`ErrorInbox::snapshot`]: an owned, read-only view of a
 /// group, for the `errors` efun / `/api/v1/errors` to serialize however
 /// they like without borrowing the inbox.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Serialize` (OBI-194): `loom-http`'s `/api/v1/errors` route renders
+/// this straight to JSON -- field names are the wire contract, so rename
+/// deliberately, not incidentally.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct ErrorRecord {
     pub program: String,
     pub function: String,

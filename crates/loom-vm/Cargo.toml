@@ -18,6 +18,10 @@ loom-compiler = { version = "0.0.1", path = "../loom-compiler" }
 # OBI-36 S2b: `crate::roles`'s `LOOM_ROLES_SEED` dev/CI loader. Already a
 # workspace dependency (loom-persist), so no new licence/deny.toml surface.
 serde_json = "1.0.145"
+# OBI-194: `crate::errors::ErrorRecord` is serialized by `loom-http`'s
+# `/api/v1/errors` route; same `serde` version already pinned by
+# loom-net (workspace dependency, no new licence/deny.toml surface).
+serde = { version = "1.0.228", features = ["derive"] }
 # OBI-169: the error inbox's `loom_runtime_errors_total` counter, via the
 # same `metrics` facade `loom-net`/`loom-obs` already depend on (already a
 # workspace dependency, no new licence/deny.toml surface).

@@ -360,6 +360,14 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         tokio::spawn(run_audit_sink(p, audit_rx, shutdown_rx.clone()));
     }
 
+    // OBI-194: the grouped runtime-error inbox (`loom_vm::errors`),
+    // published by the world thread every tick for `loom-http`'s
+    // `/api/v1/errors` route to read -- same "cheaply cloned handle the
+    // world thread updates" shape as `readiness`/`metrics` below, just a
+    // bare `watch` channel instead of a custom type (`loom-http`'s
+    // `ErrorsHandle` is exactly this receiver type).
+    let (errors_tx, errors_rx) = watch::channel(Vec::new());
+
     let world_handle = spawn_world_thread(
         mudlib_root.clone(),
         event_rx,
@@ -370,6 +378,7 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         roles_snapshot_rx,
         roles_reload_tx,
         audit_tx,
+        errors_tx,
         persist.is_some(),
         persist.is_none(),
     )?;
@@ -386,7 +395,7 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
         .expect("metrics recorder installed exactly once per process");
 
     let (ws_accept_tx, ws_accept_rx) = mpsc::channel(WS_ACCEPT_QUEUE_DEPTH);
-    let mut http_state = loom_http::HttpState::new(ws_accept_tx, readiness, metrics);
+    let mut http_state = loom_http::HttpState::new(ws_accept_tx, readiness, metrics, errors_rx);
     if let Some(web_root) = web_root_from_env() {
         http_state = http_state.with_web_root(web_root);
     }
@@ -985,6 +994,7 @@ fn spawn_world_thread(
     mut roles_snapshot_rx: watch::Receiver<Option<std::sync::Arc<RolesSnapshot>>>,
     roles_reload_tx: mpsc::Sender<()>,
     audit_tx: mpsc::Sender<Vec<loom_vm::AuditRow>>,
+    errors_tx: watch::Sender<Vec<loom_vm::errors::ErrorRecord>>,
     has_audit_sink: bool,
     load_roles_seed: bool,
 ) -> Result<thread::JoinHandle<()>, String> {
@@ -1086,6 +1096,13 @@ fn spawn_world_thread(
                         // this is the coalescing boundary, not just a
                         // "received" acknowledgement.
                         tick_pending.store(false, Ordering::Release);
+
+                        // OBI-194: publish the unfiltered error-inbox
+                        // snapshot for `loom-http`'s `/api/v1/errors` to
+                        // read; `send` only fails if every receiver (just
+                        // `loom-http`'s `HttpState` clone) is gone, i.e.
+                        // the process is shutting down -- nothing to do.
+                        let _ = errors_tx.send(world.errors_snapshot(None));
 
                         // OBI-123 D-S2.5: once per world tick, flush any
                         // audit entries recorded since the last flush.

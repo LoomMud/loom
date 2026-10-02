@@ -1039,6 +1039,8 @@ dependencies = [
  "http-body-util",
  "loom-net",
  "loom-obs",
+ "loom-vm",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1119,6 +1121,7 @@ dependencies = [
  "loom-syntax",
  "metrics",
  "proptest",
+ "serde",
  "serde_json",
 ]
 
