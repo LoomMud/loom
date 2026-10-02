@@ -811,6 +811,35 @@ impl CompiledProgram {
 /// state by declaring program + name).
 pub type Vars = HashMap<(Rc<str>, Rc<str>), Value>;
 
+/// A copy-on-write capture of a whole [`Registry`]'s object graph (spec
+/// §8.1 model 2, OBI-173): the output of [`Registry::capture`], and the
+/// input to `crate::snapshot::SnapshotJob`'s byte encoder. Every `BcObject`
+/// here still points at this process's live `Rc<CompiledProgram>` --
+/// that pointer is never serialized (see `crate::snapshot`'s module docs);
+/// only `BcObject::program`'s `path` is.
+pub struct RegistrySnapshot {
+    /// `(generation, Some(object))` per slot, in slot-index order, so a
+    /// byte decoder can rebuild `ObjectId`s unchanged just by replaying
+    /// index order (`Registry::restore`).
+    pub slots: Vec<(u32, Option<BcObject>)>,
+    pub free: Vec<u32>,
+    pub names: HashMap<String, ObjectId>,
+    pub next_clone: u64,
+    pub conns: HashMap<u64, ObjectId>,
+    pub bind_seq: HashMap<u64, u64>,
+    pub next_bind_seq: u64,
+    pub rng_state: u64,
+    /// [`Interner::all_names`] at capture time, indexed by [`Sym`].
+    pub sym_names: Vec<Rc<str>>,
+}
+
+/// `#[derive(Clone)]`: cheap -- every field is either `Copy`, a `String`/
+/// `Vec` of plain data, or an `Rc` (OBI-173 binary snapshots:
+/// `Registry::capture` clones every live slot's `BcObject` this way, which
+/// is exactly the "O(object count) `Rc` bumps, not O(bytes)" copy-on-write
+/// capture the spec's binary-snapshot model relies on -- see
+/// `crate::snapshot`).
+#[derive(Clone)]
 pub struct BcObject {
     /// `/std/sword` (blueprint) or `/std/sword#12` (clone).
     pub name: String,
@@ -1234,6 +1263,110 @@ impl Registry {
                 generation: s.generation,
             })
             .collect()
+    }
+
+    /// Capture a copy-on-write snapshot of the whole object graph (spec
+    /// §8.1 model 2, OBI-173): `O(live object count)` `Rc` clones (every
+    /// object's `vars`/`inventory`/`program` pointer is bumped, nothing is
+    /// deep-copied), not `O(bytes)`. This is the *entire* synchronous cost
+    /// a binary snapshot charges the world thread -- the much larger job
+    /// of turning this into bytes (`crate::snapshot::SnapshotJob`) runs
+    /// against the returned, now-independent [`RegistrySnapshot`] and can
+    /// be spread across many later ticks without ever re-borrowing this
+    /// `Registry`, because every `Value` here is immutable-once-shared
+    /// (module docs on `bcvm::heap`): a later in-place write anywhere in
+    /// the live registry goes through `Rc::make_mut`, which clones the
+    /// buffer instead of mutating through this snapshot's own `Rc`.
+    ///
+    /// Refused (not silently wrong) while an `atomic fn` scope is open:
+    /// the journal only makes sense relative to one in-flight call's frame
+    /// stack, and a snapshot taken mid-scope could later be loaded into a
+    /// process with no frame to roll back against.
+    pub fn capture(&self) -> Result<RegistrySnapshot, &'static str> {
+        if self.atomic_active != 0 {
+            return Err("cannot snapshot while an atomic fn scope is open");
+        }
+        let slots = self
+            .slots
+            .iter()
+            .map(|s| (s.generation, s.obj.clone()))
+            .collect();
+        Ok(RegistrySnapshot {
+            slots,
+            free: self.free.clone(),
+            names: self.names.clone(),
+            next_clone: self.next_clone,
+            conns: self.conns.clone(),
+            bind_seq: self.bind_seq.clone(),
+            next_bind_seq: self.next_bind_seq,
+            rng_state: self.rng.state(),
+            sym_names: self.syms.all_names().to_vec(),
+        })
+    }
+
+    /// The load side of [`Registry::capture`] (OBI-173): rebuild every
+    /// field [`Registry::capture`] reads, from a [`crate::snapshot::
+    /// DecodedSnapshot`] that has just been parsed back out of bytes
+    /// (possibly in a brand new process -- the "standby side of copyover",
+    /// spec §8.1). `ObjectId`s are preserved exactly: slots are rebuilt at
+    /// the same `(index, generation)` they were captured at, so every
+    /// `env`/`inventory`/`conns`/`names` reference the snapshot carried
+    /// stays valid without any remapping pass.
+    ///
+    /// `compiler` compiles (or reuses an already-compiled) program for
+    /// every distinct path referenced by a restored object, exactly like a
+    /// normal boot would -- a binary snapshot carries *dynamic* state
+    /// (vars, placement, connections), never a program's bytecode, so the
+    /// fresh process's own mudlib on disk is always the source of truth
+    /// for code. A path the snapshot references that no longer compiles
+    /// (or no longer exists) is a clean `Err`, not a panic.
+    pub fn restore(
+        &mut self,
+        snap: crate::snapshot::DecodedSnapshot,
+        compiler: &mut Compiler,
+    ) -> Result<(), String> {
+        let mut syms = Interner::default();
+        for name in &snap.sym_names {
+            syms.intern(name);
+        }
+        let mut slots = Vec::with_capacity(snap.slots.len());
+        let mut objects_by_uid: HashMap<Sym, u64> = HashMap::new();
+        for (generation, obj) in snap.slots {
+            let obj = match obj {
+                None => None,
+                Some(d) => {
+                    let prog = compiler
+                        .ensure_program(self, &d.program_path)
+                        .map_err(|e| format!("{}: {e}", d.program_path))?;
+                    let mut o = BcObject::new(prog);
+                    o.name = d.name;
+                    o.vars = d.vars.into_iter().collect();
+                    o.env = d.env;
+                    o.inventory = d.inventory;
+                    o.conn = d.conn;
+                    o.uid = d.uid;
+                    o.euid = d.euid;
+                    o.owner = d.owner;
+                    o.recompute_mem_bytes();
+                    if !crate::quota::is_unlimited_uid(syms.name(o.owner)) {
+                        *objects_by_uid.entry(o.owner).or_insert(0) += 1;
+                    }
+                    Some(o)
+                }
+            };
+            slots.push(Slot { generation, obj });
+        }
+        self.slots = slots;
+        self.free = snap.free;
+        self.names = snap.names;
+        self.next_clone = snap.next_clone;
+        self.conns = snap.conns;
+        self.bind_seq = snap.bind_seq;
+        self.next_bind_seq = snap.next_bind_seq;
+        self.rng = crate::rng::Rng::from_state(snap.rng_state);
+        self.syms = syms;
+        self.objects_by_uid = objects_by_uid;
+        Ok(())
     }
 
     /// Move `id` out of its current environment (if any) and into `dest`'s
