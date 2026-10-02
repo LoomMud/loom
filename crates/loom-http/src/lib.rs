@@ -15,6 +15,16 @@
 //! - `/metrics` (OBI-28/OBI-115): renders `HttpState`'s
 //!   [`loom_obs::PrometheusMetrics`] as Prometheus text exposition
 //!   format.
+//! - `/api/v1/errors` (OBI-194, handed off from OBI-169): the grouped
+//!   runtime-error inbox (`loom_vm::errors::ErrorRecord`) as JSON, newest
+//!   first, optionally narrowed by `?program=<prefix>`. Read from
+//!   `HttpState`'s `errors` [`tokio::sync::watch::Receiver`], published by
+//!   the world thread on every tick (`loom-cli`'s glue) -- same "cheaply
+//!   cloned handle the world thread updates" shape as `Readiness`/
+//!   `PrometheusMetrics`. **Unauthenticated read**, same rationale as
+//!   `/metrics`: there is no in-game caller to `valid_read`-filter by at
+//!   this layer. If the admin UI needs auth/RBAC here, that's a security-
+//!   model design call for the CTO, not scope creep on this route.
 //! - fallback (OBI-158): when `HttpState`'s `web_root` is set, serves the
 //!   built `web-client/` (`index.html` and its `dist/` bundle) as the
 //!   router fallback -- explicit routes above always win, so this can
@@ -25,16 +35,26 @@
 
 use std::path::PathBuf;
 
+use axum::Json;
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use loom_obs::{PrometheusMetrics, Readiness};
-use tokio::sync::mpsc;
+use loom_vm::errors::ErrorRecord;
+use serde::Deserialize;
+use tokio::sync::{mpsc, watch};
 use tower_http::services::ServeDir;
 use tracing::debug;
+
+/// Published by the world thread (`loom-cli`'s glue, every tick) with the
+/// latest unfiltered `World::errors_snapshot(None)`; read by `GET
+/// /api/v1/errors`. A bare `watch::Receiver` is already a cheaply-cloned,
+/// thread-safe handle -- no wrapper type needed, same shape as
+/// `Readiness`/`PrometheusMetrics`.
+pub type ErrorsHandle = watch::Receiver<Vec<ErrorRecord>>;
 
 /// Shared state for `loom-http`'s routes.
 #[derive(Clone)]
@@ -42,6 +62,7 @@ pub struct HttpState {
     ws_accept_tx: mpsc::Sender<WebSocket>,
     readiness: Readiness,
     metrics: PrometheusMetrics,
+    errors: ErrorsHandle,
     web_root: Option<PathBuf>,
 }
 
@@ -50,11 +71,13 @@ impl HttpState {
         ws_accept_tx: mpsc::Sender<WebSocket>,
         readiness: Readiness,
         metrics: PrometheusMetrics,
+        errors: ErrorsHandle,
     ) -> Self {
         Self {
             ws_accept_tx,
             readiness,
             metrics,
+            errors,
             web_root: None,
         }
     }
@@ -74,6 +97,7 @@ pub fn app(state: HttpState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .route("/api/v1/errors", get(errors))
         .with_state(state);
     match web_root {
         Some(root) => router.fallback_service(ServeDir::new(root)),
@@ -105,6 +129,30 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
     state.metrics.render()
 }
 
+/// Query params for `GET /api/v1/errors`: `program` is a plain
+/// string-prefix match, same semantics as
+/// `loom_vm::errors::ErrorInbox::snapshot`'s `program_prefix`.
+#[derive(Deserialize)]
+struct ErrorsQuery {
+    program: Option<String>,
+}
+
+async fn errors(
+    State(state): State<HttpState>,
+    Query(query): Query<ErrorsQuery>,
+) -> impl IntoResponse {
+    let rows = state.errors.borrow();
+    let filtered: Vec<ErrorRecord> = match &query.program {
+        Some(prefix) => rows
+            .iter()
+            .filter(|r| r.program.starts_with(prefix))
+            .cloned()
+            .collect(),
+        None => rows.clone(),
+    };
+    Json(filtered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +166,13 @@ mod tests {
     use tokio::net::TcpListener as TokioTcpListener;
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use tower::ServiceExt;
+
+    /// An `ErrorsHandle` with an empty, never-updated inbox: every test
+    /// below exercises a route other than `/api/v1/errors`, which gets
+    /// its own dedicated handle further down.
+    fn empty_errors_handle() -> ErrorsHandle {
+        watch::channel(Vec::new()).1
+    }
 
     async fn spawn_test_server() -> (
         SocketAddr,
@@ -133,6 +188,7 @@ mod tests {
             ws_accept_tx,
             Readiness::new(),
             PrometheusMetrics::new_unregistered(),
+            empty_errors_handle(),
         );
         let app = app(state);
         tokio::spawn(async move {
@@ -261,6 +317,7 @@ mod tests {
             ws_accept_tx,
             Readiness::new(),
             PrometheusMetrics::new_unregistered(),
+            empty_errors_handle(),
         );
         let app = app(state);
         tokio::spawn(async move {
@@ -368,6 +425,7 @@ mod tests {
             ws_accept_tx,
             readiness,
             PrometheusMetrics::new_unregistered(),
+            empty_errors_handle(),
         );
         app(state)
     }
@@ -391,6 +449,7 @@ mod tests {
             ws_accept_tx,
             readiness.clone(),
             PrometheusMetrics::new_unregistered(),
+            empty_errors_handle(),
         );
         let app = app(state);
 
@@ -427,6 +486,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn errors_route_reflects_the_live_inbox_and_filters_by_program() {
+        let (errors_tx, errors_rx) = watch::channel(Vec::new());
+        let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
+        let state = HttpState::new(
+            ws_accept_tx,
+            Readiness::new(),
+            PrometheusMetrics::new_unregistered(),
+            errors_rx,
+        );
+        let app = app(state);
+
+        // Before the world thread has published anything: an empty
+        // array, not a 404/500.
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/errors")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed, json!([]));
+
+        // The "world thread" publishes a snapshot with two groups in two
+        // different programs.
+        errors_tx
+            .send(vec![
+                ErrorRecord {
+                    program: "/domains/shire/room".to_string(),
+                    function: "init".to_string(),
+                    message: "bad thing".to_string(),
+                    count: 3,
+                    first_seen_unix_ms: 1,
+                    last_seen_unix_ms: 2,
+                    sample_trace: vec!["in init()".to_string()],
+                },
+                ErrorRecord {
+                    program: "/domains/bree/npc".to_string(),
+                    function: "heartbeat".to_string(),
+                    message: "other thing".to_string(),
+                    count: 1,
+                    first_seen_unix_ms: 5,
+                    last_seen_unix_ms: 6,
+                    sample_trace: vec![],
+                },
+            ])
+            .unwrap();
+
+        // Unfiltered: both rows, JSON shape matches `ErrorRecord`'s fields.
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/errors")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed,
+            json!([
+                {
+                    "program": "/domains/shire/room",
+                    "function": "init",
+                    "message": "bad thing",
+                    "count": 3,
+                    "first_seen_unix_ms": 1,
+                    "last_seen_unix_ms": 2,
+                    "sample_trace": ["in init()"],
+                },
+                {
+                    "program": "/domains/bree/npc",
+                    "function": "heartbeat",
+                    "message": "other thing",
+                    "count": 1,
+                    "first_seen_unix_ms": 5,
+                    "last_seen_unix_ms": 6,
+                    "sample_trace": [],
+                },
+            ])
+        );
+
+        // `?program=` narrows to a prefix match.
+        let request = axum::http::Request::builder()
+            .uri("/api/v1/errors?program=/domains/shire")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["program"], "/domains/shire/room");
+    }
+
+    #[tokio::test]
     async fn root_is_404_without_a_web_root() {
         let app = spawn_health_test_server().await;
         let request = axum::http::Request::builder()
@@ -451,6 +605,7 @@ mod tests {
             ws_accept_tx,
             Readiness::new(),
             PrometheusMetrics::new_unregistered(),
+            empty_errors_handle(),
         )
         .with_web_root(dir.path().to_path_buf());
         let app = app(state);
