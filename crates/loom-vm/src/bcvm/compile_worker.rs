@@ -77,7 +77,7 @@
 //!   interface and linked (`parent_path` → `registry.program(..)`)
 //!   against a different, already-stale one.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -141,6 +141,59 @@ pub struct RecompileResult {
     /// while type-checking the batch, with a [`source_hash`] taken at the
     /// same time — see the module doc comment's "staleness" section.
     pub ancestor_hashes: Vec<(String, u64)>,
+}
+
+/// [`RecompileSetJob`]'s finished result (OBI-207, P2-B3.1b, D-B3.14): the
+/// multi-root generalisation of [`RecompileResult`] -- `Compiler::
+/// recompile_set`'s changed-set-plus-reverse-inherit-expansion logic,
+/// replicated against a [`ProgramSnapshot`] on the background thread
+/// exactly the way [`run_recompile`] already replicates `Compiler::
+/// recompile` (see the module doc comment for why this can't be a live
+/// `Rc<CompiledProgram>` instead).
+#[derive(Debug, Default)]
+pub struct RecompileSetResult {
+    /// Every program actually compiled in this batch -- the reverse-
+    /// inherit targets (`recompiled`, below) plus any never-loaded
+    /// ancestor pulled in purely to resolve a target's parent link
+    /// (OBI-156) -- ancestors first, so [`super::registry::Compiler::
+    /// finish_recompile_set`] can link each one against an
+    /// already-processed earlier entry in the same batch.
+    pub programs: Vec<WireProgram>,
+    /// Every changed, already-loaded path plus its reverse-inherit
+    /// dependents, parents-first across the whole batch -- exactly
+    /// [`super::registry::RecompileSetOutcome::recompiled`]'s contents,
+    /// just not yet installed. A subset of `programs`' paths (an
+    /// OBI-156 ancestor pulled in only for linking is never itself a
+    /// target).
+    pub recompiled: Vec<String>,
+    /// Changed paths with no registered program at `begin_recompile_set`
+    /// time -- nothing to do, the next `ensure_program` compiles them
+    /// fresh.
+    pub skipped_unloaded: Vec<String>,
+    /// Deleted paths that were still registered -- kept running on their
+    /// last-compiled program, not recompiled (nothing on disk to compile
+    /// from).
+    pub deleted_loaded: Vec<String>,
+    /// Every out-of-batch ancestor/import this compile actually consulted
+    /// while type-checking the batch, with a [`source_hash`] taken at the
+    /// same time -- see the module doc comment's "staleness" section.
+    pub ancestor_hashes: Vec<(String, u64)>,
+}
+
+/// What a background [`RecompileSetJob`] finishes with. Unlike
+/// [`CompileOutcome`], `roots.is_empty()` (every changed path was unloaded,
+/// a deleted path alone, or there was nothing to do) is not a failure --
+/// it is a [`Ready`](CompileSetOutcome::Ready) outcome with empty
+/// `programs`/`recompiled`, same as `Compiler::recompile_set`'s
+/// synchronous "bail" path when there is nothing to compile. `Failed`
+/// carries every diagnostic collected so far (a malformed changed-path
+/// string, or a real compile error anywhere in the batch) -- all-or-
+/// nothing, same contract as [`super::registry::RecompileSetOutcome::
+/// failures`].
+#[derive(Debug)]
+pub enum CompileSetOutcome {
+    Ready(RecompileSetResult),
+    Failed(Vec<(String, String)>),
 }
 
 /// What a background [`RecompileJob`] finishes with.
@@ -445,6 +498,324 @@ fn run_recompile(root: &Path, path: &str, snapshot: &ProgramSnapshot) -> Compile
     })
 }
 
+/// A [`Compiler::recompile_set`]-style classification of `changed`/`deleted`
+/// against one [`ProgramSnapshot`] (OBI-207, D-B3.14): which changed paths
+/// are already-registered roots vs. unloaded, which deleted paths are
+/// still loaded, and the full reverse-inherit target set, parents-first.
+/// Pure and snapshot-only (no disk I/O, no session) so it can run twice --
+/// once against the snapshot [`spawn_recompile_set`] captured, once
+/// against a fresh one at `finish_recompile_set` time -- and the two
+/// results compared for equality as the multi-root staleness check (the
+/// generalisation of [`finish_recompile`]'s single-root dependent-set
+/// check). `Err` collects every malformed `changed`/`deleted` path
+/// (`mudlib::normalize_path` failure) -- a batch-failing diagnostic, same
+/// as a real compile error.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Targets {
+    /// Changed paths that are already registered -- the actual roots of
+    /// the reverse-inherit expansion.
+    pub(crate) roots: Vec<String>,
+    pub(crate) skipped_unloaded: Vec<String>,
+    pub(crate) deleted_loaded: Vec<String>,
+    /// `roots` plus every currently-registered program that (directly or
+    /// transitively) inherits one of them, parents-first across the whole
+    /// batch -- [`super::registry::RecompileSetOutcome::recompiled`]'s
+    /// contents.
+    pub(crate) ordered: Vec<String>,
+}
+
+pub(crate) fn classify_targets(
+    snapshot: &ProgramSnapshot,
+    changed: &[String],
+    deleted: &[String],
+) -> Result<Targets, Vec<(String, String)>> {
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut roots: Vec<String> = Vec::new();
+    let mut skipped_unloaded = Vec::new();
+    for raw in changed {
+        match mudlib::normalize_path(raw) {
+            Ok(path) => {
+                if snapshot.entry(&path).is_some() {
+                    roots.push(path);
+                } else {
+                    skipped_unloaded.push(path);
+                }
+            }
+            Err(e) => failures.push((raw.clone(), e)),
+        }
+    }
+    let mut deleted_loaded = Vec::new();
+    for raw in deleted {
+        if let Ok(path) = mudlib::normalize_path(raw)
+            && snapshot.entry(&path).is_some()
+        {
+            deleted_loaded.push(path);
+        }
+    }
+    if !failures.is_empty() {
+        return Err(failures);
+    }
+    if roots.is_empty() {
+        return Ok(Targets {
+            roots,
+            skipped_unloaded,
+            deleted_loaded,
+            ordered: Vec::new(),
+        });
+    }
+
+    let mut targets: BTreeSet<String> = roots.iter().cloned().collect();
+    for p in snapshot.entries.keys() {
+        if !deleted_loaded.iter().any(|d| d == p) && roots.iter().any(|r| snapshot.inherits(p, r)) {
+            targets.insert(p.clone());
+        }
+    }
+    let mut ordered: Vec<String> = targets.into_iter().collect();
+    ordered.sort_by_key(|p| snapshot.chain_len(p));
+
+    Ok(Targets {
+        roots,
+        skipped_unloaded,
+        deleted_loaded,
+        ordered,
+    })
+}
+
+/// A `begin_recompile_set` in flight (OBI-207, D-B3.14): the multi-root
+/// generalisation of [`RecompileJob`] -- poll [`RecompileSetJob::poll`]
+/// (non-blocking) from the world thread until it returns `Some`.
+pub struct RecompileSetJob {
+    rx: mpsc::Receiver<CompileSetOutcome>,
+    changed: Vec<String>,
+    deleted: Vec<String>,
+    begin_snapshot: ProgramSnapshot,
+}
+
+impl RecompileSetJob {
+    pub fn changed(&self) -> &[String] {
+        &self.changed
+    }
+
+    pub fn deleted(&self) -> &[String] {
+        &self.deleted
+    }
+
+    pub fn begin_snapshot(&self) -> &ProgramSnapshot {
+        &self.begin_snapshot
+    }
+
+    /// Non-blocking: `None` while the background thread is still running.
+    pub fn poll(&self) -> Option<CompileSetOutcome> {
+        match self.rx.try_recv() {
+            Ok(outcome) => Some(outcome),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(CompileSetOutcome::Failed(vec![(
+                "<batch>".to_string(),
+                "internal: compile worker thread exited without a result".to_string(),
+            )])),
+        }
+    }
+}
+
+/// Kick off `changed`/`deleted`'s batch recompile (D-B3.14's reverse-
+/// inherit-expanded, dependency-ordered compile stage) on a new background
+/// OS thread -- the multi-root generalisation of [`spawn_recompile`].
+/// Returns immediately; nothing about `root`/`changed`/`deleted`/
+/// `snapshot` is shared with anything the world thread touches afterwards.
+pub fn spawn_recompile_set(
+    root: PathBuf,
+    changed: Vec<String>,
+    deleted: Vec<String>,
+    snapshot: ProgramSnapshot,
+) -> RecompileSetJob {
+    spawn_recompile_set_after(root, changed, deleted, snapshot, std::time::Duration::ZERO)
+}
+
+/// [`spawn_recompile_set`], but the background thread sleeps for `delay`
+/// before it starts compiling -- test/tooling support, same as
+/// [`spawn_recompile_after`].
+#[doc(hidden)]
+pub fn spawn_recompile_set_after(
+    root: PathBuf,
+    changed: Vec<String>,
+    deleted: Vec<String>,
+    snapshot: ProgramSnapshot,
+    delay: std::time::Duration,
+) -> RecompileSetJob {
+    let (tx, rx) = mpsc::channel();
+    let job_changed = changed.clone();
+    let job_deleted = deleted.clone();
+    let begin_snapshot = snapshot.clone();
+    let tx_for_thread = tx.clone();
+    let spawned = thread::Builder::new()
+        .name("loom-compile-set".to_string())
+        .spawn(move || {
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            let outcome = run_recompile_set(&root, &changed, &deleted, &snapshot);
+            let _ = tx_for_thread.send(outcome);
+        });
+    if let Err(e) = spawned {
+        let _ = tx.send(CompileSetOutcome::Failed(vec![(
+            "<batch>".to_string(),
+            format!("failed to spawn background compile thread: {e}"),
+        )]));
+    }
+    RecompileSetJob {
+        rx,
+        changed: job_changed,
+        deleted: job_deleted,
+        begin_snapshot,
+    }
+}
+
+/// The actual background work for a batch (D-B3.14, OBI-207): [`Compiler::
+/// recompile_set`]'s reverse-inherit-expansion logic, replicated against a
+/// [`ProgramSnapshot`] instead of a live [`Registry`] -- same reasoning and
+/// same private per-thread [`Session`] as [`run_recompile`]. Compiles
+/// "in topological waves" (D-B3.14's phrase): `ordered` -- the whole
+/// batch's targets -- is already parents-before-children across every
+/// root (same chain-length sort `Compiler::recompile_set` uses), and each
+/// wave (one chain-length tier) is compiled before the next can need it,
+/// through the one shared `Session` so a child's compile finds its
+/// already-processed parent's checked HIR/linearization cached.
+fn run_recompile_set(
+    root: &Path,
+    changed: &[String],
+    deleted: &[String],
+    snapshot: &ProgramSnapshot,
+) -> CompileSetOutcome {
+    let targets = match classify_targets(snapshot, changed, deleted) {
+        Ok(t) => t,
+        Err(failures) => return CompileSetOutcome::Failed(failures),
+    };
+    if targets.roots.is_empty() {
+        return CompileSetOutcome::Ready(RecompileSetResult {
+            programs: Vec::new(),
+            recompiled: Vec::new(),
+            skipped_unloaded: targets.skipped_unloaded,
+            deleted_loaded: targets.deleted_loaded,
+            ancestor_hashes: Vec::new(),
+        });
+    }
+
+    let mut session = Session::new(mudlib::FsLoader {
+        root: root.to_path_buf(),
+    });
+    for p in &targets.ordered {
+        session.invalidate(p);
+    }
+
+    // OBI-156 (generalised to a batch, same as `Compiler::recompile_set`):
+    // a root may inherit an ancestor that was never loaded/registered at
+    // all. Compiling each root resolves its whole linearization; queue any
+    // member the snapshot doesn't know about, ancestor-first, ahead of
+    // every target below.
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut to_compile: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for root_path in &targets.roots {
+        match session.compile(root_path) {
+            Outcome::Ok(checked) => {
+                for anc in &checked.info.linearization {
+                    if **anc == *root_path.as_str() {
+                        continue;
+                    }
+                    if snapshot.entry(anc).is_none() && seen.insert(anc.to_string()) {
+                        to_compile.push(anc.to_string());
+                    }
+                }
+            }
+            Outcome::Failed(msg) | Outcome::Missing(msg) => {
+                failures.push((root_path.clone(), msg.clone()))
+            }
+        }
+    }
+    for p in &targets.ordered {
+        if seen.insert(p.clone()) {
+            to_compile.push(p.clone());
+        }
+    }
+    if !failures.is_empty() {
+        return CompileSetOutcome::Failed(failures);
+    }
+
+    for p in &to_compile {
+        match session.compile(p) {
+            Outcome::Ok(_) => {}
+            Outcome::Failed(msg) | Outcome::Missing(msg) => failures.push((p.clone(), msg.clone())),
+        }
+    }
+    if !failures.is_empty() {
+        return CompileSetOutcome::Failed(failures);
+    }
+
+    let in_batch: HashSet<String> = to_compile.iter().cloned().collect();
+    let mut programs: Vec<WireProgram> = Vec::new();
+    for p in &to_compile {
+        let anc_hir = match session.outcomes().get(p) {
+            Some(Outcome::Ok(c)) => c.hir.clone(),
+            _ => {
+                failures.push((
+                    p.clone(),
+                    format!("internal: {p} missing from the compile session"),
+                ));
+                continue;
+            }
+        };
+        let parent_path = anc_hir.inherits.first().map(|inh| inh.path.to_string());
+        let unit = match compile_hir_unit(&anc_hir) {
+            Ok(u) => u,
+            Err(e) => {
+                failures.push((p.clone(), format!("{p}: {e}")));
+                continue;
+            }
+        };
+        let var_specs = unit
+            .var_specs
+            .iter()
+            .map(|v| WireVarSpec {
+                name: v.name.to_string(),
+                ty_bytes: bytecode::encode_ty(&v.ty),
+                has_init: v.has_init,
+            })
+            .collect();
+        programs.push(WireProgram {
+            path: p.clone(),
+            version: snapshot.next_version(p),
+            module_bytes: bytecode::encode(&unit.module),
+            var_specs,
+            non_public: unit.non_public.iter().map(|s| s.to_string()).collect(),
+            parent_path,
+            source_hash: source_hash(root, p).unwrap_or(0),
+        });
+    }
+    if !failures.is_empty() {
+        return CompileSetOutcome::Failed(failures);
+    }
+
+    let mut ancestor_hashes = Vec::new();
+    for (p, outcome) in session.outcomes() {
+        if in_batch.contains(p) {
+            continue;
+        }
+        if matches!(outcome, Outcome::Ok(_))
+            && let Some(h) = source_hash(root, p)
+        {
+            ancestor_hashes.push((p.clone(), h));
+        }
+    }
+
+    CompileSetOutcome::Ready(RecompileSetResult {
+        programs,
+        recompiled: targets.ordered,
+        skipped_unloaded: targets.skipped_unloaded,
+        deleted_loaded: targets.deleted_loaded,
+        ancestor_hashes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +869,85 @@ mod tests {
         assert_ne!(
             begin.dependents_of("/root"),
             new_dependent.dependents_of("/root")
+        );
+    }
+
+    #[test]
+    fn classify_targets_unions_reverse_inherit_across_every_root() {
+        // root1 -> mid -> leaf; root2 standalone. Both roots changed;
+        // `mid`/`leaf` are pulled in purely through `root1`.
+        let mut snapshot = ProgramSnapshot::default();
+        insert(&mut snapshot, "/root1", None, 1);
+        insert(&mut snapshot, "/mid", Some("/root1"), 1);
+        insert(&mut snapshot, "/leaf", Some("/mid"), 1);
+        insert(&mut snapshot, "/root2", None, 1);
+        insert(&mut snapshot, "/unrelated", None, 1);
+
+        let targets = classify_targets(
+            &snapshot,
+            &["/root1".to_string(), "/root2".to_string()],
+            &[],
+        )
+        .expect("no malformed paths");
+        assert_eq!(targets.roots, vec!["/root1", "/root2"]);
+        assert!(targets.skipped_unloaded.is_empty());
+        assert!(targets.deleted_loaded.is_empty());
+        let mut ordered = targets.ordered.clone();
+        ordered.sort_by_key(|p| snapshot.chain_len(p));
+        assert_eq!(ordered, targets.ordered, "already parents-first");
+        assert!(targets.ordered.contains(&"/root1".to_string()));
+        assert!(targets.ordered.contains(&"/root2".to_string()));
+        assert!(targets.ordered.contains(&"/mid".to_string()));
+        assert!(targets.ordered.contains(&"/leaf".to_string()));
+        assert!(!targets.ordered.contains(&"/unrelated".to_string()));
+        // Parents before children: `/mid` before `/leaf`.
+        let mid_pos = targets.ordered.iter().position(|p| p == "/mid").unwrap();
+        let leaf_pos = targets.ordered.iter().position(|p| p == "/leaf").unwrap();
+        assert!(mid_pos < leaf_pos);
+    }
+
+    #[test]
+    fn classify_targets_skips_unloaded_and_reports_deleted_loaded() {
+        let mut snapshot = ProgramSnapshot::default();
+        insert(&mut snapshot, "/loaded", None, 1);
+
+        let targets = classify_targets(
+            &snapshot,
+            &["/loaded".to_string(), "/never_loaded".to_string()],
+            &["/loaded".to_string()],
+        )
+        .expect("no malformed paths");
+        assert_eq!(targets.roots, vec!["/loaded"]);
+        assert_eq!(targets.skipped_unloaded, vec!["/never_loaded"]);
+        // `/loaded` is both changed and deleted: it stays a root (deleted
+        // only excludes a *dependent* from the reverse-inherit expansion,
+        // same as `Compiler::recompile_set`), but is also reported.
+        assert_eq!(targets.deleted_loaded, vec!["/loaded"]);
+    }
+
+    #[test]
+    fn classify_targets_agrees_before_and_after_an_unrelated_change() {
+        // The multi-root staleness check (`finish_recompile_set`) compares
+        // two `classify_targets` calls for equality -- confirm an
+        // unrelated registry change (a brand-new, unrelated program) does
+        // *not* trip it, while a new dependent of an actual root does.
+        let mut begin = ProgramSnapshot::default();
+        insert(&mut begin, "/root", None, 1);
+        insert(&mut begin, "/mid", Some("/root"), 1);
+
+        let mut unrelated_change = begin.clone();
+        insert(&mut unrelated_change, "/elsewhere", None, 1);
+        let changed = vec!["/root".to_string()];
+        assert_eq!(
+            classify_targets(&begin, &changed, &[]),
+            classify_targets(&unrelated_change, &changed, &[])
+        );
+
+        let mut new_dependent = begin.clone();
+        insert(&mut new_dependent, "/also_mid", Some("/root"), 1);
+        assert_ne!(
+            classify_targets(&begin, &changed, &[]),
+            classify_targets(&new_dependent, &changed, &[])
         );
     }
 }

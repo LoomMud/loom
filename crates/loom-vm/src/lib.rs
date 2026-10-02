@@ -26,7 +26,7 @@ pub mod world;
 use std::path::Path;
 
 pub use bcvm::Value;
-pub use bcvm::registry::UpgradeWarning;
+pub use bcvm::registry::{ChangeSet, RecompileReport, UpgradeWarning};
 pub use bcvm::vm::RtError;
 pub use host::{Host, NullHost};
 pub use object::ObjectId;

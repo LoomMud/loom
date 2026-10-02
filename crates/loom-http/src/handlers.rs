@@ -47,6 +47,8 @@ struct LoginRequest {
 #[derive(Debug, Deserialize)]
 struct GithubCallbackRequest {
     code: String,
+    #[serde(default)]
+    totp_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +85,7 @@ fn auth_error_response(error: AuthError) -> (StatusCode, Json<ErrorResponse>) {
         AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
         AuthError::TotpRequired => (StatusCode::FORBIDDEN, "totp_required"),
         AuthError::TotpInvalid => (StatusCode::FORBIDDEN, "totp_invalid"),
+        AuthError::TotpAlreadyEnrolled => (StatusCode::CONFLICT, "totp_already_enrolled"),
         AuthError::InvalidRefreshToken => (StatusCode::UNAUTHORIZED, "invalid_refresh_token"),
         AuthError::DirectoryUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
@@ -325,7 +328,10 @@ async fn github_callback(
                 .into_response();
         }
     };
-    match auth.github_login(user.id).await {
+    match auth
+        .github_login(user.id, request.totp_code.as_deref())
+        .await
+    {
         Ok(pair) => token_response(&pair),
         Err(error) => auth_error_response(error).into_response(),
     }

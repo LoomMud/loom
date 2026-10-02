@@ -201,11 +201,24 @@ pub struct RefreshTokenRecord {
     pub mfa_at: Option<OffsetDateTime>,
 }
 
+/// Fresh tier + TOTP enrolment state for a uid (OBI-174/OBI-195 review fix
+/// 5): `None` from [`Persist::staff_auth_status`] means no `staff` row at
+/// all, which callers must refuse outright rather than treat as tier 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaffTierStatus {
+    pub tier: i16,
+    pub totp_secret: Option<String>,
+    pub totp_confirmed: bool,
+}
+
 /// The outcome of [`Persist::session_rotate`] (OBI-198 re-review,
-/// must-fix 1 and 2): a single atomic consume-and-insert, so two
-/// concurrent rotations of the same token can never both win, and the
-/// new row always inherits the consumed row's `expires_at`/`sid`/`amr`/
-/// `mfa_at` rather than recomputing any of them.
+/// must-fix 1 and 2; supersedes the OBI-195 `refresh_token_rotate`/
+/// `RefreshTokenRotation` design this was rebased onto -- `session_rotate`
+/// is strictly more atomic, since it also carries `sid`/`amr`/`mfa_at`/
+/// `expires_at` forward and takes the staff-row lock): a single atomic
+/// consume-and-insert, so two concurrent rotations of the same token can
+/// never both win, and the new row always inherits the consumed row's
+/// `expires_at`/`sid`/`amr`/`mfa_at` rather than recomputing any of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionRotateOutcome {
     /// The old token was unrevoked, within its absolute expiry, and
@@ -657,7 +670,6 @@ impl Persist {
     }
 
     /// Enrol (or re-enrol) `uid`'s TOTP secret via the `auth_totp_enroll`
-    /// security-definer function. Self-service only -- the function itself
     /// re-checks `actor == uid` in SQL. Re-enrolling always clears any
     /// prior confirmation, so [`Persist::staff_login`]'s `totp_confirmed`
     /// never reports true for a secret nobody has proven.
@@ -698,6 +710,24 @@ impl Persist {
             Some(row) => row.try_get("totp_secret")?,
             None => None,
         })
+    }
+
+    /// Anti-replay (OBI-174, OBI-195 review fix 4): atomically accept
+    /// `step` for `uid` only if it is strictly greater than the last step
+    /// ever accepted for that uid, recording it if so -- via the
+    /// `auth_totp_consume_step` security-definer function, since `loom_app`
+    /// only has `SELECT` on `staff` (0001_init.sql), same reason every
+    /// other `staff` write goes through a function. A code that is RFC
+    /// 6238-valid but already consumed (replayed, or racing against
+    /// itself) is refused even though its *signature* still checks out
+    /// within the skew window.
+    pub async fn totp_consume_step(&self, uid: &str, step: i64) -> Result<bool> {
+        let accepted: bool = sqlx::query_scalar("SELECT auth_totp_consume_step($1, $2)")
+            .bind(uid)
+            .bind(step)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(accepted)
     }
 
     /// Record a newly-issued refresh token. Only `token_hash` (SHA-256 of
@@ -1209,12 +1239,39 @@ impl Persist {
     }
 
     /// Read `uid`'s current tier (0 if `uid` has no `staff` row, i.e. it is
-    /// a player).
+    /// a player). Kept separate from [`Persist::staff_auth_status`] for
+    /// non-auth callers (e.g. `roles_*` plumbing) that only need the tier
+    /// and have no TOTP gate to enforce.
     pub async fn tier_of(&self, uid: &str) -> Result<i16> {
         let row = sqlx::query!("SELECT tier FROM staff WHERE uid = $1", uid)
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|r| r.tier).unwrap_or(0))
+    }
+
+    /// Fresh tier + TOTP enrolment state for `uid` (OBI-174, OBI-195 review
+    /// fix 5): `None` means no `staff` row at all. The web auth layer
+    /// (`loom-http::auth`) uses this instead of [`Persist::tier_of`] at
+    /// every token issue/refresh/GitHub login specifically so a removed
+    /// staff uid is refused outright rather than silently minting a
+    /// tier-0 token the way a `tier_of`-based check used to.
+    pub async fn staff_auth_status(&self, uid: &str) -> Result<Option<StaffTierStatus>> {
+        use sqlx::Row;
+        let row =
+            sqlx::query("SELECT tier, totp_secret, totp_confirmed_at FROM staff WHERE uid = $1")
+                .bind(uid)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(match row {
+            Some(row) => Some(StaffTierStatus {
+                tier: row.try_get("tier")?,
+                totp_secret: row.try_get("totp_secret")?,
+                totp_confirmed: row
+                    .try_get::<Option<OffsetDateTime>, _>("totp_confirmed_at")?
+                    .is_some(),
+            }),
+            None => None,
+        })
     }
 
     /// List `uid`'s unexpired grants via the `active_grants` view, ignoring

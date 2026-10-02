@@ -1,0 +1,21 @@
+
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# gitleaks config (CI `hygiene` job, OBI-215): extends the built-in
+# ruleset and allowlists exactly the private-key PEM fixtures this repo
+# intentionally commits for tests -- throwaway keys generated once,
+# offline, for `loom-git`'s GitHub App JWT and TLS transport unit tests.
+# Never a real credential, never used outside `cargo test`. Anything
+# else matching gitleaks' default rules still fails the build.
+
+[extend]
+useDefault = true
+
+[allowlist]
+paths = [
+  '''crates/loom-git/src/github/testdata/test_key\.pkcs1\.pem''',
+  '''crates/loom-git/src/github/testdata/test_key\.pkcs8\.pem''',
+  '''crates/loom-git/src/github/testdata/test_tls_key\.pem''',
+  '''crates/loom-git/tests/testdata/test_key\.pkcs8\.pem''',
+]

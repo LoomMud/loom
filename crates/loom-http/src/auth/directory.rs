@@ -35,6 +35,30 @@ pub struct StaffAuthRecord {
     pub totp_confirmed: bool,
 }
 
+/// Fresh tier + TOTP enrolment state for a uid, re-read from Postgres at
+/// every token issue/refresh/GitHub login (OBI-174) -- deliberately *not*
+/// the same shape as [`StaffAuthRecord`] even though the fields overlap,
+/// because this one is `Option`-wrapped at the call site
+/// ([`StaffDirectory::auth_status_for`]): `None` means "no `staff` row",
+/// which [`crate::auth::AuthService`] must refuse outright (OBI-195 review
+/// fix 5) rather than fall back to a tier-0 token the way the old
+/// `tier_of`-returns-0-for-missing-rows design did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaffAuthStatus {
+    pub tier: i16,
+    pub totp_secret: Option<String>,
+    pub totp_confirmed: bool,
+}
+
+/// The outcome of atomically rotating a refresh token (OBI-195 review fix
+/// 1): lookup-then-revoke used to be two statements, so two concurrent
+/// requests presenting the same refresh token could both see "not yet
+/// revoked" and both succeed, defeating reuse detection. Superseded by
+/// [`SessionRotateOutcome`]/`session_rotate` (OBI-198, OBI-216): that path
+/// is strictly more atomic, since it also carries `sid`/`amr`/`mfa_at`/
+/// `expires_at` forward in the same statement and takes the owning
+/// staff row's lock.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshRecord {
     pub staff_uid: String,
@@ -87,9 +111,11 @@ pub trait StaffDirectory: Send + Sync {
         password: &str,
     ) -> Result<Option<StaffAuthRecord>, DirectoryError>;
 
-    /// The *current* tier for `uid` (0 if it has no `staff` row). Always a
-    /// fresh read; never cached by this trait's implementations.
-    async fn tier_of(&self, uid: &str) -> Result<i16, DirectoryError>;
+    /// Fresh tier + TOTP state for `uid`, `None` if it has no `staff` row
+    /// (OBI-195 review fix 5). Always a fresh read; never cached by this
+    /// trait's implementations. Replaces the old `tier_of`, which
+    /// defaulted a missing row to tier 0 instead of refusing outright.
+    async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError>;
 
     async fn totp_enroll(&self, uid: &str, secret_base32: &str) -> Result<(), DirectoryError>;
     async fn totp_confirm(&self, uid: &str) -> Result<(), DirectoryError>;
@@ -97,6 +123,12 @@ pub trait StaffDirectory: Send + Sync {
     /// the TOTP-verify step, which needs to check a user-submitted code
     /// against the secret [`Self::totp_enroll`] just stored.
     async fn totp_secret_for(&self, uid: &str) -> Result<Option<String>, DirectoryError>;
+    /// Anti-replay (OBI-195 review fix 4): atomically accept `step` only
+    /// if it is strictly greater than the last step ever accepted for
+    /// `uid`, recording it if so. `false` means the step was already used
+    /// (same code submitted twice, or two requests racing on the same
+    /// step) -- a code that is RFC 6238-valid but must still be refused.
+    async fn totp_consume_step(&self, uid: &str, step: u64) -> Result<bool, DirectoryError>;
 
     async fn refresh_token_insert(
         &self,
@@ -159,8 +191,22 @@ impl StaffDirectory for loom_persist::Persist {
         }))
     }
 
-    async fn tier_of(&self, uid: &str) -> Result<i16, DirectoryError> {
-        loom_persist::Persist::tier_of(self, uid)
+    async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError> {
+        let status = loom_persist::Persist::staff_auth_status(self, uid)
+            .await
+            .map_err(|_| DirectoryError)?;
+        Ok(status.map(|s| StaffAuthStatus {
+            tier: s.tier,
+            totp_secret: s.totp_secret,
+            totp_confirmed: s.totp_confirmed,
+        }))
+    }
+
+    async fn totp_consume_step(&self, uid: &str, step: u64) -> Result<bool, DirectoryError> {
+        // `step` is a Unix-time-derived 30s counter; it will not reach
+        // `i64::MAX` before the heat death of the universe, so this cast
+        // never truncates in practice.
+        loom_persist::Persist::totp_consume_step(self, uid, step as i64)
             .await
             .map_err(|_| DirectoryError)
     }

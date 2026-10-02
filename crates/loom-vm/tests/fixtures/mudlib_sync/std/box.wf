@@ -1,0 +1,9 @@
+// Flagged CONFINED by the master only after the master's own program_flags
+// edit in `master_in_the_set_flushes_the_program_flags_cache` -- `/std/box`
+// itself is never recompiled/reloaded in that test.
+fn create() {
+}
+
+pub fn move_into_obj(dest: object) {
+    move_to(dest)
+}
