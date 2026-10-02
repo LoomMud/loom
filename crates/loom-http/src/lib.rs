@@ -51,6 +51,7 @@ pub struct HttpState {
     web_root: Option<PathBuf>,
     auth: Option<auth::AuthService>,
     github: Option<std::sync::Arc<dyn auth::GithubIdentityProvider>>,
+    github_login: Option<auth::GithubLoginConfig>,
 }
 
 impl HttpState {
@@ -66,6 +67,7 @@ impl HttpState {
             web_root: None,
             auth: None,
             github: None,
+            github_login: None,
         }
     }
 
@@ -85,11 +87,19 @@ impl HttpState {
         self
     }
 
-    /// Mount `/auth/github/callback` (OBI-174, optional). Unset by
-    /// default; requires [`Self::with_auth`] to also be set, since GitHub
-    /// login still goes through the same `AuthService`.
-    pub fn with_github(mut self, github: std::sync::Arc<dyn auth::GithubIdentityProvider>) -> Self {
+    /// Mount `/auth/github/*` (OBI-174/OBI-201, optional): the real
+    /// authorization-code + PKCE flow. Unset by default; requires
+    /// [`Self::with_auth`] to also be set, since GitHub login still goes
+    /// through the same `AuthService`. `login_config` is the non-secret
+    /// half (client id + exact redirect URI) the `/auth/github/start`
+    /// handler needs to build the authorize URL.
+    pub fn with_github(
+        mut self,
+        github: std::sync::Arc<dyn auth::GithubIdentityProvider>,
+        login_config: auth::GithubLoginConfig,
+    ) -> Self {
         self.github = Some(github);
+        self.github_login = Some(login_config);
         self
     }
 }
