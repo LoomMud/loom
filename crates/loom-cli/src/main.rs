@@ -234,8 +234,8 @@ fn disasm(root: PathBuf, program: &str) -> Result<(), String> {
         loom_compiler::Outcome::Failed(r) => return Err(format!("{normalized}: has errors:\n{r}")),
         loom_compiler::Outcome::Missing(r) => return Err(format!("{normalized}: {r}")),
     };
-    let module =
-        loom_compiler::codegen::compile(&checked.hir, &checked.src).map_err(|e| format!("{normalized}: {e}"))?;
+    let module = loom_compiler::codegen::compile(&checked.hir, &checked.src)
+        .map_err(|e| format!("{normalized}: {e}"))?;
     loom_compiler::verify::verify(&module).map_err(|e| {
         format!("{normalized}: compiler bug: assembled bytecode failed verification: {e}")
     })?;

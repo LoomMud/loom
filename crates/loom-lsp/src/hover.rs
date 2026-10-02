@@ -349,7 +349,7 @@ mod tests {
     fn check(src: &str) -> (ast::Program, Option<loom_compiler::Checked>) {
         let (ast, diags) = loom_syntax::parse(src);
         assert!(diags.is_empty(), "{diags:?}");
-        let r = check_program("/t", &ast, vec![], vec![]);
+        let r = check_program("/t", src, &ast, vec![], vec![]);
         (ast, r.ok())
     }
 
