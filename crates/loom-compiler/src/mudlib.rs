@@ -87,6 +87,17 @@ pub struct Session<L: SourceLoader> {
     /// in for every file that parses cleanly, independent of whether it
     /// goes on to resolve/type-check (these lints are syntax-only).
     warnings: BTreeMap<String, Vec<String>>,
+    /// Same lints as `warnings`, unrendered (spans + codes), for tooling
+    /// that wants structured positions instead of rustc-style text
+    /// (`loom-lsp`, OBI-168).
+    raw_warnings: BTreeMap<String, Vec<Diagnostic>>,
+    /// Unrendered diagnostics behind each `Outcome::Failed`: parse errors,
+    /// inherit/import resolution errors, or resolver/type-checker errors,
+    /// whichever stage failed first. Empty for `Ok`/`Missing`. Additive to
+    /// `Outcome` (which only keeps the rendered report) so a consumer that
+    /// wants spans and codes -- `loom-lsp`'s `textDocument/publishDiagnostics`
+    /// (OBI-168) -- does not have to re-parse the rendered text.
+    raw_diags: BTreeMap<String, Vec<Diagnostic>>,
     stack: Vec<String>,
 }
 
@@ -96,6 +107,8 @@ impl<L: SourceLoader> Session<L> {
             loader,
             done: BTreeMap::new(),
             warnings: BTreeMap::new(),
+            raw_warnings: BTreeMap::new(),
+            raw_diags: BTreeMap::new(),
             stack: Vec::new(),
         }
     }
@@ -110,6 +123,18 @@ impl<L: SourceLoader> Session<L> {
         &self.warnings
     }
 
+    /// Unrendered lint warnings for `path` (empty if none, or not compiled
+    /// yet): see `raw_warnings` field docs.
+    pub fn raw_warnings_for(&self, path: &str) -> &[Diagnostic] {
+        self.raw_warnings.get(path).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Unrendered diagnostics behind `path`'s `Outcome::Failed`, if any: see
+    /// `raw_diags` field docs.
+    pub fn raw_diagnostics_for(&self, path: &str) -> &[Diagnostic] {
+        self.raw_diags.get(path).map_or(&[], |v| v.as_slice())
+    }
+
     /// Force `path` to be recompiled on the next `.compile(path)` call
     /// (spec §7.2 `compile_object`/`update`): drops its cached [`Outcome`]
     /// so a stale interface can never be reused for it. Callers doing an
@@ -122,6 +147,8 @@ impl<L: SourceLoader> Session<L> {
         // Lint warnings are recomputed on the next compile; drop stale ones
         // so a fixed file doesn't keep reporting old W09xx warnings.
         self.warnings.remove(path);
+        self.raw_warnings.remove(path);
+        self.raw_diags.remove(path);
     }
 
     pub fn into_outcomes(self) -> BTreeMap<String, Outcome> {
@@ -158,6 +185,7 @@ impl<L: SourceLoader> Session<L> {
         };
         let (ast, diags) = loom_syntax::parse(&src);
         if !diags.is_empty() {
+            self.raw_diags.insert(path.to_string(), diags.clone());
             return Outcome::Failed(render(path, &src, &diags));
         }
         // Syntax-only lints (D-P1.4 etc., OBI-86) run on every clean parse,
@@ -171,6 +199,7 @@ impl<L: SourceLoader> Session<L> {
                     .map(|d| d.render(&format!("{path}.wf"), &src))
                     .collect(),
             );
+            self.raw_warnings.insert(path.to_string(), lints);
         }
         let mut diags = Vec::new();
         let mut parents = Vec::new();
@@ -199,11 +228,15 @@ impl<L: SourceLoader> Session<L> {
             }
         }
         if !diags.is_empty() {
+            self.raw_diags.insert(path.to_string(), diags.clone());
             return Outcome::Failed(render(path, &src, &diags));
         }
         match check_program(path, &ast, parents, imports) {
             Ok(c) => Outcome::Ok(c),
-            Err(d) => Outcome::Failed(render(path, &src, &d)),
+            Err(d) => {
+                self.raw_diags.insert(path.to_string(), d.clone());
+                Outcome::Failed(render(path, &src, &d))
+            }
         }
     }
 

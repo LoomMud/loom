@@ -1,0 +1,16 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// /domains/start/yard: a clean leaf room, used for hover/definition/
+// completion tests (no diagnostics expected here).
+
+inherit /std/room
+
+pub override fn short() -> string {
+    return "the training yard"
+}
+
+pub fn greet() -> string {
+    let who = short()
+    return $"Welcome to {who}."
+}

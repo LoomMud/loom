@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// /std/room: base room.
+
+inherit /std/object
+
+pub override fn short() -> string {
+    return "a featureless room"
+}
+
+pub fn describe() -> string {
+    return "Nothing to see here."
+}
+
+pub fn exits() -> {string: string} {
+    return {:}
+}

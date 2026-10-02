@@ -37,6 +37,18 @@ case "$target_name" in
     cargo +nightly fuzz run -s "$san" decode_verify "$corpus" -- \
       -max_total_time="$secs" -max_len=8192 -timeout=5 -rss_limit_mb=2048
     ;;
+  lsp)
+    # loom-lsp request-handler fuzz smoke (OBI-168, spec M-LSP-4): first
+    # 4 bytes are a little-endian cursor offset (wrapped mod len), the
+    # rest is source text.
+    cd "$root/crates/loom-lsp"
+    corpus=fuzz/corpus/lsp_requests
+    mkdir -p "$corpus"
+    cp ../loom-syntax/tests/golden/*.wf "$corpus"/ 2>/dev/null || true
+    cargo +nightly fuzz build -s "$san" lsp_requests
+    cargo +nightly fuzz run -s "$san" lsp_requests "$corpus" -- \
+      -max_total_time="$secs" -max_len=4096 -timeout=5 -rss_limit_mb=2048
+    ;;
   *)
     echo "unknown fuzz target: $target_name" >&2
     exit 1
