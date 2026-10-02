@@ -50,18 +50,6 @@ allow-wildcard-paths = true
 
 [advisories]
 yanked = "deny"
-# RUSTSEC-2023-0071 ("Marvin Attack", `rsa` crate, no patch available):
-# accepted per CTO review (OBI-191) -- the only private-key operation on
-# this path is RS256 App-JWT *signing* with driver-chosen, fixed claims
-# (iat/exp/iss), roughly once per 55 minutes (loom-git::github's token
-# cache refresh skew), not a remote decryption oracle on attacker-chosen
-# input. Remove this ignore in OBI-215, which moves JWT signing onto the
-# TLS transport's own constant-time RSA (ring/aws-lc-rs) once that
-# transport exists -- a second RSA implementation has no benefit after
-# that lands.
-ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "rsa: RS256 App-JWT signing only, fixed inputs, ~1/55min; no decryption oracle. Remove with OBI-215 (move signing to ring/aws-lc-rs with the TLS transport)." },
-]
 
 [sources]
 unknown-registry = "deny"
