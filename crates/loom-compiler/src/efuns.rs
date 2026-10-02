@@ -388,7 +388,11 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
             P1,
         ),
         // Spec Phase 2 B5, OBI-170: see `loom_vm::efuns` for the
-        // authoritative arity/privilege/tick cost.
+        // authoritative arity/privilege/tick cost. `profile_stop`'s
+        // second (optional) bool arg is `force` (should-fix 4, OBI-232):
+        // close a window owned by a different principal, subject to the
+        // VM's own P3 check on top of this P1 -- see
+        // `RegistryHost::driver_efun`'s `"profile_stop"` arm.
         "profile_start" => (
             "profile_start",
             vec![P(s.clone())],
@@ -396,7 +400,13 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
             Ret::Ty(Ty::Void),
             P1,
         ),
-        "profile_stop" => ("profile_stop", vec![], 0, Ret::Ty(Ty::String), P1),
+        "profile_stop" => (
+            "profile_stop",
+            vec![P(Ty::Bool)],
+            0,
+            Ret::Ty(Ty::String),
+            P1,
+        ),
         _ => return None,
     };
     Some(EfunSig {

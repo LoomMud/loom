@@ -3904,20 +3904,44 @@ impl<'a> RegistryHost<'a> {
                 }
                 Ok(Value::Int(queued))
             }
-            // Spec Phase 2 B5 (OBI-170): open a per-function tick/time
-            // sampling window on `path` -- replaces any window already
-            // open (the previous one's samples are simply discarded,
-            // same "last write wins" shape as `set_heartbeat`). The
-            // generic P1 `valid_efun` pre-check above already gated this
-            // call; no path-specific apply (it reads nothing it couldn't
-            // already see by calling into `path` itself, and writes only
-            // the profiler's own counters).
+            // Spec Phase 2 B5 (OBI-170), ownership added per CTO review
+            // should-fix 4 (OBI-232): open a per-function tick/time
+            // sampling window on `path`. The generic P1 `valid_efun`
+            // pre-check above already gated this call; no path-specific
+            // apply (it reads nothing it couldn't already see by calling
+            // into `path` itself, and writes only the profiler's own
+            // counters).
+            //
+            // No longer "last write wins" (the OBI-170 PR #67 should-fix
+            // this closes): a window already open, owned by a *different*
+            // principal than the one calling now, is left alone and this
+            // call fails -- one P1 caller (a builder debugging their own
+            // area) can no longer silently discard another's in-progress
+            // profile. The same owner re-calling `profile_start` (e.g. to
+            // retarget to a different program) still just replaces their
+            // own window, same as before.
             "profile_start" => {
                 let p = a0
                     .as_str()
                     .ok_or_else(|| RtError::new("profile_start(): expected string"))?;
                 let path = mudlib::normalize_path(p).map_err(RtError::new)?;
-                self.registry.profiler = Some(crate::profiler::Profiler::new(path));
+                let owner = self
+                    .registry
+                    .syms
+                    .name(principal_of(self.registry, self.self_object()).euid)
+                    .to_string();
+                if let Some(existing) = self.registry.profiler.as_ref()
+                    && existing.owner() != owner
+                {
+                    return Err(RtError::new(format!(
+                        "profile_start(): a profiling window on {:?} is already open, owned by \
+                         {} -- have them call profile_stop() first, or force-close it yourself \
+                         with profile_stop(true) if you hold P3 privilege",
+                        existing.program(),
+                        existing.owner()
+                    )));
+                }
+                self.registry.profiler = Some(crate::profiler::Profiler::new(path, owner));
                 Ok(Value::Null)
             }
             // Close the window opened by `profile_start` and return its
@@ -3927,12 +3951,69 @@ impl<'a> RegistryHost<'a> {
             // struct, because Weft has no `profile`-shaped record type to
             // hand one back as yet -- a builder command wraps this in a
             // single `send(this_player(), profile_stop())`.
+            //
+            // `force` (should-fix 4, OBI-232): optional second arg,
+            // default `false`. A caller who isn't the window's owner
+            // normally gets a permission error instead of silently
+            // closing someone else's in-progress profile (mirrors
+            // `profile_start`'s new refusal); passing `true` still
+            // requires passing this efun's own P3 `valid_efun` check
+            // (same mechanism `seteuid`/`account_create` use), so only a
+            // caller the master actually grants P3 to can force-close
+            // another principal's window.
             "profile_stop" => {
-                let text = match self.registry.profiler.take() {
-                    Some(p) => p.report().render(),
-                    None => "profile: no sampling window is open (call profile_start() first)\n"
-                        .to_string(),
+                let force = matches!(a0, Value::Bool(true));
+                let Some(open_owner) = self
+                    .registry
+                    .profiler
+                    .as_ref()
+                    .map(|p| p.owner().to_string())
+                else {
+                    return Ok(Value::str(
+                        "profile: no sampling window is open (call profile_start() first)\n",
+                    ));
                 };
+                let caller_owner = self
+                    .registry
+                    .syms
+                    .name(principal_of(self.registry, self.self_object()).euid)
+                    .to_string();
+                if open_owner != caller_owner {
+                    if !force {
+                        return Err(RtError::new(format!(
+                            "profile_stop(): this window is owned by {open_owner}, not you -- \
+                             pass true to force-close it (requires P3 privilege)"
+                        )));
+                    }
+                    // A distinct `Operation::Efun` name from plain
+                    // "profile_stop" (not a registered efun -- it never
+                    // needs to be, `Operation::Efun`'s `name` is just an
+                    // opaque cache-key/describe() tag here): the policy
+                    // decision cache keys *only* on efun name, not
+                    // name+class (`Operation::cache_parts`, "the efun
+                    // class is not part of the key: it is fixed per efun
+                    // name") -- reusing "profile_stop" here would let the
+                    // generic P1 pre-check's cached `true` answer this
+                    // unrelated P3 question too, defeating the whole
+                    // check (caught by this file's own
+                    // `force_without_p3_is_still_denied` integration
+                    // test).
+                    self.authorize(
+                        "profile_stop",
+                        Privilege::P3,
+                        Operation::Efun {
+                            name: "profile_stop(force)",
+                            class: Privilege::P3,
+                        },
+                    )?;
+                }
+                let text = self
+                    .registry
+                    .profiler
+                    .take()
+                    .expect("checked Some above")
+                    .report()
+                    .render();
                 Ok(Value::str(&text))
             }
             // P2-B7 (OBI-182, spec §7.4): `update --canary N%` --

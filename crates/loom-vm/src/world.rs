@@ -1902,19 +1902,50 @@ impl World {
 
     /// `profile <program>` (spec Phase 2 B5, OBI-170): open a sampling
     /// window on `program` (normalized, same rule as `compile_object`'s
-    /// path argument), discarding any window already open -- mirrors the
-    /// `profile_start` efun, for a host-side (test/admin-command) caller
-    /// that doesn't want to go through a Weft call to use it.
-    pub fn profile_start(&mut self, program: &str) -> Result<(), String> {
+    /// path argument) -- mirrors the `profile_start` efun, for a
+    /// host-side (test/admin-command) caller that doesn't want to go
+    /// through a Weft call to use it.
+    ///
+    /// `owner` is this caller's principal (CTO review, OBI-170 PR #67
+    /// should-fix 4 / OBI-232): if a window is already open under a
+    /// *different* owner, this fails instead of silently discarding it
+    /// (no more "last write wins") -- the caller must have that owner
+    /// call `profile_stop` first, or call `profile_stop` here with
+    /// `force: true` themselves (a host-side caller is trusted to decide
+    /// that for itself; there is no master/efun-privilege gate at this
+    /// level, unlike the `profile_stop` efun's P3 check).
+    pub fn profile_start(&mut self, program: &str, owner: &str) -> Result<(), String> {
         let path = loom_compiler::mudlib::normalize_path(program)?;
-        self.registry.profiler = Some(crate::profiler::Profiler::new(path));
+        if let Some(existing) = &self.registry.profiler
+            && existing.owner() != owner
+        {
+            return Err(format!(
+                "profile: a window on {:?} is already open, owned by {} -- profile_stop() it \
+                 first (or force-close it)",
+                existing.program(),
+                existing.owner()
+            ));
+        }
+        self.registry.profiler = Some(crate::profiler::Profiler::new(path, owner.to_string()));
         Ok(())
     }
 
     /// Close the window `profile_start` opened and render its report
     /// (see `crate::profiler::ProfileReport::render`) -- mirrors the
     /// `profile_stop` efun. `None` if no window was open.
-    pub fn profile_stop(&mut self) -> Option<String> {
+    ///
+    /// Refuses to close a window owned by a different `caller` unless
+    /// `force` is set (should-fix 4, OBI-232) -- the caller decides for
+    /// itself whether it is entitled to force (this host-side entry
+    /// point has no master/privilege model of its own to check against).
+    pub fn profile_stop(&mut self, caller: &str, force: bool) -> Option<String> {
+        let owner = self.registry.profiler.as_ref()?.owner().to_string();
+        if owner != caller && !force {
+            return Some(format!(
+                "profile_stop(): this window is owned by {owner}, not {caller} -- pass \
+                 force: true to close it anyway"
+            ));
+        }
         self.registry.profiler.take().map(|p| p.report().render())
     }
 
