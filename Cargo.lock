@@ -1138,6 +1138,7 @@ dependencies = [
  "loom-net",
  "loom-obs",
  "loom-persist",
+ "loom-supervise",
  "loom-vm",
  "serde_json",
  "sqlx",
@@ -1264,6 +1265,15 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "loom-supervise"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
