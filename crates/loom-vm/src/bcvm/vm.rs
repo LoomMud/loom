@@ -411,6 +411,30 @@ pub trait Host {
     /// clone/destruct recorded since `mark`, in reverse order, exactly
     /// restoring the prior state.
     fn rollback_atomic(&mut self, _mark: u64) {}
+
+    /// `profile <program>` (spec Phase 2 B5, OBI-170): is a sampling
+    /// window currently open for `program`? Checked once per
+    /// [`Interpreter::push_call`], on *every* Weft function call whether
+    /// or not profiling is in use anywhere -- so the default (`false`,
+    /// no clock read, no allocation) is the only cost the "profiling off
+    /// has unmeasurable overhead" acceptance bar actually has to hold to.
+    fn profiling_active(&self, _program: &str) -> bool {
+        false
+    }
+    /// One profiled call just returned (normally, or by unwinding past
+    /// its frame): `function` is its name, `ticks` is the budget charged
+    /// while its frame was on the stack, `wall` is the elapsed real time
+    /// over the same span. Only called when [`Host::profiling_active`]
+    /// answered `true` for `program` at the matching `push_call`, so the
+    /// default (no-op) never runs on the hot "profiling off" path either.
+    fn profile_record(
+        &mut self,
+        _program: &str,
+        _function: &str,
+        _ticks: u64,
+        _wall: std::time::Duration,
+    ) {
+    }
 }
 
 /// One activation: which function, at which instruction, with its own
@@ -455,6 +479,14 @@ struct Frame {
     /// its own" (OBI-35 scope): the host is the only place a `GuardSet`
     /// lives.
     creator_frame: bool,
+    /// `Some((start, ticks_before))` iff [`Host::profiling_active`]
+    /// answered `true` for this frame's program when it was pushed
+    /// (spec Phase 2 B5, OBI-170): `pop_frame` reports its cost once via
+    /// [`Host::profile_record`] using the wall-clock elapsed since
+    /// `start` and the ticks charged since `ticks_before`. `None`
+    /// (profiling off, or this isn't the sampled program) is the common
+    /// case and the only thing `pop_frame` has to check on that path.
+    prof: Option<(std::time::Instant, u64)>,
 }
 
 /// Per-execution limits (spec §5.9): every tick-metered op consumes one
@@ -733,6 +765,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
         if let Some(guard) = creator_guard {
             self.host.enter_creator_frame(guard);
         }
+        // Spec Phase 2 B5 (OBI-170): ask the host once, by program path,
+        // whether a `profile` window wants this call. `false` (the
+        // default, and every ordinary call while profiling is off) skips
+        // straight past the `Instant::now()`/tick snapshot below.
+        let prof = self
+            .host
+            .profiling_active(&m.path)
+            .then(|| (std::time::Instant::now(), *self.ticks_left));
         self.stack.push(Frame {
             code,
             code_ops,
@@ -744,6 +784,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
             handlers: Vec::new(),
             atomic_mark,
             creator_frame: creator_guard.is_some(),
+            prof,
         });
         Ok(())
     }
@@ -755,6 +796,18 @@ impl<'a, H: Host> Interpreter<'a, H> {
     /// ran after `enter_creator_frame`).
     fn pop_frame(&mut self) -> Frame {
         let f = self.stack.pop().unwrap();
+        // Spec Phase 2 B5 (OBI-170): report this call's cost exactly
+        // once, on whichever path popped it (normal return or error
+        // unwind, `pop_frame_on_error` calls through here too). Skipped
+        // entirely when `f.prof` is `None` -- profiling off, or this
+        // frame's program wasn't the one being sampled.
+        if let Some((start, ticks_before)) = f.prof {
+            let wall = start.elapsed();
+            let ticks = ticks_before.saturating_sub(*self.ticks_left);
+            let program = self.module_of(&f).path.to_string();
+            let function = self.frame_name(&f).to_string();
+            self.host.profile_record(&program, &function, ticks, wall);
+        }
         if f.entered {
             self.host.leave_self();
         }
@@ -1962,6 +2015,80 @@ mod tests {
 
         let message = result.unwrap_err();
         assert!(message.contains("Too deep recursion"), "{message}");
+    }
+
+    /// Spec Phase 2 B5 (OBI-170) integration test: a `Host` that answers
+    /// `profiling_active`/`profile_record` like `RegistryHost` does, wired
+    /// straight to the interpreter's `push_call`/`pop_frame` hooks --
+    /// proves the VM-level wiring (not just `crate::profiler::Profiler`'s
+    /// own unit tests) actually counts calls/ticks for a real, hot,
+    /// recursive Weft function (`countdown`, this module's existing
+    /// fixture) end to end.
+    struct ProfHost {
+        inner: NoHost,
+        target: &'static str,
+        calls: std::cell::RefCell<std::collections::HashMap<String, (u64, u64)>>,
+    }
+    impl Host for ProfHost {
+        fn self_object(&self) -> ObjectId {
+            self.inner.self_object()
+        }
+        fn call_static(&mut self, program: &str, name: &str, args: Vec<Value>) -> R<Value> {
+            self.inner.call_static(program, name, args)
+        }
+        fn call_virtual(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
+            self.inner.call_virtual(name, args)
+        }
+        fn call_other(&mut self, recv: Value, name: &str, args: Vec<Value>) -> R<Value> {
+            self.inner.call_other(recv, name, args)
+        }
+        fn call_efun(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
+            self.inner.call_efun(name, args)
+        }
+        fn load_global(&mut self, owner: &str, name: &str) -> R<Value> {
+            self.inner.load_global(owner, name)
+        }
+        fn store_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
+            self.inner.store_global(owner, name, v)
+        }
+        fn profiling_active(&self, program: &str) -> bool {
+            program == self.target
+        }
+        fn profile_record(
+            &mut self,
+            _program: &str,
+            function: &str,
+            ticks: u64,
+            _wall: std::time::Duration,
+        ) {
+            let mut calls = self.calls.borrow_mut();
+            let entry = calls.entry(function.to_string()).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += ticks;
+        }
+    }
+
+    #[test]
+    fn profiler_hook_counts_calls_and_ticks_for_a_hot_recursive_function() {
+        let module = countdown_module(false);
+        let mut host = ProfHost {
+            inner: NoHost,
+            target: "/test/countdown",
+            calls: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+        let limits = Limits::default();
+        let mut ticks = 1_000_000u64;
+        let mut interp = Interpreter::new(&module, &mut host, &limits, &mut ticks);
+        let result = interp.call("countdown", vec![Value::Int(50)]);
+        match result.unwrap() {
+            Value::Int(0) => {}
+            other => panic!("expected Int(0), got {other:?}"),
+        }
+        let calls = host.calls.borrow();
+        let (call_count, tick_count) = *calls.get("countdown").expect("countdown was profiled");
+        // One top-level call plus 50 recursive calls down to the base case.
+        assert_eq!(call_count, 51);
+        assert!(tick_count > 0, "expected nonzero ticks charged");
     }
 
     #[test]
