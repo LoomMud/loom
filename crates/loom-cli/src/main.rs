@@ -412,9 +412,13 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
                 tracing::debug!(%err, "set_nodelay failed on an HTTP connection");
             }
         });
-        axum::serve(http_listener, loom_http::app(http_state))
-            .await
-            .map_err(|err| format!("HTTP server failed: {err}"))
+        axum::serve(
+            http_listener,
+            loom_http::app(http_state)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .map_err(|err| format!("HTTP server failed: {err}"))
     });
 
     let mut server = tokio::spawn(loom_net::run_server_with_ws(

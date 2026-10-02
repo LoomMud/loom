@@ -33,25 +33,58 @@
 //! `github_identities` (populated only by an arch/root through
 //! `Persist::github_link`, T4+). An unlinked id is refused outright --
 //! this module has no code path that inserts a `staff` row.
+//!
+//! ## Rate limiting, lockout, and audit (OBI-200)
+//!
+//! [`AuthService::login`]/[`AuthService::totp_confirm`] share one
+//! [`RateLimiter`] (see that module's docs for the exact numbers): a
+//! wrong password or wrong TOTP code counts as a failure toward both a
+//! per-account lockout and a per-IP token bucket, and a locked account
+//! gets exactly the same response as a wrong password. Every login,
+//! refresh-reuse, and TOTP enrol/reset is appended to `audit_log` via
+//! [`StaffDirectory::record_audit`] (M-AUTH-9); see
+//! `docs/threat-model-phase2.md` §6.1 (M-AUTH-1, M-AUTH-2, M-AUTH-9).
 
 mod claims;
 mod directory;
 mod github;
 mod jwt;
+pub mod ratelimit;
 mod totp;
 
 pub use claims::{AccessClaims, scopes_for_tier};
-pub use directory::{DirectoryError, RefreshRecord, StaffAuthRecord, StaffDirectory};
+pub use directory::{AuditEvent, DirectoryError, RefreshRecord, StaffAuthRecord, StaffDirectory};
 pub use github::{GithubAuthError, GithubIdentityProvider, GithubUser};
 pub use jwt::{JwtKeys, TokenPair};
+pub use ratelimit::{RateLimitDecision, RateLimiter};
 pub use totp::{TotpEnrollment, generate_totp_secret, totp_for_secret, verify_totp_code};
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use tracing::warn;
+
+/// Everything a login/refresh/TOTP attempt carries about *who's asking*,
+/// for the rate limiter (M-AUTH-1) and the audit trail (M-AUTH-9) --
+/// never for an authorization decision (that's still `sub`/tier, read
+/// fresh from the directory). `ip` is `None` only in tests or if
+/// `loom-http`'s client-IP resolution ([`crate::client_ip`]) truly has
+/// nothing to fall back to.
+#[derive(Debug, Clone, Default)]
+pub struct AuthContext {
+    pub ip: Option<IpAddr>,
+    pub user_agent: Option<String>,
+}
+
+impl AuthContext {
+    pub fn new(ip: Option<IpAddr>, user_agent: Option<String>) -> Self {
+        Self { ip, user_agent }
+    }
+}
 
 /// Access tokens are short-lived: a promotion/demotion or a TOTP
 /// requirement change is at most this stale before a refresh picks it up.
@@ -79,6 +112,12 @@ pub enum AuthError {
     InvalidRefreshToken,
     /// The backing directory (Postgres) failed.
     DirectoryUnavailable,
+    /// The per-IP token bucket is empty (M-AUTH-1). Distinct from
+    /// [`AuthError::InvalidCredentials`] -- unlike an account lockout,
+    /// which must look exactly like a wrong password, an IP-level
+    /// throttle is not account-specific and doesn't leak anything about
+    /// a particular username.
+    RateLimited,
 }
 
 impl std::fmt::Display for AuthError {
@@ -89,6 +128,7 @@ impl std::fmt::Display for AuthError {
             AuthError::TotpInvalid => "totp code invalid",
             AuthError::InvalidRefreshToken => "invalid refresh token",
             AuthError::DirectoryUnavailable => "directory unavailable",
+            AuthError::RateLimited => "rate limited",
         };
         f.write_str(s)
     }
@@ -111,6 +151,7 @@ pub struct AuthService {
     keys: JwtKeys,
     access_ttl: Duration,
     refresh_ttl: Duration,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl AuthService {
@@ -120,6 +161,7 @@ impl AuthService {
             keys,
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_ttl: REFRESH_TOKEN_TTL,
+            rate_limiter: Arc::new(RateLimiter::new()),
         }
     }
 
@@ -132,24 +174,104 @@ impl AuthService {
         self
     }
 
+    /// Swap in a rate limiter with shrunk windows for a deterministic
+    /// test (OBI-200).
+    #[cfg(test)]
+    pub fn with_rate_limiter(mut self, rate_limiter: RateLimiter) -> Self {
+        self.rate_limiter = Arc::new(rate_limiter);
+        self
+    }
+
     /// Username/password login (design §9). Refuses with
     /// [`AuthError::TotpRequired`]/[`AuthError::TotpInvalid`] for a T3+
     /// staff member unless `totp_code` verifies against their confirmed
     /// secret.
+    ///
+    /// Rate limiting (OBI-200, M-AUTH-1): checked *before* any
+    /// credential work. A throttled IP gets [`AuthError::RateLimited`]. A
+    /// locked account gets exactly [`AuthError::InvalidCredentials`] --
+    /// the same response as a wrong password, so a client can never tell
+    /// "this account is locked" from "that password is wrong" (which
+    /// would otherwise leak account existence/activity). A wrong
+    /// password or a wrong TOTP code both count as a failure toward the
+    /// account lockout; a *missing* TOTP code does not (it isn't a
+    /// guess). Every outcome is audited (M-AUTH-9).
     pub async fn login(
         &self,
         username: &str,
         password: &str,
         totp_code: Option<&str>,
+        ctx: &AuthContext,
     ) -> Result<TokenPair, AuthError> {
-        let record = self
-            .directory
-            .staff_login(username, password)
-            .await?
-            .ok_or(AuthError::InvalidCredentials)?;
+        match self.rate_limiter.check(username, ctx.ip) {
+            RateLimitDecision::IpThrottled => {
+                self.audit(
+                    "auth.login.fail",
+                    None,
+                    ctx,
+                    "deny",
+                    Some("ip_rate_limited".to_string()),
+                )
+                .await;
+                return Err(AuthError::RateLimited);
+            }
+            RateLimitDecision::AccountLocked => {
+                self.audit(
+                    "auth.login.fail",
+                    None,
+                    ctx,
+                    "deny",
+                    Some("account_locked".to_string()),
+                )
+                .await;
+                return Err(AuthError::InvalidCredentials);
+            }
+            RateLimitDecision::Allowed => {}
+        }
 
-        self.enforce_totp_gate(&record, totp_code)?;
-        self.issue_tokens(&record.uid).await
+        let record = match self.directory.staff_login(username, password).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                self.rate_limiter.record_failure(username);
+                self.audit(
+                    "auth.login.fail",
+                    None,
+                    ctx,
+                    "deny",
+                    Some("invalid_credentials".to_string()),
+                )
+                .await;
+                return Err(AuthError::InvalidCredentials);
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        if let Err(err) = self.enforce_totp_gate(&record, totp_code) {
+            if err == AuthError::TotpInvalid {
+                self.rate_limiter.record_failure(username);
+            }
+            self.audit(
+                "auth.login.fail",
+                Some(record.uid.clone()),
+                ctx,
+                "deny",
+                Some(totp_gate_detail(&err).to_string()),
+            )
+            .await;
+            return Err(err);
+        }
+
+        self.rate_limiter.record_success(username);
+        let pair = self.issue_tokens(&record.uid).await?;
+        self.audit(
+            "auth.login.ok",
+            Some(record.uid.clone()),
+            ctx,
+            "allow",
+            None,
+        )
+        .await;
+        Ok(pair)
     }
 
     /// GitHub login (design §9): `github_id` is the numeric id the caller
@@ -184,8 +306,12 @@ impl AuthService {
     /// token, i.e. a stolen refresh token) revokes every other outstanding
     /// token for that uid, not just the one presented, since by
     /// definition one of the two parties holding it is not the legitimate
-    /// session.
-    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenPair, AuthError> {
+    /// session. That replay is audited as `auth.refresh.reuse` (M-AUTH-9).
+    pub async fn refresh(
+        &self,
+        refresh_token: &str,
+        ctx: &AuthContext,
+    ) -> Result<TokenPair, AuthError> {
         let token_hash = hash_token(refresh_token);
         let record = self
             .directory
@@ -197,6 +323,14 @@ impl AuthService {
             self.directory
                 .refresh_token_revoke_all(&record.staff_uid)
                 .await?;
+            self.audit(
+                "auth.refresh.reuse",
+                Some(record.staff_uid.clone()),
+                ctx,
+                "deny",
+                None,
+            )
+            .await;
             return Err(AuthError::InvalidRefreshToken);
         }
         if record.expires_at <= now() {
@@ -218,19 +352,46 @@ impl AuthService {
     /// the directory re-checks actor == uid in SQL). Returns the
     /// enrolment payload (base32 secret + `otpauth://` URL) once; the
     /// caller must show it to the user now, since only its hash-adjacent
-    /// state (not the plaintext) is ever returned again.
-    pub async fn totp_enroll(&self, uid: &str) -> Result<totp::TotpEnrollment, AuthError> {
+    /// state (not the plaintext) is ever returned again. Audited as
+    /// `auth.totp.enrol` the first time `uid` gets a secret, or
+    /// `auth.totp.reset` if one already existed (M-AUTH-9).
+    pub async fn totp_enroll(
+        &self,
+        uid: &str,
+        ctx: &AuthContext,
+    ) -> Result<totp::TotpEnrollment, AuthError> {
+        let had_prior_secret = self.directory.totp_secret_for(uid).await?.is_some();
         let enrollment = totp::generate_totp_secret(uid);
         self.directory
             .totp_enroll(uid, &enrollment.secret_base32)
             .await?;
+        let kind = if had_prior_secret {
+            "auth.totp.reset"
+        } else {
+            "auth.totp.enrol"
+        };
+        self.audit(kind, Some(uid.to_string()), ctx, "allow", None)
+            .await;
         Ok(enrollment)
     }
 
     /// Verify `code` against `uid`'s just-enrolled (or previously
     /// enrolled) secret and, on success, mark it confirmed -- the gate
-    /// [`Self::login`] checks for T3+ staff.
-    pub async fn totp_confirm(&self, uid: &str, code: &str) -> Result<(), AuthError> {
+    /// [`Self::login`] checks for T3+ staff. TOTP attempts share the
+    /// login rate limiter (M-AUTH-1): a wrong code counts as a failure
+    /// against both the per-account and per-IP limits.
+    pub async fn totp_confirm(
+        &self,
+        uid: &str,
+        code: &str,
+        ctx: &AuthContext,
+    ) -> Result<(), AuthError> {
+        match self.rate_limiter.check(uid, ctx.ip) {
+            RateLimitDecision::IpThrottled => return Err(AuthError::RateLimited),
+            RateLimitDecision::AccountLocked => return Err(AuthError::TotpInvalid),
+            RateLimitDecision::Allowed => {}
+        }
+
         let secret = self
             .directory
             .totp_secret_for(uid)
@@ -238,8 +399,10 @@ impl AuthService {
             .ok_or(AuthError::TotpInvalid)?;
         if totp::verify_totp_code(&secret, code) {
             self.directory.totp_confirm(uid).await?;
+            self.rate_limiter.record_success(uid);
             Ok(())
         } else {
+            self.rate_limiter.record_failure(uid);
             Err(AuthError::TotpInvalid)
         }
     }
@@ -318,6 +481,40 @@ impl AuthService {
         } else {
             Err(AuthError::TotpInvalid)
         }
+    }
+
+    /// Append one audit row (M-AUTH-9), logging and swallowing any
+    /// directory failure -- see [`StaffDirectory::record_audit`]'s doc
+    /// comment for why this never propagates.
+    async fn audit(
+        &self,
+        kind: &'static str,
+        uid: Option<String>,
+        ctx: &AuthContext,
+        verdict: &'static str,
+        detail: Option<String>,
+    ) {
+        let event = AuditEvent {
+            kind,
+            uid,
+            ip: ctx.ip,
+            user_agent: ctx.user_agent.clone(),
+            verdict,
+            detail,
+        };
+        if let Err(err) = self.directory.record_audit(event).await {
+            warn!(?err, kind, "failed to record auth audit event");
+        }
+    }
+}
+
+/// A short, non-sensitive label for why `enforce_totp_gate` refused a
+/// login, for the `auth.login.fail` audit row's `detail`.
+fn totp_gate_detail(error: &AuthError) -> &'static str {
+    match error {
+        AuthError::TotpRequired => "totp_required",
+        AuthError::TotpInvalid => "totp_invalid",
+        _ => "totp_gate_failed",
     }
 }
 

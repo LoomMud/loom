@@ -44,6 +44,9 @@ use uuid::Uuid;
 const ARGON_M_COST_KIB: u32 = 19 * 1024;
 const ARGON_T_COST: u32 = 2;
 const ARGON_P_COST: u32 = 1;
+/// Never a real credential -- only ever hashed once (at [`Persist::from_pool`])
+/// and verified against for its CPU cost (OBI-200, M-AUTH-2).
+const DUMMY_PASSWORD: &str = "loom-dummy-verify-constant-time-padding";
 
 pub type Result<T> = std::result::Result<T, PersistError>;
 
@@ -67,6 +70,13 @@ pub enum PersistError {
 pub struct Persist {
     pool: PgPool,
     argon2: Argon2<'static>,
+    /// A precomputed Argon2id hash of a fixed, never-used password,
+    /// verified against on every lookup of an unknown account/staff
+    /// username (OBI-200, M-AUTH-2). Running a real Argon2 verify against
+    /// *some* hash for a nonexistent user spends the same CPU time a real
+    /// user's wrong-password attempt would, so response timing never
+    /// reveals whether a username exists.
+    dummy_password_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,10 +477,30 @@ impl Persist {
     pub fn from_pool(pool: PgPool) -> Result<Self> {
         let params = Params::new(ARGON_M_COST_KIB, ARGON_T_COST, ARGON_P_COST, None)
             .map_err(|_| PersistError::ArgonParams)?;
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let dummy_password_hash = {
+            let salt = SaltString::generate(&mut OsRng);
+            argon2
+                .hash_password(DUMMY_PASSWORD.as_bytes(), &salt)
+                .map_err(|e| PersistError::PasswordHash(e.to_string()))?
+                .to_string()
+        };
         Ok(Self {
             pool,
-            argon2: Argon2::new(Algorithm::Argon2id, Version::V0x13, params),
+            argon2,
+            dummy_password_hash,
         })
+    }
+
+    /// Run a real Argon2id verify against the fixed dummy hash so a
+    /// lookup miss (unknown account/staff username) costs the same CPU
+    /// time as a wrong-password attempt against a real one (OBI-200,
+    /// M-AUTH-2). The result is always discarded -- this exists purely
+    /// for its timing, never its outcome.
+    fn dummy_verify(&self, password: &str) {
+        let parsed = PasswordHash::new(&self.dummy_password_hash)
+            .expect("the dummy hash computed in from_pool is always a valid PHC string");
+        let _ = self.argon2.verify_password(password.as_bytes(), &parsed);
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -512,6 +542,9 @@ impl Persist {
         .await?;
 
         let Some(row) = row else {
+            // OBI-200, M-AUTH-2: dummy verify so timing doesn't reveal that
+            // this username doesn't exist.
+            self.dummy_verify(password);
             return Ok(None);
         };
 
@@ -554,6 +587,9 @@ impl Persist {
         .await?;
 
         let Some(row) = row else {
+            // OBI-200, M-AUTH-2: dummy verify so timing doesn't reveal that
+            // this username doesn't exist (or isn't staff).
+            self.dummy_verify(password);
             return Ok(None);
         };
         use sqlx::Row;
@@ -714,7 +750,8 @@ impl Persist {
     /// Link a GitHub numeric user id to an existing staff uid via
     /// `auth_github_link`. `actor` MUST be the driver/app's authenticated
     /// principal (an arch or root, T4+); the function re-checks this in SQL
-    /// and never creates a staff row for an unrecognised uid.
+    /// and never creates a staff row for an unrecognised uid. Audited as
+    /// `auth.github.link` (OBI-200, M-AUTH-9).
     pub async fn github_link(
         &self,
         actor: &str,
@@ -729,7 +766,69 @@ impl Persist {
             .bind(reason)
             .execute(&self.pool)
             .await?;
+        if let Err(err) = self
+            .record_auth_audit(
+                "auth.github.link",
+                Some(actor),
+                Some(uid),
+                Some(format!("github_id={github_id} reason={reason}")),
+            )
+            .await
+        {
+            tracing::warn!(%err, "failed to audit auth.github.link");
+        }
         Ok(())
+    }
+
+    /// Unlink a staff uid's GitHub identity via `auth_github_unlink`.
+    /// Same actor-tier floor as [`Self::github_link`] (T4+). Audited as
+    /// `auth.github.unlink` (OBI-200, M-AUTH-9).
+    pub async fn github_unlink(&self, actor: &str, uid: &str, reason: &str) -> Result<()> {
+        sqlx::query("SELECT auth_github_unlink($1, $2, $3)")
+            .bind(actor)
+            .bind(uid)
+            .bind(reason)
+            .execute(&self.pool)
+            .await?;
+        if let Err(err) = self
+            .record_auth_audit(
+                "auth.github.unlink",
+                Some(actor),
+                Some(uid),
+                Some(reason.to_string()),
+            )
+            .await
+        {
+            tracing::warn!(%err, "failed to audit auth.github.unlink");
+        }
+        Ok(())
+    }
+
+    /// Append one `audit_log` row for an auth event that isn't already
+    /// covered by [`Self::insert_audit_batch`]'s callers in `loom-http`
+    /// (OBI-200, M-AUTH-9). `verdict` is always `"allow"` here -- the
+    /// callers of this helper ([`Self::github_link`]/`github_unlink`)
+    /// only run after their SQL function already succeeded.
+    async fn record_auth_audit(
+        &self,
+        kind: &str,
+        caller: Option<&str>,
+        target: Option<&str>,
+        detail: Option<String>,
+    ) -> Result<()> {
+        let row = AuditRow {
+            at: OffsetDateTime::now_utc(),
+            kind: kind.to_string(),
+            caller: caller.map(|s| s.to_string()),
+            effective_principal: target.map(|s| s.to_string()),
+            apply: None,
+            class: None,
+            argument: None,
+            guard_set: Vec::new(),
+            verdict: "allow".to_string(),
+            detail,
+        };
+        self.insert_audit_batch(&[row]).await
     }
 
     pub async fn save_object_state(&self, object: &ObjectState) -> Result<()> {

@@ -262,6 +262,89 @@ async fn github_lookup_is_none_for_an_unlinked_id() {
     assert!(fx.app.github_lookup(999_999_999).await.unwrap().is_none());
 }
 
+/// OBI-200: `auth_github_unlink` is the missing counterpart to
+/// `auth_github_link` -- same T4+ floor, and it actually removes the row.
+#[tokio::test]
+async fn github_unlink_requires_t4_and_removes_the_link() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let t1_uid = unique_uid("boromir-unlink");
+    let t1_account = seed_account(&fx.owner, &unique_uid("boromir-unlink-acct")).await;
+    seed_staff(&fx.owner, &t1_uid, t1_account, 1).await;
+
+    let t4_uid = unique_uid("elrond-unlink");
+    let t4_account = seed_account(&fx.owner, &unique_uid("elrond-unlink-acct")).await;
+    seed_staff(&fx.owner, &t4_uid, t4_account, 4).await;
+
+    let target_uid = unique_uid("samwise-unlink");
+    let target_account = seed_account(&fx.owner, &unique_uid("samwise-unlink-acct")).await;
+    seed_staff(&fx.owner, &target_uid, target_account, 1).await;
+
+    let github_id = rand_github_id();
+    fx.app
+        .github_link(&t4_uid, &target_uid, github_id, "test")
+        .await
+        .expect("t4 may link");
+
+    // T1 may not unlink.
+    let err = fx.app.github_unlink(&t1_uid, &target_uid, "test").await;
+    assert!(err.is_err());
+    assert!(fx.app.github_lookup(github_id).await.unwrap().is_some());
+
+    // T4 may unlink, and the link is actually gone afterward.
+    fx.app
+        .github_unlink(&t4_uid, &target_uid, "device lost")
+        .await
+        .expect("t4 may unlink");
+    assert!(fx.app.github_lookup(github_id).await.unwrap().is_none());
+}
+
+/// Acceptance (OBI-200): "audit rows written for each event" --
+/// `github_link`/`github_unlink` land `auth.github.link`/`auth.github.unlink`
+/// rows in `audit_log` with the actor and target.
+#[tokio::test]
+async fn github_link_and_unlink_write_audit_log_rows() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let t4_uid = unique_uid("elrond-audit");
+    let t4_account = seed_account(&fx.owner, &unique_uid("elrond-audit-acct")).await;
+    seed_staff(&fx.owner, &t4_uid, t4_account, 4).await;
+
+    let target_uid = unique_uid("samwise-audit");
+    let target_account = seed_account(&fx.owner, &unique_uid("samwise-audit-acct")).await;
+    seed_staff(&fx.owner, &target_uid, target_account, 1).await;
+
+    let github_id = rand_github_id();
+    fx.app
+        .github_link(&t4_uid, &target_uid, github_id, "test-link")
+        .await
+        .expect("link");
+    fx.app
+        .github_unlink(&t4_uid, &target_uid, "test-unlink")
+        .await
+        .expect("unlink");
+
+    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT kind, caller, effective_principal FROM audit_log \
+         WHERE kind IN ('auth.github.link', 'auth.github.unlink') \
+         AND effective_principal = $1 ORDER BY id",
+    )
+    .bind(&target_uid)
+    .fetch_all(&fx.owner)
+    .await
+    .unwrap();
+
+    assert_eq!(rows.len(), 2, "expected one link row and one unlink row");
+    assert_eq!(rows[0].0, "auth.github.link");
+    assert_eq!(rows[0].1.as_deref(), Some(t4_uid.as_str()));
+    assert_eq!(rows[1].0, "auth.github.unlink");
+    assert_eq!(rows[1].1.as_deref(), Some(t4_uid.as_str()));
+}
+
 fn rand_github_id() -> i64 {
     use std::sync::atomic::{AtomicI64, Ordering};
     static COUNTER: AtomicI64 = AtomicI64::new(1_000_000);

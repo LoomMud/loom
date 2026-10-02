@@ -8,6 +8,7 @@
 
 use axum::Json;
 use axum::Router;
+use axum::extract::ConnectInfo;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -15,7 +16,8 @@ use axum::routing::post;
 use serde::{Deserialize, Serialize};
 
 use crate::HttpState;
-use crate::auth::{AuthError, GithubAuthError, TokenPair};
+use crate::auth::{AuthContext, AuthError, GithubAuthError, TokenPair};
+use crate::client_ip::client_ip;
 
 pub fn auth_router() -> Router<HttpState> {
     Router::new()
@@ -80,8 +82,21 @@ fn auth_error_response(error: AuthError) -> (StatusCode, Json<ErrorResponse>) {
         AuthError::TotpInvalid => (StatusCode::FORBIDDEN, "totp_invalid"),
         AuthError::InvalidRefreshToken => (StatusCode::UNAUTHORIZED, "invalid_refresh_token"),
         AuthError::DirectoryUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
     };
     (status, Json(ErrorResponse { error: code }))
+}
+
+/// Build the [`AuthContext`] (client IP + user agent) an auth call needs
+/// for rate limiting and audit (OBI-200). `peer` is the TCP connection's
+/// address (see [`crate::client_ip::client_ip`]'s doc comment on why XFF
+/// is trusted unconditionally here).
+fn auth_context(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> AuthContext {
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.chars().take(256).collect::<String>());
+    AuthContext::new(client_ip(headers, peer), user_agent)
 }
 
 /// Extract `sub` from a bearer access token in `Authorization: Bearer ...`.
@@ -101,6 +116,8 @@ fn bearer_uid(headers: &HeaderMap, state: &HttpState) -> Option<String> {
 
 async fn login(
     State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> impl IntoResponse {
     let Some(auth) = state.auth.as_ref() else {
@@ -112,11 +129,13 @@ async fn login(
         )
             .into_response();
     };
+    let ctx = auth_context(&headers, Some(peer));
     match auth
         .login(
             &request.username,
             &request.password,
             request.totp_code.as_deref(),
+            &ctx,
         )
         .await
     {
@@ -127,6 +146,8 @@ async fn login(
 
 async fn refresh(
     State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<RefreshRequest>,
 ) -> impl IntoResponse {
     let Some(auth) = state.auth.as_ref() else {
@@ -138,7 +159,8 @@ async fn refresh(
         )
             .into_response();
     };
-    match auth.refresh(&request.refresh_token).await {
+    let ctx = auth_context(&headers, Some(peer));
+    match auth.refresh(&request.refresh_token, &ctx).await {
         Ok(pair) => (StatusCode::OK, Json(TokenResponse::from(pair))).into_response(),
         Err(error) => auth_error_response(error).into_response(),
     }
@@ -157,14 +179,19 @@ async fn logout(
     }
 }
 
-async fn totp_enroll(State(state): State<HttpState>, headers: HeaderMap) -> impl IntoResponse {
+async fn totp_enroll(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let Some(uid) = bearer_uid(&headers, &state) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     // Safe to unwrap: `bearer_uid` only returns `Some` when `state.auth`
     // is `Some`.
     let auth = state.auth.as_ref().unwrap();
-    match auth.totp_enroll(&uid).await {
+    let ctx = auth_context(&headers, Some(peer));
+    match auth.totp_enroll(&uid, &ctx).await {
         Ok(enrollment) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -179,6 +206,7 @@ async fn totp_enroll(State(state): State<HttpState>, headers: HeaderMap) -> impl
 
 async fn totp_verify(
     State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<TotpVerifyRequest>,
 ) -> impl IntoResponse {
@@ -186,7 +214,8 @@ async fn totp_verify(
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let auth = state.auth.as_ref().unwrap();
-    match auth.totp_confirm(&uid, &request.code).await {
+    let ctx = auth_context(&headers, Some(peer));
+    match auth.totp_confirm(&uid, &request.code, &ctx).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => auth_error_response(error).into_response(),
     }

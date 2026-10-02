@@ -37,6 +37,7 @@ use tower_http::services::ServeDir;
 use tracing::debug;
 
 pub mod auth;
+mod client_ip;
 mod handlers;
 
 pub use handlers::auth_router;

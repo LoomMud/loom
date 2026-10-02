@@ -7,7 +7,25 @@
 //! implementation is `impl StaffDirectory for loom_persist::Persist` at
 //! the bottom of this file.
 
+use std::net::IpAddr;
+
 use time::OffsetDateTime;
+
+/// One `audit_log` row for an auth event (OBI-200, M-AUTH-9): `kind` is
+/// one of `auth.login.ok`, `auth.login.fail`, `auth.refresh.reuse`,
+/// `auth.totp.enrol`, `auth.totp.reset`, `auth.github.link`,
+/// `auth.github.unlink`. `uid` is `None` only for a login attempt against
+/// a username that never resolved to a staff row (so there is no uid to
+/// attribute it to); the attempted username still lands in `detail`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEvent {
+    pub kind: &'static str,
+    pub uid: Option<String>,
+    pub ip: Option<IpAddr>,
+    pub user_agent: Option<String>,
+    pub verdict: &'static str,
+    pub detail: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaffAuthRecord {
@@ -65,6 +83,14 @@ pub trait StaffDirectory: Send + Sync {
 
     /// `None` means unlinked: GitHub login must refuse, never create staff.
     async fn github_lookup(&self, github_id: i64) -> Result<Option<String>, DirectoryError>;
+
+    /// Append one `audit_log` row (OBI-200, M-AUTH-9). Best-effort from
+    /// the caller's point of view -- a failure here must never stop a
+    /// login/refresh/enrol from completing (losing an audit row is bad;
+    /// refusing a legitimate staff member because Postgres hiccuped on an
+    /// `INSERT` would be worse), so [`crate::auth::AuthService`] logs and
+    /// swallows any `Err` from this instead of propagating it.
+    async fn record_audit(&self, event: AuditEvent) -> Result<(), DirectoryError>;
 }
 
 #[async_trait::async_trait]
@@ -150,6 +176,30 @@ impl StaffDirectory for loom_persist::Persist {
 
     async fn github_lookup(&self, github_id: i64) -> Result<Option<String>, DirectoryError> {
         loom_persist::Persist::github_lookup(self, github_id)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn record_audit(&self, event: AuditEvent) -> Result<(), DirectoryError> {
+        let detail = serde_json::json!({
+            "ip": event.ip.map(|ip| ip.to_string()),
+            "user_agent": event.user_agent,
+            "detail": event.detail,
+        })
+        .to_string();
+        let row = loom_persist::AuditRow {
+            at: time::OffsetDateTime::now_utc(),
+            kind: event.kind.to_string(),
+            caller: event.uid,
+            effective_principal: None,
+            apply: None,
+            class: None,
+            argument: None,
+            guard_set: Vec::new(),
+            verdict: event.verdict.to_string(),
+            detail: Some(detail),
+        };
+        loom_persist::Persist::insert_audit_batch(self, std::slice::from_ref(&row))
             .await
             .map_err(|_| DirectoryError)
     }
