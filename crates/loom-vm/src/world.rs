@@ -606,6 +606,7 @@ impl World {
             last_call_out_quota_uid: None,
             tick_share: HashMap::new(),
             disk_usage: crate::disk_usage::DiskUsage::default(),
+            errors: crate::errors::ErrorInbox::new(),
         })
     }
 
@@ -833,25 +834,43 @@ impl World {
         result
     }
 
-    /// Record `e` in the error inbox (OBI-169), attributed to `acting`'s
-    /// leaf program at the time of the error. Not necessarily where the
-    /// error actually originated -- a cross-object/program call chain can
-    /// fail several frames deep -- see `crate::errors`'s module doc for
-    /// the flagged `(program, function, message)` grouping deviation from
-    /// the spec's `(program, line, message)`.
+    /// Record `e` in the error inbox (OBI-169), attributed to the
+    /// **innermost** frame's own declaring program (`e.trace_programs`'s
+    /// first entry -- most recent frame first, same order as
+    /// `e.trace`), falling back to `acting`'s own program only when the
+    /// error carries no trace at all (raised before any frame ever
+    /// pushed, e.g. `start`'s "no function" lookup failure).
+    ///
+    /// CTO review (OBI-169, PR #72, must-fix 1): attributing to
+    /// `acting`'s program instead -- the *entry* object, not where the
+    /// error actually originated -- would leak a `/secure` program's
+    /// error message (which can embed input) to anyone who can
+    /// `valid_read` the entry object's own, less-privileged program, any
+    /// time a cross-object/program call chain (`call_other`, an apply)
+    /// fails several frames deep inside something the caller could never
+    /// read directly. The grouping key's `program` (and the redaction
+    /// rule below) must both be keyed on the real origin.
     fn note_error(&mut self, acting: ObjectId, e: &RtError) {
-        let program = self
-            .registry
-            .get(acting)
-            .map(|o| o.program.path.to_string())
-            .unwrap_or_else(|| "?".to_string());
+        let program = e.trace_programs.first().cloned().unwrap_or_else(|| {
+            self.registry
+                .get(acting)
+                .map(|o| o.program.path.to_string())
+                .unwrap_or_else(|| "?".to_string())
+        });
         let function = crate::errors::function_of(e);
         let now_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        self.errors
-            .record(&program, &function, &e.message, &e.trace, now_unix_ms);
+        let redacted = program.starts_with("/secure/");
+        self.errors.record(
+            &program,
+            &function,
+            &e.message,
+            &e.trace,
+            now_unix_ms,
+            redacted,
+        );
     }
 
     /// The grouped runtime-error inbox (OBI-169), unfiltered by

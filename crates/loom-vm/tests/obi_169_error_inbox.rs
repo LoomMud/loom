@@ -67,7 +67,11 @@ fn a_different_message_on_the_same_program_is_a_different_group() {
         world.tick(&mut host);
 
         let rows = world.errors_snapshot(None);
-        assert_eq!(rows.len(), 2, "player's and vault's errors are distinct groups");
+        assert_eq!(
+            rows.len(),
+            2,
+            "player's and vault's errors are distinct groups"
+        );
         assert!(rows.iter().any(|r| r.program == "/std/player"));
         assert!(rows.iter().any(|r| r.program == "/std/vault"));
     });
@@ -122,5 +126,103 @@ fn the_errors_efun_prefix_filter_narrows_by_program() {
 
         world.input(1, "errorcount /nowhere", &mut host);
         assert_eq!(host.take(1), "0\n");
+    });
+}
+
+/// CTO review (OBI-169, PR #72, must-fix 1): a `/std` object that calls
+/// into a program it has no `valid_read` access to must not leak that
+/// program's error under its own (readable) entry. Before the fix,
+/// `note_error` attributed every error to the *entry* object's own
+/// program (`acting`) regardless of which program actually raised it --
+/// so `/std/player` calling into `/secure/leak` (denied by this
+/// fixture's `valid_read`) would have recorded the error under
+/// `/std/player`, which the caller can always read, leaking `/secure`
+/// error text to it. After the fix, the entry is attributed to
+/// `/secure/leak` itself, and the per-program `valid_read` filter the
+/// `errors` efun already applies hides it from this caller entirely --
+/// same as it already hides a denied program's *own* errors (the
+/// `/std/vault` case above), just now also covering an error that
+/// originated several frames deep inside a call chain the entry object
+/// started.
+#[test]
+fn a_denied_programs_error_raised_through_a_call_chain_is_attributed_to_it_not_the_caller() {
+    on_world_thread(|| {
+        let root = fixture("errors_inbox");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host);
+        host.take(1);
+
+        world.input(1, "triggerleak", &mut host);
+        let reply = host.take(1);
+        assert!(
+            reply.contains("random(): n must be > 0"),
+            "the error still propagates to the caller as a reported error: {reply}"
+        );
+
+        // The Rust-side inbox (no permission filter) attributes the
+        // error to `/secure/leak`, the program that actually raised it --
+        // never to `/std/player`, the entry object that merely called
+        // into it.
+        let rows = world.errors_snapshot(None);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].program, "/secure/leak");
+        assert!(
+            rows[0].redacted,
+            "a /secure/** origin is always recorded redacted"
+        );
+
+        // The in-game `errors()` efun, filtered by the caller's own
+        // `valid_read`, sees nothing at all: `/secure/leak` is denied,
+        // and (unlike the pre-fix behaviour) there is no `/std/player`
+        // entry for this error to hide behind.
+        world.input(1, "errorcount", &mut host);
+        assert_eq!(host.take(1), "0\n");
+    });
+}
+
+/// CTO review (OBI-169, PR #72, must-fix 2): a `/secure/**` origin's
+/// message is shown as `"<redacted>"` to anyone below T5, and as the
+/// real text only to T5 -- independent of whether `valid_read` itself
+/// allows the program (`/secure/vault2` does, unlike `/secure/leak`
+/// above, so this isolates the message-redaction rule from the
+/// program-visibility filter).
+#[test]
+fn a_secure_origins_message_is_redacted_below_t5_and_shown_at_t5() {
+    on_world_thread(|| {
+        let root = fixture("errors_inbox");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host);
+        host.take(1);
+
+        world.input(1, "triggervault2", &mut host);
+        host.take(1);
+
+        let rows = world.errors_snapshot(None);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].program, "/secure/vault2");
+        assert!(rows[0].redacted);
+        assert_eq!(
+            rows[0].message, "random(): n must be > 0",
+            "the Rust-side inbox (no permission/redaction filter) always has the real text"
+        );
+
+        // Below T5 (this fixture's default, no roles snapshot at all):
+        // the `errors` efun shows the flag but masks the message.
+        world.input(1, "errormessage /secure/vault2", &mut host);
+        assert_eq!(host.take(1), "<redacted>\n");
+
+        // At T5 (`seteuid` to an account this fixture's roles snapshot
+        // maps to tier 5, mirroring a real post-auth `seteuid`): the real
+        // message is shown.
+        world.set_roles_snapshot(std::sync::Arc::new(
+            loom_vm::RolesSnapshot::from_seed_json(r#"{"staff": {"root-tester": 5}}"#)
+                .expect("seed parses"),
+        ));
+        world.input(1, "become root-tester", &mut host);
+        assert_eq!(host.take(1), "ok\n");
+        world.input(1, "errormessage /secure/vault2", &mut host);
+        assert_eq!(host.take(1), "random(): n must be > 0\n");
     });
 }

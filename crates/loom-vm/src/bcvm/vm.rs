@@ -46,6 +46,19 @@ use crate::security::GuardSet;
 pub struct RtError {
     pub message: String,
     pub trace: Vec<String>,
+    /// CTO review (OBI-169, PR #72, must-fix 1): the declaring program
+    /// path for each matching entry in [`Self::trace`] (same length,
+    /// same "most recent frame first" order, `"?"` for a frame with no
+    /// known program -- e.g. the interpreter's own hand-assembled base
+    /// module in unit tests). This is what lets the error inbox
+    /// (`crate::errors`) attribute an error to the program that actually
+    /// raised it (the innermost frame) instead of the entry object's own
+    /// program, which can be a different, less-privileged one several
+    /// `call_other`/apply frames up the chain -- attributing to the
+    /// entry object would otherwise leak a `/secure` program's error
+    /// message to whatever `valid_read` lets the entry object's own
+    /// program see.
+    pub trace_programs: Vec<String>,
     /// `false` for tick/call-depth exhaustion (spec: not catchable — a
     /// `try`/`catch` in the unwind path must not stop it). `true` for
     /// everything else, including `throw` and ordinary runtime errors
@@ -62,6 +75,7 @@ impl RtError {
         RtError {
             message: message.into(),
             trace: Vec::new(),
+            trace_programs: Vec::new(),
             catchable: true,
             thrown: None,
         }
@@ -80,6 +94,7 @@ impl RtError {
         RtError {
             message,
             trace: Vec::new(),
+            trace_programs: Vec::new(),
             catchable: true,
             thrown: Some(value),
         }
@@ -115,6 +130,14 @@ pub trait ProgramCode {
     /// file).
     fn version(&self) -> u32 {
         0
+    }
+    /// This program's declaring path (`/std/player`, ...), for
+    /// [`RtError::trace_programs`] (OBI-169, CTO review on PR #72,
+    /// must-fix 1). `None` for anything with no real mudlib path (the
+    /// hand-assembled test modules in this file) -- callers fall back to
+    /// `"?"`, same as a frame with no trace at all.
+    fn program_path(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -476,6 +499,19 @@ pub struct Interpreter<'a, H: Host> {
     stack: Vec<Frame>,
     /// Suspend-at-`TickCheck` countdown (D26 test hook); `None` = never.
     suspend_after: Option<u64>,
+    /// The declaring program of `module` itself (OBI-169, CTO review on
+    /// PR #72, must-fix 1): the base-module fallback for
+    /// [`RtError::trace_programs`] when a frame's own `code` is `None`
+    /// (every frame actually run by *this* `Interpreter` instance, since
+    /// `code: None` means "the module this `Interpreter` itself was
+    /// constructed with", not "unknown"). `None` for every call site that
+    /// doesn't know/care (every hand-assembled test module in this file,
+    /// and the base driver module efun dispatch runs against) -- those
+    /// fall back to `"?"`, same as before this field existed. Set via
+    /// [`Self::with_base_program`] by [`crate::bcvm::registry::
+    /// RegistryHost::call_in`], the one real call site that runs a named
+    /// *program's* own module as this `Interpreter`'s base.
+    base_program: Option<Rc<str>>,
 }
 
 impl<'a, H: Host> Interpreter<'a, H> {
@@ -492,7 +528,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
             ticks_left,
             stack: Vec::new(),
             suspend_after: None,
+            base_program: None,
         }
+    }
+
+    /// See [`Self::base_program`]'s doc.
+    pub fn with_base_program(mut self, path: Rc<str>) -> Self {
+        self.base_program = Some(path);
+        self
     }
 
     /// D26 test hook: park the whole call chain at the `n`th `TickCheck`
@@ -769,15 +812,37 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     // Any trace already on `e` came from deeper, non-flat
                     // execution (a driver efun's nested run); append every
                     // live frame of this stack beneath it once, then unwind.
+                    // `trace_programs` is extended in lockstep (same
+                    // length, same order, OBI-169 CTO review on PR #72
+                    // must-fix 1) so the error inbox can attribute to the
+                    // *innermost* frame's own declaring program rather
+                    // than the entry object's.
                     if e.trace.len() < 12 {
+                        let take = 12 - e.trace.len();
                         let names: Vec<String> = self
                             .stack
                             .iter()
                             .rev()
-                            .take(12 - e.trace.len())
+                            .take(take)
                             .map(|f| format!("in {}()", self.frame_name(f)))
                             .collect();
+                        let programs: Vec<String> = self
+                            .stack
+                            .iter()
+                            .rev()
+                            .take(take)
+                            .map(|f| {
+                                f.code
+                                    .as_ref()
+                                    .and_then(|c| c.program_path())
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| {
+                                        self.base_program.as_deref().unwrap_or("?").to_string()
+                                    })
+                            })
+                            .collect();
                         e.trace.extend(names);
+                        e.trace_programs.extend(programs);
                     }
                     while !self.stack.is_empty() {
                         self.pop_frame_on_error();

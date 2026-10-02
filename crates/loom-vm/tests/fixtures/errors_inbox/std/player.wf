@@ -16,6 +16,13 @@ pub fn process_input(line: string) {
     } else if verb == "spawnvault" {
         clone_object("/std/vault")
         send(self, "spawned\n")
+    } else if verb == "triggerleak" {
+        load_object("/secure/leak").boom()
+    } else if verb == "triggervault2" {
+        load_object("/secure/vault2").boom()
+    } else if verb == "become" and len(words) == 2 {
+        seteuid(words[1])
+        send(self, "ok\n")
     } else if verb == "errorcount" {
         var filter = ""
         if len(words) == 2 {
@@ -23,6 +30,14 @@ pub fn process_input(line: string) {
         }
         let rows = errors(filter)
         send(self, $"{len(rows)}\n")
+    } else if verb == "errormessage" and len(words) == 2 {
+        let rows = errors(words[1])
+        if len(rows) == 0 {
+            send(self, "none\n")
+        } else {
+            let m = rows[0]["message"] ?? "?"
+            send(self, $"{m}\n")
+        }
     } else {
         send(self, "What?\n")
     }
