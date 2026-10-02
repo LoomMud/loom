@@ -389,7 +389,13 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
         ),
         // Spec Phase 2 B5, OBI-170: see `loom_vm::efuns` for the
         // authoritative arity/privilege/tick cost.
-        "profile_start" => ("profile_start", vec![P(s.clone())], 1, Ret::Ty(Ty::Void), P1),
+        "profile_start" => (
+            "profile_start",
+            vec![P(s.clone())],
+            1,
+            Ret::Ty(Ty::Void),
+            P1,
+        ),
         "profile_stop" => ("profile_stop", vec![], 0, Ret::Ty(Ty::String), P1),
         _ => return None,
     };
