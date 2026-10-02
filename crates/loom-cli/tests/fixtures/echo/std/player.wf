@@ -1,0 +1,25 @@
+// OBI-176 fixture: a minimal login-style state machine exercising
+// set_echo() around a password prompt, independent of /secure/login's
+// full account machinery.
+var state: string = "name"
+
+pub fn logon() {
+    send(self, "Name: ")
+}
+
+pub fn process_input(line: string) {
+    if state == "name" {
+        state = "password"
+        set_echo(self, false)
+        send(self, "Password: ")
+    } else if state == "password" {
+        set_echo(self, true)
+        state = "done"
+        send(self, $"Welcome, {trim(line)}.\n")
+    } else {
+        send(self, "ok\n")
+    }
+}
+
+pub fn net_dead() {
+}

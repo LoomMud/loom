@@ -56,6 +56,12 @@ enum ServerEnvelope<'a> {
         package: &'a str,
         payload: &'a serde_json::Value,
     },
+    /// WS equivalent of telnet's `IAC WILL/WONT ECHO` (OBI-176): the web
+    /// client masks its input field while `enabled` is `false` and
+    /// restores plain text entry once it comes back `true`.
+    Echo {
+        enabled: bool,
+    },
 }
 
 /// Runs one accepted WebSocket connection. Mirrors `run_connection` in
@@ -96,6 +102,12 @@ pub(crate) async fn run_ws_connection(
                     ConnControl::Close => {
                         let _ = sink.send(Message::Close(None)).await;
                         break;
+                    }
+                    ConnControl::SetEcho(enabled) => {
+                        let env = ServerEnvelope::Echo { enabled };
+                        if send_json(&mut sink, &env).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }

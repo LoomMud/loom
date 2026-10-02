@@ -36,6 +36,12 @@ use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 use tracing::debug;
 
+pub mod auth;
+mod client_ip;
+mod handlers;
+
+pub use handlers::auth_router;
+
 /// Shared state for `loom-http`'s routes.
 #[derive(Clone)]
 pub struct HttpState {
@@ -43,6 +49,8 @@ pub struct HttpState {
     readiness: Readiness,
     metrics: PrometheusMetrics,
     web_root: Option<PathBuf>,
+    auth: Option<auth::AuthService>,
+    github: Option<std::sync::Arc<dyn auth::GithubIdentityProvider>>,
 }
 
 impl HttpState {
@@ -56,6 +64,8 @@ impl HttpState {
             readiness,
             metrics,
             web_root: None,
+            auth: None,
+            github: None,
         }
     }
 
@@ -63,6 +73,23 @@ impl HttpState {
     /// router fallback (OBI-158). Unset by default -- see `LOOM_WEB_ROOT`.
     pub fn with_web_root(mut self, root: PathBuf) -> Self {
         self.web_root = Some(root);
+        self
+    }
+
+    /// Mount `/auth/*` (OBI-174): staff login, refresh, logout, TOTP
+    /// enrolment/verification. Unset by default -- `loom-cli` only calls
+    /// this when Postgres (`LOOM_DATABASE_URL`) and a JWT secret
+    /// (`LOOM_JWT_SECRET`) are both configured.
+    pub fn with_auth(mut self, auth: auth::AuthService) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Mount `/auth/github/callback` (OBI-174, optional). Unset by
+    /// default; requires [`Self::with_auth`] to also be set, since GitHub
+    /// login still goes through the same `AuthService`.
+    pub fn with_github(mut self, github: std::sync::Arc<dyn auth::GithubIdentityProvider>) -> Self {
+        self.github = Some(github);
         self
     }
 }
@@ -74,6 +101,7 @@ pub fn app(state: HttpState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .merge(handlers::auth_router())
         .with_state(state);
     match web_root {
         Some(root) => router.fallback_service(ServeDir::new(root)),
