@@ -13,6 +13,7 @@
 pub mod bcvm;
 pub mod disk_usage;
 pub mod efuns;
+pub mod errors;
 pub mod fileio;
 pub mod host;
 pub mod object;

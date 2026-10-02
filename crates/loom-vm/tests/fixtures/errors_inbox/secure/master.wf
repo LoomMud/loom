@@ -1,0 +1,28 @@
+// Master object for the OBI-169 error-inbox fixture: like `tworoom`'s
+// master (every efun/path allowed) except `valid_read` denies the
+// `/std/vault` program specifically, so `tests/obi_169_error_inbox.rs` can
+// exercise the `errors` efun's per-program permission filter without a
+// full tier/roles setup.
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return path != "/std/vault"
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}
