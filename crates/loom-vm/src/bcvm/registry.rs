@@ -1129,6 +1129,102 @@ enum JournalEntry {
     },
 }
 
+/// Validate every cross-reference a decoded snapshot carries *before*
+/// [`Registry::restore`] touches `self` with any of it (PR #69 review,
+/// OBI-173 R1): a snapshot file is attacker-reachable the moment it
+/// touches disk or a copyover channel (same trust boundary as
+/// `crate::snapshot`'s own module docs), so a hand-crafted or merely
+/// corrupt file must become a clean `Err` here, never a `Registry` left
+/// with a dangling `ObjectId`, a `free` list that hands out a live slot
+/// as empty, or an `env`/`inventory` pair that disagree about who
+/// contains whom.
+///
+/// Checks, in order:
+/// - every `env`/`inventory`/`conns`/`names` [`ObjectId`] points at a
+///   slot that is both in range and *live* (`Some` object) with a
+///   matching `generation` -- a stale generation is exactly the "this
+///   object was destroyed and its slot reused" case [`ObjectId`] exists
+///   to detect;
+/// - every `free` entry is an in-range, *empty* slot, and the list has no
+///   duplicate index (two free-list entries for the same slot would let
+///   two different `instantiate` calls hand out the same `ObjectId`);
+/// - every live object whose `env` is `Some(e)` is actually present in
+///   `e`'s own `inventory` (the two sides of placement must agree, or a
+///   later `move_object`/`destruct` walk -- which trusts exactly this
+///   invariant -- silently corrupts the graph instead of panicking or
+///   erroring).
+fn validate_decoded_snapshot(snap: &crate::snapshot::DecodedSnapshot) -> Result<(), String> {
+    let slot_count = snap.slots.len();
+
+    let live_generation = |idx: u32| -> Option<u32> {
+        snap.slots
+            .get(idx as usize)
+            .and_then(|(generation, obj)| obj.as_ref().map(|_| *generation))
+    };
+
+    let check_id = |id: ObjectId, what: &str| -> Result<(), String> {
+        match live_generation(id.index) {
+            Some(g) if g == id.generation => Ok(()),
+            Some(g) => Err(format!(
+                "{what} references object {}#{} but the live slot's generation is {g}",
+                id.index, id.generation
+            )),
+            None => Err(format!(
+                "{what} references object {}#{} but slot {} is empty or out of range",
+                id.index, id.generation, id.index
+            )),
+        }
+    };
+
+    let mut seen_free = std::collections::HashSet::new();
+    for &idx in &snap.free {
+        if idx as usize >= slot_count {
+            return Err(format!("free list references out-of-range slot {idx}"));
+        }
+        if snap.slots[idx as usize].1.is_some() {
+            return Err(format!("free list references live slot {idx}"));
+        }
+        if !seen_free.insert(idx) {
+            return Err(format!("free list contains duplicate slot {idx}"));
+        }
+    }
+
+    for (name, id) in &snap.names {
+        check_id(*id, &format!("name {name:?}"))?;
+    }
+    for (conn, id) in &snap.conns {
+        check_id(*id, &format!("connection {conn}"))?;
+    }
+
+    for (i, (generation, obj)) in snap.slots.iter().enumerate() {
+        let Some(obj) = obj else { continue };
+        let this_id = ObjectId {
+            index: i as u32,
+            generation: *generation,
+        };
+        if let Some(env) = obj.env {
+            check_id(env, &format!("object {:?} (slot {i}) env", obj.name))?;
+            // `check_id` above already proved `env.index` is in range and
+            // live, so the slot access here cannot panic.
+            let env_obj = snap.slots[env.index as usize].1.as_ref().unwrap();
+            if !env_obj.inventory.contains(&this_id) {
+                return Err(format!(
+                    "object {:?} (slot {i}) has env slot {} but is not in that object's inventory",
+                    obj.name, env.index
+                ));
+            }
+        }
+        for inv_id in &obj.inventory {
+            check_id(
+                *inv_id,
+                &format!("object {:?} (slot {i}) inventory", obj.name),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 impl Registry {
     pub fn register_program(&mut self, prog: Rc<CompiledProgram>) {
         self.programs.insert(prog.path.to_string(), prog);
@@ -1313,6 +1409,14 @@ impl Registry {
     /// `env`/`inventory`/`conns`/`names` reference the snapshot carried
     /// stays valid without any remapping pass.
     ///
+    /// Every cross-reference the snapshot carries is validated by
+    /// [`validate_decoded_snapshot`] *before* anything below touches
+    /// `self` (PR #69 review, OBI-173 R1): a corrupt or hand-crafted
+    /// snapshot must become a clean `Err`, never a `Registry` with a
+    /// dangling `env`/`inventory`/`conns`/`names` reference or a
+    /// `free` list that silently hands out a live slot as if it were
+    /// empty.
+    ///
     /// `compiler` compiles (or reuses an already-compiled) program for
     /// every distinct path referenced by a restored object, exactly like a
     /// normal boot would -- a binary snapshot carries *dynamic* state
@@ -1325,6 +1429,7 @@ impl Registry {
         snap: crate::snapshot::DecodedSnapshot,
         compiler: &mut Compiler,
     ) -> Result<(), String> {
+        validate_decoded_snapshot(&snap)?;
         let mut syms = Interner::default();
         for name in &snap.sym_names {
             syms.intern(name);

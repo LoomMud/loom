@@ -97,6 +97,13 @@ pub enum SnapshotError {
     /// `Registry` (e.g. a program path that no longer compiles against
     /// the standby's `mudlib_root`).
     Restore(String),
+    /// A `Value` nested more than [`MAX_VALUE_NESTING`] containers deep,
+    /// either while encoding a live value or while decoding bytes
+    /// (PR #69 review, OBI-173 R1): a crafted/corrupt input can otherwise
+    /// recurse the native stack straight through its guard page and
+    /// abort the process rather than failing cleanly, same trust-boundary
+    /// concern as every other variant here.
+    NestingTooDeep,
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -121,6 +128,10 @@ impl std::fmt::Display for SnapshotError {
             ),
             SnapshotError::Corrupt(msg) => write!(f, "snapshot file is corrupt: {msg}"),
             SnapshotError::Restore(msg) => write!(f, "cannot restore snapshot: {msg}"),
+            SnapshotError::NestingTooDeep => write!(
+                f,
+                "snapshot value nesting exceeds the {MAX_VALUE_NESTING}-container limit"
+            ),
         }
     }
 }
@@ -193,6 +204,18 @@ impl<'a> Cursor<'a> {
         Ok(s)
     }
 
+    /// Bytes left in the stream -- an upper bound on how many *elements*
+    /// a length-prefixed section can possibly hold (every element is at
+    /// least one byte), used to clamp an untrusted count before it is
+    /// handed to `Vec::with_capacity`/`HashMap::with_capacity` (PR #69
+    /// review, OBI-173 R1: a crafted file's declared count must not be
+    /// able to request an allocation far larger than the bytes actually
+    /// available, which can abort the process rather than failing
+    /// cleanly).
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
     fn u8(&mut self) -> Result<u8, SnapshotError> {
         Ok(self.take(1, "u8")?[0])
     }
@@ -211,6 +234,15 @@ impl<'a> Cursor<'a> {
     fn f64(&mut self) -> Result<f64, SnapshotError> {
         Ok(f64::from_bits(self.u64()?))
     }
+    /// A trusted element count to preallocate with: never more than the
+    /// bytes actually remaining in the stream, so a bogus huge count in a
+    /// small/truncated buffer clamps down to a small, harmless
+    /// allocation instead of requesting (and aborting the process on)
+    /// tens of gigabytes.
+    fn bounded_count(&self, n: u32) -> usize {
+        (n as usize).min(self.remaining())
+    }
+
     fn bytes(&mut self) -> Result<Vec<u8>, SnapshotError> {
         let n = self.u32()? as usize;
         Ok(self.take(n, "length-prefixed bytes")?.to_vec())
@@ -238,7 +270,25 @@ impl<'a> Cursor<'a> {
 // Value encode/decode
 // ---------------------------------------------------------------------
 
+/// Container nesting limit shared by [`encode_value`]/[`decode_value`]
+/// (PR #69 review, OBI-173 R1): neither recurses without bound, so a
+/// crafted/corrupt input (or a pathologically deep live value) cannot
+/// blow the native stack and abort the process -- it gets a clean
+/// [`SnapshotError::NestingTooDeep`] instead. Chosen to match
+/// [`crate::bcvm::vm::Limits::max_depth`]'s own default (512): there is
+/// no separate "container nesting" limit elsewhere in the VM to reuse, so
+/// this mirrors the Weft call-depth default per the review's own
+/// fallback.
+const MAX_VALUE_NESTING: usize = 512;
+
 fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), SnapshotError> {
+    encode_value_at(v, out, 0)
+}
+
+fn encode_value_at(v: &Value, out: &mut Vec<u8>, depth: usize) -> Result<(), SnapshotError> {
+    if depth > MAX_VALUE_NESTING {
+        return Err(SnapshotError::NestingTooDeep);
+    }
     match v {
         Value::Null => w_u8(out, 0),
         Value::Bool(b) => {
@@ -266,15 +316,15 @@ fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), SnapshotError> {
                 w_u8(out, 6);
                 w_u32(out, a.items().len() as u32);
                 for item in a.items() {
-                    encode_value(item, out)?;
+                    encode_value_at(item, out, depth + 1)?;
                 }
             }
             HeapObj::Map(m) => {
                 w_u8(out, 7);
                 w_u32(out, m.entries.len() as u32);
                 for (k, v) in &m.entries {
-                    encode_value(k, out)?;
-                    encode_value(v, out)?;
+                    encode_value_at(k, out, depth + 1)?;
+                    encode_value_at(v, out, depth + 1)?;
                 }
             }
             HeapObj::Struct(s) => {
@@ -284,7 +334,7 @@ fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), SnapshotError> {
                 w_u32(out, s.fields.len() as u32);
                 for (name, val) in &s.fields {
                     w_str(out, name);
-                    encode_value(val, out)?;
+                    encode_value_at(val, out, depth + 1)?;
                 }
             }
             HeapObj::Enum(e) => {
@@ -294,7 +344,7 @@ fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), SnapshotError> {
                 w_str(out, &e.variant);
                 w_u32(out, e.payload.len() as u32);
                 for val in &e.payload {
-                    encode_value(val, out)?;
+                    encode_value_at(val, out, depth + 1)?;
                 }
             }
             HeapObj::Fn(_) => return Err(SnapshotError::UnsupportedValue("function")),
@@ -304,6 +354,13 @@ fn encode_value(v: &Value, out: &mut Vec<u8>) -> Result<(), SnapshotError> {
 }
 
 fn decode_value(c: &mut Cursor) -> Result<Value, SnapshotError> {
+    decode_value_at(c, 0)
+}
+
+fn decode_value_at(c: &mut Cursor, depth: usize) -> Result<Value, SnapshotError> {
+    if depth > MAX_VALUE_NESTING {
+        return Err(SnapshotError::NestingTooDeep);
+    }
     let tag = c.u8()?;
     Ok(match tag {
         0 => Value::Null,
@@ -313,19 +370,19 @@ fn decode_value(c: &mut Cursor) -> Result<Value, SnapshotError> {
         4 => Value::Object(c.obj_id()?),
         5 => Value::str(&c.string()?),
         6 => {
-            let n = c.u32()? as usize;
-            let mut items = Vec::with_capacity(n);
+            let n = c.u32()?;
+            let mut items = Vec::with_capacity(c.bounded_count(n));
             for _ in 0..n {
-                items.push(decode_value(c)?);
+                items.push(decode_value_at(c, depth + 1)?);
             }
             Value::array(items)
         }
         7 => {
-            let n = c.u32()? as usize;
+            let n = c.u32()?;
             let mut m = MapData::default();
             for _ in 0..n {
-                let k = decode_value(c)?;
-                let v = decode_value(c)?;
+                let k = decode_value_at(c, depth + 1)?;
+                let v = decode_value_at(c, depth + 1)?;
                 m.insert(k, v);
             }
             Value::map(m)
@@ -333,11 +390,11 @@ fn decode_value(c: &mut Cursor) -> Result<Value, SnapshotError> {
         8 => {
             let module: Rc<str> = c.string()?.into();
             let name: Rc<str> = c.string()?.into();
-            let n = c.u32()? as usize;
-            let mut fields = Vec::with_capacity(n);
+            let n = c.u32()?;
+            let mut fields = Vec::with_capacity(c.bounded_count(n));
             for _ in 0..n {
                 let fname: Rc<str> = c.string()?.into();
-                let v = decode_value(c)?;
+                let v = decode_value_at(c, depth + 1)?;
                 fields.push((fname, v));
             }
             Value::struct_val(StructVal {
@@ -350,10 +407,10 @@ fn decode_value(c: &mut Cursor) -> Result<Value, SnapshotError> {
             let module: Rc<str> = c.string()?.into();
             let name: Rc<str> = c.string()?.into();
             let variant: Rc<str> = c.string()?.into();
-            let n = c.u32()? as usize;
-            let mut payload = Vec::with_capacity(n);
+            let n = c.u32()?;
+            let mut payload = Vec::with_capacity(c.bounded_count(n));
             for _ in 0..n {
-                payload.push(decode_value(c)?);
+                payload.push(decode_value_at(c, depth + 1)?);
             }
             Value::enum_val(EnumVal {
                 module,
@@ -546,7 +603,7 @@ fn decode_object(c: &mut Cursor) -> Result<DecodedObject, SnapshotError> {
     let name = c.string()?;
     let program_path = c.string()?;
     let vars_count = c.u32()? as usize;
-    let mut vars = Vec::with_capacity(vars_count);
+    let mut vars = Vec::with_capacity(vars_count.min(c.remaining()));
     for _ in 0..vars_count {
         let decl: Rc<str> = c.string()?.into();
         let var_name: Rc<str> = c.string()?.into();
@@ -555,7 +612,7 @@ fn decode_object(c: &mut Cursor) -> Result<DecodedObject, SnapshotError> {
     }
     let env = c.opt_obj_id()?;
     let inv_count = c.u32()? as usize;
-    let mut inventory = Vec::with_capacity(inv_count);
+    let mut inventory = Vec::with_capacity(inv_count.min(c.remaining()));
     for _ in 0..inv_count {
         inventory.push(c.obj_id()?);
     }
@@ -602,13 +659,13 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotError> {
     let rng_state = c.u64()?;
 
     let free_count = c.u32()? as usize;
-    let mut free = Vec::with_capacity(free_count);
+    let mut free = Vec::with_capacity(free_count.min(c.remaining()));
     for _ in 0..free_count {
         free.push(c.u32()?);
     }
 
     let names_count = c.u32()? as usize;
-    let mut names = HashMap::with_capacity(names_count);
+    let mut names = HashMap::with_capacity(names_count.min(c.remaining()));
     for _ in 0..names_count {
         let name = c.string()?;
         let id = c.obj_id()?;
@@ -616,7 +673,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotError> {
     }
 
     let conns_count = c.u32()? as usize;
-    let mut conns = HashMap::with_capacity(conns_count);
+    let mut conns = HashMap::with_capacity(conns_count.min(c.remaining()));
     for _ in 0..conns_count {
         let conn = c.u64()?;
         let id = c.obj_id()?;
@@ -624,7 +681,7 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotError> {
     }
 
     let bind_seq_count = c.u32()? as usize;
-    let mut bind_seq = HashMap::with_capacity(bind_seq_count);
+    let mut bind_seq = HashMap::with_capacity(bind_seq_count.min(c.remaining()));
     for _ in 0..bind_seq_count {
         let conn = c.u64()?;
         let seq = c.u64()?;
@@ -632,12 +689,12 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotError> {
     }
 
     let sym_count = c.u32()? as usize;
-    let mut sym_names = Vec::with_capacity(sym_count);
+    let mut sym_names = Vec::with_capacity(sym_count.min(c.remaining()));
     for _ in 0..sym_count {
         sym_names.push(c.string()?);
     }
 
-    let mut slots = Vec::with_capacity(slot_count);
+    let mut slots = Vec::with_capacity(slot_count.min(c.remaining()));
     for _ in 0..slot_count {
         let generation = c.u32()?;
         let has_obj = c.u8()?;
@@ -660,4 +717,102 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, SnapshotError> {
         rng_state,
         sym_names,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR #69 review item 1: a crafted file can declare a `free_count`
+    /// (or any other length-prefixed count) far larger than the bytes
+    /// actually backing it. Before the fix this fed straight into
+    /// `Vec::with_capacity`, which can abort the whole process on an
+    /// allocation failure for an untrusted input that never touched the
+    /// heap otherwise. After the fix the capacity is clamped to the
+    /// remaining byte count, and the stream still fails -- cleanly, as a
+    /// typed [`SnapshotError`] -- once it actually runs out of bytes.
+    #[test]
+    fn huge_declared_count_in_a_tiny_buffer_is_a_typed_error_not_an_abort() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SNAPSHOT_MAGIC);
+        bytes.extend_from_slice(&SNAPSHOT_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&SNAPSHOT_ABI_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // slot_count
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // next_clone
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // next_bind_seq
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // rng_state
+        // free_count: a crafted file asking for ~4 billion `u32`s (~16GB)
+        // with zero bytes left in the stream to back them.
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let err = decode_snapshot(&bytes)
+            .err()
+            .expect("a huge declared count backed by a tiny buffer must not decode");
+        assert!(matches!(err, SnapshotError::Truncated(_)), "{err:?}");
+    }
+
+    /// Same bug, a different section: a `vars`/`inventory` count inside an
+    /// object record is just as untrusted as the top-level ones.
+    #[test]
+    fn huge_object_section_count_in_a_tiny_buffer_is_a_typed_error_not_an_abort() {
+        let mut bytes = Vec::new();
+        w_str(&mut bytes, "thing"); // name
+        w_str(&mut bytes, "/std/thing"); // program_path
+        // vars_count: huge, with nothing behind it.
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut c = Cursor::new(&bytes);
+        let err = decode_object(&mut c)
+            .err()
+            .expect("a huge vars count backed by a tiny buffer must not decode");
+        assert!(matches!(err, SnapshotError::Truncated(_)), "{err:?}");
+    }
+
+    /// PR #69 review item 2: `encode_value`/`decode_value` recursed with
+    /// no depth limit, so a deeply nested live value (encode side) or a
+    /// crafted deeply-nested byte stream (decode side) could blow the
+    /// native stack and abort the process instead of failing cleanly.
+    #[test]
+    fn deeply_nested_value_is_a_typed_error_on_both_the_encode_and_decode_path() {
+        // Run on a dedicated, generously-sized stack: this test's own
+        // *fixture* (an owned, ~530-deep nested `Value`) recurses on drop
+        // (plain compiler-generated drop glue, unrelated to the bounded
+        // `encode_value`/`decode_value` under test here), which is enough
+        // to overflow a default debug-build test-thread stack on its own.
+        // The guard this test actually exists to prove -- that
+        // `encode_value`/`decode_value` refuse to recurse past
+        // `MAX_VALUE_NESTING` in the first place -- does not depend on
+        // the stack size at all.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                // Encode side: a value nested well past the limit, built
+                // iteratively (not recursively) so *building* it can't
+                // itself blow the stack.
+                let mut v = Value::Int(0);
+                for _ in 0..(MAX_VALUE_NESTING + 16) {
+                    v = Value::array(vec![v]);
+                }
+                let mut out = Vec::new();
+                let err =
+                    encode_value(&v, &mut out).expect_err("nesting limit must trip on encode");
+                assert!(matches!(err, SnapshotError::NestingTooDeep), "{err:?}");
+
+                // Decode side: a byte stream of nothing but "array of one
+                // item" tags, deep enough to trip the same limit before
+                // the stream ever runs out of bytes -- this is testing
+                // the depth guard itself, not truncation.
+                let mut bytes = Vec::new();
+                for _ in 0..(MAX_VALUE_NESTING + 16) {
+                    w_u8(&mut bytes, 6); // array tag
+                    w_u32(&mut bytes, 1); // one item
+                }
+                w_u8(&mut bytes, 0); // innermost element: Null
+                let mut c = Cursor::new(&bytes);
+                let err = decode_value(&mut c).expect_err("nesting limit must trip on decode");
+                assert!(matches!(err, SnapshotError::NestingTooDeep), "{err:?}");
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("test thread panicked");
+    }
 }

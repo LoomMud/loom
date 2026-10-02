@@ -148,6 +148,182 @@ fn bad_magic_and_bad_abi_are_clean_errors_not_panics() {
     );
 }
 
+/// PR #69 review item 3: `Registry::restore` must validate every
+/// cross-reference a decoded snapshot carries *before* installing
+/// anything, so a tampered/corrupt snapshot becomes a clean `Err`
+/// (`SnapshotError::Restore`, through `World::load_snapshot`) rather than
+/// a silently corrupted live object graph. These tests go one level
+/// below `World::load_snapshot` (straight at `Registry::restore`) so each
+/// one can isolate a single kind of corruption precisely.
+mod restore_validation {
+    use loom_vm::ObjectId;
+    use loom_vm::bcvm::registry::{Compiler, Registry};
+
+    use super::*;
+
+    /// A real, valid decoded snapshot of a small world, for tests to
+    /// tamper with one field at a time.
+    fn decode_a_real_snapshot() -> (std::path::PathBuf, loom_vm::snapshot::DecodedSnapshot) {
+        let root = fixture("tworoom");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        // Connecting a player guarantees at least two live objects with a
+        // real env/inventory relationship (the player placed in a room),
+        // which some of these tests need to tamper with.
+        world.connect(1, &mut host);
+        let bytes = world
+            .begin_snapshot()
+            .expect("capture")
+            .encode_all()
+            .expect("encode");
+        let decoded = loom_vm::snapshot::decode_snapshot(&bytes).expect("decode");
+        (root, decoded)
+    }
+
+    /// The index of some live object slot (every fixture world has at
+    /// least one: the master plus the two rooms).
+    fn a_live_slot_index(decoded: &loom_vm::snapshot::DecodedSnapshot) -> usize {
+        decoded
+            .slots
+            .iter()
+            .position(|(_, obj)| obj.is_some())
+            .expect("at least one live object")
+    }
+
+    #[test]
+    fn rejects_an_env_pointing_at_a_slot_with_the_wrong_generation() {
+        let (root, mut decoded) = decode_a_real_snapshot();
+        let idx = a_live_slot_index(&decoded);
+        let live_generation = decoded.slots[idx].0;
+        decoded.slots[idx].1.as_mut().unwrap().env = Some(ObjectId {
+            index: idx as u32,
+            generation: live_generation.wrapping_add(1),
+        });
+
+        let mut registry = Registry::default();
+        let mut compiler = Compiler::new(root);
+        let err = registry
+            .restore(decoded, &mut compiler)
+            .expect_err("a stale-generation env reference must not install");
+        assert!(err.contains("env"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_inventory_entry_pointing_out_of_range() {
+        let (root, mut decoded) = decode_a_real_snapshot();
+        let idx = a_live_slot_index(&decoded);
+        decoded.slots[idx].1.as_mut().unwrap().inventory = vec![ObjectId {
+            index: u32::MAX,
+            generation: 0,
+        }];
+
+        let mut registry = Registry::default();
+        let mut compiler = Compiler::new(root);
+        let err = registry
+            .restore(decoded, &mut compiler)
+            .expect_err("an out-of-range inventory reference must not install");
+        assert!(err.contains("inventory"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_names_entry_pointing_at_an_empty_slot() {
+        let (root, mut decoded) = decode_a_real_snapshot();
+        let empty_idx = decoded
+            .slots
+            .iter()
+            .position(|(_, obj)| obj.is_none())
+            .unwrap_or(
+                // Every slot happened to be live: make one up by
+                // pointing past the end of the table instead, which is
+                // just as much an empty/out-of-range slot.
+                decoded.slots.len(),
+            );
+        decoded.names.insert(
+            "/tampered".to_string(),
+            ObjectId {
+                index: empty_idx as u32,
+                generation: 0,
+            },
+        );
+
+        let mut registry = Registry::default();
+        let mut compiler = Compiler::new(root);
+        let err = registry
+            .restore(decoded, &mut compiler)
+            .expect_err("a names entry pointing at an empty/out-of-range slot must not install");
+        assert!(err.contains("name"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_free_list_entry_pointing_at_a_live_slot() {
+        let (root, mut decoded) = decode_a_real_snapshot();
+        let idx = a_live_slot_index(&decoded);
+        decoded.free.push(idx as u32);
+
+        let mut registry = Registry::default();
+        let mut compiler = Compiler::new(root);
+        let err = registry
+            .restore(decoded, &mut compiler)
+            .expect_err("a free-list entry naming a live slot must not install");
+        assert!(err.contains("free list"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_duplicate_free_list_entry() {
+        let (root, mut decoded) = decode_a_real_snapshot();
+        let dup = *decoded.free.first().unwrap_or(&0);
+        decoded.free.push(dup);
+        // Make sure the duplicated index really is an empty slot so this
+        // test isolates "duplicate" from "names a live slot".
+        if decoded
+            .slots
+            .get(dup as usize)
+            .is_none_or(|(_, obj)| obj.is_some())
+        {
+            decoded.free = vec![0, 0];
+            decoded.slots[0].1 = None;
+        }
+        let mut registry = Registry::default();
+        let mut compiler = Compiler::new(root);
+        let err = registry
+            .restore(decoded, &mut compiler)
+            .expect_err("a duplicate free-list entry must not install");
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_env_inventory_disagreement() {
+        let (root, mut decoded) = decode_a_real_snapshot();
+        let idx = a_live_slot_index(&decoded);
+        // Give the object a live, correctly-generationed `env` that
+        // simply doesn't list it back in its own inventory.
+        let other_idx = decoded
+            .slots
+            .iter()
+            .enumerate()
+            .position(|(i, (_, obj))| i != idx && obj.is_some())
+            .expect("a second live object to use as a mismatched env");
+        let other_gen = decoded.slots[other_idx].0;
+        decoded.slots[other_idx]
+            .1
+            .as_mut()
+            .unwrap()
+            .inventory
+            .clear();
+        decoded.slots[idx].1.as_mut().unwrap().env = Some(ObjectId {
+            index: other_idx as u32,
+            generation: other_gen,
+        });
+
+        let mut registry = Registry::default();
+        let mut compiler = Compiler::new(root);
+        let err = registry
+            .restore(decoded, &mut compiler)
+            .expect_err("an env/inventory disagreement must not install");
+        assert!(err.contains("inventory"), "{err}");
+    }
+}
+
 const N_ITEMS: usize = 10_000;
 
 /// OBI-173 acceptance: benchmark on the E1.2 world (10k live `/std/item`
