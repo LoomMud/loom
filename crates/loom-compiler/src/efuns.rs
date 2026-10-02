@@ -66,6 +66,7 @@ const NAMES: &[&str] = &[
     "move_to",
     "send",
     "disconnect",
+    "set_echo",
     "bind_connection",
     "compile_object",
     "upgrade_all",
@@ -140,6 +141,13 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
         // on objects the caller doesn't own is P2"): disconnect(ob) acts
         // on another user's connection.
         "disconnect" => ("disconnect", vec![P(oobj)], 1, Ret::Ty(Ty::Void), P2),
+        "set_echo" => (
+            "set_echo",
+            vec![P(oobj.clone()), P(Ty::Bool)],
+            2,
+            Ret::Ty(Ty::Void),
+            P0,
+        ),
         "bind_connection" => ("bind_connection", vec![P(obj)], 1, Ret::Ty(Ty::Void), P3),
         "compile_object" => (
             "compile_object",

@@ -14,6 +14,8 @@ use loom_vm::Host;
 pub struct FakeHost {
     pub out: HashMap<u64, String>,
     pub closed: Vec<u64>,
+    /// Every `set_echo()` call, in order, as `(conn, enabled)`.
+    pub echo: Vec<(u64, bool)>,
 }
 
 impl FakeHost {
@@ -29,6 +31,9 @@ impl Host for FakeHost {
     }
     fn close(&mut self, conn: u64) {
         self.closed.push(conn);
+    }
+    fn set_echo(&mut self, conn: u64, enabled: bool) {
+        self.echo.push((conn, enabled));
     }
 }
 

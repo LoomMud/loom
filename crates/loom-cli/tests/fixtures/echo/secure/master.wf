@@ -1,0 +1,9 @@
+// Master object: hands every new connection a fresh player.
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+// Phase 0 policy (OBI-35): the driver fails closed without this apply.
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
