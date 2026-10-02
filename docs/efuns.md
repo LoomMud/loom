@@ -15,6 +15,7 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `move_to` | `move_to(Object) -> Void` | P0 | 2 |
 | `send` | `send(Optional(Object), String) -> Void` | P0 | 2 |
 | `disconnect` | `disconnect(Optional(Object)) -> Void` | P2 | 2 |
+| `set_echo` | `set_echo(Optional(Object), Bool) -> Void` | P0 | 2 |
 | `bind_connection` | `bind_connection(Object) -> Void` | P3 | 2 |
 | `compile_object` | `compile_object(String) -> Optional(String)` | P1 | 500 |
 | `upgrade_all` | `upgrade_all(String) -> Int` | P1 | 50 |

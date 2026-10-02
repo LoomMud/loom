@@ -23,12 +23,25 @@
 
 ALTER TABLE staff ADD COLUMN totp_secret TEXT;
 ALTER TABLE staff ADD COLUMN totp_confirmed_at TIMESTAMPTZ;
+-- Anti-replay (OBI-195 review fix 4): the last RFC 6238 time-step accepted
+-- for this uid, across enrolment confirmation and every login/refresh/
+-- GitHub-login TOTP check. A code is only ever accepted if its step is
+-- strictly greater than this value (see `loom-http::auth`'s
+-- `totp_consume_step` call), closing the standard "the same 6-digit code
+-- works twice inside one 30s+skew window" replay gap that RFC 6238 itself
+-- says is the implementer's job, not the algorithm's.
+ALTER TABLE staff ADD COLUMN totp_last_step BIGINT;
 
 -- auth_totp_enroll: self-service only (D-27.2 pattern: re-check in SQL, not
 -- just at the app layer). p_actor must equal p_uid -- nobody, not even an
 -- arch, resets another uid's TOTP secret through this function. (An
 -- admin-driven reset flow for a lost device is deliberately deferred; see
--- the OBI-174 PR description.)
+-- the OBI-174 PR description.) Refuses outright if a secret is already
+-- confirmed (OBI-195 review fix 3): overwriting a confirmed secret from
+-- nothing but a bearer token would let a stolen access token silently
+-- downgrade a T3+ account's second factor; a real reset needs a dedicated,
+-- step-up-gated flow (tracked as a follow-up, OBI-199), not a bare
+-- re-enrol.
 CREATE OR REPLACE FUNCTION public.auth_totp_enroll(
     p_actor  TEXT,
     p_uid    TEXT,
@@ -47,8 +60,15 @@ BEGIN
         RAISE EXCEPTION 'TOTP enrolment is self-service only';
     END IF;
 
+    IF EXISTS (
+        SELECT 1 FROM public.staff
+        WHERE uid = p_uid AND totp_confirmed_at IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'TOTP is already enrolled and confirmed for % -- reset needs a dedicated, step-up-gated flow (see OBI-199)', p_uid;
+    END IF;
+
     UPDATE public.staff
-    SET totp_secret = p_secret, totp_confirmed_at = NULL
+    SET totp_secret = p_secret, totp_confirmed_at = NULL, totp_last_step = NULL
     WHERE uid = p_uid;
 
     IF NOT FOUND THEN
@@ -95,6 +115,45 @@ $$;
 
 REVOKE ALL ON FUNCTION public.auth_totp_confirm(TEXT, TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.auth_totp_confirm(TEXT, TEXT) TO loom_app;
+
+-- auth_totp_consume_step (OBI-195 review fix 4): atomically accept a
+-- caller-presented RFC 6238 time-step for `uid` only if it's strictly
+-- greater than the last one ever accepted, recording it if so. A
+-- SECURITY DEFINER function, not a raw `loom_app` UPDATE, for the same
+-- reason every other write to `staff` is one: `loom_app` only has
+-- `SELECT` on this table (0001_init.sql). Unlike `auth_totp_enroll`/
+-- `auth_totp_confirm`, this one is *not* self-service-actor-checked --
+-- it is called for the uid the caller is actively trying to authenticate
+-- *as*, before that authentication has succeeded, so there is no
+-- "authenticated actor" to compare against yet; the anti-replay property
+-- itself (monotonic per uid) is the only invariant this function
+-- protects.
+CREATE OR REPLACE FUNCTION public.auth_totp_consume_step(
+    p_uid  TEXT,
+    p_step BIGINT
+) RETURNS BOOLEAN
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    accepted BOOLEAN;
+BEGIN
+    IF p_uid IS NULL OR p_step IS NULL THEN
+        RAISE EXCEPTION 'uid and step are required';
+    END IF;
+
+    UPDATE public.staff
+    SET totp_last_step = p_step
+    WHERE uid = p_uid AND (totp_last_step IS NULL OR totp_last_step < p_step);
+
+    accepted := FOUND;
+    RETURN accepted;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.auth_totp_consume_step(TEXT, BIGINT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.auth_totp_consume_step(TEXT, BIGINT) TO loom_app;
 
 -- ---------------------------------------------------------------------------
 -- Refresh-token session bookkeeping (design §9, D-P2.5). This is session

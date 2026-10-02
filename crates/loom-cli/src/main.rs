@@ -1227,6 +1227,12 @@ impl Host for NetHost {
     fn close(&mut self, conn: u64) {
         let _ = self.command_tx.blocking_send(NetCommand::Close(conn));
     }
+
+    fn set_echo(&mut self, conn: u64, enabled: bool) {
+        let _ = self
+            .command_tx
+            .blocking_send(NetCommand::SetEcho(conn, enabled));
+    }
 }
 
 async fn shutdown_signal() {

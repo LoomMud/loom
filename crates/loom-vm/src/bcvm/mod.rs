@@ -24,7 +24,7 @@ pub mod vm;
 pub use compile::{CompileError, compile_and_verify};
 pub use heap::{ArrayData, HeapObj, MapData, Value, cost};
 pub use registry::{
-    BcObject, CompiledProgram, Compiler, CowMetrics, Registry, RegistryHost, UpgradeWarning,
-    compile_hir_program,
+    BcObject, ChangeSet, CompiledProgram, Compiler, CowMetrics, RecompileReport, Registry,
+    RegistryHost, SyncMetrics, UpgradeWarning, compile_hir_program,
 };
 pub use vm::{CallSite, Host, Interpreter, Limits, RtError};

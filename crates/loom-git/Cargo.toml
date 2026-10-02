@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "loom-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The `git` CLI is the only thing this crate shells out to (D-B3.1); no
+# gix/libgit2 dependency. `metrics` matches `loom-net`'s pattern (a direct
+# dependency, no `loom-obs`/`loom-vm` coupling -- the exporter is wired up
+# wherever the global recorder is installed).
+metrics = "0.24.6"
+tracing = "0.1.41"
+# B3.3 GitHub App client: RS256 JWT signing is `ring::signature::RsaKeyPair`
+# (RSA_PKCS1_SHA256), not RustCrypto `rsa` -- `rsa` has an open advisory
+# with no upstream fix (RUSTSEC-2023-0071, the Marvin timing side
+# channel) and production needs a TLS transport to `https://api.github.com`
+# that already pulls in rustls + `ring` (see `github::tls_transport`
+# below -- rustls uses `ring` directly, not via any `ureq` TLS feature,
+# which stays disabled; see that dependency's own comment), so this
+# reuses the same backend instead of carrying two RSA stacks (OBI-215).
+# `pkcs1`/`pkcs8`/`der` are ASN.1 format crates (no RSA arithmetic of
+# their own) used only to re-wrap a PKCS#1 PEM as the PKCS#8 DER `ring`
+# requires -- see `github::jwt` for the one call site. `zeroize` wraps
+# the decoded key DER buffers so they're wiped on drop; it's already in
+# the dependency tree via `rustls`/`rustls-pki-types` below, named
+# explicitly here since `github::jwt` uses it directly.
+ring = "0.17.14"
+pkcs1 = { version = "0.7.5", features = ["pkcs8"] }
+pkcs8 = "0.10.2"
+pem-rfc7468 = { version = "0.7.0", features = ["alloc"] }
+der = { version = "0.7.10", features = ["alloc"] }
+zeroize = "1.9.0"
+base64 = "0.23.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+# The production transport to the real `https://api.github.com`
+# (OBI-215, `github::tls_transport`): `rustls` + the `ring` feature (the
+# same backend as the JWT signer above), with `rustls-native-certs`'
+# platform root store -- deliberately NOT `ureq`'s own `tls` feature
+# (disabled below: no `tls` in `features`) or the `webpki-roots` crate
+# that feature pulls in, which bundles Mozilla's root list under
+# CDLA-Permissive-2.0, a data licence this workspace's OSI-only licence
+# gate (`deny.toml`, OBI-44) does not allow. `ureq` itself is kept only
+# as the plain-HTTP test-seam transport (`github::UreqClient`); `url`
+# only parses the (small, trusted-input) API base URL -- no network of
+# its own.
+ureq = { version = "2.12.1", default-features = false, features = ["json"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-native-certs = "0.8.4"
+rustls-pki-types = "1.15.1"
+url = "2.5.8"
+time = { version = "0.3.55", features = ["parsing", "formatting"] }
+
+[dev-dependencies]
+tempfile = "3.14"

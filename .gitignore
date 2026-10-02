@@ -4,6 +4,7 @@
 .env.*
 /web-client/node_modules
 /web-client/dist
-# CI-only loadtest-smoke output (OBI-40); real runs' results/*.json,*.md
-# are committed by hand.
+# CI-only loadtest-smoke/loadtest-e1-1 output (OBI-40/OBI-177); real runs'
+# results/*.json,*.md are committed by hand.
 /results/ci-smoke.*
+/results/ci-e1-1.*

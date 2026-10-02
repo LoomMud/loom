@@ -22,6 +22,7 @@ struct FakeStaff {
     tier: i16,
     totp_secret: Option<String>,
     totp_confirmed: bool,
+    totp_last_step: Option<u64>,
 }
 
 #[derive(Default)]
@@ -51,8 +52,16 @@ impl FakeDirectory {
                 tier,
                 totp_secret: None,
                 totp_confirmed: false,
+                totp_last_step: None,
             },
         );
+    }
+
+    /// Simulate a staff row being deleted (OBI-195 review fix 5): the uid
+    /// stops existing entirely, as opposed to [`Self::set_tier`] with 0,
+    /// which keeps a legitimate (demoted) row.
+    fn remove_staff(&self, uid: &str) {
+        self.inner.lock().unwrap().staff.remove(uid);
     }
 
     fn set_tier(&self, uid: &str, tier: i16) {
@@ -65,6 +74,24 @@ impl FakeDirectory {
             .unwrap()
             .github_links
             .insert(github_id, uid.to_string());
+    }
+
+    /// Directly mark `uid`'s pending secret confirmed, *without* going
+    /// through [`AuthService::totp_confirm`] (and so without consuming a
+    /// real TOTP step). TOTP codes are tied to real wall-clock time --
+    /// there is no way to mint a second, distinct *real* code inside one
+    /// fast, non-sleeping test, so a test that wants to prove a *later*
+    /// login with a real code succeeds must set up "already confirmed"
+    /// this way instead of spending the one real code available to it on
+    /// confirmation.
+    fn confirm_totp_for_test(&self, uid: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .staff
+            .get_mut(uid)
+            .unwrap()
+            .totp_confirmed = true;
     }
 
     /// Directly mark a refresh token revoked (simulating an admin/logout
@@ -118,15 +145,31 @@ impl StaffDirectory for FakeDirectory {
         }))
     }
 
-    async fn tier_of(&self, uid: &str) -> Result<i16, DirectoryError> {
+    async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError> {
         Ok(self
             .inner
             .lock()
             .unwrap()
             .staff
             .get(uid)
-            .map(|s| s.tier)
-            .unwrap_or(0))
+            .map(|s| StaffAuthStatus {
+                tier: s.tier,
+                totp_secret: s.totp_secret.clone(),
+                totp_confirmed: s.totp_confirmed,
+            }))
+    }
+
+    async fn totp_consume_step(&self, uid: &str, step: u64) -> Result<bool, DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(staff) = inner.staff.get_mut(uid) else {
+            return Ok(false);
+        };
+        if staff.totp_last_step.is_none_or(|last| last < step) {
+            staff.totp_last_step = Some(step);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     async fn totp_enroll(&self, uid: &str, secret_base32: &str) -> Result<(), DirectoryError> {
@@ -191,6 +234,31 @@ impl StaffDirectory for FakeDirectory {
             .refresh_tokens
             .get(token_hash)
             .cloned())
+    }
+
+    async fn refresh_token_rotate(
+        &self,
+        token_hash: &str,
+    ) -> Result<RefreshRotation, DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(record) = inner.refresh_tokens.get_mut(token_hash) else {
+            return Ok(RefreshRotation::NotFound);
+        };
+        if record.revoked_at.is_some() {
+            return Ok(RefreshRotation::Reused {
+                staff_uid: record.staff_uid.clone(),
+            });
+        }
+        if record.expires_at <= now() {
+            return Ok(RefreshRotation::Expired);
+        }
+        record.revoked_at = Some(now());
+        Ok(RefreshRotation::Rotated {
+            staff_uid: record.staff_uid.clone(),
+            sid: record.sid.clone(),
+            amr: record.amr.clone(),
+            mfa_at: record.mfa_at,
+        })
     }
 
     async fn refresh_token_revoke(&self, token_hash: &str) -> Result<(), DirectoryError> {
@@ -307,14 +375,15 @@ async fn t3_staff_with_confirmed_totp_can_log_in_with_a_correct_code() {
     directory.add_staff("gandalf", "mithrandir", 3);
     let service = test_service(directory.clone());
 
-    // Enrol + confirm, same flow the HTTP handlers drive.
+    // Enrol via the service (same flow the HTTP handlers drive), but
+    // confirm directly against the directory rather than through
+    // `service.totp_confirm` -- TOTP codes are tied to real wall-clock
+    // time, so going through the real confirm flow would consume *this
+    // test's* one available real code and leave nothing left to prove a
+    // later login succeeds with.
     let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gandalf");
     let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
-    let code = totp.generate_current().to_string();
-    service
-        .totp_confirm("gandalf", &code, &ctx())
-        .await
-        .unwrap();
 
     // A stale/wrong code is refused distinctly from "none supplied".
     let result = service
@@ -325,9 +394,9 @@ async fn t3_staff_with_confirmed_totp_can_log_in_with_a_correct_code() {
     assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
 
     // The current code succeeds.
-    let fresh_code = totp.generate_current().to_string();
+    let code = totp.generate_current().to_string();
     let pair = service
-        .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
+        .login("gandalf", "mithrandir", Some(&code), &ctx())
         .await
         .unwrap();
     let claims = service.verify_access_token(&pair.access_token).unwrap();
@@ -469,10 +538,13 @@ async fn refresh_carries_forward_the_logins_sid_amr_and_mfa_at() {
     directory.add_staff("gimli", "dwarf", 3);
     let service = test_service(directory.clone());
 
+    // Confirm directly against the directory rather than through
+    // `service.totp_confirm` -- that would consume this test's one
+    // deterministic real code (TOTP replay protection, OBI-195 review fix
+    // 4) and leave nothing left for the login below to present.
     let enrollment = service.totp_enroll("gimli", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gimli");
     let totp = totp::totp_for_secret(&enrollment.secret_base32, "gimli").unwrap();
-    let code = totp.generate_current().to_string();
-    service.totp_confirm("gimli", &code, &ctx()).await.unwrap();
 
     let fresh_code = totp.generate_current().to_string();
     let pair = service
@@ -519,7 +591,7 @@ async fn unknown_refresh_token_is_refused() {
 async fn github_login_for_an_unlinked_user_is_refused() {
     let directory = FakeDirectory::new();
     let service = test_service(directory);
-    let result = service.github_login(123456).await;
+    let result = service.github_login(123456, None).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
 }
 
@@ -530,7 +602,7 @@ async fn github_login_for_a_linked_user_succeeds_and_reads_tier_from_the_directo
     directory.link_github(42, "samwise");
     let service = test_service(directory);
 
-    let pair = service.github_login(42).await.unwrap();
+    let pair = service.github_login(42, None).await.unwrap();
     let claims = service.verify_access_token(&pair.access_token).unwrap();
     assert_eq!(claims.sub, "samwise");
     assert_eq!(claims.tier, 2);
@@ -607,22 +679,23 @@ async fn wrong_totp_codes_count_toward_the_account_lockout() {
 async fn a_missing_totp_code_does_not_count_as_a_failure() {
     let directory = FakeDirectory::new();
     directory.add_staff("gandalf", "mithrandir", 3);
-    let service = test_service(directory);
+    let service = test_service(directory.clone());
 
+    // Confirm directly against the directory rather than through
+    // `service.totp_confirm` -- TOTP codes are tied to real wall-clock
+    // time, so going through the real confirm flow would consume this
+    // test's one available real code and leave nothing left to prove the
+    // final login succeeds with (OBI-195 review fix 4 anti-replay).
     let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gandalf");
     let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
-    let code = totp.generate_current().to_string();
-    service
-        .totp_confirm("gandalf", &code, &ctx())
-        .await
-        .unwrap();
 
     for _ in 0..10 {
         let result = service.login("gandalf", "mithrandir", None, &ctx()).await;
         assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
     }
 
-    // Still not locked -- a fresh code succeeds.
+    // Still not locked -- the current code succeeds.
     let fresh_code = totp.generate_current().to_string();
     assert!(
         service
@@ -731,16 +804,12 @@ async fn totp_enrol_and_reset_are_audited_distinctly() {
     let service = test_service(directory.clone());
     let from_ip = ctx_from("192.0.2.30");
 
-    let first = service.totp_enroll("gandalf", &from_ip).await.unwrap();
-    let totp = totp::totp_for_secret(&first.secret_base32, "gandalf").unwrap();
-    let code = totp.generate_current().to_string();
-    service
-        .totp_confirm("gandalf", &code, &from_ip)
-        .await
-        .unwrap();
+    let _first = service.totp_enroll("gandalf", &from_ip).await.unwrap();
 
-    // Re-enrolling over an already-confirmed secret is a reset.
-    let _ = service.totp_enroll("gandalf", &from_ip).await.unwrap();
+    // Re-enrolling before confirming is still allowed (OBI-195 review fix
+    // 3 only refuses overwriting a *confirmed* secret) and is audited as
+    // a reset, not a fresh enrolment.
+    let second = service.totp_enroll("gandalf", &from_ip).await.unwrap();
 
     let events = directory.audit_events();
     assert!(events.iter().any(|e| e.kind == "auth.totp.enrol"));
@@ -750,6 +819,19 @@ async fn totp_enrol_and_reset_are_audited_distinctly() {
         .expect("a totp.reset row");
     assert_eq!(reset.uid.as_deref(), Some("gandalf"));
     assert_eq!(reset.ip, Some("192.0.2.30".parse().unwrap()));
+
+    // Once confirmed, a further enrol attempt is refused outright
+    // (OBI-195 review fix 3) -- there is no "reset" path left through this
+    // self-service endpoint; a real reset needs a dedicated, step-up-gated
+    // flow (OBI-199 follow-up).
+    let totp = totp::totp_for_secret(&second.secret_base32, "gandalf").unwrap();
+    let code = totp.generate_current().to_string();
+    service
+        .totp_confirm("gandalf", &code, &from_ip)
+        .await
+        .unwrap();
+    let result = service.totp_enroll("gandalf", &from_ip).await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpAlreadyEnrolled);
 }
 
 // -----------------------------------------------------------------------
@@ -869,4 +951,149 @@ mod http_wire {
         let response = app.oneshot(login_request("203.0.113.78")).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+}
+
+/// OBI-195 review fix 2: TOTP must gate `refresh`, not just the original
+/// password login -- a T2 promoted to T3 must stop being able to refresh
+/// without a code the moment the next refresh happens.
+#[tokio::test]
+async fn promotion_to_t3_requires_totp_on_the_next_refresh() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("aragorn", "strider", 2);
+    let service = test_service(directory.clone());
+
+    let pair = service
+        .login("aragorn", "strider", None, &ctx())
+        .await
+        .unwrap();
+    directory.set_tier("aragorn", 3);
+
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
+}
+
+/// OBI-195 review fix 2: GitHub login must gate TOTP for T3+ exactly like
+/// the password path -- a linked GitHub identity does not bypass the
+/// mandatory-TOTP floor.
+#[tokio::test]
+async fn github_login_for_t3_without_totp_is_refused() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("elrond", "unused-password", 3);
+    directory.link_github(99, "elrond");
+    let service = test_service(directory);
+
+    let result = service.github_login(99, None).await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
+}
+
+/// OBI-195 review fix 2: GitHub login succeeds for a T3+ uid once a
+/// correct TOTP code is supplied.
+#[tokio::test]
+async fn github_login_for_t3_with_totp_succeeds() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("elrond", "unused-password", 3);
+    directory.link_github(99, "elrond");
+    let service = test_service(directory.clone());
+
+    let enrollment = service.totp_enroll("elrond", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("elrond");
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "elrond").unwrap();
+
+    let code = totp.generate_current().to_string();
+    let pair = service.github_login(99, Some(&code)).await.unwrap();
+    let claims = service.verify_access_token(&pair.access_token).unwrap();
+    assert_eq!(claims.tier, 3);
+}
+
+/// OBI-195 review fix 3: enrolling over an already-*confirmed* secret
+/// using nothing but a bearer token is refused outright.
+#[tokio::test]
+async fn totp_enroll_refuses_to_overwrite_a_confirmed_secret() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gimli", "axe", 1);
+    let service = test_service(directory);
+
+    let enrollment = service.totp_enroll("gimli", &ctx()).await.unwrap();
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gimli").unwrap();
+    let code = totp.generate_current().to_string();
+    service.totp_confirm("gimli", &code, &ctx()).await.unwrap();
+
+    let result = service.totp_enroll("gimli", &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpAlreadyEnrolled);
+}
+
+/// OBI-195 review fix 3: enrolling is still fine before confirmation (a
+/// user who started enrolling but never finished can retry).
+#[tokio::test]
+async fn totp_enroll_before_confirmation_can_be_retried() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gimli", "axe", 1);
+    let service = test_service(directory);
+
+    service.totp_enroll("gimli", &ctx()).await.unwrap();
+    // Never confirmed -- re-enrolling (e.g. scanned the QR code wrong the
+    // first time) must still work.
+    service.totp_enroll("gimli", &ctx()).await.unwrap();
+}
+
+/// OBI-195 review fix 4: the same TOTP code can never be accepted twice,
+/// even for two different logins inside the same 30s(+skew) step.
+#[tokio::test]
+async fn totp_code_replay_is_refused() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("legolas", "bow", 3);
+    let service = test_service(directory);
+
+    let enrollment = service.totp_enroll("legolas", &ctx()).await.unwrap();
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "legolas").unwrap();
+    let code = totp.generate_current().to_string();
+    service
+        .totp_confirm("legolas", &code, &ctx())
+        .await
+        .unwrap();
+
+    // The confirm call above already consumed this step's code -- using it
+    // again at login must be refused as a replay, not accepted a second
+    // time just because the signature still checks out.
+    let result = service.login("legolas", "bow", Some(&code), &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpInvalid);
+}
+
+/// OBI-195 review fix 5: a uid with no `staff` row at all (removed staff)
+/// must never mint a token -- the old `tier_of`-based design defaulted
+/// this to tier 0 and happily minted one.
+#[tokio::test]
+async fn refresh_for_a_removed_staff_row_is_refused_and_revokes_sessions() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("boromir", "gondor", 1);
+    let service = test_service(directory.clone());
+
+    let pair = service
+        .login("boromir", "gondor", None, &ctx())
+        .await
+        .unwrap();
+    directory.remove_staff("boromir");
+
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
+/// OBI-195 review fix 1: concurrent presentation of the same refresh
+/// token can only ever rotate successfully once -- a second, racing
+/// presentation always lands on reuse, never on a second success. (This
+/// in-memory fake is single-threaded under its own mutex, so this mostly
+/// documents the contract; the real concurrency proof is the
+/// `loom-persist` integration test against live Postgres.)
+#[tokio::test]
+async fn concurrent_refresh_rotation_only_succeeds_once() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("pippin", "took", 1);
+    let service = test_service(directory);
+
+    let pair = service.login("pippin", "took", None, &ctx()).await.unwrap();
+
+    let first = service.refresh(&pair.refresh_token, &ctx()).await;
+    let second = service.refresh(&pair.refresh_token, &ctx()).await;
+    assert!(first.is_ok());
+    assert_eq!(second.unwrap_err(), AuthError::InvalidRefreshToken);
 }

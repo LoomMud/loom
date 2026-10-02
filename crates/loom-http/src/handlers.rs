@@ -42,8 +42,15 @@ struct RefreshRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct LogoutRequest {
+    refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GithubCallbackRequest {
     code: String,
+    #[serde(default)]
+    totp_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +87,7 @@ fn auth_error_response(error: AuthError) -> (StatusCode, Json<ErrorResponse>) {
         AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
         AuthError::TotpRequired => (StatusCode::FORBIDDEN, "totp_required"),
         AuthError::TotpInvalid => (StatusCode::FORBIDDEN, "totp_invalid"),
+        AuthError::TotpAlreadyEnrolled => (StatusCode::CONFLICT, "totp_already_enrolled"),
         AuthError::InvalidRefreshToken => (StatusCode::UNAUTHORIZED, "invalid_refresh_token"),
         AuthError::DirectoryUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
         AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
@@ -168,7 +176,7 @@ async fn refresh(
 
 async fn logout(
     State(state): State<HttpState>,
-    Json(request): Json<RefreshRequest>,
+    Json(request): Json<LogoutRequest>,
 ) -> impl IntoResponse {
     let Some(auth) = state.auth.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -255,7 +263,10 @@ async fn github_callback(
                 .into_response();
         }
     };
-    match auth.github_login(user.id).await {
+    match auth
+        .github_login(user.id, request.totp_code.as_deref())
+        .await
+    {
         Ok(pair) => (StatusCode::OK, Json(TokenResponse::from(pair))).into_response(),
         Err(error) => auth_error_response(error).into_response(),
     }
