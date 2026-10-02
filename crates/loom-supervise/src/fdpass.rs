@@ -145,6 +145,20 @@ pub fn send_fds(sock: &UnixStream, fds: &[BorrowedFd<'_>]) -> io::Result<()> {
                 }
                 return Err(err);
             }
+            // A short write here would mean the kernel sent fewer than
+            // `TAG.len()` bytes of the accompanying payload -- on a
+            // local `AF_UNIX` socket with a 4-byte `iov` this is not
+            // expected in practice, but checking costs nothing and turns
+            // a theoretical "ancillary data silently not fully
+            // delivered" case into a clear error instead of a
+            // mysterious tag mismatch on the receiving end (CTO
+            // re-review nit, OBI-226).
+            if rc as usize != TAG.len() {
+                return Err(io::Error::other(format!(
+                    "send_fds: short write ({rc} of {} bytes)",
+                    TAG.len()
+                )));
+            }
             break;
         }
     }
@@ -221,7 +235,16 @@ pub fn recv_fds(sock: &UnixStream) -> io::Result<Vec<OwnedFd>> {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let data_len = (*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                // `cmsg_len` is kernel-written and should always be at
+                // least `CMSG_LEN(0)` (the header-only length) for a
+                // well-formed cmsg, but treat a smaller value as "no
+                // payload" rather than underflowing the `usize`
+                // subtraction (CTO re-review nit, OBI-226) -- this is
+                // defence in depth, not a path any real kernel is
+                // expected to take.
+                let cmsg_len = (*cmsg).cmsg_len as usize;
+                let header_len = libc::CMSG_LEN(0) as usize;
+                let data_len = cmsg_len.saturating_sub(header_len);
                 let count = data_len / std::mem::size_of::<RawFd>();
                 let data = libc::CMSG_DATA(cmsg) as *const RawFd;
                 for i in 0..count {

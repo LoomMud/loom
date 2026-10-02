@@ -50,3 +50,15 @@ pub mod listener;
 pub mod version_source;
 
 pub use version_source::{FileVersionSource, VersionSource};
+
+// Loom only ever runs on Linux (the runtime image is debian/distroless,
+// design §9.2), and this crate leans on Linux-specific ancillary-data
+// behaviour `libc` doesn't even expose identically elsewhere (e.g.
+// `MSG_CMSG_CLOEXEC`, `SCM_MAX_FD`'s value). Fail the build with a clear
+// message rather than a wall of missing-constant errors from `libc` if
+// someone ever points this crate at another target (CTO re-review nit,
+// OBI-226).
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "loom-supervise is Linux-only (SCM_RIGHTS/MSG_CMSG_CLOEXEC semantics are not portable)"
+);
