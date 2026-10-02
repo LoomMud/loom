@@ -390,6 +390,20 @@ async fn serve(mudlib_root: PathBuf) -> Result<(), String> {
     if let Some(web_root) = web_root_from_env() {
         http_state = http_state.with_web_root(web_root);
     }
+    // OBI-174: `/auth/*` only mounted when both Postgres and a JWT secret
+    // are configured -- staff web auth has nothing to authenticate against
+    // otherwise (no `staff` table without Postgres) and must never sign a
+    // token with a guessable default secret.
+    if let (Some(p), Some(secret)) = (persist.clone(), jwt_secret_from_env()) {
+        let directory: std::sync::Arc<dyn loom_http::auth::StaffDirectory> = std::sync::Arc::new(p);
+        let keys = loom_http::auth::JwtKeys::from_secret(&secret);
+        http_state = http_state.with_auth(loom_http::auth::AuthService::new(directory, keys));
+    } else {
+        tracing::info!(
+            "staff web auth (/auth/*) disabled: set both LOOM_DATABASE_URL (or DATABASE_URL) \
+             and LOOM_JWT_SECRET to enable it"
+        );
+    }
     let mut http_server = tokio::spawn(async move {
         // Same reason as loom-net's telnet accept: WebSocket frames are
         // small interactive writes, so disable Nagle on every HTTP socket.
@@ -480,6 +494,18 @@ fn http_addr_from_env() -> String {
 /// runs that don't set it.
 fn web_root_from_env() -> Option<PathBuf> {
     std::env::var_os("LOOM_WEB_ROOT").map(PathBuf::from)
+}
+
+/// Staff web auth's JWT signing secret (OBI-174, design §9/D-P2.5).
+/// `/auth/*` is only mounted when this is set *and* Postgres
+/// (`connect_persist`) is configured -- same "absent by default" shape as
+/// `LOOM_WEB_ROOT`. There is no insecure default: an operator who wants
+/// staff auth must generate and set a real secret (at least 32 bytes of
+/// CSPRNG output, e.g. `openssl rand -hex 32`) themselves.
+fn jwt_secret_from_env() -> Option<Vec<u8>> {
+    std::env::var("LOOM_JWT_SECRET")
+        .ok()
+        .map(String::into_bytes)
 }
 
 /// The `serve()` world-tick timer (spec r5 N2, OBI-82): every `interval`

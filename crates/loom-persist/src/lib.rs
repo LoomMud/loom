@@ -155,6 +155,30 @@ pub struct TierPolicyRow {
     pub efun_classes: Vec<i16>,
 }
 
+/// A staff row resolved by username/password for the web auth layer
+/// (OBI-174, design §9/D-P2.5): the staff uid, its current tier, and
+/// whatever TOTP state it has (both read fresh from Postgres -- the tier
+/// here is never cached past the single query that produced it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaffAuthRecord {
+    pub uid: String,
+    pub account_id: Uuid,
+    pub tier: i16,
+    pub totp_secret: Option<String>,
+    pub totp_confirmed: bool,
+}
+
+/// A `refresh_tokens` row (OBI-174). Only ever looked up by
+/// [`Persist::refresh_token_lookup`]'s SHA-256 hash of the bearer token --
+/// the plaintext token itself is never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshTokenRecord {
+    pub id: Uuid,
+    pub staff_uid: String,
+    pub expires_at: OffsetDateTime,
+    pub revoked_at: Option<OffsetDateTime>,
+}
+
 /// A row from the `active_grants` view (already excludes expired grants).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GrantRow {
@@ -505,6 +529,207 @@ impl Persist {
             id: row.id,
             username: row.username,
         }))
+    }
+
+    /// Resolve a staff login by account username/password (OBI-174): joins
+    /// `accounts` to `staff` by `account_id` (never by `uid = username` --
+    /// see `roles_resolve_account`'s doc comment on why those can diverge),
+    /// verifies the Argon2id hash the same way [`Persist::verify_login`]
+    /// does, and returns `None` for either a bad password or an account
+    /// that has no `staff` row (a player, not staff).
+    pub async fn staff_login(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<Option<StaffAuthRecord>> {
+        let row = sqlx::query(
+            "SELECT a.id as account_id, a.password_hash, s.uid, s.tier, s.totp_secret, \
+                    s.totp_confirmed_at
+             FROM accounts a
+             JOIN staff s ON s.account_id = a.id
+             WHERE a.username = $1",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        use sqlx::Row;
+        let password_hash: String = row.try_get("password_hash")?;
+
+        let parsed = PasswordHash::new(&password_hash)
+            .map_err(|error| PersistError::PasswordHash(error.to_string()))?;
+        if self
+            .argon2
+            .verify_password(password.as_bytes(), &parsed)
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(StaffAuthRecord {
+            uid: row.try_get("uid")?,
+            account_id: row.try_get("account_id")?,
+            tier: row.try_get("tier")?,
+            totp_secret: row.try_get("totp_secret")?,
+            totp_confirmed: row
+                .try_get::<Option<OffsetDateTime>, _>("totp_confirmed_at")?
+                .is_some(),
+        }))
+    }
+
+    /// Enrol (or re-enrol) `uid`'s TOTP secret via the `auth_totp_enroll`
+    /// security-definer function. Self-service only -- the function itself
+    /// re-checks `actor == uid` in SQL. Re-enrolling always clears any
+    /// prior confirmation, so [`Persist::staff_login`]'s `totp_confirmed`
+    /// never reports true for a secret nobody has proven.
+    pub async fn totp_enroll(&self, uid: &str, secret_base32: &str) -> Result<()> {
+        sqlx::query("SELECT auth_totp_enroll($1, $2, $3)")
+            .bind(uid)
+            .bind(uid)
+            .bind(secret_base32)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Mark `uid`'s pending TOTP secret confirmed via `auth_totp_confirm`.
+    /// Callers must have already verified a code against the pending
+    /// secret (loom-http does this before calling); this function only
+    /// records that fact.
+    pub async fn totp_confirm(&self, uid: &str) -> Result<()> {
+        sqlx::query("SELECT auth_totp_confirm($1, $2)")
+            .bind(uid)
+            .bind(uid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The uid's currently enrolled TOTP secret (confirmed or not), for
+    /// the verify step to check a submitted code against. `loom_app` has
+    /// plain `SELECT` on `staff` already (0001_init.sql); no
+    /// security-definer wrapper needed for a read.
+    pub async fn totp_secret_for(&self, uid: &str) -> Result<Option<String>> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT totp_secret FROM staff WHERE uid = $1")
+            .bind(uid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(row) => row.try_get("totp_secret")?,
+            None => None,
+        })
+    }
+
+    /// Record a newly-issued refresh token. Only `token_hash` (SHA-256 of
+    /// the bearer token, computed by loom-http) is ever stored.
+    pub async fn refresh_token_insert(
+        &self,
+        staff_uid: &str,
+        token_hash: &str,
+        expires_at: OffsetDateTime,
+    ) -> Result<Uuid> {
+        use sqlx::Row;
+        let row = sqlx::query(
+            "INSERT INTO refresh_tokens (staff_uid, token_hash, expires_at)
+             VALUES ($1, $2, $3)
+             RETURNING id",
+        )
+        .bind(staff_uid)
+        .bind(token_hash)
+        .bind(expires_at)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get("id")?)
+    }
+
+    /// Look up a refresh token by the SHA-256 hash of its bearer value.
+    /// Callers must check both `expires_at` and `revoked_at` themselves --
+    /// this returns whatever row matches the hash, expired or not, so a
+    /// caller can tell "expired" apart from "never existed" if it ever
+    /// needs to (it currently doesn't, but the distinction costs nothing).
+    pub async fn refresh_token_lookup(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<RefreshTokenRecord>> {
+        use sqlx::Row;
+        let row = sqlx::query(
+            "SELECT id, staff_uid, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(RefreshTokenRecord {
+            id: row.try_get("id")?,
+            staff_uid: row.try_get("staff_uid")?,
+            expires_at: row.try_get("expires_at")?,
+            revoked_at: row.try_get("revoked_at")?,
+        }))
+    }
+
+    /// Revoke a single refresh token by its bearer-value hash (logout, or
+    /// rotating it out after a single use).
+    pub async fn refresh_token_revoke(&self, token_hash: &str) -> Result<()> {
+        sqlx::query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Revoke every outstanding refresh token for `uid` (reuse-detection
+    /// response: a revoked or expired token being replayed looks like a
+    /// stolen refresh token, so the whole session family is killed, not
+    /// just the one token).
+    pub async fn refresh_token_revoke_all(&self, uid: &str) -> Result<()> {
+        sqlx::query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE staff_uid = $1 AND revoked_at IS NULL")
+            .bind(uid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Resolve a numeric GitHub user id to a linked staff uid
+    /// (`github_identities`, OBI-174). `None` means unlinked -- GitHub
+    /// login must never create a staff row, only ever authenticate as a
+    /// uid an arch has already linked via `auth_github_link`.
+    pub async fn github_lookup(&self, github_id: i64) -> Result<Option<String>> {
+        use sqlx::Row;
+        let row = sqlx::query("SELECT staff_uid FROM github_identities WHERE github_id = $1")
+            .bind(github_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(match row {
+            Some(row) => Some(row.try_get("staff_uid")?),
+            None => None,
+        })
+    }
+
+    /// Link a GitHub numeric user id to an existing staff uid via
+    /// `auth_github_link`. `actor` MUST be the driver/app's authenticated
+    /// principal (an arch or root, T4+); the function re-checks this in SQL
+    /// and never creates a staff row for an unrecognised uid.
+    pub async fn github_link(
+        &self,
+        actor: &str,
+        uid: &str,
+        github_id: i64,
+        reason: &str,
+    ) -> Result<()> {
+        sqlx::query("SELECT auth_github_link($1, $2, $3, $4)")
+            .bind(actor)
+            .bind(uid)
+            .bind(github_id)
+            .bind(reason)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn save_object_state(&self, object: &ObjectState) -> Result<()> {
