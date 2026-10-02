@@ -101,6 +101,48 @@ $$;
 REVOKE ALL ON FUNCTION public.staff_sessions_lock_for_rotate(TEXT) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.staff_sessions_lock_for_rotate(TEXT) TO loom_app;
 
+-- OBI-219 (re-review of OBI-198/PR #77, same shape as must-fix 2):
+-- logout (`Persist::session_revoke_family_by_token`) revokes a whole
+-- family by `sid`, keyed off the presented token's row, but that row's
+-- `UPDATE` previously took no lock on the owning `staff` row at all. A
+-- `session_rotate` in flight on the same family only takes `FOR SHARE`
+-- on `staff` (see above), which does not conflict with an unlocked
+-- `UPDATE staff_sessions`, so the old session's `UPDATE ... WHERE sid =
+-- (...)` could run, find, and revoke the old (pre-rotation) row while
+-- the rotation is still uncommitted, and then under READ COMMITTED's
+-- EvalPlanQual the logout's `UPDATE` never re-checks the newly
+-- inserted row once the rotation commits -- the rotated session
+-- survives logout. Taking `FOR UPDATE` on `staff` first, same as
+-- `staff_sessions_revoke_for_uid`, forces this to serialize against
+-- `session_rotate`'s `FOR SHARE` exactly like every other revoke path.
+CREATE OR REPLACE FUNCTION public.staff_sessions_revoke_family(p_token_hash TEXT) RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_uid TEXT;
+    v_sid TEXT;
+BEGIN
+    SELECT staff_uid, sid INTO v_uid, v_sid
+    FROM public.staff_sessions WHERE token_hash = p_token_hash;
+
+    IF NOT FOUND THEN
+        -- Unknown token: a no-op, same as the previous plain UPDATE.
+        RETURN;
+    END IF;
+
+    PERFORM 1 FROM public.staff WHERE uid = v_uid FOR UPDATE;
+
+    UPDATE public.staff_sessions
+    SET revoked_at = NOW()
+    WHERE sid = v_sid AND revoked_at IS NULL;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.staff_sessions_revoke_family(TEXT) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.staff_sessions_revoke_family(TEXT) TO loom_app;
+
 -- Tier change, TOTP (re-)enrolment, or staff-row removal.
 CREATE OR REPLACE FUNCTION public.staff_sessions_revoke_on_staff_change() RETURNS TRIGGER
 LANGUAGE plpgsql
