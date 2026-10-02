@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "loom-supervise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# OBI-184 (P2-O1, design §7.5/§9.2): `loom supervise` is the in-pod
+# supervisor that owns the listening sockets across a copyover and hands
+# them to a new driver process over a `AF_UNIX` control socket with
+# `SCM_RIGHTS`. That syscall-level ancillary-data exchange has no safe std
+# API, so this is -- deliberately, and only here -- the one crate in the
+# workspace that opts out of `unsafe_code = "deny"` (CTO review required
+# before this merges: see OBI-184). Every `unsafe` block is confined to
+# `fdpass.rs` and is a thin, tested wrapper around `libc::sendmsg`/
+# `recvmsg`; nothing above `fdpass` touches raw fds directly.
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dependencies]
+libc = "0.2.177"
+tracing = "0.1.41"
+
+[dev-dependencies]
+tempfile = "3.14"

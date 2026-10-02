@@ -1267,6 +1267,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-supervise"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "loom-syntax"
 version = "0.0.1"
 dependencies = [
