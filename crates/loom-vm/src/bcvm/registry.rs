@@ -3276,6 +3276,16 @@ impl<'a> RegistryHost<'a> {
     /// caller writes unconditionally right after this returns `true`, on
     /// the single-threaded world thread, so nothing else can race it in
     /// between).
+    ///
+    /// **OBI-236 fix:** the directory pool (`seeded_total`/`note_write`)
+    /// and the save pool (`DiskUsage::seeded_save_total`, used by
+    /// `check_save_disk_quota`) are seeded independently, so whichever of
+    /// the two a given `<u>` happens to hit first no longer determines
+    /// what the *other* pool starts from. `disk_quota_mb` still has to
+    /// cover everything `<u>` has on disk, so `projected` here folds in
+    /// `DiskUsage::save_total`'s current save-pool total (0 if `<u>` has
+    /// never gone through `check_save_disk_quota` yet -- this never
+    /// forces a save-file stat on an unrelated `write_file`).
     fn check_disk_quota(&mut self, path: &str, new_bytes: u64) -> R<bool> {
         let Some(driver) = self.driver.as_ref() else {
             return Ok(true);
@@ -3301,7 +3311,11 @@ impl<'a> RegistryHost<'a> {
         let max_bytes = max_mb.saturating_mul(crate::quota::MB);
         let driver = self.driver.as_mut().expect("checked above");
         let seeded = driver.disk_usage.seeded_total(&root, &u);
-        let projected = seeded.saturating_sub(old_bytes).saturating_add(new_bytes);
+        let save_now = driver.disk_usage.save_total(&u);
+        let projected = seeded
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes)
+            .saturating_add(save_now);
         if projected > max_bytes {
             self.registry
                 .quota_breaches
@@ -3333,6 +3347,15 @@ impl<'a> RegistryHost<'a> {
     /// same non-raising `Ok(false)`-on-breach shape as `check_disk_quota`;
     /// see [`crate::disk_usage::DiskUsage::seeded_save_total`] for why the
     /// seed here is one `metadata()` stat instead of a directory walk.
+    ///
+    /// **OBI-236 fix:** this uses its own save pool
+    /// (`seeded_save_total`/`note_save_write`), seeded independently of
+    /// `check_disk_quota`'s directory pool -- whichever of the two runs
+    /// first for a given `<u>` no longer determines what the other
+    /// starts from. `projected` folds in `DiskUsage::dir_total`'s current
+    /// directory-pool total (0 if `<u>` has never gone through
+    /// `check_disk_quota` yet) so a save is still checked against
+    /// everything `<u>` has on disk, not just its own save file.
     fn check_save_disk_quota(&mut self, save_file_rel: &str, new_bytes: u64) -> R<bool> {
         let Some(driver) = self.driver.as_ref() else {
             return Ok(true);
@@ -3355,7 +3378,11 @@ impl<'a> RegistryHost<'a> {
         let seeded = driver
             .disk_usage
             .seeded_save_total(&save_root, &u, save_file_rel);
-        let projected = seeded.saturating_sub(old_bytes).saturating_add(new_bytes);
+        let dir_now = driver.disk_usage.dir_total(&u);
+        let projected = seeded
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes)
+            .saturating_add(dir_now);
         if projected > max_bytes {
             self.registry
                 .quota_breaches
@@ -3370,7 +3397,7 @@ impl<'a> RegistryHost<'a> {
             return Ok(false);
         }
         let driver = self.driver.as_mut().expect("checked above");
-        driver.disk_usage.note_write(&u, old_bytes, new_bytes);
+        driver.disk_usage.note_save_write(&u, old_bytes, new_bytes);
         Ok(true)
     }
 
