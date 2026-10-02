@@ -16,10 +16,20 @@ publish.workspace = true
 # API, so this is -- deliberately, and only here -- the one crate in the
 # workspace that opts out of `unsafe_code = "deny"` (CTO review required
 # before this merges: see OBI-184). Every `unsafe` block is confined to
-# `fdpass.rs` and is a thin, tested wrapper around `libc::sendmsg`/
-# `recvmsg`; nothing above `fdpass` touches raw fds directly.
+# `fdpass.rs`/`listener.rs` and is a thin, tested wrapper around
+# `libc::sendmsg`/`recvmsg`/`fcntl`/`FromRawFd`; nothing above those two
+# modules touches raw fds directly.
+#
+# `"allow"`, not `"warn"`: CI's `cargo clippy --workspace --all-targets
+# -- -D warnings` (`.github/workflows/ci.yml`) promotes every currently-
+# warn-level lint to a hard error, which would defeat a `"warn"`-level
+# exception here just as surely as the workspace's own `"deny"` does --
+# `"allow"` is the only level `-D warnings` cannot touch (there is
+# nothing for it to "promote"), so it is the only level that actually
+# expresses "this is an intentional, reviewed exception," not "the CI
+# flag for reviewing it hasn't been added yet."
 [lints.rust]
-unsafe_code = "warn"
+unsafe_code = "allow"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
