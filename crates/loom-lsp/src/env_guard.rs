@@ -46,8 +46,16 @@ pub fn filtered_env<I: IntoIterator<Item = (String, String)>>(vars: I) -> Vec<(S
 /// set) or re-exec isn't available (non-Unix, or the current executable
 /// path can't be resolved) -- in which case this silently continues with
 /// the inherited environment rather than refusing to start. Never returns
-/// on success (the process image is replaced); returns on failure so
-/// `main` can decide whether that is fatal.
+/// on success (the process image is replaced).
+///
+/// N2 (CTO review of OBI-168): if the re-exec itself fails *and* the
+/// inherited environment still holds a secret-looking variable (one
+/// whose name ends in `_URL`, `_KEY`, `_SECRET`, or `_TOKEN` -- exactly
+/// the shape of `DATABASE_URL`, a GitHub App key, a webhook secret, ...),
+/// this exits the process non-zero rather than serving with that secret
+/// still in its environment. A clean environment with no such variable
+/// is not worth refusing to start over, so that case still degrades to a
+/// warning.
 #[cfg(unix)]
 pub fn maybe_reexec() {
     use std::os::unix::process::CommandExt;
@@ -65,7 +73,27 @@ pub fn maybe_reexec() {
         .envs(kept)
         .env(SENTINEL, "1")
         .exec(); // replaces this process on success; only returns on error
-    tracing::warn!(%err, "loom-lsp: re-exec with a cleared environment failed, continuing with the inherited one (M-LSP-5 degraded)");
+    let secret_vars: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| looks_like_secret(k))
+        .collect();
+    if secret_vars.is_empty() {
+        tracing::warn!(%err, "loom-lsp: re-exec with a cleared environment failed, continuing with the inherited one (M-LSP-5 degraded, no secret-looking vars present)");
+    } else {
+        tracing::error!(%err, ?secret_vars, "loom-lsp: re-exec with a cleared environment failed, and secret-looking vars are present (M-LSP-5); refusing to start rather than serve with them inherited");
+        std::process::exit(1);
+    }
+}
+
+/// Does `key` look like it might hold a credential (spec M-LSP-5's own
+/// examples: `DATABASE_URL`, an App private key, a webhook/OAuth secret,
+/// a token)? A name-based heuristic, deliberately over-inclusive: a false
+/// positive just means "exit instead of degrade" on an env var that
+/// happened to share a naming convention with a real secret, which is
+/// the safe direction to be wrong in.
+fn looks_like_secret(key: &str) -> bool {
+    const SUFFIXES: &[&str] = &["_URL", "_KEY", "_SECRET", "_TOKEN"];
+    SUFFIXES.iter().any(|s| key.ends_with(s))
 }
 
 #[cfg(not(unix))]
@@ -97,5 +125,15 @@ mod tests {
         assert!(keys.contains(&"RUST_LOG"));
         assert!(!keys.contains(&"DATABASE_URL"));
         assert!(!keys.contains(&"GITHUB_APP_PRIVATE_KEY"));
+    }
+
+    #[test]
+    fn looks_like_secret_matches_the_spec_examples() {
+        assert!(looks_like_secret("DATABASE_URL"));
+        assert!(looks_like_secret("GITHUB_APP_PRIVATE_KEY"));
+        assert!(looks_like_secret("WEBHOOK_SECRET"));
+        assert!(looks_like_secret("GITHUB_TOKEN"));
+        assert!(!looks_like_secret("PATH"));
+        assert!(!looks_like_secret("RUST_LOG"));
     }
 }

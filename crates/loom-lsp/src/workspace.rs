@@ -170,6 +170,14 @@ impl Workspace {
         }
     }
 
+    /// Whether this workspace is in `Local` mode (spec M-LSP-2/M-LSP-3:
+    /// callers must only honour a client-supplied root directory in this
+    /// mode -- a `Vfs`-mode workspace's reads are gated and must never be
+    /// swapped out for an ungated directory).
+    pub fn is_local(&self) -> bool {
+        matches!(self.mode, UriMode::Local { .. })
+    }
+
     /// The URI a program path maps to in this workspace's scheme, whether
     /// or not it is open, exists, or is readable (go-to-definition targets
     /// a file that may be none of those).

@@ -4,16 +4,25 @@
 //! The transport-agnostic protocol core: one [`run`] loop over any
 //! [`Connection`] (stdio, in-memory-bridged WebSocket, or a test harness).
 //!
-//! Spec `docs/threat-model-phase2.md` \u00a76.3 **M-LSP-4**: every request runs
+//! Spec `docs/threat-model-phase2.md` §6.3 **M-LSP-4**: every request runs
 //! on a bounded worker pool (never the main loop thread, so the server
 //! keeps reading `$/cancelRequest`/`didChange`/etc. while a slow compile
-//! is in flight), with a 5 s deadline and cancellation honoured. The
-//! worker itself cannot be force-stopped (Rust has no safe thread-kill),
-//! so "cancellation honoured" means what most synchronous LSP servers
-//! mean by it: the *response* is cancelled/timed-out immediately and the
-//! stray in-flight compile's result, if it ever finishes, is discarded --
-//! not that the CPU work inside `loom-compiler` stops early. Documented
-//! limitation, not a silent gap.
+//! is in flight), with a 5 s deadline and cancellation honoured.
+//!
+//! The pool is `MAX_CONCURRENT_REQUESTS` **persistent** worker threads
+//! reading from a bounded job queue (CTO review of OBI-168, F3): a
+//! worker calls `dispatch_request` directly and only picks up its next
+//! job once that call actually returns, so a pool slot is occupied for
+//! exactly as long as real compile work is running, never released early
+//! just because the client-facing deadline fired. The deadline itself is
+//! enforced by a separate, cheap (sleep-only) timer thread per in-flight
+//! job, which sends a timeout response to the client without touching
+//! the worker -- the worker keeps running to completion regardless (Rust
+//! has no safe thread-kill, so "cancellation honoured" means the
+//! *response* is cancelled/timed-out immediately, not that the CPU work
+//! inside `loom-compiler` stops early; documented limitation, not a
+//! silent gap). When the job queue is full, a new request is refused
+//! immediately with no thread spawned at all (M-LSP-4's backpressure).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -38,8 +47,12 @@ use crate::workspace::{LimitExceeded, Workspace};
 use crate::{completion, definition, hover};
 
 /// Spec M-LSP-4: "a bounded blocking pool ... with a 5 s per-request
-/// deadline".
+/// deadline". This many persistent worker threads exist for the whole
+/// server lifetime; it is also the hard cap on concurrent compiles.
 const MAX_CONCURRENT_REQUESTS: usize = 4;
+/// How many requests may wait for a free worker before new ones are
+/// refused outright (CTO review F3.2: "about 16 pending").
+const MAX_PENDING_REQUESTS: usize = 16;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Parse (and, if it parses clean, type-check) `path`'s current buffer.
@@ -88,6 +101,12 @@ fn server_capabilities() -> ServerCapabilities {
 /// become no-ops.
 type Inflight = Arc<Mutex<HashMap<RequestId, Arc<AtomicBool>>>>;
 
+/// One request queued for a worker.
+struct Job {
+    req: Request,
+    ws: Workspace,
+}
+
 /// Run the server against `connection` until the client shuts it down.
 /// `root` is the warp/mudlib checkout this server serves (one server
 /// instance per root; a multi-root client needs one server per folder,
@@ -109,23 +128,28 @@ pub fn run_with_workspace(
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let (id, params) = connection.initialize_start()?;
     let init_params: InitializeParams = serde_json::from_value(params)?;
-    // Prefer a client-given workspace folder, falling back to the
-    // deprecated single `rootUri` for older clients. Only meaningful in
-    // `Local` mode; a `Vfs`-mode workspace ignores it (there is no
-    // filesystem root to override -- M-LSP-3).
-    let client_root = init_params
-        .workspace_folders
-        .as_ref()
-        .and_then(|fs| fs.first())
-        .map(|f| &f.uri)
-        .or({
-            #[allow(deprecated)]
-            init_params.root_uri.as_ref()
-        })
-        .and_then(crate::workspace::uri_to_fs_path)
-        .filter(|p| p.is_dir());
-    if let Some(root) = client_root {
-        ws = Workspace::new(root);
+    // F1 (CTO review of OBI-168): only honour a client-supplied root in
+    // `Local` mode. A `Vfs`-mode workspace's reads are gated by a
+    // `ReadAuthorizer` (spec M-LSP-2); swapping it for a plain
+    // `Workspace::new(root)` here would silently replace that gate with
+    // an ungated `LocalDirectoryProvider` and start accepting `file://`
+    // URIs (M-LSP-3) the moment any client sent an `initialize` with a
+    // `rootUri` -- exactly the bypass this review caught.
+    if ws.is_local() {
+        let client_root = init_params
+            .workspace_folders
+            .as_ref()
+            .and_then(|fs| fs.first())
+            .map(|f| &f.uri)
+            .or({
+                #[allow(deprecated)]
+                init_params.root_uri.as_ref()
+            })
+            .and_then(crate::workspace::uri_to_fs_path)
+            .filter(|p| p.is_dir());
+        if let Some(root) = client_root {
+            ws = Workspace::new(root);
+        }
     }
     let init_result = serde_json::json!({
         "capabilities": server_capabilities(),
@@ -133,11 +157,11 @@ pub fn run_with_workspace(
     });
     connection.initialize_finish(id, init_result)?;
 
-    let permits = crossbeam_channel::bounded::<()>(MAX_CONCURRENT_REQUESTS);
-    for _ in 0..MAX_CONCURRENT_REQUESTS {
-        permits.0.send(()).ok();
-    }
     let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
+    let (job_tx, job_rx) = crossbeam_channel::bounded::<Job>(MAX_PENDING_REQUESTS);
+    for _ in 0..MAX_CONCURRENT_REQUESTS {
+        spawn_worker(connection.sender.clone(), inflight.clone(), job_rx.clone());
+    }
 
     for msg in &connection.receiver {
         match msg {
@@ -145,7 +169,7 @@ pub fn run_with_workspace(
                 if connection.handle_shutdown(&req)? {
                     break;
                 }
-                spawn_request(&connection, &ws, &permits, &inflight, req);
+                dispatch_or_refuse(&connection, &ws, &job_tx, &inflight, req)?;
             }
             Message::Notification(not) => {
                 if not.method == "$/cancelRequest" {
@@ -160,67 +184,91 @@ pub fn run_with_workspace(
     Ok(())
 }
 
-/// Hand `req` to a worker thread (spec M-LSP-4): acquires one of
-/// `MAX_CONCURRENT_REQUESTS` permits (blocking further dispatch, not the
-/// receive loop, if the pool is full), runs the handler on a second,
-/// disposable thread so the deadline can be enforced even if the handler
-/// never returns, and sends exactly one response -- whichever of
-/// "finished", "timed out", or "cancelled" happens first.
-fn spawn_request(
+/// Queue `req` for a worker (spec M-LSP-4), or refuse it immediately --
+/// no thread spawned either way -- if `MAX_PENDING_REQUESTS` are already
+/// waiting (CTO review F3.2: the previous design spawned one OS thread
+/// per request *before* checking any bound, so a burst of requests was
+/// unbounded thread growth; this one never spawns anything on the
+/// receive-loop thread at all).
+fn dispatch_or_refuse(
     connection: &Connection,
     ws: &Workspace,
-    permits: &(
-        crossbeam_channel::Sender<()>,
-        crossbeam_channel::Receiver<()>,
-    ),
+    job_tx: &crossbeam_channel::Sender<Job>,
     inflight: &Inflight,
     req: Request,
-) {
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let id = req.id.clone();
-    let answered = Arc::new(AtomicBool::new(false));
-    inflight
-        .lock()
-        .unwrap()
-        .insert(id.clone(), answered.clone());
-
-    let ws = ws.clone();
-    let sender = connection.sender.clone();
-    let permit_tx = permits.0.clone();
-    let permit_rx = permits.1.clone();
-    let inflight = inflight.clone();
-
-    std::thread::spawn(move || {
-        // Block *this* dispatch thread (not the receive loop above) until
-        // a pool slot frees up.
-        let _ = permit_rx.recv();
-
-        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        {
-            let ws = ws.clone();
-            let req = req.clone();
-            std::thread::spawn(move || {
-                let resp = dispatch_request(&ws, req);
-                let _ = done_tx.send(resp);
-            });
-            // The inner worker is intentionally detached: see module docs
-            // on why a timed-out compile cannot be force-stopped.
+    let job = Job {
+        req,
+        ws: ws.clone(),
+    };
+    match job_tx.try_send(job) {
+        Ok(()) => {
+            inflight
+                .lock()
+                .unwrap()
+                .insert(id, Arc::new(AtomicBool::new(false)));
         }
-        let resp = match done_rx.recv_timeout(REQUEST_DEADLINE) {
-            Ok(resp) => resp,
-            Err(_) => Response::new_err(
-                id.clone(),
+        Err(_) => {
+            let resp = Response::new_err(
+                id,
                 ErrorCode::RequestFailed as i32,
                 format!(
-                    "exceeded the {:?} analysis deadline (M-LSP-4)",
-                    REQUEST_DEADLINE
+                    "loom-lsp is busy ({MAX_PENDING_REQUESTS} requests already pending, M-LSP-4)"
                 ),
-            ),
-        };
-        if !answered.swap(true, Ordering::SeqCst) {
-            let _ = sender.send(Message::Response(resp));
+            );
+            connection.sender.send(Message::Response(resp))?;
         }
-        inflight.lock().unwrap().remove(&id);
-        let _ = permit_tx.send(());
+    }
+    Ok(())
+}
+
+/// One persistent worker thread (spec M-LSP-4): pulls a [`Job`] off the
+/// queue, runs it to completion on *this* thread (so the pool never grows
+/// past `MAX_CONCURRENT_REQUESTS`, and a slot only frees when the real
+/// work is actually done -- CTO review F3.3), and races a cheap timer
+/// thread against it purely to answer the client within
+/// [`REQUEST_DEADLINE`] even if the compile itself runs long.
+fn spawn_worker(
+    sender: crossbeam_channel::Sender<Message>,
+    inflight: Inflight,
+    job_rx: crossbeam_channel::Receiver<Job>,
+) {
+    std::thread::spawn(move || {
+        for job in job_rx {
+            let id = job.req.id.clone();
+            let answered = match inflight.lock().unwrap().get(&id).cloned() {
+                Some(a) => a,
+                None => Arc::new(AtomicBool::new(false)), // cancelled before dequeue is handled below anyway
+            };
+
+            // Cheap (sleep-only) deadline timer: never runs any compiler
+            // code, so it can't itself become a resource problem.
+            {
+                let sender = sender.clone();
+                let answered = answered.clone();
+                let id = id.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(REQUEST_DEADLINE);
+                    if !answered.swap(true, Ordering::SeqCst) {
+                        let resp = Response::new_err(
+                            id,
+                            ErrorCode::RequestFailed as i32,
+                            format!(
+                                "exceeded the {REQUEST_DEADLINE:?} analysis deadline (M-LSP-4)"
+                            ),
+                        );
+                        let _ = sender.send(Message::Response(resp));
+                    }
+                });
+            }
+
+            let resp = dispatch_request(&job.ws, job.req);
+            if !answered.swap(true, Ordering::SeqCst) {
+                let _ = sender.send(Message::Response(resp));
+            }
+            inflight.lock().unwrap().remove(&id);
+        }
     });
 }
 

@@ -38,13 +38,21 @@ impl TestClient {
         std::thread::spawn(move || {
             let _ = loom_lsp::server::run(server_conn, fixture_root());
         });
-        TestClient::handshake(client_conn)
+        TestClient::handshake(client_conn, None)
     }
 
     /// A session using the per-session/Vfs mode (spec M-LSP-2/M-LSP-3):
     /// reads are gated by `readable`, and `loom-vfs://` URIs replace
     /// `file://` ones.
     fn start_vfs(readable: &[&str]) -> TestClient {
+        TestClient::start_vfs_with_root_uri(readable, None)
+    }
+
+    /// As [`TestClient::start_vfs`], but the `initialize` handshake sends
+    /// `rootUri` = `root_uri` (spec M-LSP-2/M-LSP-3, CTO review F1: a
+    /// `Vfs`-mode workspace must ignore this, not swap itself out for an
+    /// ungated `Workspace::new(root)`).
+    fn start_vfs_with_root_uri(readable: &[&str], root_uri: Option<&str>) -> TestClient {
         use loom_lsp::file_provider::{GatedProvider, LocalDirectoryProvider};
         use loom_lsp::workspace::Workspace;
         use std::collections::HashSet;
@@ -68,16 +76,16 @@ impl TestClient {
         std::thread::spawn(move || {
             let _ = loom_lsp::server::run_with_workspace(server_conn, ws);
         });
-        TestClient::handshake(client_conn)
+        TestClient::handshake(client_conn, root_uri)
     }
 
-    fn handshake(conn: Connection) -> TestClient {
+    fn handshake(conn: Connection, root_uri: Option<&str>) -> TestClient {
         let mut c = TestClient { conn, next_id: 1 };
         let id = c.send_request(
             "initialize",
             json!({
                 "processId": null,
-                "rootUri": null,
+                "rootUri": root_uri,
                 "capabilities": {},
             }),
         );
@@ -378,6 +386,87 @@ fn m_lsp_2_a_session_that_cannot_read_the_target_gets_no_location() {
     let resp = t4.recv_response(id);
     let result = resp.response_result.expect("T4 must get a Location");
     assert_eq!(result["uri"].as_str().unwrap(), vfs_uri("/secure/master"));
+}
+
+/// CTO review of OBI-168, F1 (critical): a client-supplied `rootUri` must
+/// not replace a `Vfs`-mode workspace's gated provider with an ungated
+/// `LocalDirectoryProvider`. Same scenario as the M-LSP-2 test above, but
+/// this time the `initialize` handshake sends a real, existing directory
+/// as `rootUri` -- exactly what the bug did silently honour.
+#[test]
+fn f1_a_client_supplied_root_uri_does_not_bypass_vfs_gating() {
+    let src = std::fs::read_to_string(fixture_root().join("domains/start/privileged.wf")).unwrap();
+    let line = src.lines().position(|l| l.starts_with("inherit")).unwrap() as u32;
+    let character = src
+        .lines()
+        .nth(line as usize)
+        .unwrap()
+        .find("/secure/master")
+        .unwrap() as u32
+        + 1;
+
+    // `rootUri` points at a real, existing directory laid out exactly
+    // like this workspace's own fixture tree (the fixture root itself) --
+    // the exact precondition `Workspace::new(root).is_dir()` needs to
+    // fire, *and* a root an attacker would plausibly send to reach
+    // `/secure/master.wf` if the bypass were live.
+    let root_uri = format!("file://{}", fixture_root().to_str().unwrap());
+    let mut t1 =
+        TestClient::start_vfs_with_root_uri(&["/domains/start/privileged"], Some(&root_uri));
+
+    // Discriminator #1: a well-formed `loom-vfs://` request for something
+    // *readable* must still work. If the bug swapped the session into
+    // `Local` mode, `program_path` would stop understanding the
+    // `loom-vfs:` scheme at all (`UriMode::Local`'s match arm only parses
+    // `file:`), so *every* vfs-scheme request -- not just unreadable ones
+    // -- would start returning `null`. Seeing a real hover result here is
+    // what proves the workspace is still genuinely gated, not merely
+    // coincidentally denying the one path #2 checks.
+    t1.did_open_uri(&vfs_uri("/domains/start/privileged"), &src);
+    let id = t1.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": vfs_uri("/domains/start/privileged") },
+            "position": { "line": line, "character": character },
+        }),
+    );
+    let resp = t1.recv_response(id);
+    assert_ne!(
+        resp.response_result.unwrap(),
+        Value::Null,
+        "a readable loom-vfs:// request must still work after a client rootUri -- if this is \
+         null, the session silently fell back to Local mode and no longer understands \
+         loom-vfs: URIs at all"
+    );
+
+    // Discriminator #2: go-to-definition into the unreadable `/secure/master`
+    // must still return nothing.
+    let id = t1.send_request(
+        "textDocument/definition",
+        json!({
+            "textDocument": { "uri": vfs_uri("/domains/start/privileged") },
+            "position": { "line": line, "character": character },
+        }),
+    );
+    let resp = t1.recv_response(id);
+    assert_eq!(
+        resp.response_result.unwrap(),
+        Value::Null,
+        "a client-supplied rootUri must not turn Vfs mode into an ungated Local one"
+    );
+
+    // Also: a `file://` URI must still be rejected as a request target
+    // (M-LSP-3), proving the workspace is still genuinely in Vfs mode and
+    // not just coincidentally denying this one path.
+    let id = t1.send_request(
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": file_uri("/domains/start/privileged") },
+            "position": { "line": 0, "character": 0 },
+        }),
+    );
+    let resp = t1.recv_response(id);
+    assert_eq!(resp.response_result.unwrap(), Value::Null);
 }
 
 #[test]

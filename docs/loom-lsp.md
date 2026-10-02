@@ -70,21 +70,36 @@ criterion asks for.
   never reach a response and never be accepted as one. `--stdio`/`--root`
   (`Workspace::new`) keeps `file://`, which is correct and expected for a
   local editor on a trusted checkout -- the threat model's trust boundary
-  is "a browser reaching the service", not a local editor.
+  is "a browser reaching the service", not a local editor. A client's
+  `initialize` `rootUri`/`workspaceFolders` is honoured **only** when the
+  workspace is already in `Local` mode (`run_with_workspace` checks
+  `ws.is_local()` first); a `Vfs`-mode session ignores it entirely, since
+  honouring it there would silently replace the gated workspace with an
+  ungated one (CTO review of OBI-168, F1 -- `tests/lsp_integration.rs`'s
+  `f1_*` test sends a real `rootUri` to a `Vfs` session and checks both
+  that it's still gated and that it hasn't otherwise broken).
 - **M-LSP-4 (limits, deadline, cancellation, fuzzing).** Documents over 1
   MiB and a 65th open document are refused (with a `publishDiagnostics`
-  explaining why, not a silent drop). Every request runs on its own
-  worker thread, bounded to 4 concurrent, with a 5 s deadline and
-  `$/cancelRequest` honoured -- whichever of "finished" / "timed out" /
-  "cancelled" happens first wins, and the other two become no-ops (the
-  in-flight compile itself cannot be force-stopped; see `server.rs`'s
-  module docs for why). `crates/loom-lsp/fuzz`'s `lsp_requests` target
-  fuzzes `hover`/`definition`/`completion` over arbitrary `(offset,
-  source)` pairs (`scripts/fuzz-smoke.sh lsp`, wired into the same
-  PR-triggered smoke job as the parser/bytecode fuzz targets -- there is
-  no separate scheduled *nightly* workflow in this repo yet for any fuzz
-  target, parser/bytecode included, so this matches the existing pattern
-  rather than inventing a new one).
+  explaining why, not a silent drop). Requests run on `MAX_CONCURRENT_REQUESTS`
+  (4) **persistent** worker threads pulling from a bounded job queue (16
+  pending); a request beyond that queue is refused immediately with no
+  thread spawned at all. A worker only picks up its next job once the
+  current one *actually* finishes -- a 5 s client-facing deadline is
+  enforced by a separate, cheap timer thread per in-flight job that
+  replies to the client without touching the worker, so a slow compile
+  can't make the pool grow or free a slot early (CTO review of OBI-168,
+  F3). `$/cancelRequest` is honoured the same way -- whichever of
+  "finished" / "timed out" / "cancelled" happens first wins, and the
+  other two become no-ops (the in-flight compile itself cannot be
+  force-stopped; see `server.rs`'s module docs for why). The WS bridge
+  additionally caps messages at 4 MiB / frames at 1 MiB, sessions at 32
+  concurrent, and closes an idle (60 s) session. `crates/loom-lsp/fuzz`'s
+  `lsp_requests` target fuzzes `hover`/`definition`/`completion` over
+  arbitrary `(offset, source)` pairs (`scripts/fuzz-smoke.sh lsp`, wired
+  into the same PR-triggered smoke job as the parser/bytecode fuzz
+  targets -- there is no separate scheduled *nightly* workflow in this
+  repo yet for any fuzz target, parser/bytecode included, so this matches
+  the existing pattern rather than inventing a new one).
 - **M-LSP-5 (no inherited secrets).** `env_guard::maybe_reexec` (called
   first thing in `main`) re-execs the process with every environment
   variable dropped except a small allowlist (`PATH`, `HOME`, `LANG`,
@@ -146,11 +161,24 @@ concept at the socket level -- today every WS connection shares the one
 ./target/debug/loom-lsp --ws 127.0.0.1:7777 --root /path/to/warp
 ```
 
+**This is a local/dev bridge, not the production path** (CTO review of
+OBI-168, F2): it has no authentication, and today it always runs `Local`
+mode (every file under `--root` readable), so `serve` refuses to bind
+anything but a loopback address. Real staff exposure goes through
+`loom-http` with a D-TM4 single-use ticket in front of a `Vfs`-mode
+workspace (OBI-180's job, via [`run_with_workspace`]). If you have
+deliberately put real auth/gating in front of this process some other
+way and need it reachable off-box anyway, pass
+`--ws-insecure-public` to skip the bind check -- the server logs a loud
+warning when you do.
+
 Each new WS connection gets an independent LSP session (its own
-`initialize` handshake, its own open-buffer overlay). The wire format is
-plain JSON-RPC 2.0 objects, one per WS text frame -- exactly the
+`initialize` handshake, its own open-buffer overlay), up to 32 concurrent
+sessions (spec M-LSP-4); a session idle for 60 s is closed. The wire
+format is plain JSON-RPC 2.0 objects, one per WS text frame -- exactly the
 `DidOpenTextDocumentParams`/`HoverParams`/etc. shapes `lsp-types` defines,
-with no transport envelope beyond the WS frame itself.
+with no transport envelope beyond the WS frame itself. Frames are capped
+at 1 MiB and whole messages at 4 MiB (spec M-LSP-4).
 
 ## Testing
 

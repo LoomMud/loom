@@ -19,11 +19,15 @@ enum Transport {
 struct Args {
     transport: Transport,
     root: PathBuf,
+    /// F2 (CTO review of OBI-168): require an explicit opt-in to bind a
+    /// non-loopback `--ws` address, since that listener has no auth.
+    ws_insecure_public: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut transport = Transport::Stdio;
     let mut root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut ws_insecure_public = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -37,22 +41,29 @@ fn parse_args() -> Result<Args, String> {
                         .map_err(|e| format!("invalid --ws address {addr:?}: {e}"))?,
                 );
             }
+            "--ws-insecure-public" => ws_insecure_public = true,
             "--root" => {
                 root = it.next().ok_or("--root needs a path")?.into();
             }
             "-h" | "--help" => {
                 println!(
-                    "loom-lsp [--stdio | --ws HOST:PORT] [--root DIR]\n\n\
+                    "loom-lsp [--stdio | --ws HOST:PORT] [--root DIR] [--ws-insecure-public]\n\n\
                      --stdio       run over stdin/stdout (default; VS Code, neovim)\n\
-                     --ws ADDR     run a WebSocket bridge on ADDR (one LSP session per connection)\n\
-                     --root DIR    the warp/mudlib checkout to serve (default: cwd, or the client's rootUri over stdio)"
+                     --ws ADDR     run a WebSocket bridge on ADDR (one LSP session per connection);\n\
+                     \x20\x20\x20\x20\x20\x20\x20\x20refuses a non-loopback ADDR by default (M-LSP-2/M-LSP-5, no auth of its own)\n\
+                     --root DIR    the warp/mudlib checkout to serve (default: cwd, or the client's rootUri over stdio)\n\
+                     --ws-insecure-public  allow --ws to bind a non-loopback address anyway (dev/debug only; see docs/loom-lsp.md)"
                 );
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument {other:?} (try --help)")),
         }
     }
-    Ok(Args { transport, root })
+    Ok(Args {
+        transport,
+        root,
+        ws_insecure_public,
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -79,7 +90,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         Transport::Ws(addr) => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(loom_lsp::ws::serve(addr, args.root))?;
+            rt.block_on(loom_lsp::ws::serve(
+                addr,
+                args.root,
+                args.ws_insecure_public,
+            ))?;
         }
     }
     Ok(())

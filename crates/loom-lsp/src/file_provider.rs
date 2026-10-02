@@ -54,7 +54,16 @@ pub struct LocalDirectoryProvider {
 
 impl FileProvider for LocalDirectoryProvider {
     fn read(&self, path: &str) -> Result<String, String> {
-        let file = self.root.join(format!("{}.wf", &path[1..]));
+        // N1 (CTO review of OBI-168): `path` is documented as normalised,
+        // but this is a `pub` trait impl a future caller could hand an
+        // un-normalised string to (an empty string, or one with a
+        // non-ASCII first byte would panic on a raw `&path[1..]` slice).
+        // Re-validate here so the provider is safe on its own, not only
+        // because today's callers happen to normalise first.
+        let Ok(normalized) = loom_compiler::mudlib::normalize_path(path) else {
+            return Err("No such file or directory".to_string());
+        };
+        let file = self.root.join(format!("{}.wf", &normalized[1..]));
         std::fs::read_to_string(&file).map_err(|e| e.to_string())
     }
 
@@ -113,5 +122,17 @@ pub mod tests {
             denied, missing,
             "a denial must look exactly like a missing file"
         );
+    }
+
+    #[test]
+    fn local_directory_provider_read_does_not_panic_on_bad_paths() {
+        // N1: an empty string or a path missing its leading `/` used to
+        // panic on a raw `&path[1..]` slice.
+        let provider = LocalDirectoryProvider {
+            root: std::env::temp_dir(),
+        };
+        assert!(provider.read("").is_err());
+        assert!(provider.read("no-leading-slash").is_err());
+        assert!(provider.read("/../escape").is_err());
     }
 }
