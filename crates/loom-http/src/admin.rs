@@ -43,6 +43,9 @@ pub fn admin_router() -> Router<HttpState> {
     Router::new()
         .route("/api/v1/admin/roles/tier", post(set_tier))
         .route("/api/v1/admin/audit", get(audit_recent))
+        .route("/api/v1/admin/who", get(who))
+        .route("/api/v1/admin/objects", get(list_objects))
+        .route("/api/v1/admin/objects/{*rest}", get(object_vars))
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +88,10 @@ fn admin_error_response(error: AdminError) -> (StatusCode, Json<ErrorResponse>) 
         AdminError::DirectoryUnavailable => {
             error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
         }
+        AdminError::WorldUnavailable => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
+        }
+        AdminError::NotFound => error_response(StatusCode::NOT_FOUND, "not_found"),
     }
 }
 
@@ -219,6 +226,161 @@ async fn audit_recent(
     }
 }
 
+/// `GET /api/v1/admin/who` response row (M-ADM-3: no email, no IP --
+/// those fields simply don't exist on [`crate::admin_query::WhoEntry`],
+/// so there's nothing here for serde to serialize even by accident).
+#[derive(Debug, Serialize)]
+struct WhoEntryResponse {
+    conn_id: u64,
+    account: Option<String>,
+    connected_at: String,
+    idle_secs: i64,
+}
+
+impl From<crate::admin_query::WhoEntry> for WhoEntryResponse {
+    fn from(entry: crate::admin_query::WhoEntry) -> Self {
+        WhoEntryResponse {
+            conn_id: entry.conn_id,
+            account: entry.account,
+            connected_at: entry
+                .connected_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            idle_secs: entry.idle_secs,
+        }
+    }
+}
+
+async fn who(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(auth) = state.auth_service() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
+    };
+    let Some(claims) = bearer_claims(&headers, &state) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(query) = state.world_query() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
+    };
+    let ctx = auth_context(&headers, Some(peer));
+    match auth.admin_who(&claims, &ctx, query).await {
+        Ok(rows) => {
+            let rows: Vec<WhoEntryResponse> = rows.into_iter().map(Into::into).collect();
+            (StatusCode::OK, Json(rows)).into_response()
+        }
+        Err(error) => admin_error_response(error).into_response(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ObjectSummaryResponse {
+    path: String,
+    euid: String,
+}
+
+impl From<crate::admin_query::ObjectSummary> for ObjectSummaryResponse {
+    fn from(entry: crate::admin_query::ObjectSummary) -> Self {
+        ObjectSummaryResponse {
+            path: entry.path,
+            euid: entry.euid,
+        }
+    }
+}
+
+async fn list_objects(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(auth) = state.auth_service() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
+    };
+    let Some(claims) = bearer_claims(&headers, &state) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(query) = state.world_query() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
+    };
+    let ctx = auth_context(&headers, Some(peer));
+    match auth.admin_list_objects(&claims, &ctx, query).await {
+        Ok(rows) => {
+            let rows: Vec<ObjectSummaryResponse> = rows.into_iter().map(Into::into).collect();
+            (StatusCode::OK, Json(rows)).into_response()
+        }
+        Err(error) => admin_error_response(error).into_response(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct VarEntryResponse {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ObjectVarsResponse {
+    path: String,
+    vars: Vec<VarEntryResponse>,
+}
+
+impl From<crate::admin_query::ObjectVars> for ObjectVarsResponse {
+    fn from(entry: crate::admin_query::ObjectVars) -> Self {
+        ObjectVarsResponse {
+            path: entry.path,
+            vars: entry
+                .vars
+                .into_iter()
+                .map(|v| VarEntryResponse {
+                    name: v.name,
+                    value: v.value,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// `GET /api/v1/admin/objects/:path/vars`, mounted as the
+/// `/api/v1/admin/objects/{*rest}` wildcard (axum has no way to express
+/// a static suffix after a variable-length path segment): `rest` is
+/// everything after `/api/v1/admin/objects/`, and this handler is the
+/// one place that peels the `/vars` suffix back off to recover the
+/// object path -- e.g. a request for `/std/room`'s variables is
+/// `GET /api/v1/admin/objects/std/room/vars`, `rest` is `"std/room/vars"`,
+/// and the object path passed to [`crate::auth::AuthService::
+/// admin_object_vars`] is `"/std/room"`. A `rest` that doesn't end in
+/// `/vars` is a plain `404` -- there is no other route under this
+/// prefix.
+async fn object_vars(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Path(rest): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let Some(object_path) = rest.strip_suffix("/vars").map(|p| format!("/{p}")) else {
+        return error_response(StatusCode::NOT_FOUND, "not_found").into_response();
+    };
+    let Some(auth) = state.auth_service() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
+    };
+    let Some(claims) = bearer_claims(&headers, &state) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(query) = state.world_query() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
+    };
+    let ctx = auth_context(&headers, Some(peer));
+    match auth
+        .admin_object_vars(&claims, &ctx, query, &object_path)
+        .await
+    {
+        Ok(vars) => (StatusCode::OK, Json(ObjectVarsResponse::from(vars))).into_response(),
+        Err(error) => admin_error_response(error).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::Request;
@@ -233,9 +395,14 @@ mod tests {
     // A minimal in-memory `StaffDirectory` sufficient to drive these HTTP
     // wire-level tests -- `auth::tests` already covers `AuthService`'s
     // own logic in depth; these only prove the handler plumbing (body
-    // parsing, status codes, bearer extraction).
+    // parsing, status codes, bearer extraction). `audits` captures every
+    // `record_audit` call (OBI-234: "every object/variable access is
+    // audited") so tests can assert on it directly, not just infer it
+    // from the response.
     #[derive(Default, Clone)]
-    struct Dir;
+    struct Dir {
+        audits: std::sync::Arc<std::sync::Mutex<Vec<crate::auth::AuditEvent>>>,
+    }
 
     #[async_trait::async_trait]
     impl StaffDirectory for Dir {
@@ -328,8 +495,9 @@ mod tests {
         }
         async fn record_audit(
             &self,
-            _event: crate::auth::AuditEvent,
+            event: crate::auth::AuditEvent,
         ) -> Result<(), crate::auth::DirectoryError> {
+            self.audits.lock().unwrap().push(event);
             Ok(())
         }
         async fn admin_set_tier(
@@ -356,22 +524,85 @@ mod tests {
         }
     }
 
-    fn test_app() -> (axum::Router, AuthService) {
+    /// A minimal [`crate::admin_query::WorldAdminQuery`] fake: `who`
+    /// returns one fixed session (never an email/IP field -- the type
+    /// has none to put one in); `list_objects` plays the part of
+    /// `valid_read`'s filtering (everyone sees `/std/room`, only `lead`
+    /// also sees `/secure/master`), so the routing/gating tests below
+    /// can tell "reached the world query and got a real filtered answer"
+    /// apart from "never got that far".
+    struct FakeWorldQuery;
+
+    #[async_trait::async_trait]
+    impl crate::admin_query::WorldAdminQuery for FakeWorldQuery {
+        async fn who(
+            &self,
+        ) -> Result<Vec<crate::admin_query::WhoEntry>, crate::admin_query::WorldQueryError>
+        {
+            Ok(vec![crate::admin_query::WhoEntry {
+                conn_id: 1,
+                account: Some("apprentice".to_string()),
+                connected_at: time::OffsetDateTime::now_utc(),
+                idle_secs: 5,
+            }])
+        }
+
+        async fn list_objects(
+            &self,
+            euid: &str,
+            _tier: i16,
+        ) -> Result<Vec<crate::admin_query::ObjectSummary>, crate::admin_query::WorldQueryError>
+        {
+            let all = vec![
+                crate::admin_query::ObjectSummary {
+                    path: "/std/room".to_string(),
+                    euid: "root".to_string(),
+                },
+                crate::admin_query::ObjectSummary {
+                    path: "/secure/master".to_string(),
+                    euid: "root".to_string(),
+                },
+            ];
+            Ok(all
+                .into_iter()
+                .filter(|o| euid == "lead" || !o.path.starts_with("/secure/"))
+                .collect())
+        }
+
+        async fn object_vars(
+            &self,
+            _euid: &str,
+            _tier: i16,
+            path: &str,
+        ) -> Result<crate::admin_query::ObjectVars, crate::admin_query::WorldQueryError> {
+            Ok(crate::admin_query::ObjectVars {
+                path: path.to_string(),
+                vars: vec![crate::admin_query::VarEntry {
+                    name: "hp".to_string(),
+                    value: "100".to_string(),
+                }],
+            })
+        }
+    }
+
+    fn test_app() -> (axum::Router, AuthService, Dir) {
         let keys = JwtKeys::single(
             [7u8; 32],
             "test-kid",
             "https://build.loommud.com/",
             jwt::AUDIENCE,
         );
-        let auth = AuthService::new(std::sync::Arc::new(Dir), keys);
+        let dir = Dir::default();
+        let auth = AuthService::new(std::sync::Arc::new(dir.clone()), keys);
         let (ws_accept_tx, _ws_accept_rx) = tokio::sync::mpsc::channel(1);
         let state = HttpState::new(
             ws_accept_tx,
             loom_obs::Readiness::new(),
             loom_obs::PrometheusMetrics::new_unregistered(),
         )
-        .with_auth(auth.clone());
-        (app(state), auth)
+        .with_auth(auth.clone())
+        .with_world_query(std::sync::Arc::new(FakeWorldQuery));
+        (app(state), auth, dir)
     }
 
     async fn access_token(auth: &AuthService, sub: &str, tier: i16, mfa_at: Option<i64>) -> String {
@@ -406,7 +637,7 @@ mod tests {
 
     #[tokio::test]
     async fn roles_tier_with_an_actor_field_in_the_body_is_400() {
-        let (app, auth) = test_app();
+        let (app, auth, _dir) = test_app();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let token = access_token(&auth, "lead", 3, Some(now)).await;
 
@@ -432,7 +663,7 @@ mod tests {
 
     #[tokio::test]
     async fn roles_tier_without_bearer_is_401() {
-        let (app, _auth) = test_app();
+        let (app, _auth, _dir) = test_app();
         let request = Request::builder()
             .method("POST")
             .uri("/api/v1/admin/roles/tier")
@@ -448,7 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn roles_tier_below_tier_3_is_forbidden() {
-        let (app, auth) = test_app();
+        let (app, auth, _dir) = test_app();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let token = access_token(&auth, "builder", 2, Some(now)).await;
         let request = Request::builder()
@@ -467,7 +698,7 @@ mod tests {
 
     #[tokio::test]
     async fn roles_tier_succeeds_for_t3_with_step_up() {
-        let (app, auth) = test_app();
+        let (app, auth, _dir) = test_app();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let token = access_token(&auth, "lead", 3, Some(now)).await;
         let request = Request::builder()
@@ -487,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_view_requires_tier_3() {
-        let (app, auth) = test_app();
+        let (app, auth, _dir) = test_app();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let token = access_token(&auth, "builder", 2, Some(now)).await;
         let request = Request::builder()
@@ -503,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn audit_view_succeeds_for_t3() {
-        let (app, auth) = test_app();
+        let (app, auth, _dir) = test_app();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let token = access_token(&auth, "lead", 3, Some(now)).await;
         let request = Request::builder()
@@ -517,5 +748,253 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let _: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    }
+
+    /// M-ADM-3: `who`'s response shape never carries an email or an IP,
+    /// whatever the caller's tier -- asserted directly on the parsed JSON
+    /// keys, not just by trusting the Rust type.
+    #[tokio::test]
+    async fn who_response_never_includes_email_or_ip() {
+        let (app, auth, dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "apprentice", 1, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/who")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        let keys: Vec<&str> = rows[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        assert!(!keys.contains(&"email"));
+        assert!(!keys.contains(&"ip"));
+        assert!(keys.contains(&"account"));
+        assert!(keys.contains(&"connected_at"));
+        assert!(keys.contains(&"idle_secs"));
+
+        // M-ADM-4: audited.
+        let audits = dir.audits.lock().unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.kind == "admin.who" && e.verdict == "allow")
+        );
+    }
+
+    #[tokio::test]
+    async fn who_without_bearer_is_401() {
+        let (app, _auth, _dir) = test_app();
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/who")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn objects_list_below_tier_3_is_forbidden() {
+        let (app, auth, dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "builder", 2, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/objects")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let audits = dir.audits.lock().unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.kind == "admin.objects.list" && e.verdict == "deny")
+        );
+    }
+
+    #[tokio::test]
+    async fn objects_list_at_tier_3_is_filtered_by_valid_read() {
+        let (app, auth, dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        // A T3 caller who isn't `lead`: `FakeWorldQuery::list_objects`
+        // (standing in for `valid_read`) hides `/secure/master` from
+        // anyone but `lead` -- proves the HTTP layer passes the real
+        // `euid` through and doesn't re-filter or widen the result.
+        let token = access_token(&auth, "domainlead", 3, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/objects")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["path"], "/std/room");
+        let audits = dir.audits.lock().unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.kind == "admin.objects.list" && e.verdict == "allow")
+        );
+    }
+
+    #[tokio::test]
+    async fn objects_list_at_tier_3_for_lead_sees_secure_too() {
+        let (app, auth, _dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "lead", 3, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/objects")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn object_vars_below_tier_4_is_forbidden() {
+        let (app, auth, dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "domainlead", 3, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/objects/std/room/vars")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let audits = dir.audits.lock().unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.kind == "admin.objects.vars" && e.verdict == "deny")
+        );
+    }
+
+    #[tokio::test]
+    async fn object_vars_at_tier_4_succeeds_for_non_secure_path() {
+        let (app, auth, dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "wizard", 4, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/objects/std/room/vars")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["path"], "/std/room");
+        assert_eq!(payload["vars"][0]["name"], "hp");
+        let audits = dir.audits.lock().unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.kind == "admin.objects.vars" && e.verdict == "allow")
+        );
+    }
+
+    #[tokio::test]
+    async fn object_vars_for_secure_path_below_tier_5_is_forbidden() {
+        let (app, auth, dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        // T4 passes the plain object-vars floor but not the stricter
+        // `/secure/` one.
+        let token = access_token(&auth, "wizard", 4, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/objects/secure/master/vars")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let audits = dir.audits.lock().unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.kind == "admin.objects.vars" && e.verdict == "deny")
+        );
+    }
+
+    #[tokio::test]
+    async fn object_vars_for_secure_path_at_tier_5_succeeds() {
+        let (app, auth, _dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "lead", 5, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/objects/secure/master/vars")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["path"], "/secure/master");
+    }
+
+    #[tokio::test]
+    async fn object_vars_without_world_query_wired_is_503() {
+        // Same shape as `/auth/*`'s "optional, 503 if unconfigured" rule
+        // (`lib.rs` module doc): no `with_world_query` call at all.
+        let keys = JwtKeys::single(
+            [7u8; 32],
+            "test-kid",
+            "https://build.loommud.com/",
+            jwt::AUDIENCE,
+        );
+        let auth = AuthService::new(std::sync::Arc::new(Dir::default()), keys);
+        let (ws_accept_tx, _ws_accept_rx) = tokio::sync::mpsc::channel(1);
+        let state = HttpState::new(
+            ws_accept_tx,
+            loom_obs::Readiness::new(),
+            loom_obs::PrometheusMetrics::new_unregistered(),
+        )
+        .with_auth(auth.clone());
+        let app = app(state);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "lead", 5, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/objects/secure/master/vars")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

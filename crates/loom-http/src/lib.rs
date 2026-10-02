@@ -37,6 +37,7 @@ use tower_http::services::ServeDir;
 use tracing::debug;
 
 mod admin;
+pub mod admin_query;
 pub mod auth;
 mod client_ip;
 mod handlers;
@@ -54,6 +55,7 @@ pub struct HttpState {
     auth: Option<auth::AuthService>,
     github: Option<std::sync::Arc<dyn auth::GithubIdentityProvider>>,
     github_webhook: Option<webhook::GithubWebhookConfig>,
+    world_query: Option<std::sync::Arc<dyn admin_query::WorldAdminQuery>>,
 }
 
 impl HttpState {
@@ -70,6 +72,7 @@ impl HttpState {
             auth: None,
             github: None,
             github_webhook: None,
+            world_query: None,
         }
     }
 
@@ -109,6 +112,25 @@ impl HttpState {
     pub fn with_github_webhook(mut self, config: webhook::GithubWebhookConfig) -> Self {
         self.github_webhook = Some(config);
         self
+    }
+
+    /// Wire the `who`/object-browser routes (OBI-234, P2-O2) to a real
+    /// world-thread query channel. Unset by default -- those routes
+    /// answer `503` (`AdminError::WorldUnavailable`) until `loom-cli`
+    /// configures the world-side receiver (see `admin_query`'s module
+    /// doc for the channel contract) and calls this.
+    pub fn with_world_query(
+        mut self,
+        world_query: std::sync::Arc<dyn admin_query::WorldAdminQuery>,
+    ) -> Self {
+        self.world_query = Some(world_query);
+        self
+    }
+
+    /// `Some` iff [`Self::with_world_query`] was called -- `admin.rs`'s
+    /// `who`/`objects`/`objects/:path/vars` handlers.
+    pub(crate) fn world_query(&self) -> Option<&dyn admin_query::WorldAdminQuery> {
+        self.world_query.as_deref()
     }
 }
 
