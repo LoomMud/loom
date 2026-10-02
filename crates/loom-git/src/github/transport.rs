@@ -9,16 +9,19 @@
 //! TLS anyway.
 //!
 //! [`UreqClient`] has **no `tls` feature enabled** (see the crate's
-//! `Cargo.toml`): it can reach `http://` only. Production wiring to the
-//! real `https://api.github.com` needs a TLS-capable transport supplied
-//! by whatever binary links this crate for deployment (D-B3.11
-//! follow-up) -- most simply, `loom-cli` depending on `ureq` itself with
-//! its `tls` feature on, since that binary is built and run only where a
-//! real C toolchain exists (CI, the release image), never in this
-//! agent's sandbox.
+//! `Cargo.toml`): it can reach `http://` only, which is all these tests
+//! need. Production wiring to the real `https://api.github.com` uses
+//! [`super::tls_transport::RustlsHttpClient`] instead (OBI-215) -- a
+//! hand-rolled minimal HTTP/1.1-over-`rustls` client, not `ureq`'s own
+//! `tls` feature, because that feature's bundled root store
+//! (`webpki-roots`) is CDLA-Permissive-2.0, a data licence this
+//! workspace's OSI-only licence gate does not allow (`deny.toml`,
+//! OBI-44). `rustls-native-certs`' platform root store has no such
+//! issue.
 
 use std::io::Read;
 
+#[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: Vec<u8>,

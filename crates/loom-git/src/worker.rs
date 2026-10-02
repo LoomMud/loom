@@ -9,11 +9,16 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::cli::{GitError, Repo, WorktreeRepo, rejects_git_segment, stdout_string};
+use crate::github::pulls::PullRequestOpener;
 use crate::identity::{Identity, driver_identity};
 use crate::lock::TreeLock;
+use crate::propose::{
+    self, ProposeAuthorizer, ProposeError, ProposeGitHub, ProposeLimits, ProposeQuota,
+    ProposeRequest, ProposeResult,
+};
 
 /// Mints (and caches) the short-lived installation token used for push
 /// and fetch (D-B3.5/D-B3.11). `None` configured anywhere up the chain
@@ -147,6 +152,10 @@ enum Msg {
         path: String,
         command: String,
     },
+    Propose {
+        req: ProposeRequest,
+        resp: SyncSender<Result<ProposeResult, ProposeError>>,
+    },
     Kick,
     Barrier(SyncSender<()>),
     Shutdown,
@@ -225,10 +234,62 @@ impl GitWorkerHandle {
         }
     }
 
+    /// Run the `propose` job (B3.3, design doc §4) on the worker thread,
+    /// serialised with commit/push/sync (D-B3.1). Blocks until the job
+    /// completes -- same shape as [`Self::barrier`], not a fire-and-forget
+    /// message.
+    pub fn propose(&self, req: ProposeRequest) -> Result<ProposeResult, ProposeError> {
+        let (tx, rx) = sync_channel(0);
+        if self.tx.send(Msg::Propose { req, resp: tx }).is_err() {
+            return Err(ProposeError::Git(GitError::Spawn(
+                "GitWorker thread is gone".to_string(),
+            )));
+        }
+        rx.recv().unwrap_or_else(|_| {
+            Err(ProposeError::Git(GitError::Spawn(
+                "GitWorker thread is gone".to_string(),
+            )))
+        })
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.send(Msg::Shutdown);
         if let Some(j) = self.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = j.join();
+        }
+    }
+}
+
+/// The dedicated `loom-warp-propose` App's PR-create side (D-B3.9):
+/// optional, independent of the (also optional) push [`TokenProvider`]
+/// above -- "no App configured" (design doc §4 step 7) means this is
+/// `None`, not that push/fetch are also disabled.
+pub struct ProposeGitHubConfig {
+    pub pr_opener: Box<dyn PullRequestOpener>,
+    pub owner: String,
+    pub repo: String,
+}
+
+/// Everything `propose` (B3.3) needs beyond the commit/push/sync config
+/// above: the master-gate authorizer, the rate/open-proposal quota, the
+/// limits, and (optionally) the GitHub App's PR-create side.
+pub struct ProposeConfig {
+    pub authorizer: Box<dyn ProposeAuthorizer>,
+    pub quota: Box<dyn ProposeQuota>,
+    pub limits: ProposeLimits,
+    pub github: Option<ProposeGitHubConfig>,
+}
+
+impl ProposeConfig {
+    /// `propose` with no GitHub App configured at all (step 7): every
+    /// call still runs limits/authz/commit-build, then returns
+    /// [`ProposeError::NoGitHubApp`] with the commit kept locally.
+    pub fn disabled() -> Self {
+        Self {
+            authorizer: Box::new(crate::propose::AllowAllAuthorizer),
+            quota: Box::new(crate::propose::InMemoryQuota::new()),
+            limits: ProposeLimits::default(),
+            github: None,
         }
     }
 }
@@ -245,6 +306,23 @@ impl GitWorker {
         recompile_host: Box<dyn RecompileHost>,
         audit: Box<dyn AuditSink>,
     ) -> GitWorkerHandle {
+        Self::spawn_with_propose(
+            config,
+            token_provider,
+            recompile_host,
+            audit,
+            ProposeConfig::disabled(),
+        )
+    }
+
+    /// [`Self::spawn`] plus the `propose` (B3.3) wiring.
+    pub fn spawn_with_propose(
+        config: GitConfig,
+        token_provider: Option<Box<dyn TokenProvider>>,
+        recompile_host: Box<dyn RecompileHost>,
+        audit: Box<dyn AuditSink>,
+        propose_config: ProposeConfig,
+    ) -> GitWorkerHandle {
         let (tx, rx) = sync_channel(4096);
         let tree_lock = TreeLock::new();
         let worker_lock = tree_lock.clone();
@@ -258,6 +336,7 @@ impl GitWorker {
                     token_provider,
                     recompile_host,
                     audit,
+                    propose_config,
                 );
             })
             .expect("spawn loom-git worker thread");
@@ -276,6 +355,7 @@ fn run(
     token_provider: Option<Box<dyn TokenProvider>>,
     recompile_host: Box<dyn RecompileHost>,
     audit: Box<dyn AuditSink>,
+    propose_config: ProposeConfig,
 ) {
     let repo = Repo::new(&config.git_dir, &config.work_tree);
     let mut pending: std::collections::HashMap<(String, String), PendingCommit> =
@@ -301,6 +381,19 @@ fn run(
                         command,
                         deadline: Instant::now() + config.commit_coalesce,
                     },
+                );
+            }
+            Ok(Msg::Propose { req, resp }) => {
+                handle_propose(
+                    &repo,
+                    &config,
+                    &mut pending,
+                    &mut push_dirty,
+                    &mut push_deadline,
+                    &token_provider,
+                    &propose_config,
+                    req,
+                    resp,
                 );
             }
             Ok(Msg::Kick) => sync_requested = true,
@@ -332,6 +425,19 @@ fn run(
                             command,
                             deadline: Instant::now() + config.commit_coalesce,
                         },
+                    );
+                }
+                Ok(Msg::Propose { req, resp }) => {
+                    handle_propose(
+                        &repo,
+                        &config,
+                        &mut pending,
+                        &mut push_dirty,
+                        &mut push_deadline,
+                        &token_provider,
+                        &propose_config,
+                        req,
+                        resp,
                     );
                 }
                 Ok(Msg::Kick) => sync_requested = true,
@@ -386,6 +492,64 @@ fn run(
             push_deadline = None;
         }
     }
+}
+
+fn flush_uid_commits(
+    repo: &Repo,
+    pending: &mut std::collections::HashMap<(String, String), PendingCommit>,
+    uid: &str,
+    push_dirty: &mut bool,
+    push_deadline: &mut Option<Instant>,
+) {
+    let keys: Vec<(String, String)> = pending.keys().filter(|(u, _)| u == uid).cloned().collect();
+    for key in keys {
+        if let Some(pc) = pending.remove(&key) {
+            commit_one(repo, &pc);
+            *push_dirty = true;
+            push_deadline.get_or_insert(Instant::now());
+        }
+    }
+}
+
+/// Design doc §4 step 1 ("drain pending commits for the proposer") plus
+/// the whole propose job: builds [`ProposeGitHub`] from the worker's
+/// configured push token (reused for fetch/push, D-B3.9's note that the
+/// same App token provider serves both roles) and `propose_config`'s PR
+/// opener, then hands off to [`propose::run_propose`].
+#[allow(clippy::too_many_arguments)]
+fn handle_propose(
+    repo: &Repo,
+    config: &GitConfig,
+    pending: &mut std::collections::HashMap<(String, String), PendingCommit>,
+    push_dirty: &mut bool,
+    push_deadline: &mut Option<Instant>,
+    token_provider: &Option<Box<dyn TokenProvider>>,
+    propose_config: &ProposeConfig,
+    req: ProposeRequest,
+    resp: SyncSender<Result<ProposeResult, ProposeError>>,
+) {
+    flush_uid_commits(repo, pending, &req.uid, push_dirty, push_deadline);
+
+    let github = match (token_provider.as_deref(), propose_config.github.as_ref()) {
+        (Some(tp), Some(gh_cfg)) => Some(ProposeGitHub {
+            token_provider: tp,
+            pr_opener: gh_cfg.pr_opener.as_ref(),
+            owner: &gh_cfg.owner,
+            repo: &gh_cfg.repo,
+        }),
+        _ => None,
+    };
+    let result = propose::run_propose(
+        repo,
+        config,
+        github.as_ref(),
+        propose_config.authorizer.as_ref(),
+        propose_config.quota.as_ref(),
+        &propose_config.limits,
+        req,
+        SystemTime::now(),
+    );
+    let _ = resp.send(result);
 }
 
 fn flush_due_commits(

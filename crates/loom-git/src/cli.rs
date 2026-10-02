@@ -189,6 +189,50 @@ impl Repo {
         run(self.build_authed(args, token), args)
     }
 
+    /// Run `args` with extra environment variables and/or stdin bytes,
+    /// piped through this repo's hardened base command. The one spot
+    /// `propose` (B3.3) builds a commit through git plumbing (`read-tree`
+    /// / `hash-object` / `update-index` / `write-tree` / `commit-tree`)
+    /// without a full working-tree checkout.
+    pub(crate) fn git_piped(
+        &self,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        stdin: Option<&[u8]>,
+    ) -> Result<Output, GitError> {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut cmd = self.build(args);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        if stdin.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| GitError::Spawn(e.to_string()))?;
+        if let Some(data) = stdin {
+            child
+                .stdin
+                .take()
+                .expect("stdin requested above")
+                .write_all(data)
+                .map_err(|e| GitError::Spawn(e.to_string()))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|e| GitError::Spawn(e.to_string()))?;
+        if !output.status.success() {
+            return Err(GitError::Failed {
+                args: args.iter().map(|s| s.to_string()).collect(),
+                status: output.status.code().unwrap_or(-1),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+        Ok(output)
+    }
+
     /// Whether this repo has already been seeded (D-B3.6: `mudlib-sync`
     /// becomes seed-only once this is true). Not called from anywhere in
     /// this crate yet -- the seeding step is B3.5's gitops/bootstrap
