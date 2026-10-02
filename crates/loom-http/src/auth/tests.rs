@@ -31,6 +31,10 @@ struct FakeDirectoryInner {
     refresh_tokens: HashMap<String, RefreshRecord>, // keyed by token_hash
     github_links: HashMap<i64, String>,
     audit_events: Vec<AuditEvent>,
+    /// How many times [`StaffDirectory::resolve_uid`] has been called
+    /// (OBI-204 review fix): used to prove `login` checks the IP bucket
+    /// *before* paying for this lookup.
+    resolve_uid_calls: u32,
 }
 
 #[derive(Default, Clone)]
@@ -121,6 +125,10 @@ impl FakeDirectory {
     fn audit_events(&self) -> Vec<AuditEvent> {
         self.inner.lock().unwrap().audit_events.clone()
     }
+
+    fn resolve_uid_calls(&self) -> u32 {
+        self.inner.lock().unwrap().resolve_uid_calls
+    }
 }
 
 #[async_trait::async_trait]
@@ -146,13 +154,9 @@ impl StaffDirectory for FakeDirectory {
     }
 
     async fn resolve_uid(&self, username: &str) -> Result<Option<String>, DirectoryError> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .staff
-            .get(username)
-            .map(|s| s.uid.clone()))
+        let mut inner = self.inner.lock().unwrap();
+        inner.resolve_uid_calls += 1;
+        Ok(inner.staff.get(username).map(|s| s.uid.clone()))
     }
 
     async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError> {
@@ -720,6 +724,33 @@ async fn ip_bucket_throttles_logins_across_many_accounts() {
     let other_ip = ctx_from("203.0.113.51");
     let result = service.login("nobody-5", "whatever", None, &other_ip).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
+/// OBI-204 review fix: `login` checks the (cheap, no-DB) IP bucket
+/// *before* resolving the username to a uid, so a throttled IP never pays
+/// for that lookup.
+#[tokio::test]
+async fn login_checks_the_ip_bucket_before_resolving_the_account() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("frodo", "ringbearer", 1);
+    let service = test_service(directory.clone()).with_rate_limiter(RateLimiter::with_test_tuning(
+        5,
+        std::time::Duration::from_secs(900),
+        std::time::Duration::from_secs(900),
+        1.0,
+        std::time::Duration::from_secs(3600),
+    ));
+
+    let from_ip = ctx_from("198.51.100.20");
+    // Spends the IP bucket's one token.
+    let _ = service.login("frodo", "wrong", None, &from_ip).await;
+    assert_eq!(directory.resolve_uid_calls(), 1);
+
+    // The bucket is now dry: a second attempt must be refused by the IP
+    // check alone, without ever calling `resolve_uid` again.
+    let result = service.login("frodo", "wrong", None, &from_ip).await;
+    assert_eq!(result.unwrap_err(), AuthError::RateLimited);
+    assert_eq!(directory.resolve_uid_calls(), 1);
 }
 
 /// Acceptance: "audit rows written for each event" -- login ok, login
