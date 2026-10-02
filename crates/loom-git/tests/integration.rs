@@ -393,6 +393,23 @@ fn push_lands_on_live_env_branch() {
     handle
         .record_write("appr1", identity, "/room.wf", "ed /room.wf")
         .unwrap();
+    // OBI-222: this test previously relied purely on the worker's
+    // timer-based commit_coalesce/push_debounce to land the write and
+    // push it -- the *second* wait_for below needs a full extra
+    // commit+push cycle after the boot-time sync's own push (which is
+    // what made the first wait_for below pass quickly even under load:
+    // it only needs *a* push to have landed, not this write's content).
+    // On a CPU-starved self-hosted runner, waiting on wall-clock timers
+    // to fire is unbounded -- the worker thread only gets to check its
+    // deadlines when the OS schedules it at all. `kick()` (same
+    // mechanism `upstream_main_move_is_rebased_in_and_recompile_is_called`
+    // and the conflict test already use) forces an immediate
+    // flush-all-pending-commits-then-sync-then-push pass the next time
+    // the worker thread runs at all, instead of making convergence
+    // depend on comparing `Instant::now()` against a short coalesce/
+    // debounce deadline that can be missed by many ticks in a row under
+    // contention.
+    handle.kick();
 
     wait_for(
         || fx.remote_has_ref("refs/heads/live/test"),
