@@ -205,14 +205,27 @@ impl GithubWebhookConfig {
         kicker: Arc<dyn GithubWebhookKicker>,
     ) -> std::io::Result<Self> {
         let raw = std::fs::read(secret_path)?;
-        Ok(Self::new(raw, repo_id, kicker))
+        Self::new(raw, repo_id, kicker)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
-    pub fn new(secret: Vec<u8>, repo_id: u64, kicker: Arc<dyn GithubWebhookKicker>) -> Self {
-        // Trailing newline on a mounted secret file is common and not
-        // part of the secret.
+    /// `Err` if `secret` is empty after trimming a trailing newline (an
+    /// empty-file or whitespace-only secret mount): `HmacSha256::new_
+    /// from_slice(&[])` happily accepts a zero-length key, which would
+    /// make every signature -- including a forged one with no real
+    /// secret at all -- verify (CTO review, OBI-191). Callers must wire
+    /// this error to "webhook not configured" (503), the same posture
+    /// as no config at all, never to a silently-open route.
+    pub fn new(
+        secret: Vec<u8>,
+        repo_id: u64,
+        kicker: Arc<dyn GithubWebhookKicker>,
+    ) -> Result<Self, EmptyWebhookSecret> {
         let trimmed = trim_trailing_newline(secret);
-        Self {
+        if trimmed.is_empty() {
+            return Err(EmptyWebhookSecret);
+        }
+        Ok(Self {
             secret: Arc::new(trimmed),
             repo_id,
             kicker: DebouncedKicker::spawn(kicker, DEFAULT_KICK_DEBOUNCE),
@@ -221,7 +234,7 @@ impl GithubWebhookConfig {
                 RATE_LIMIT_CAPACITY,
                 RATE_LIMIT_REFILL_INTERVAL,
             ))),
-        }
+        })
     }
 
     /// Test-only seam: a shorter debounce window so coalescing tests
@@ -233,9 +246,12 @@ impl GithubWebhookConfig {
         repo_id: u64,
         kicker: Arc<dyn GithubWebhookKicker>,
         debounce: Duration,
-    ) -> Self {
+    ) -> Result<Self, EmptyWebhookSecret> {
         let trimmed = trim_trailing_newline(secret);
-        Self {
+        if trimmed.is_empty() {
+            return Err(EmptyWebhookSecret);
+        }
+        Ok(Self {
             secret: Arc::new(trimmed),
             repo_id,
             kicker: DebouncedKicker::spawn(kicker, debounce),
@@ -244,9 +260,23 @@ impl GithubWebhookConfig {
                 RATE_LIMIT_CAPACITY,
                 RATE_LIMIT_REFILL_INTERVAL,
             ))),
-        }
+        })
     }
 }
+
+/// The webhook secret was empty (after trimming a trailing newline) --
+/// refused at construction rather than accepted as a key that makes
+/// every HMAC verify (CTO review, OBI-191).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyWebhookSecret;
+
+impl std::fmt::Display for EmptyWebhookSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GitHub webhook secret is empty")
+    }
+}
+
+impl std::error::Error for EmptyWebhookSecret {}
 
 fn trim_trailing_newline(mut secret: Vec<u8>) -> Vec<u8> {
     while matches!(secret.last(), Some(b'\n') | Some(b'\r')) {
@@ -426,7 +456,8 @@ mod tests {
     fn test_app(kicker: Arc<MockKicker>, debounce: Duration) -> Router {
         let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
         let config =
-            GithubWebhookConfig::new_with_debounce(SECRET.to_vec(), REPO_ID, kicker, debounce);
+            GithubWebhookConfig::new_with_debounce(SECRET.to_vec(), REPO_ID, kicker, debounce)
+                .expect("SECRET is non-empty");
         let state = HttpState::new(
             ws_accept_tx,
             Readiness::new(),
@@ -590,7 +621,8 @@ mod tests {
                 count: Arc::new(AtomicUsize::new(0)),
             }),
             Duration::from_millis(10),
-        );
+        )
+        .expect("SECRET is non-empty");
         // Drain the bucket directly rather than firing 31 real requests.
         {
             let mut rate = config.rate.lock().unwrap();
@@ -628,5 +660,55 @@ mod tests {
         assert!(decode_hex("abc").is_none());
         assert!(decode_hex("zz").is_none());
         assert_eq!(decode_hex("ff"), Some(vec![0xff]));
+    }
+
+    /// CTO review, OBI-191: an empty (or whitespace/newline-only) secret
+    /// must be refused at construction -- `HmacSha256::new_from_slice(&[])`
+    /// happily accepts a zero-length key, which would make *every*
+    /// `X-Hub-Signature-256` verify, including a forged one with no real
+    /// secret at all.
+    #[test]
+    fn empty_secret_is_rejected() {
+        let kicker = Arc::new(MockKicker {
+            count: Arc::new(AtomicUsize::new(0)),
+        });
+        let result = GithubWebhookConfig::new_with_debounce(
+            Vec::new(),
+            REPO_ID,
+            kicker.clone(),
+            Duration::from_millis(10),
+        );
+        assert!(matches!(result, Err(EmptyWebhookSecret)));
+    }
+
+    /// Same, but for a secret file that is just a trailing newline --
+    /// trimming it must not silently produce an accepted empty secret.
+    #[test]
+    fn whitespace_only_secret_is_rejected() {
+        let kicker = Arc::new(MockKicker {
+            count: Arc::new(AtomicUsize::new(0)),
+        });
+        let result = GithubWebhookConfig::new_with_debounce(
+            b"\n\r\n".to_vec(),
+            REPO_ID,
+            kicker.clone(),
+            Duration::from_millis(10),
+        );
+        assert!(matches!(result, Err(EmptyWebhookSecret)));
+    }
+
+    #[test]
+    fn from_secret_file_rejects_empty_file() {
+        let kicker = Arc::new(MockKicker {
+            count: Arc::new(AtomicUsize::new(0)),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("warp_webhook");
+        std::fs::write(&path, b"").unwrap();
+        let err = match GithubWebhookConfig::from_secret_file(&path, REPO_ID, kicker) {
+            Err(e) => e,
+            Ok(_) => panic!("expected an empty-secret error"),
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

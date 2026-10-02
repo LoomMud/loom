@@ -12,9 +12,10 @@ use rsa::RsaPrivateKey;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
 use rsa::pkcs8::DecodePrivateKey;
+use rsa::rand_core::OsRng;
 use serde::Serialize;
 use sha2::Sha256;
-use signature::{SignatureEncoding, Signer};
+use signature::{RandomizedSigner, SignatureEncoding};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +68,12 @@ pub fn mint(app_id: &str, key: &RsaPrivateKey, now: SystemTime) -> Result<String
     let signing_input = format!("{header}.{payload}");
 
     let signing_key = SigningKey::<Sha256>::new(key.clone());
-    let sig = signing_key.sign(signing_input.as_bytes());
+    // RUSTSEC-2023-0071 ("Marvin Attack") mitigation: sign with blinding
+    // (`RandomizedSigner` + `OsRng`), not the unblinded `Signer::sign`
+    // path, per CTO review (OBI-191). PKCS#1 v1.5 signatures are
+    // otherwise deterministic -- blinding changes only the computation,
+    // never the output -- so this does not change what a verifier sees.
+    let sig = signing_key.sign_with_rng(&mut OsRng, signing_input.as_bytes());
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
 
     Ok(format!("{signing_input}.{sig_b64}"))
