@@ -145,6 +145,16 @@ impl StaffDirectory for FakeDirectory {
         }))
     }
 
+    async fn resolve_uid(&self, username: &str) -> Result<Option<String>, DirectoryError> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .staff
+            .get(username)
+            .map(|s| s.uid.clone()))
+    }
+
     async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError> {
         Ok(self
             .inner
@@ -604,6 +614,46 @@ async fn wrong_totp_codes_count_toward_the_account_lockout() {
 
     // The account is now locked: even the correct password+code combo is
     // refused, with the same "invalid credentials" response.
+    let fresh_code = totp.generate_current().to_string();
+    let result = service
+        .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
+/// OBI-204 acceptance: `login`'s wrong-password failures and
+/// `totp_confirm`'s wrong-code failures land on the *same* account
+/// counter -- both resolve to the one `uid:` namespaced key, so an
+/// attacker can't double their effective guess budget by splitting
+/// attempts across the two entry points.
+#[tokio::test]
+async fn wrong_login_password_and_wrong_totp_confirm_share_one_account_counter() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory);
+
+    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+    let code = totp.generate_current().to_string();
+    service
+        .totp_confirm("gandalf", &code, &ctx())
+        .await
+        .unwrap();
+
+    // 3 wrong login passwords...
+    for _ in 0..3 {
+        let result = service.login("gandalf", "wrong", None, &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+    }
+    // ...and 2 wrong TOTP codes via totp_confirm -- 5 total against the
+    // same account.
+    for _ in 0..2 {
+        let result = service.totp_confirm("gandalf", "000000", &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::TotpInvalid);
+    }
+
+    // The account is now locked from the combined count -- even the
+    // correct password+code combo is refused.
     let fresh_code = totp.generate_current().to_string();
     let result = service
         .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
