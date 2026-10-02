@@ -4,6 +4,7 @@ persistent var moves: int = 0
 persistent var beats: int = 0
 persistent var last_call_out: int = -1
 persistent var burn_count: int = 0
+persistent var reconnect_count: int = 0
 
 pub fn logon() {
     send(self, "Welcome to Loom!\n")
@@ -164,4 +165,12 @@ fn dive(n: int) -> int {
 }
 
 pub fn net_dead() {
+}
+
+// OBI-221: copyover's new-process side calls this once per restored
+// connection after re-adopting its socket, so mudlib code can observe
+// (and tests can assert on) the hand-off.
+pub fn reconnect() {
+    reconnect_count += 1
+    send(self, "reconnected\n")
 }

@@ -1,6 +1,7 @@
 // Base room.
 var short_desc: string = "A room"
 var exits: {string: string} = {:}
+persistent var reconnect_count: int = 0
 
 fn create() {
 }
@@ -28,4 +29,11 @@ pub fn exit_dest(dir: string) -> string? {
 pub fn look() -> string {
     let names = keys(exits)
     return $"{short()}\n{long()}\nExits: {join(names, ", ")}\n"
+}
+
+// OBI-221: copyover runs reconnect() on every loaded object, not only
+// interactive ones (docs/copyover.md), so non-interactive objects can
+// re-arm heartbeats/call_outs the fresh scheduler does not carry over.
+pub fn reconnect() {
+    reconnect_count += 1
 }
