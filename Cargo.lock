@@ -1343,10 +1343,12 @@ dependencies = [
 name = "loom-vm"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "loom-compiler",
  "loom-syntax",
  "proptest",
  "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]
