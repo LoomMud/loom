@@ -1550,6 +1550,79 @@ pub struct Registry {
     /// `loom_tier_quota_breaches_total{tier,quota}` (OBI-121 S2c); see
     /// `crate::quota::QuotaBreachMetrics`.
     pub quota_breaches: crate::quota::QuotaBreachMetrics,
+    /// Canary updates in flight (P2-B7, OBI-182, spec §7.4), keyed by
+    /// program path. At most one per path: starting a new one for a path
+    /// that already has one active is refused by `RegistryHost::
+    /// canary_update_efun`, and any *plain* recompile of the path (not
+    /// through `canary_update`) implicitly cancels it (`Registry::
+    /// install`) rather than leaving it pointed at a candidate that is no
+    /// longer `programs[path]`.
+    pub canaries: HashMap<String, CanaryState>,
+}
+
+/// One in-flight canary (P2-B7, OBI-182, spec §7.4): `canary_update(path,
+/// ..)` installs `candidate` as `programs[path]` same as any recompile,
+/// but only `pct`% of instances (chosen by a deterministic hash of the
+/// object id, spec: "by object id hash") migrate to it on access while
+/// this is active -- the rest stay pinned to `stable` (see `RegistryHost::
+/// ensure_current`). `World::tick` watches `errors_at_start` vs. the
+/// error inbox's live count for `candidate`'s path (P2-B4) and either
+/// promotes (clears this, letting the remaining instances lazily migrate
+/// like a normal install) or rolls back (re-points `programs[path]` at
+/// `stable` and clears this, so every instance already on `candidate`
+/// lazily migrates *back* -- `RegistryHost::upgrade` is symmetric, it has
+/// no notion of "forward"/"backward").
+pub struct CanaryState {
+    /// The program that was live immediately before this canary started;
+    /// what a rollback re-installs.
+    pub stable: Rc<CompiledProgram>,
+    /// The new version being canaried; `programs[path]` for as long as
+    /// this canary is active (promotion is a no-op on `programs`, it only
+    /// clears this entry and lets the rest of the cohort catch up).
+    pub candidate: Rc<CompiledProgram>,
+    /// 1..=100: the percentage of accessed instances routed to
+    /// `candidate` while this is active.
+    pub pct: u8,
+    /// The world tick (`Scheduler::tick`) this canary started on --
+    /// ticks, not wall-clock time, deliberately (same deviation as
+    /// `TickShareWindow`, `World::tick`'s own doc comment: a world tick is
+    /// a fixed 100 ms when the driver is ticking on its normal timer, so
+    /// this is fully deterministic from the tick counter alone and a test
+    /// can drive a whole window with repeated `World::tick()` calls
+    /// instead of a real sleep).
+    pub started_tick: u64,
+    /// How many world ticks this canary watches for before auto-promoting
+    /// (if the error budget was never exceeded).
+    pub window_ticks: u64,
+    /// The error inbox's `count_for_program(candidate.path)` the instant
+    /// this canary started (P2-B4): `World::tick` compares the *current*
+    /// count against this baseline, not the raw count, so pre-existing
+    /// errors unrelated to this candidate never count against it.
+    pub errors_at_start: u64,
+    /// How many *new* errors (current count minus `errors_at_start`) this
+    /// candidate may accrue before `World::tick` rolls it back
+    /// immediately, without waiting for `window_ticks` to elapse.
+    pub max_new_errors: u64,
+}
+
+/// Spec §7.4: "installs the new version for a fraction of ... clones (by
+/// object id hash)". A fast, deterministic spread (Knuth's multiplicative
+/// hash) over `id`'s slot index -- stable for as long as the object lives
+/// (an index is only reused after the slot frees and is handed back out,
+/// at which point it is a different object with a different generation,
+/// so revisiting this function for it is correct, not a stale decision
+/// leaking across objects). `pct` is clamped to `0..=100` by the caller
+/// (`RegistryHost::canary_update_efun`); `0` never selects anything,
+/// `100` always does.
+pub fn canary_cohort(id: ObjectId, pct: u8) -> bool {
+    if pct == 0 {
+        return false;
+    }
+    if pct >= 100 {
+        return true;
+    }
+    let hashed = (id.index as u64).wrapping_mul(2_654_435_761);
+    (hashed % 100) < pct as u64
 }
 
 /// One undoable effect recorded while an `atomic fn` scope is open.
@@ -1694,6 +1767,36 @@ impl Registry {
 
     pub fn program(&self, path: &str) -> Option<Rc<CompiledProgram>> {
         self.programs.get(path).cloned()
+    }
+
+    /// P2-B7 (OBI-182): promote `path`'s in-flight canary -- clears the
+    /// entry and bumps `install_generation` so every instance still
+    /// pinned to `stable` (because it was not in the fraction cohort)
+    /// re-checks on its next access and lazily migrates to `candidate`,
+    /// which has been `programs[path]` all along. A no-op (returns
+    /// `false`) if `path` has no active canary.
+    pub fn promote_canary(&mut self, path: &str) -> bool {
+        if self.canaries.remove(path).is_none() {
+            return false;
+        }
+        self.install_generation += 1;
+        true
+    }
+
+    /// P2-B7 (OBI-182): roll `path`'s in-flight canary back -- re-points
+    /// `programs[path]` at `stable` and clears the entry, then bumps
+    /// `install_generation` so every instance already migrated to
+    /// `candidate` (the fraction cohort) re-checks on its next access and
+    /// lazily migrates *back* (`RegistryHost::upgrade` works on any
+    /// target program, not only a "newer" one). A no-op (returns `false`)
+    /// if `path` has no active canary.
+    pub fn rollback_canary(&mut self, path: &str) -> bool {
+        let Some(canary) = self.canaries.remove(path) else {
+            return false;
+        };
+        self.programs.insert(path.to_string(), canary.stable);
+        self.install_generation += 1;
+        true
     }
 
     pub fn insert(&mut self, obj: BcObject) -> ObjectId {
@@ -2501,12 +2604,27 @@ impl<'a> RegistryHost<'a> {
         if self.has_live_frame(id) {
             return;
         }
-        let current = self.registry.programs.get(&*o.program.path).cloned();
-        if let Some(current) = current
-            && !Rc::ptr_eq(&current, &o.program)
-            && let Err(w) = self.upgrade(id, current)
-        {
-            self.registry.lazy_upgrade_warnings.push(w);
+        let path = o.program.path.clone();
+        let current = self.registry.programs.get(&*path).cloned();
+        if let Some(current) = current {
+            // P2-B7 (OBI-182): a path with an active canary routes by the
+            // object id hash instead of unconditionally migrating to
+            // `current` (which, for the duration of the canary, *is*
+            // `candidate` -- see `CanaryState`'s own doc comment). Not in
+            // the cohort means "stay on `stable`", which is a no-op here
+            // whenever that is already `o.program` (the overwhelmingly
+            // common case: an object this function has already stamped
+            // once during this same canary's window).
+            let target = match self.registry.canaries.get(&*path) {
+                Some(canary) if canary_cohort(id, canary.pct) => current.clone(),
+                Some(canary) => canary.stable.clone(),
+                None => current.clone(),
+            };
+            if !Rc::ptr_eq(&target, &o.program)
+                && let Err(w) = self.upgrade(id, target)
+            {
+                self.registry.lazy_upgrade_warnings.push(w);
+            }
         }
         if let Some(o) = self.registry.get_mut(id) {
             o.checked_generation = generation;
@@ -3779,6 +3897,23 @@ impl<'a> RegistryHost<'a> {
                 }
                 Ok(Value::Int(queued))
             }
+            // P2-B7 (OBI-182, spec §7.4): `update --canary N%` --
+            // recompile `path` same as `compile_object`, but only route
+            // `pct`% of accessed instances (by object id hash) to the new
+            // version while `World::tick` watches the P2-B4 error inbox
+            // for `window_ticks`, auto-promoting (if the new-error budget
+            // is never exceeded) or auto-rolling-back (the instant it is).
+            // Same tier as `compile_object`/`upgrade_all` (D-P1.6): a
+            // canary is strictly less exposure than either (it starts at
+            // a *fraction*, not everyone).
+            "canary_update" => self.canary_update_efun(&a0, &a1, &a2, &a3),
+            // Introspection for the builder command/web IDE driving the
+            // above: `null` if `path` has no canary in flight, else a map
+            // of its live state. Same `valid_upgrade`/P1 gate as
+            // `canary_update` -- whoever can manage a path's canary is who
+            // should be able to see its state; no separate `valid_read`
+            // dependency.
+            "canary_status" => self.canary_status_efun(&a0),
             "call_out" => {
                 let func = a0
                     .as_str()
@@ -4636,6 +4771,132 @@ impl<'a> RegistryHost<'a> {
         Ok(Value::array(out))
     }
 
+    /// `canary_update(path, pct, window_ticks, max_new_errors)` (P2-B7,
+    /// OBI-182, spec §7.4): compile `path` exactly like `compile_object`
+    /// (install is lazy either way, so nothing migrates synchronously
+    /// here), then start a canary that routes `pct`% of future accesses
+    /// (by object id hash) to the new version instead of all of them.
+    /// `window_ticks` is how long (in world ticks, `World::tick`'s own
+    /// counter -- not wall-clock time, same deviation as
+    /// `TickShareWindow`) the canary runs before auto-promoting if it
+    /// stays within budget; `max_new_errors` is how many *new*
+    /// `errors`-inbox occurrences (P2-B4) for `path` it may accrue before
+    /// `World::tick` rolls it back immediately instead of waiting out the
+    /// window. Returns `null` on success (a canary is now in flight) or a
+    /// diagnostics/error string, mirroring `compile_object`'s
+    /// `Optional<String>`.
+    fn canary_update_efun(
+        &mut self,
+        path: &Value,
+        pct: &Value,
+        window_ticks: &Value,
+        max_new_errors: &Value,
+    ) -> R<Value> {
+        let p = Self::want_str(path, "canary_update(): expected string path")?;
+        let path = mudlib::normalize_path(&p).map_err(RtError::new)?;
+        let pct = Self::want_int(pct, "canary_update(): expected int pct")?;
+        let window_ticks =
+            Self::want_int(window_ticks, "canary_update(): expected int window_ticks")?;
+        let max_new_errors = Self::want_int(
+            max_new_errors,
+            "canary_update(): expected int max_new_errors",
+        )?;
+        if !(1..=100).contains(&pct) {
+            return Err(RtError::new("canary_update(): pct must be 1..=100"));
+        }
+        if window_ticks < 1 {
+            return Err(RtError::new("canary_update(): window_ticks must be >= 1"));
+        }
+        if max_new_errors < 0 {
+            return Err(RtError::new("canary_update(): max_new_errors must be >= 0"));
+        }
+        self.authorize(
+            "canary_update",
+            Privilege::P1,
+            Operation::Upgrade { path: &path },
+        )?;
+        if self.registry.canaries.contains_key(&path) {
+            return Ok(Value::str(&format!(
+                "canary_update(): a canary is already in flight for {path}"
+            )));
+        }
+        if self.registry.program(&path).is_none() {
+            return Ok(Value::str(&format!(
+                "canary_update(): no program registered for {path}"
+            )));
+        }
+        // `self.recompile` both compiles (all-or-nothing, same as
+        // `compile_object`) and installs: install is lazy-only (OBI-89),
+        // so this never touches a single existing instance -- the
+        // `CanaryState` below is what then governs who, if anyone, moves
+        // to it before it is promoted or rolled back.
+        let stable = self.registry.program(&path).expect("checked above");
+        match self.recompile(&path) {
+            Err(e) => Ok(Value::str(&e)),
+            Ok(_warnings) => {
+                let candidate = self
+                    .registry
+                    .program(&path)
+                    .expect("recompile just installed it");
+                let driver = self.driver.as_ref().expect("checked above");
+                let started_tick = driver.scheduler.tick();
+                let errors_at_start = driver.errors.count_for_program(&path);
+                self.registry.canaries.insert(
+                    path.clone(),
+                    CanaryState {
+                        stable,
+                        candidate,
+                        pct: pct as u8,
+                        started_tick,
+                        window_ticks: window_ticks as u64,
+                        errors_at_start,
+                        max_new_errors: max_new_errors as u64,
+                    },
+                );
+                metrics::counter!("loom_canary_started_total", "program" => path.clone())
+                    .increment(1);
+                Ok(Value::Null)
+            }
+        }
+    }
+
+    /// `canary_status(path)`: `null` if `path` has no canary in flight,
+    /// else `{"program": string, "pct": int, "ticks_left": int,
+    /// "new_errors": int, "max_new_errors": int}` -- `ticks_left` is
+    /// already saturated at 0 (never negative) and `new_errors` is the
+    /// live `errors`-inbox delta `World::tick` itself compares against
+    /// `max_new_errors`, so a builder command can show progress without
+    /// duplicating that arithmetic.
+    fn canary_status_efun(&mut self, path: &Value) -> R<Value> {
+        let p = Self::want_str(path, "canary_status(): expected string path")?;
+        let path = mudlib::normalize_path(&p).map_err(RtError::new)?;
+        self.authorize(
+            "canary_status",
+            Privilege::P1,
+            Operation::Upgrade { path: &path },
+        )?;
+        let Some(canary) = self.registry.canaries.get(&path) else {
+            return Ok(Value::Null);
+        };
+        let driver = self.driver.as_ref().expect("checked above");
+        let now_tick = driver.scheduler.tick();
+        let new_errors = driver
+            .errors
+            .count_for_program(&path)
+            .saturating_sub(canary.errors_at_start);
+        let ticks_left = (canary.started_tick + canary.window_ticks).saturating_sub(now_tick);
+        let mut m = heap::MapData::default();
+        m.insert(Value::str("program"), Value::str(&path));
+        m.insert(Value::str("pct"), Value::Int(canary.pct as i64));
+        m.insert(Value::str("ticks_left"), Value::Int(ticks_left as i64));
+        m.insert(Value::str("new_errors"), Value::Int(new_errors as i64));
+        m.insert(
+            Value::str("max_new_errors"),
+            Value::Int(canary.max_new_errors as i64),
+        );
+        Ok(Value::map(m))
+    }
+
     /// Run `name` declared in exactly `target` as `on` in a *fresh*
     /// [`Interpreter`] — the driver-started path (applies, `$init`, efuns
     /// that run Weft code, and the run-to-completion `Host::call_*`
@@ -4960,6 +5221,16 @@ impl<'a> RegistryHost<'a> {
     ) -> Result<Vec<UpgradeWarning>, String> {
         for v in new_set.values() {
             self.registry.register_program(v.clone());
+        }
+        // P2-B7 (OBI-182): a plain recompile of a path that has an active
+        // canary supersedes it -- `new_set`'s value just became the new
+        // `programs[path]` directly (not gated by the old canary's
+        // fraction any more), so the stale `CanaryState` (whose
+        // `candidate` is no longer what's installed) must not linger to
+        // confuse `ensure_current`'s routing or `World::tick`'s window
+        // check.
+        for path in new_set.keys() {
+            self.registry.canaries.remove(path);
         }
         // OBI-121 S2c (CTO review B4): a recompiled path's cached
         // `program_flags` result is stale (the master may return
@@ -5791,6 +6062,34 @@ mod tests {
     use crate::bcvm::vm::Exec;
     use loom_compiler::mudlib::{Outcome, Session};
     use proptest::prelude::*;
+
+    /// P2-B7 (OBI-182): `canary_cohort`'s endpoints are exact (0% never
+    /// selects, 100% always does) and an interior percentage selects
+    /// roughly its own share over a large id range -- the spread just
+    /// needs to be deterministic and non-degenerate, not a particular
+    /// distribution.
+    #[test]
+    fn canary_cohort_endpoints_are_exact_and_an_interior_pct_is_roughly_proportional() {
+        let ids: Vec<ObjectId> = (0..10_000)
+            .map(|i| ObjectId {
+                index: i,
+                generation: 0,
+            })
+            .collect();
+        assert!(
+            ids.iter().all(|&id| !canary_cohort(id, 0)),
+            "0% must never select anything"
+        );
+        assert!(
+            ids.iter().all(|&id| canary_cohort(id, 100)),
+            "100% must always select"
+        );
+        let selected = ids.iter().filter(|&&id| canary_cohort(id, 25)).count();
+        assert!(
+            (2_000..3_000).contains(&selected),
+            "25% of 10,000 ids should land near 2,500, got {selected}"
+        );
+    }
 
     #[test]
     fn self_recursive_virtual_call_hits_the_depth_guard_not_the_native_stack() {

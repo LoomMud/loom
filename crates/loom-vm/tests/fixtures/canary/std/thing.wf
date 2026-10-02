@@ -1,0 +1,9 @@
+// Cloned by the P2-B7 canary tests. `touch()` is harmless on v1; the
+// test rewrites this file to a v2 whose `touch()` raises a runtime error
+// (`random(0)`) to drive the auto-rollback path, or to a harmless v2 (a
+// new var, same behaviour) to drive the auto-promote path.
+var tag: string = "v1"
+
+pub fn touch() -> string {
+    return tag
+}

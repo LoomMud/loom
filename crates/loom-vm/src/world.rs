@@ -1373,6 +1373,57 @@ impl World {
         // OBI-36: same reasoning for roles_result -- bounded latency even
         // on an otherwise idle world.
         self.drain_roles_results(host);
+        self.poll_canaries();
+    }
+
+    /// P2-B7 (OBI-182, spec §7.4): decide every in-flight canary's fate
+    /// for this tick -- auto-rollback the instant its new-error budget
+    /// (P2-B4) is exceeded, or auto-promote once its window has elapsed
+    /// without that happening. Runs every tick (cheap: one `HashMap`
+    /// lookup into the error inbox per active canary, and there is never
+    /// more than a handful of these live at once) rather than on its own
+    /// cadence, so a tight `max_new_errors: 0` budget rolls back within
+    /// one tick of the first new error, not up to a whole heartbeat
+    /// interval later.
+    fn poll_canaries(&mut self) {
+        if self.registry.canaries.is_empty() {
+            return;
+        }
+        let now_tick = self.scheduler.tick();
+        // Collect decisions before mutating `self.registry.canaries`
+        // (promote/rollback both remove the entry): iterating and
+        // mutating the same map at once would either not compile (an
+        // active borrow) or skip entries after a removal, depending on
+        // iteration order.
+        enum Decision {
+            Promote,
+            Rollback,
+        }
+        let mut decisions: Vec<(String, Decision)> = Vec::new();
+        for (path, canary) in self.registry.canaries.iter() {
+            let new_errors = self
+                .errors
+                .count_for_program(path)
+                .saturating_sub(canary.errors_at_start);
+            if new_errors > canary.max_new_errors {
+                decisions.push((path.clone(), Decision::Rollback));
+            } else if now_tick >= canary.started_tick + canary.window_ticks {
+                decisions.push((path.clone(), Decision::Promote));
+            }
+        }
+        for (path, decision) in decisions {
+            match decision {
+                Decision::Promote => {
+                    self.registry.promote_canary(&path);
+                    metrics::counter!("loom_canary_promoted_total", "program" => path).increment(1);
+                }
+                Decision::Rollback => {
+                    self.registry.rollback_canary(&path);
+                    metrics::counter!("loom_canary_rolled_back_total", "program" => path)
+                        .increment(1);
+                }
+            }
+        }
     }
 
     /// The current world tick (`Scheduler::advance`'s counter; advanced by
@@ -1473,6 +1524,13 @@ impl World {
     /// tick's batch (OBI-89, tests/introspection).
     pub fn eager_upgrade_queue_len(&self) -> usize {
         self.scheduler.eager_upgrade_queue_len()
+    }
+
+    /// Whether `path` has a canary in flight right now (P2-B7, OBI-182,
+    /// tests/introspection) -- cleared the instant `World::tick`
+    /// auto-promotes or auto-rolls-back.
+    pub fn canary_active(&self, path: &str) -> bool {
+        self.registry.canaries.contains_key(path)
     }
 
     /// Drain every warning recorded by a *lazy* per-instance upgrade since

@@ -238,6 +238,21 @@ impl ErrorInbox {
         rows
     }
 
+    /// Total occurrence count across every group whose `program` is
+    /// exactly `program` (not a prefix match, unlike `snapshot` -- the
+    /// canary error watch (P2-B7, OBI-182) wants "errors attributed to
+    /// this one declaring program", never a whole subtree). Used as the
+    /// canary baseline/delta: `World::tick` compares this before and
+    /// after a canary's install to decide auto-promote vs. auto-rollback
+    /// (spec §7.4).
+    pub fn count_for_program(&self, program: &str) -> u64 {
+        self.groups
+            .iter()
+            .filter(|(k, _)| k.program == program)
+            .map(|(_, e)| e.count)
+            .sum()
+    }
+
     /// Distinct program paths with at least one recorded group, sorted.
     /// Used by the `errors` efun's per-program `valid_read` permission
     /// filter: cheaper to authorize once per *program* than once per
@@ -334,6 +349,25 @@ mod tests {
 
         assert_eq!(inbox.snapshot(None).len(), 2);
         assert_eq!(inbox.snapshot(Some("/nowhere")).len(), 0);
+    }
+
+    /// P2-B7 (OBI-182): `count_for_program` sums across every distinct
+    /// `(function, message)` group for the exact program path, and is
+    /// unaffected by a different program's groups.
+    #[test]
+    fn count_for_program_sums_every_group_for_an_exact_program_match() {
+        let mut inbox = ErrorInbox::new();
+        inbox.record("/d/shire/calc.wf", "f", "boom one", &[], 1, false);
+        inbox.record("/d/shire/calc.wf", "f", "boom one", &[], 2, false);
+        inbox.record("/d/shire/calc.wf", "g", "boom two", &[], 3, false);
+        // A different program (even a prefix match of the first) must not
+        // be counted: `snapshot`'s prefix filter is deliberately not what
+        // this method does.
+        inbox.record("/d/shire/calc.wf.bak", "f", "boom one", &[], 4, false);
+
+        assert_eq!(inbox.count_for_program("/d/shire/calc.wf"), 3);
+        assert_eq!(inbox.count_for_program("/d/shire/calc.wf.bak"), 1);
+        assert_eq!(inbox.count_for_program("/nowhere.wf"), 0);
     }
 
     #[test]
