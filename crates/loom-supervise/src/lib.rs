@@ -33,6 +33,7 @@
 //!   corresponding `supervise` subcommand in `loom-cli`.
 
 pub mod fdpass;
+pub mod listener;
 pub mod version_source;
 
 pub use version_source::{FileVersionSource, VersionSource};

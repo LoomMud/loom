@@ -1138,6 +1138,7 @@ dependencies = [
  "loom-net",
  "loom-obs",
  "loom-persist",
+ "loom-supervise",
  "loom-vm",
  "serde_json",
  "sqlx",
