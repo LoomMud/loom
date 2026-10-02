@@ -145,9 +145,12 @@ drive once it has staged the new process and is ready to hand off sockets:
 4. Once every adopted connection has produced a `NetEvent::Connected`
    (so the session table really is live before mudlib code can write to
    it), call `world.reconnect_all(host)`. This calls the `reconnect()`
-   apply (if the object defines one -- missing is not an error) on every
-   bound object, with that object's connection active, so `send()`/
-   `set_echo()` etc. inside `reconnect()` reach the newly-adopted socket.
+   apply (if the object defines one -- missing is not an error) first on
+   every bound object, with that object's connection active, so `send()`/
+   `set_echo()` etc. inside `reconnect()` reach the newly-adopted socket;
+   then on every other loaded object with no connection context. The
+   scheduler is not snapshotted (docs/copyover.md), so `reconnect()` is
+   where any object re-arms its heartbeat/`call_out`s.
 5. Only now does the new process's listener start accepting *new*
    connections (spec's pause-target boundary: "new process loads
    snapshot, re-adopts sockets, calls `reconnect()` ... target pause

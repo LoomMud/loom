@@ -172,3 +172,41 @@ fn reconnect_all_covers_every_restored_connection_independently() {
         Some(Value::Int(1))
     ));
 }
+
+/// docs/copyover.md (OBI-184 decision): the scheduler is not snapshotted,
+/// so `reconnect_all` runs `reconnect()` on *every* loaded object -- a
+/// non-interactive room gets its hook too (that is where it would re-arm
+/// a heartbeat/call_out), exactly once, and the interactive player still
+/// gets exactly one call, with its connection bound.
+#[test]
+fn reconnect_all_also_fires_on_non_interactive_objects() {
+    let root = fixture("tworoom");
+    let mut world = World::boot(&root).expect("boot");
+    let mut host = FakeHost::default();
+    world.connect(3, &mut host);
+    host.take(3);
+    let player = world.connection_object(3).expect("bound");
+    let hall = world
+        .find_object("/domains/start/hall")
+        .expect("hall loaded once a player is in it");
+
+    let bytes = world
+        .begin_snapshot()
+        .expect("capture")
+        .encode_all()
+        .expect("encode");
+    let mut new_world =
+        World::load_snapshot(&root, Limits::default(), &bytes).expect("load_snapshot");
+    let mut new_host = FakeHost::default();
+    new_world.reconnect_all(&mut new_host);
+
+    assert!(matches!(
+        new_world.var(hall, "reconnect_count"),
+        Some(Value::Int(1))
+    ));
+    assert!(matches!(
+        new_world.var(player, "reconnect_count"),
+        Some(Value::Int(1))
+    ));
+    assert_eq!(new_host.take(3), "reconnected\n");
+}

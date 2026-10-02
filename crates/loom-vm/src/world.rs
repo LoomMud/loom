@@ -999,20 +999,50 @@ impl World {
         }
     }
 
-    /// Drive [`World::reconnect`] over every connection the loaded
-    /// snapshot bound, in ascending `conn` id order (deterministic, and
-    /// matching the order the connection table was written in -- see
-    /// `crate::snapshot`'s module docs). The copyover driver calls this
-    /// once, after it has finished re-adopting every handed-off socket
-    /// into `loom-net`'s session table under the same `conn` ids the
-    /// snapshot recorded, not before (a `reconnect()` apply that tries to
-    /// write to its connection before the session exists has nothing to
-    /// write to).
+    /// Run the `reconnect()` apply once on **every** loaded object
+    /// (docs/copyover.md, OBI-184 decision): the scheduler is not part of
+    /// the snapshot, so a fresh process starts with no pending
+    /// `call_out`s and no heartbeat subscribers, and `reconnect()` is
+    /// where any object -- interactive or not -- re-arms them.
+    ///
+    /// Order: first every connection the loaded snapshot bound, in
+    /// ascending `conn` id order, through [`World::reconnect`] (so the
+    /// body runs with that connection bound and can write to it
+    /// immediately); then every other live object, in ascending object
+    /// index order, with no connection context. An object destructed by
+    /// an earlier `reconnect()` body in the same pass is skipped.
+    ///
+    /// The copyover driver calls this once, after it has finished
+    /// re-adopting every handed-off socket into `loom-net`'s session
+    /// table under the same `conn` ids the snapshot recorded, not before
+    /// (a `reconnect()` apply that tries to write to its connection
+    /// before the session exists has nothing to write to).
     pub fn reconnect_all(&mut self, host: &mut dyn Host) {
-        let mut conns: Vec<u64> = self.registry.conns.keys().copied().collect();
-        conns.sort_unstable();
+        let conns = self.live_connections();
+        let bound: std::collections::HashSet<ObjectId> = conns
+            .iter()
+            .filter_map(|c| self.registry.conns.get(c).copied())
+            .collect();
         for conn in conns {
             self.reconnect(conn, host);
+        }
+        let mut rest: Vec<ObjectId> = self
+            .registry
+            .ids()
+            .into_iter()
+            .filter(|ob| !bound.contains(ob))
+            .collect();
+        rest.sort_unstable_by_key(|ob| ob.index);
+        for ob in rest {
+            if self.registry.get(ob).is_none() {
+                continue;
+            }
+            // Same as `World::tick`'s heartbeat/call_out errors: there is
+            // no connection to report to, and one object's failing hook
+            // must not stop the rest of the pass.
+            let _ = self.exec(host, ob, None, None, None, None, None, |h| {
+                h.call_apply(ob, "reconnect", Vec::new())
+            });
         }
     }
 
