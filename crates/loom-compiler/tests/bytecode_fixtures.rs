@@ -16,7 +16,7 @@ fn compile_and_verify(rel: &str) {
     );
     assert!(!report.programs.is_empty(), "{rel}: no programs found");
     for (path, c) in &report.programs {
-        let module = loom_compiler::codegen::compile(&c.hir)
+        let module = loom_compiler::codegen::compile(&c.hir, &c.src)
             .unwrap_or_else(|e| panic!("{rel}{path}: codegen: {e}"));
         loom_compiler::verify::verify(&module).unwrap_or_else(|e| {
             panic!(

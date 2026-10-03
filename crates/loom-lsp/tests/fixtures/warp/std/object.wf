@@ -1,0 +1,29 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// /std/object: base of everything in the world (warp convention, mirrored
+// here as a minimal LSP test fixture -- see crates/loom-cli's own
+// `fixtures/warp-phase0` for the same convention elsewhere in this repo).
+
+var name: string = "object"
+
+// Apply: runs once after load/clone. Never re-run on update.
+fn create() {
+}
+
+pub fn set_name(new_name: string) {
+    name = new_name
+}
+
+pub fn query_name() -> string {
+    return name
+}
+
+// One-line description, e.g. "a rusty dagger".
+pub fn short() -> string {
+    return "a thing"
+}
+
+pub fn visible() -> bool {
+    return true
+}

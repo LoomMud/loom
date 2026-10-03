@@ -73,7 +73,16 @@ pub struct Function {
 #[derive(Clone, Debug, Default)]
 pub struct Block {
     pub insts: Vec<Inst>,
+    /// 1-based source line for each entry of [`Self::insts`] (OBI-231,
+    /// spec: the error inbox's `(program, line, message)` grouping), same
+    /// length as `insts` always; `0` means "no span tracked this far"
+    /// (never emitted by `codegen` today -- `FnLower` always has a current
+    /// statement span by the time it emits anything -- but a future
+    /// synthetic `Inst` with no source counterpart could still choose it).
+    pub lines: Vec<u32>,
     pub term: Terminator,
+    /// Source line for `term`'s assembled `Op` (see [`Self::lines`]).
+    pub term_line: u32,
 }
 
 #[derive(Clone, Debug, Default)]

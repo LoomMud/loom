@@ -13,9 +13,11 @@
 pub mod bcvm;
 pub mod disk_usage;
 pub mod efuns;
+pub mod errors;
 pub mod fileio;
 pub mod host;
 pub mod object;
+pub mod profiler;
 pub mod quota;
 pub mod rng;
 pub mod roles;

@@ -115,7 +115,7 @@ fn base() -> ParentInfo {
     let src = "pub fn base_fn() -> int {\n    return 1\n}\n";
     let (ast, d) = loom_syntax::parse(src);
     assert!(d.is_empty());
-    let c = loom_compiler::check_program("/base", &ast, vec![], vec![]).expect("base");
+    let c = loom_compiler::check_program("/base", src, &ast, vec![], vec![]).expect("base");
     ParentInfo {
         label: None,
         info: c.info,
@@ -137,7 +137,7 @@ proptest! {
         let src = program(&stmts, ret);
         let (ast, pd) = loom_syntax::parse(&src);
         prop_assume!(pd.is_empty());
-        match loom_compiler::check_program("/p", &ast, vec![base()], vec![]) {
+        match loom_compiler::check_program("/p", &src, &ast, vec![base()], vec![]) {
             Ok(c) => {
                 let dump = loom_compiler::dump::program(&c.hir);
                 prop_assert!(!dump.contains("{error}"), "poison in clean HIR:\n{}\n{}", src, dump);
@@ -145,7 +145,7 @@ proptest! {
                 // *verified* bytecode, or declines with `Unsupported` (a
                 // known V2 gap, e.g. function values) - it must never
                 // produce bytecode the verifier rejects.
-                match loom_compiler::codegen::compile(&c.hir) {
+                match loom_compiler::codegen::compile(&c.hir, &c.src) {
                     Ok(module) => {
                         if let Err(e) = loom_compiler::verify::verify(&module) {
                             prop_assert!(

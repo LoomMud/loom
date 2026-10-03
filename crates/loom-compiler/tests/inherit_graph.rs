@@ -28,7 +28,7 @@ fn compile(
             span: Span::default(),
         })
         .collect();
-    check_program(path, &ast, parents, Vec::new())
+    check_program(path, src, &ast, parents, Vec::new())
         .map_err(|ds| ds.into_iter().map(|d| d.message).collect())
 }
 

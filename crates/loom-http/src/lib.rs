@@ -82,7 +82,7 @@ impl HttpState {
     /// Mount `/auth/*` (OBI-174): staff login, refresh, logout, TOTP
     /// enrolment/verification. Unset by default -- `loom-cli` only calls
     /// this when Postgres (`LOOM_DATABASE_URL`) and a JWT secret
-    /// (`LOOM_JWT_SECRET`) are both configured.
+    /// (`LOOM_JWT_KEY_FILE`) are both configured.
     pub fn with_auth(mut self, auth: auth::AuthService) -> Self {
         self.auth = Some(auth);
         self

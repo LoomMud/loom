@@ -33,11 +33,19 @@ use crate::ty::{ConstVal, Ty};
 pub struct Checked {
     pub hir: hir::Program,
     pub info: Rc<ProgramInfo>,
+    /// This program's source text, kept around (OBI-231) so a caller that
+    /// only has a `Checked` (not the original `SourceLoader`) can still
+    /// hand `src` to `codegen::compile` and get a real line-table: spans
+    /// on the HIR are byte offsets, and turning one into a 1-based source
+    /// line (`loom_syntax::line_col`) needs the source text, which
+    /// `hir::Program` itself does not carry.
+    pub src: Rc<str>,
 }
 
 /// Check one program against its (already checked) parents and imports.
 pub fn check_program(
     path: &str,
+    src: &str,
     ast: &ast::Program,
     parents: Vec<ParentInfo>,
     imports: Vec<crate::interface::ImportInfo>,
@@ -351,7 +359,11 @@ pub fn check_program(
         consts: hir_consts,
         fns,
     };
-    Ok(Checked { hir, info })
+    Ok(Checked {
+        hir,
+        info,
+        src: Rc::from(src),
+    })
 }
 
 // ---- imports ---------------------------------------------------------

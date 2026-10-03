@@ -1,0 +1,9 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// /domains/start/privileged: fixture referencing /secure/master, used by
+// the M-LSP-2 read-gating integration test. Not a realistic inherit (a
+// real tier policy would never let a workroom inherit /secure), just a
+// literal path for go-to-definition to resolve.
+
+inherit /secure/master

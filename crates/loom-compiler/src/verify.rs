@@ -79,6 +79,21 @@ fn verify_function(m: &Module, f: &FunctionCode) -> Result<(), VerifyError> {
     if f.code.is_empty() {
         return Err(VerifyError("empty function body".into()));
     }
+    // OBI-231: `lines` is debug info, not required for a function to run,
+    // but if present at all it must cover every instruction -- a partial
+    // table would silently misattribute whichever instructions fall past
+    // its end to "no line" instead of failing loudly, which is a worse
+    // failure mode than rejecting the module outright. `decode` already
+    // enforces this for anything that arrived over the wire; checking it
+    // again here covers a `Module` assembled directly in-process too (the
+    // same reasoning as every other check in this function).
+    if !f.lines.is_empty() && f.lines.len() != f.code.len() {
+        return Err(VerifyError(format!(
+            "line table has {} entries, code has {}",
+            f.lines.len(),
+            f.code.len()
+        )));
+    }
     for &pc in &f.entry_points {
         if pc as usize >= f.code.len() {
             return Err(VerifyError(format!("entry point {pc:04} out of bounds")));
@@ -725,6 +740,7 @@ mod tests {
             reg_types: vec![],
             entry_points: vec![0],
             code: vec![Op::Return { src: None }].into(),
+            lines: Vec::new(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_ok());
@@ -741,6 +757,7 @@ mod tests {
             reg_types: vec![Ty::Int],
             entry_points: vec![0],
             code: vec![Op::Return { src: Some(7) }].into(),
+            lines: Vec::new(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
@@ -757,6 +774,7 @@ mod tests {
             reg_types: vec![Ty::Int],
             entry_points: vec![0],
             code: vec![Op::Return { src: Some(0) }].into(),
+            lines: Vec::new(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
@@ -773,6 +791,7 @@ mod tests {
             reg_types: vec![],
             entry_points: vec![0],
             code: vec![Op::Jump { target: 5 }].into(),
+            lines: Vec::new(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
@@ -799,6 +818,7 @@ mod tests {
                 Op::Return { src: None },
             ]
             .into(),
+            lines: Vec::new(),
             capture_targets: vec![],
         };
         // dst is typed `string` but Add.Int must produce `int`.
@@ -828,6 +848,7 @@ mod tests {
                 Op::Return { src: None },
             ]
             .into(),
+            lines: Vec::new(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_ok());
@@ -854,6 +875,7 @@ mod tests {
                 Op::Return { src: None },
             ]
             .into(),
+            lines: Vec::new(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_err());
@@ -880,6 +902,7 @@ mod tests {
                 Op::Return { src: Some(2) },
             ]
             .into(),
+            lines: Vec::new(),
             capture_targets: vec![],
         };
         assert!(verify(&m1(f)).is_ok());

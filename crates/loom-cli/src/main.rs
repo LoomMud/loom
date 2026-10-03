@@ -63,7 +63,7 @@ async fn run() -> Result<(), String> {
     match command.as_str() {
         "serve" => {
             let args = parse_serve_args(args)?;
-            serve(args.mudlib, args.adopt_control_fd).await
+            serve(args.mudlib, args.save_dir, args.adopt_control_fd).await
         }
         "supervise" => {
             let mudlib = parse_mudlib_arg(args)?;
@@ -234,8 +234,8 @@ fn disasm(root: PathBuf, program: &str) -> Result<(), String> {
         loom_compiler::Outcome::Failed(r) => return Err(format!("{normalized}: has errors:\n{r}")),
         loom_compiler::Outcome::Missing(r) => return Err(format!("{normalized}: {r}")),
     };
-    let module =
-        loom_compiler::codegen::compile(&checked.hir).map_err(|e| format!("{normalized}: {e}"))?;
+    let module = loom_compiler::codegen::compile(&checked.hir, &checked.src)
+        .map_err(|e| format!("{normalized}: {e}"))?;
     loom_compiler::verify::verify(&module).map_err(|e| {
         format!("{normalized}: compiler bug: assembled bytecode failed verification: {e}")
     })?;
@@ -301,13 +301,23 @@ fn parse_mudlib_arg(mut args: impl Iterator<Item = String>) -> Result<PathBuf, S
 /// user-facing CLI surface -- it is only ever passed by `loom supervise`
 /// itself, to its own spawned standby child, with an fd number that is
 /// meaningless to type by hand.
+///
+/// `save_dir` (OBI-171) overrides [`loom_vm::World`]'s default
+/// player-save root -- a `saves` directory beside the mudlib root; see
+/// `World::set_save_root`'s docs for why that default deliberately
+/// isn't *inside* the mudlib's own Git-backed working tree.
+/// `LOOM_SAVE_DIR` is the same override as an environment variable, for
+/// Compose/Flux-style deployments that set env vars rather than args;
+/// the flag wins if both are given.
 struct ServeArgs {
     mudlib: PathBuf,
+    save_dir: Option<PathBuf>,
     adopt_control_fd: Option<std::os::fd::RawFd>,
 }
 
 fn parse_serve_args(mut args: impl Iterator<Item = String>) -> Result<ServeArgs, String> {
     let mut mudlib: Option<PathBuf> = None;
+    let mut save_dir: Option<PathBuf> = None;
     let mut adopt_control_fd: Option<std::os::fd::RawFd> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -316,6 +326,12 @@ fn parse_serve_args(mut args: impl Iterator<Item = String>) -> Result<ServeArgs,
                     return Err("--mudlib requires a value".to_string());
                 };
                 mudlib = Some(PathBuf::from(path));
+            }
+            "--save-dir" => {
+                let Some(path) = args.next() else {
+                    return Err("--save-dir requires a value".to_string());
+                };
+                save_dir = Some(PathBuf::from(path));
             }
             "--adopt-control-fd" => {
                 let Some(value) = args.next() else {
@@ -329,9 +345,15 @@ fn parse_serve_args(mut args: impl Iterator<Item = String>) -> Result<ServeArgs,
             other => return Err(format!("unexpected argument: {other}")),
         }
     }
+    if save_dir.is_none()
+        && let Some(env_dir) = std::env::var_os("LOOM_SAVE_DIR")
+    {
+        save_dir = Some(PathBuf::from(env_dir));
+    }
 
     Ok(ServeArgs {
         mudlib: mudlib.ok_or_else(|| "missing required --mudlib <path>".to_string())?,
+        save_dir,
         adopt_control_fd,
     })
 }
@@ -571,6 +593,7 @@ fn spawn_and_handoff(
 
 async fn serve(
     mudlib_root: PathBuf,
+    save_dir: Option<PathBuf>,
     adopt_control_fd: Option<std::os::fd::RawFd>,
 ) -> Result<(), String> {
     let (listener, http_listener) = acquire_listeners(adopt_control_fd).await?;
@@ -637,6 +660,7 @@ async fn serve(
 
     let world_handle = spawn_world_thread(
         mudlib_root.clone(),
+        save_dir,
         event_rx,
         command_tx.clone(),
         db_req_tx,
@@ -665,21 +689,28 @@ async fn serve(
     if let Some(web_root) = web_root_from_env() {
         http_state = http_state.with_web_root(web_root);
     }
-    // OBI-174: `/auth/*` only mounted when both Postgres and a JWT secret
-    // are configured -- staff web auth has nothing to authenticate against
-    // otherwise (no `staff` table without Postgres) and must never sign a
-    // token with a guessable default secret. A *present but too-short*
-    // secret is a misconfiguration, not "disabled" -- fail startup closed
-    // (OBI-195 review fix 6) rather than silently run with a weak key.
-    let jwt_secret = jwt_secret_from_env()?;
-    if let (Some(p), Some(secret)) = (persist.clone(), jwt_secret) {
+    // OBI-174/OBI-197: `/auth/*` only mounted when both Postgres and an
+    // EdDSA key file are configured -- staff web auth has nothing to
+    // authenticate against otherwise (no `staff` table without Postgres)
+    // and must never sign a token with a guessable or missing key.
+    //
+    // Deploy gate (OBI-195 follow-up tracking): `LOOM_JWT_SECRET` (the old
+    // HS256 shared-secret var) is intentionally **not read anywhere in
+    // this binary any more** -- setting it in any environment has no
+    // effect, by construction, not just by convention.
+    if let (Some(p), Some(key_file)) = (persist.clone(), jwt_key_file_from_env()) {
         let directory: std::sync::Arc<dyn loom_http::auth::StaffDirectory> = std::sync::Arc::new(p);
-        let keys = loom_http::auth::JwtKeys::from_secret(&secret);
+        let keys = loom_http::auth::JwtKeys::from_key_file(
+            &key_file,
+            jwt_issuer_from_env(),
+            loom_http::auth::AUDIENCE,
+        )
+        .unwrap_or_else(|err| panic!("LOOM_JWT_KEY_FILE ({}): {err}", key_file.display()));
         http_state = http_state.with_auth(loom_http::auth::AuthService::new(directory, keys));
     } else {
         tracing::info!(
             "staff web auth (/auth/*) disabled: set both LOOM_DATABASE_URL (or DATABASE_URL) \
-             and LOOM_JWT_SECRET to enable it"
+             and LOOM_JWT_KEY_FILE to enable it"
         );
     }
     let mut http_server = tokio::spawn(async move {
@@ -778,61 +809,27 @@ fn web_root_from_env() -> Option<PathBuf> {
     std::env::var_os("LOOM_WEB_ROOT").map(PathBuf::from)
 }
 
-/// Staff web auth's JWT signing secret (OBI-174, design §9/D-P2.5).
-/// `/auth/*` is only mounted when this is set *and* Postgres
+/// Staff web auth's JWT signing keyset (OBI-174, OBI-197/M-AUTH-4, design
+/// §9/D-P2.5). `/auth/*` is only mounted when this is set *and* Postgres
 /// (`connect_persist`) is configured -- same "absent by default" shape as
-/// `LOOM_WEB_ROOT`. There is no insecure default: an operator who wants
-/// staff auth must generate and set a real secret (at least 32 bytes of
-/// CSPRNG output, e.g. `openssl rand -hex 32`) themselves.
-///
-/// `Ok(None)` means unset (auth stays disabled, same as before). `Err`
-/// means it *is* set but is under the 32-byte floor -- OBI-195 review fix
-/// 6: that is a misconfiguration serious enough to fail the whole process
-/// closed at startup, not something to quietly degrade past (an operator
-/// who thinks they enabled staff auth with a weak secret must find out
-/// immediately, not have it silently run short-keyed or silently stay
-/// disabled).
-const MIN_JWT_SECRET_BYTES: usize = 32;
-
-fn jwt_secret_from_env() -> Result<Option<Vec<u8>>, String> {
-    match std::env::var("LOOM_JWT_SECRET") {
-        Ok(value) => validate_jwt_secret(value.into_bytes()).map(Some),
-        Err(_) => Ok(None),
-    }
+/// `LOOM_WEB_ROOT`. Points at a mounted secret file holding the EdDSA
+/// (Ed25519) keyset (active signing key + any still-being-rotated-out
+/// verification keys) -- see `loom_http::auth::JwtKeys::from_key_file`
+/// for its JSON shape. There is no insecure default: an operator who
+/// wants staff auth must generate and mount a real keyset themselves
+/// (e.g. `openssl genpkey -algorithm ed25519` plus a small script to emit
+/// the 32-byte seed as base64 -- see `secrets.env.example`).
+fn jwt_key_file_from_env() -> Option<PathBuf> {
+    std::env::var_os("LOOM_JWT_KEY_FILE").map(PathBuf::from)
 }
 
-/// The length check itself, split out from [`jwt_secret_from_env`] so it's
-/// testable without touching process environment state.
-fn validate_jwt_secret(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    if bytes.len() < MIN_JWT_SECRET_BYTES {
-        return Err(format!(
-            "LOOM_JWT_SECRET is {} bytes, below the {MIN_JWT_SECRET_BYTES}-byte floor -- \
-             refusing to start rather than sign tokens with a weak key \
-             (generate one with `openssl rand -hex 32`)",
-            bytes.len()
-        ));
-    }
-    Ok(bytes)
-}
-
-#[cfg(test)]
-mod jwt_secret_tests {
-    use super::*;
-
-    #[test]
-    fn short_secret_is_rejected() {
-        assert!(validate_jwt_secret(vec![b'a'; 16]).is_err());
-    }
-
-    #[test]
-    fn exactly_min_length_secret_is_accepted() {
-        assert!(validate_jwt_secret(vec![b'a'; MIN_JWT_SECRET_BYTES]).is_ok());
-    }
-
-    #[test]
-    fn empty_secret_is_rejected() {
-        assert!(validate_jwt_secret(Vec::new()).is_err());
-    }
+/// The `iss` claim staff access tokens are signed/verified with
+/// (M-AUTH-4). Defaults to a fixed, documented value so a forgotten
+/// `LOOM_JWT_ISSUER` doesn't silently sign tokens whose `iss` varies
+/// between deploys (which would make outstanding tokens fail verification
+/// after a redeploy for no operational reason).
+fn jwt_issuer_from_env() -> String {
+    std::env::var("LOOM_JWT_ISSUER").unwrap_or_else(|_| "https://build.loommud.com/".to_string())
 }
 
 /// The `serve()` world-tick timer (spec r5 N2, OBI-82): every `interval`
@@ -1330,6 +1327,7 @@ fn to_persist_audit_row(r: loom_vm::AuditRow) -> loom_persist::AuditRow {
 #[allow(clippy::too_many_arguments)]
 fn spawn_world_thread(
     mudlib_root: PathBuf,
+    save_dir: Option<PathBuf>,
     mut event_rx: mpsc::Receiver<NetEvent>,
     command_tx: mpsc::Sender<NetCommand>,
     db_req_tx: mpsc::Sender<DbRequest>,
@@ -1352,6 +1350,9 @@ fn spawn_world_thread(
                     return;
                 }
             };
+            if let Some(dir) = save_dir {
+                world.set_save_root(dir);
+            }
             // OBI-123: without Postgres (`persist` was `None`), `LOOM_ROLES_SEED`
             // is the dev/CI path (`crate::roles::load_seed_from_env`'s doc): a
             // set-but-malformed seed is a boot failure, never a silent empty

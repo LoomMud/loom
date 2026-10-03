@@ -70,6 +70,8 @@ const NAMES: &[&str] = &[
     "bind_connection",
     "compile_object",
     "upgrade_all",
+    "canary_update",
+    "canary_status",
     "len",
     "split",
     "join",
@@ -93,6 +95,8 @@ const NAMES: &[&str] = &[
     "seteuid",
     "read_file",
     "write_file",
+    "save_object",
+    "restore_object",
     "unguarded",
     "roles_tier",
     "roles_is_member",
@@ -106,6 +110,9 @@ const NAMES: &[&str] = &[
     "roles_revoke_grant",
     "roles_propose_tier",
     "roles_approve",
+    "errors",
+    "profile_start",
+    "profile_stop",
 ];
 
 /// All efun names known to the checker.
@@ -160,6 +167,28 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
         // authoritative arity/privilege/tick cost and rationale. Returns
         // the number of instances queued for a future tick's batch.
         "upgrade_all" => ("upgrade_all", vec![P(s.clone())], 1, Ret::Ty(Ty::Int), P1),
+        // Spec §7.4, OBI-182 (P2-B7): see `loom_vm::efuns` for the
+        // authoritative arity/privilege/tick cost. `null` on success
+        // (a canary just started), else a diagnostics/compile-error
+        // string -- mirrors `compile_object`'s `Optional<String>`.
+        "canary_update" => (
+            "canary_update",
+            vec![P(s.clone()), P(Ty::Int), P(Ty::Int), P(Ty::Int)],
+            4,
+            Ret::Ty(Ty::optional(Ty::String)),
+            P1,
+        ),
+        // `null` if `path` has no canary in flight, else `{"program":
+        // string, "pct": int, "ticks_left": int, "new_errors": int,
+        // "max_new_errors": int}` -- `any`-valued like `errors`, a
+        // driver-introspection efun, not mudlib data.
+        "canary_status" => (
+            "canary_status",
+            vec![P(s.clone())],
+            1,
+            Ret::Ty(Ty::optional(Ty::map(Ty::String, Ty::Any))),
+            P1,
+        ),
         "len" => ("len", vec![Param::Sized], 1, Ret::Ty(Ty::Int), P0),
         "split" => (
             "split",
@@ -243,6 +272,16 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
             2,
             Ret::Ty(Ty::Bool),
             P1,
+        ),
+        // OBI-171 (spec §8.1): see `loom_vm::efuns` for the authoritative
+        // arity/privilege/tick cost.
+        "save_object" => ("save_object", vec![P(s.clone())], 1, Ret::Ty(Ty::Bool), P1),
+        "restore_object" => (
+            "restore_object",
+            vec![P(s.clone())],
+            1,
+            Ret::Ty(Ty::Bool),
+            P0,
         ),
         "unguarded" => (
             "unguarded",
@@ -331,6 +370,43 @@ pub fn lookup(name: &str) -> Option<EfunSig> {
             P3,
         ),
         "roles_approve" => ("roles_approve", vec![P(Ty::Int)], 1, Ret::Ty(Ty::Int), P3),
+        // OBI-169: `errors(program_prefix)` -- the grouped runtime-error
+        // inbox, filtered to groups whose `program` starts with
+        // `program_prefix` (or every group, for `""`) and further
+        // filtered by the caller's own `valid_read` permission on each
+        // distinct program covered (see `RegistryHost::driver_efun`'s
+        // `"errors"` arm). Each row is `{"program": string, "function":
+        // string, "message": string, "count": int, "first_seen_unix_ms":
+        // int, "last_seen_unix_ms": int, "sample_trace": [string]}` --
+        // `any`-valued (not a declared `struct`) since this is a
+        // driver-introspection efun, not mudlib data.
+        "errors" => (
+            "errors",
+            vec![P(Ty::String)],
+            0,
+            Ret::Ty(Ty::array(Ty::map(Ty::String, Ty::Any))),
+            P1,
+        ),
+        // Spec Phase 2 B5, OBI-170: see `loom_vm::efuns` for the
+        // authoritative arity/privilege/tick cost. `profile_stop`'s
+        // second (optional) bool arg is `force` (should-fix 4, OBI-232):
+        // close a window owned by a different principal, subject to the
+        // VM's own P3 check on top of this P1 -- see
+        // `RegistryHost::driver_efun`'s `"profile_stop"` arm.
+        "profile_start" => (
+            "profile_start",
+            vec![P(s.clone())],
+            1,
+            Ret::Ty(Ty::Void),
+            P1,
+        ),
+        "profile_stop" => (
+            "profile_stop",
+            vec![P(Ty::Bool)],
+            0,
+            Ret::Ty(Ty::String),
+            P1,
+        ),
         _ => return None,
     };
     Some(EfunSig {

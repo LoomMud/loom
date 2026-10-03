@@ -1,0 +1,40 @@
+// Master object for the OBI-169 error-inbox fixture: like `tworoom`'s
+// master (every efun/path allowed) except `valid_read` denies the
+// `/std/vault` and `/secure/leak` programs specifically, so
+// `tests/obi_169_error_inbox.rs` can exercise the `errors` efun's
+// per-program permission filter without a full tier/roles setup --
+// `/secure/leak` is the CTO-review fixture (PR #72, must-fix 1) for "a
+// `/std` caller triggers an error inside a denied program and the
+// caller cannot see it" (M-ERR-1 checklist item 1). `/secure/vault2` is
+// deliberately left readable (`valid_read` returns `true` for it) so the
+// *redaction* test (must-fix 2) can check the `redacted`/T5-only message
+// rule on an entry that is otherwise visible, independent of the
+// program-level permission filter.
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return path != "/std/vault" and path != "/secure/leak"
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_seteuid(ob: object, e: string) -> bool {
+    return true
+}
+

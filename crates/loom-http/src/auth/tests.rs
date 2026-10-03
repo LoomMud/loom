@@ -31,6 +31,10 @@ struct FakeDirectoryInner {
     refresh_tokens: HashMap<String, RefreshRecord>, // keyed by token_hash
     github_links: HashMap<i64, String>,
     audit_events: Vec<AuditEvent>,
+    /// How many times [`StaffDirectory::resolve_uid`] has been called
+    /// (OBI-204 review fix): used to prove `login` checks the IP bucket
+    /// *before* paying for this lookup.
+    resolve_uid_calls: u32,
 }
 
 #[derive(Default, Clone)]
@@ -121,6 +125,10 @@ impl FakeDirectory {
     fn audit_events(&self) -> Vec<AuditEvent> {
         self.inner.lock().unwrap().audit_events.clone()
     }
+
+    fn resolve_uid_calls(&self) -> u32 {
+        self.inner.lock().unwrap().resolve_uid_calls
+    }
 }
 
 #[async_trait::async_trait]
@@ -143,6 +151,12 @@ impl StaffDirectory for FakeDirectory {
             totp_secret: staff.totp_secret.clone(),
             totp_confirmed: staff.totp_confirmed,
         }))
+    }
+
+    async fn resolve_uid(&self, username: &str) -> Result<Option<String>, DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.resolve_uid_calls += 1;
+        Ok(inner.staff.get(username).map(|s| s.uid.clone()))
     }
 
     async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError> {
@@ -205,6 +219,9 @@ impl StaffDirectory for FakeDirectory {
         uid: &str,
         token_hash: &str,
         expires_at: OffsetDateTime,
+        sid: &str,
+        amr: &[String],
+        mfa_at: Option<OffsetDateTime>,
     ) -> Result<(), DirectoryError> {
         self.inner.lock().unwrap().refresh_tokens.insert(
             token_hash.to_string(),
@@ -212,6 +229,9 @@ impl StaffDirectory for FakeDirectory {
                 staff_uid: uid.to_string(),
                 expires_at,
                 revoked_at: None,
+                sid: sid.to_string(),
+                amr: amr.to_vec(),
+                mfa_at,
             },
         );
         Ok(())
@@ -249,6 +269,9 @@ impl StaffDirectory for FakeDirectory {
         record.revoked_at = Some(now());
         Ok(RefreshRotation::Rotated {
             staff_uid: record.staff_uid.clone(),
+            sid: record.sid.clone(),
+            amr: record.amr.clone(),
+            mfa_at: record.mfa_at,
         })
     }
 
@@ -294,7 +317,12 @@ impl StaffDirectory for FakeDirectory {
 fn test_service(directory: FakeDirectory) -> AuthService {
     AuthService::new(
         Arc::new(directory),
-        JwtKeys::from_secret(b"test-only-secret-not-for-prod"),
+        JwtKeys::single(
+            [1u8; 32],
+            "test-kid",
+            "https://build.loommud.com/",
+            jwt::AUDIENCE,
+        ),
     )
 }
 
@@ -410,7 +438,12 @@ async fn forged_access_token_is_rejected() {
     // Attacker re-signs the *same* claims (tier escalated to 5) with a
     // different key -- simulating "I control the JSON, not the secret".
     let forged_claims = AccessClaims { tier: 5, ..claims };
-    let attacker_keys = JwtKeys::from_secret(b"attacker-controlled-key-not-the-servers");
+    let attacker_keys = JwtKeys::single(
+        [2u8; 32],
+        "test-kid",
+        "https://build.loommud.com/",
+        jwt::AUDIENCE,
+    );
     let forged = attacker_keys.encode(&forged_claims).unwrap();
 
     assert!(service.verify_access_token(&forged).is_err());
@@ -437,10 +470,7 @@ async fn refresh_reflects_the_directorys_current_tier_not_a_stale_claim() {
     // production) -- not through any token the client holds.
     directory.set_tier("boromir", 2);
 
-    let refreshed = service
-        .refresh(&pair.refresh_token, None, &ctx())
-        .await
-        .unwrap();
+    let refreshed = service.refresh(&pair.refresh_token, &ctx()).await.unwrap();
     let refreshed_claims = service
         .verify_access_token(&refreshed.access_token)
         .unwrap();
@@ -454,7 +484,7 @@ async fn refresh_reflects_the_directorys_current_tier_not_a_stale_claim() {
     // And a demotion takes effect just as readily.
     directory.set_tier("boromir", 0);
     let refreshed_again = service
-        .refresh(&refreshed.refresh_token, None, &ctx())
+        .refresh(&refreshed.refresh_token, &ctx())
         .await
         .unwrap();
     let claims_again = service
@@ -475,7 +505,7 @@ async fn expired_refresh_token_is_refused() {
     let pair = service.login("pippin", "took", None, &ctx()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let result = service.refresh(&pair.refresh_token, None, &ctx()).await;
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
 }
 
@@ -494,7 +524,7 @@ async fn revoked_refresh_token_is_refused_and_replay_revokes_the_family() {
     service.logout(&pair.refresh_token).await.unwrap();
     assert!(directory.is_revoked(&pair.refresh_token));
 
-    let result = service.refresh(&pair.refresh_token, None, &ctx()).await;
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
 
     // Rotate a second, legitimate session, then simulate a thief replaying
@@ -504,23 +534,69 @@ async fn revoked_refresh_token_is_refused_and_replay_revokes_the_family() {
         .login("merry", "brandybuck", None, &ctx())
         .await
         .unwrap();
-    let rotated = service
-        .refresh(&pair2.refresh_token, None, &ctx())
-        .await
-        .unwrap();
+    let rotated = service.refresh(&pair2.refresh_token, &ctx()).await.unwrap();
     // `pair2.refresh_token` is now revoked (rotated out); replaying it:
-    let replay_result = service.refresh(&pair2.refresh_token, None, &ctx()).await;
+    let replay_result = service.refresh(&pair2.refresh_token, &ctx()).await;
     assert_eq!(replay_result.unwrap_err(), AuthError::InvalidRefreshToken);
     // The legitimately-rotated token is now dead too.
-    let result = service.refresh(&rotated.refresh_token, None, &ctx()).await;
+    let result = service.refresh(&rotated.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
+}
+
+/// Acceptance (OBI-203): a refreshed token keeps the login's `sid`,
+/// `amr`, and `mfa_at` -- not a fresh `sid` per issuance and not
+/// `amr: ["refresh"]`/`mfa_at: None`.
+#[tokio::test]
+async fn refresh_carries_forward_the_logins_sid_amr_and_mfa_at() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gimli", "dwarf", 3);
+    let service = test_service(directory.clone());
+
+    // Confirm directly against the directory rather than through
+    // `service.totp_confirm` -- that would consume this test's one
+    // deterministic real code (TOTP replay protection, OBI-195 review fix
+    // 4) and leave nothing left for the login below to present.
+    let enrollment = service.totp_enroll("gimli", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gimli");
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gimli").unwrap();
+
+    let fresh_code = totp.generate_current().to_string();
+    let pair = service
+        .login("gimli", "dwarf", Some(&fresh_code), &ctx())
+        .await
+        .unwrap();
+    let claims = service.verify_access_token(&pair.access_token).unwrap();
+    assert_eq!(claims.amr, vec!["pwd".to_string(), "otp".to_string()]);
+    assert!(claims.mfa_at.is_some());
+
+    let refreshed = service.refresh(&pair.refresh_token, &ctx()).await.unwrap();
+    let refreshed_claims = service
+        .verify_access_token(&refreshed.access_token)
+        .unwrap();
+    // Same token family, not a fresh one.
+    assert_eq!(refreshed_claims.sid, claims.sid);
+    // The original login's authentication context, not "refresh".
+    assert_eq!(refreshed_claims.amr, claims.amr);
+    assert_eq!(refreshed_claims.mfa_at, claims.mfa_at);
+
+    // A second rotation still carries the same family/context forward.
+    let refreshed_again = service
+        .refresh(&refreshed.refresh_token, &ctx())
+        .await
+        .unwrap();
+    let claims_again = service
+        .verify_access_token(&refreshed_again.access_token)
+        .unwrap();
+    assert_eq!(claims_again.sid, claims.sid);
+    assert_eq!(claims_again.amr, claims.amr);
+    assert_eq!(claims_again.mfa_at, claims.mfa_at);
 }
 
 #[tokio::test]
 async fn unknown_refresh_token_is_refused() {
     let directory = FakeDirectory::new();
     let service = test_service(directory);
-    let result = service.refresh("never-issued-token", None, &ctx()).await;
+    let result = service.refresh("never-issued-token", &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
 }
 
@@ -611,6 +687,46 @@ async fn wrong_totp_codes_count_toward_the_account_lockout() {
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
 }
 
+/// OBI-204 acceptance: `login`'s wrong-password failures and
+/// `totp_confirm`'s wrong-code failures land on the *same* account
+/// counter -- both resolve to the one `uid:` namespaced key, so an
+/// attacker can't double their effective guess budget by splitting
+/// attempts across the two entry points.
+#[tokio::test]
+async fn wrong_login_password_and_wrong_totp_confirm_share_one_account_counter() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory);
+
+    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+    let code = totp.generate_current().to_string();
+    service
+        .totp_confirm("gandalf", &code, &ctx())
+        .await
+        .unwrap();
+
+    // 3 wrong login passwords...
+    for _ in 0..3 {
+        let result = service.login("gandalf", "wrong", None, &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+    }
+    // ...and 2 wrong TOTP codes via totp_confirm -- 5 total against the
+    // same account.
+    for _ in 0..2 {
+        let result = service.totp_confirm("gandalf", "000000", &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::TotpInvalid);
+    }
+
+    // The account is now locked from the combined count -- even the
+    // correct password+code combo is refused.
+    let fresh_code = totp.generate_current().to_string();
+    let result = service
+        .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
 /// A missing TOTP code ("not supplied") is not a guess and must not count
 /// toward the lockout.
 #[tokio::test]
@@ -634,6 +750,36 @@ async fn a_missing_totp_code_does_not_count_as_a_failure() {
     }
 
     // Still not locked -- the current code succeeds.
+    let fresh_code = totp.generate_current().to_string();
+    assert!(
+        service
+            .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
+            .await
+            .is_ok()
+    );
+}
+
+/// OBI-204 CTO review: an in-flight reservation must never *itself* set
+/// the lockout. After 4 wrong passwords, a correct password with no TOTP
+/// code (`TotpRequired`, the normal two-step login flow) releases its
+/// reservation; it must not leave the account locked for 15 minutes.
+#[tokio::test]
+async fn totp_required_after_four_failures_does_not_lock_the_account() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory.clone());
+
+    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gandalf");
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+
+    for _ in 0..4 {
+        let result = service.login("gandalf", "wrong", None, &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+    }
+    let result = service.login("gandalf", "mithrandir", None, &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
+
     let fresh_code = totp.generate_current().to_string();
     assert!(
         service
@@ -670,6 +816,33 @@ async fn ip_bucket_throttles_logins_across_many_accounts() {
     let other_ip = ctx_from("203.0.113.51");
     let result = service.login("nobody-5", "whatever", None, &other_ip).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
+/// OBI-204 review fix: `login` checks the (cheap, no-DB) IP bucket
+/// *before* resolving the username to a uid, so a throttled IP never pays
+/// for that lookup.
+#[tokio::test]
+async fn login_checks_the_ip_bucket_before_resolving_the_account() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("frodo", "ringbearer", 1);
+    let service = test_service(directory.clone()).with_rate_limiter(RateLimiter::with_test_tuning(
+        5,
+        std::time::Duration::from_secs(900),
+        std::time::Duration::from_secs(900),
+        1.0,
+        std::time::Duration::from_secs(3600),
+    ));
+
+    let from_ip = ctx_from("198.51.100.20");
+    // Spends the IP bucket's one token.
+    let _ = service.login("frodo", "wrong", None, &from_ip).await;
+    assert_eq!(directory.resolve_uid_calls(), 1);
+
+    // The bucket is now dry: a second attempt must be refused by the IP
+    // check alone, without ever calling `resolve_uid` again.
+    let result = service.login("frodo", "wrong", None, &from_ip).await;
+    assert_eq!(result.unwrap_err(), AuthError::RateLimited);
+    assert_eq!(directory.resolve_uid_calls(), 1);
 }
 
 /// Acceptance: "audit rows written for each event" -- login ok, login
@@ -718,11 +891,11 @@ async fn refresh_reuse_is_audited() {
         .await
         .unwrap();
     let rotated = service
-        .refresh(&pair.refresh_token, None, &from_ip)
+        .refresh(&pair.refresh_token, &from_ip)
         .await
         .unwrap();
     // Replaying the now-rotated-out token is reuse.
-    let _ = service.refresh(&pair.refresh_token, None, &from_ip).await;
+    let _ = service.refresh(&pair.refresh_token, &from_ip).await;
 
     let events = directory.audit_events();
     let reuse = events
@@ -906,7 +1079,7 @@ async fn promotion_to_t3_requires_totp_on_the_next_refresh() {
         .unwrap();
     directory.set_tier("aragorn", 3);
 
-    let result = service.refresh(&pair.refresh_token, None, &ctx()).await;
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
 }
 
@@ -1012,7 +1185,7 @@ async fn refresh_for_a_removed_staff_row_is_refused_and_revokes_sessions() {
         .unwrap();
     directory.remove_staff("boromir");
 
-    let result = service.refresh(&pair.refresh_token, None, &ctx()).await;
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
 }
 
@@ -1030,8 +1203,8 @@ async fn concurrent_refresh_rotation_only_succeeds_once() {
 
     let pair = service.login("pippin", "took", None, &ctx()).await.unwrap();
 
-    let first = service.refresh(&pair.refresh_token, None, &ctx()).await;
-    let second = service.refresh(&pair.refresh_token, None, &ctx()).await;
+    let first = service.refresh(&pair.refresh_token, &ctx()).await;
+    let second = service.refresh(&pair.refresh_token, &ctx()).await;
     assert!(first.is_ok());
     assert_eq!(second.unwrap_err(), AuthError::InvalidRefreshToken);
 }
