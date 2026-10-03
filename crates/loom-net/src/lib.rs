@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -122,7 +122,54 @@ enum ConnControl {
     Close,
     SendGmcp(String, serde_json::Value),
     SetEcho(bool),
+    /// Copyover, old-process side (design §7.5 step 2, OBI-184): stop this
+    /// connection's read/write loop *without* treating it as a disconnect
+    /// (no `NetEvent::Disconnected`, so the world never runs `net_dead()`
+    /// on the bound object), reunite the split `TcpStream`, and hand it
+    /// back through the carried `oneshot::Sender`.
+    ///
+    /// `None` means no usable `TcpStream` came back -- either the
+    /// connection is a WebSocket (no raw-fd story yet; see `ws.rs`'s
+    /// handler, which also disconnects the session when this happens) or
+    /// its task had already exited on its own between the reclaim request
+    /// and the attempt to deliver it. **Reviewed (OBI-227): any `None`
+    /// desyncs `fdpass::send_fds`' position-only fd<->`ConnId` matching
+    /// (there is no fd to send for that slot), so the copyover driver
+    /// (`loom-supervise`/`loom-cli`, not yet built) must treat `None` as
+    /// "this conn_id does not cross the copyover" -- skip it in the send
+    /// order on the old side and do not expect it in `live_connections()`
+    /// on the new side -- rather than sending a placeholder or shifting
+    /// every later fd by one.** `reunite` on two halves that genuinely
+    /// came from the same `into_split()` call cannot itself fail, so a
+    /// telnet connection's reclaim always sends `Some` once the task
+    /// actually processes the request.
+    Reclaim(oneshot::Sender<Option<TcpStream>>),
 }
+
+/// One pending "take this connection back as a raw `TcpStream`" request
+/// (OBI-184's copyover hand-off, old-process side): matches a `ConnId` to
+/// the `oneshot::Sender` [`run_server_full`] replies on. Kept as its own
+/// channel rather than a `NetCommand` variant because `NetCommand` derives
+/// `Clone`/`PartialEq`/`Eq` (for `Host`/test ergonomics elsewhere) and a
+/// `oneshot::Sender` cannot implement any of those.
+///
+/// Ordering (reviewed, OBI-227): `reclaim_rx` and `command_rx` are read
+/// from the same unbiased `tokio::select!` as every other event source in
+/// [`run_server_full`], so a `Send`/`Close`/`SetEcho` for a `ConnId` can
+/// still be in flight on `command_rx` when that id's reclaim request is
+/// processed -- harmless (the stale command just finds no entry once the
+/// reclaim removes it, or lands on the connection microseconds before it
+/// stops), but the driver issuing reclaim requests must not assume a
+/// command it just sent landed before the reclaim it sends next. The
+/// copyover driver's actual required order is coarser than per-command
+/// interleaving and is the caller's (not this module's) responsibility to
+/// enforce: quiesce new input to the objects being handed off, drain any
+/// commands already queued for them, reclaim every live connection (in
+/// the order `live_connections()` on the new side will expect, per
+/// [`ConnControl::Reclaim`]'s docs), and only then take the world
+/// snapshot -- reclaiming after the snapshot would hand off a connection
+/// the snapshot never recorded as still bound.
+pub type ReclaimRequest = (ConnId, oneshot::Sender<Option<TcpStream>>);
 
 #[derive(Debug)]
 struct ConnEntry {
@@ -145,6 +192,7 @@ pub async fn run_server(
     // `tokio::select!`'s `else` branch); nothing ever sends on it.
     let (_ws_accept_tx, ws_accept_rx) = mpsc::channel(1);
     let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+    let (_reclaim_tx, reclaim_rx) = mpsc::channel(1);
     run_server_full(
         listener,
         config,
@@ -153,6 +201,7 @@ pub async fn run_server(
         shutdown_rx,
         ws_accept_rx,
         adopt_rx,
+        reclaim_rx,
     )
     .await
 }
@@ -172,9 +221,10 @@ pub async fn run_server_with_ws(
     shutdown_rx: watch::Receiver<bool>,
     ws_accept_rx: mpsc::Receiver<axum::extract::ws::WebSocket>,
 ) -> io::Result<()> {
-    // See `run_server`'s own comment: nothing sends on this one either,
-    // it just has to stay open for `run_server_full`'s select arm.
+    // See `run_server`'s own comment: nothing sends on these either, they
+    // just have to stay open for `run_server_full`'s select arms.
     let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+    let (_reclaim_tx, reclaim_rx) = mpsc::channel(1);
     run_server_full(
         listener,
         config,
@@ -183,6 +233,7 @@ pub async fn run_server_with_ws(
         shutdown_rx,
         ws_accept_rx,
         adopt_rx,
+        reclaim_rx,
     )
     .await
 }
@@ -218,6 +269,7 @@ pub type AdoptedConn = (ConnId, TcpStream);
 /// function's auto-incrementing counter. Both `run_server`/
 /// `run_server_with_ws` are thin wrappers over this with an `adopt_rx`
 /// nothing ever sends on.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server_full(
     listener: TcpListener,
     config: NetConfig,
@@ -226,6 +278,7 @@ pub async fn run_server_full(
     mut shutdown_rx: watch::Receiver<bool>,
     mut ws_accept_rx: mpsc::Receiver<axum::extract::ws::WebSocket>,
     mut adopt_rx: mpsc::Receiver<AdoptedConn>,
+    mut reclaim_rx: mpsc::Receiver<ReclaimRequest>,
 ) -> io::Result<()> {
     let mut next_conn_id: ConnId = 1;
     let mut conns: HashMap<ConnId, ConnEntry> = HashMap::new();
@@ -239,6 +292,45 @@ pub async fn run_server_full(
             }
             Some(conn_id) = closed_rx.recv() => {
                 conns.remove(&conn_id);
+            }
+            Some((conn, reply_tx)) = reclaim_rx.recv() => {
+                // Copyover, old-process side (design §7.5 step 2): hand
+                // this connection's raw socket back to the caller instead
+                // of tearing it down. `conns.remove` here (not after the
+                // task exits via `closed_tx`) stops routing any further
+                // `NetCommand`s at this id in *this* process immediately --
+                // the connection is, from this process's point of view,
+                // already gone to its new owner, even though the task
+                // itself is still finishing its reunite-and-reply.
+                match conns.remove(&conn) {
+                    Some(entry) => {
+                        // `try_send` would leave a live connection stranded
+                        // on `Full`/`Closed`: the entry is already removed
+                        // above (so nothing in *this* loop can retry it),
+                        // and dropping `reply_tx` on the spot turns the
+                        // caller's `oneshot::Receiver::await` into a bare
+                        // `RecvError` instead of the documented `None`.
+                        // Block on the send instead, off the main select
+                        // loop (so one slow/backed-up connection can't
+                        // stall every other connection's reclaim/adopt/
+                        // command handling), and recover `reply_tx` out of
+                        // the failed send's payload to answer `None` if
+                        // the connection task had already exited on its
+                        // own in the meantime.
+                        tokio::spawn(async move {
+                            if let Err(mpsc::error::SendError(ConnControl::Reclaim(reply_tx))) =
+                                entry.tx.send(ConnControl::Reclaim(reply_tx)).await
+                            {
+                                debug!(conn, "reclaim requested but connection task had already exited");
+                                let _ = reply_tx.send(None);
+                            }
+                        });
+                    }
+                    None => {
+                        debug!(conn, "reclaim requested for an unknown/already-gone connection");
+                        let _ = reply_tx.send(None);
+                    }
+                }
             }
             Some((conn_id, stream)) = adopt_rx.recv() => {
                 if let Err(err) = stream.set_nodelay(true) {
@@ -415,6 +507,7 @@ async fn run_connection(
     );
 
     let mut disconnected_sent = false;
+    let mut reclaimed_reply: Option<oneshot::Sender<Option<TcpStream>>> = None;
 
     let start_bytes = codec.start();
     if !start_bytes.is_empty() && writer.write_all(&start_bytes).await.is_err() {
@@ -454,6 +547,10 @@ async fn run_connection(
                             if !bytes.is_empty() && writer.write_all(&bytes).await.is_err() {
                                 break;
                             }
+                        }
+                        ConnControl::Reclaim(reply_tx) => {
+                            reclaimed_reply = Some(reply_tx);
+                            break;
                         }
                     }
                 }
@@ -518,6 +615,20 @@ async fn run_connection(
                 else => break,
             }
         }
+    }
+
+    if let Some(reply_tx) = reclaimed_reply {
+        // Copyover hand-off, not a disconnect: no `NetEvent::Disconnected`
+        // (the world must not run `net_dead()` on this object), and no
+        // `closed_tx` notification either -- `run_server_full` already
+        // removed this connection's `ConnEntry` before it ever sent
+        // `ConnControl::Reclaim`, specifically so it wouldn't be waiting
+        // on this task's own bookkeeping to know the handoff happened.
+        let stream = reader
+            .reunite(writer)
+            .expect("reunite: reader/writer came from the same into_split() call");
+        let _ = reply_tx.send(Some(stream));
+        return;
     }
 
     if !disconnected_sent {
@@ -1911,6 +2022,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_ws_tx, ws_rx) = mpsc::channel(1);
         let (adopt_tx, adopt_rx) = mpsc::channel(4);
+        let (_reclaim_tx, reclaim_rx) = mpsc::channel(4);
 
         let server = tokio::spawn(run_server_full(
             listener,
@@ -1920,6 +2032,7 @@ mod tests {
             shutdown_rx,
             ws_rx,
             adopt_rx,
+            reclaim_rx,
         ));
 
         // Stand in for "a socket some other listener (pre-copyover) already
@@ -1959,6 +2072,114 @@ mod tests {
         let mut buf = [0_u8; 8];
         let n = client.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hi\r\n");
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    /// Copyover, old-process side (OBI-184): a live connection, reclaimed
+    /// via `reclaim_rx`, comes back as a real, usable `TcpStream` -- and
+    /// the world never sees a spurious `NetEvent::Disconnected` for it
+    /// (reclaiming is a hand-off, not a close; a real `net_dead()` call
+    /// on the bound object would be wrong here).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaimed_connection_is_a_live_stream_with_no_disconnect_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_ws_tx, ws_rx) = mpsc::channel(1);
+        let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+        let (reclaim_tx, reclaim_rx) = mpsc::channel(4);
+
+        let server = tokio::spawn(run_server_full(
+            listener,
+            config,
+            event_tx,
+            cmd_rx,
+            shutdown_rx,
+            ws_rx,
+            adopt_rx,
+            reclaim_rx,
+        ));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let conn = loop {
+            match event_rx.recv().await.expect("event channel closed") {
+                NetEvent::Connected(id) => break id,
+                _ => continue,
+            }
+        };
+        drain_preamble(&mut client).await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reclaim_tx.send((conn, reply_tx)).await.unwrap();
+        let mut reclaimed = reply_rx
+            .await
+            .expect("reclaim reply channel dropped")
+            .expect("reclaim should succeed for a live connection");
+
+        // The reclaimed stream is live and independent of `client`: write
+        // through it and read on the client side.
+        reclaimed.write_all(b"hi from reclaimed\n").await.unwrap();
+        let mut buf = [0_u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hi from reclaimed\n");
+
+        // No spurious disconnect: the next event (if any arrives before
+        // shutdown) must not be `Disconnected(conn)`.
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+        while let Ok(ev) = event_rx.try_recv() {
+            if let NetEvent::Disconnected(id) = ev {
+                assert_ne!(
+                    id, conn,
+                    "reclaimed connection must not also fire Disconnected"
+                );
+            }
+        }
+    }
+
+    /// Copyover, old-process side (OBI-184): reclaiming a `ConnId` that
+    /// isn't (or is no longer) live must answer `None` promptly, not hang
+    /// the caller's `oneshot::Receiver::await` -- this is the "connection
+    /// task had already exited on its own" path reviewed in OBI-227.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaiming_an_unknown_conn_id_answers_none() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, _event_rx) = mpsc::channel(256);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_ws_tx, ws_rx) = mpsc::channel(1);
+        let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+        let (reclaim_tx, reclaim_rx) = mpsc::channel(4);
+
+        let server = tokio::spawn(run_server_full(
+            listener,
+            config,
+            event_tx,
+            cmd_rx,
+            shutdown_rx,
+            ws_rx,
+            adopt_rx,
+            reclaim_rx,
+        ));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reclaim_tx.send((99999, reply_tx)).await.unwrap();
+        let reclaimed = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .expect("reclaim of an unknown conn id must answer promptly, not hang")
+            .expect("reclaim reply channel dropped");
+        assert!(
+            reclaimed.is_none(),
+            "reclaiming an unknown conn id must answer None"
+        );
 
         shutdown_tx.send(true).unwrap();
         server.await.unwrap().unwrap();

@@ -401,6 +401,104 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), slow.next()).await;
     }
 
+    /// Copyover, old-process side (OBI-184/OBI-227 review): a WebSocket
+    /// session has no raw-fd story, so `loom_net::ws`'s `Reclaim` handler
+    /// must answer `None` *and* actually end the session -- not leave a
+    /// zombie task that the registry no longer routes commands to but
+    /// that keeps reading the client's frames and emitting `NetEvent`s
+    /// for a `conn_id` nothing tracks anymore. Drives a real
+    /// `axum`-upgraded WS connection (not a bare `TcpStream`, unlike
+    /// `loom-net`'s own reclaim test) through `run_server_full`'s
+    /// `reclaim_rx` directly, since `run_server_with_ws` doesn't expose
+    /// it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ws_reclaim_answers_none_and_ends_the_session() {
+        let http_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let (ws_accept_tx, ws_accept_rx) = mpsc::channel(16);
+        let state = HttpState::new(
+            ws_accept_tx,
+            Readiness::new(),
+            PrometheusMetrics::new_unregistered(),
+        );
+        let app = app(state);
+        tokio::spawn(async move {
+            axum::serve(http_listener, app).await.unwrap();
+        });
+
+        let telnet_listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (_command_tx, command_rx) = mpsc::channel(256);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+        let (reclaim_tx, reclaim_rx) = mpsc::channel(4);
+        tokio::spawn(loom_net::run_server_full(
+            telnet_listener,
+            NetConfig::default(),
+            event_tx,
+            command_rx,
+            shutdown_rx,
+            ws_accept_rx,
+            adopt_rx,
+            reclaim_rx,
+        ));
+
+        let url = format!("ws://{http_addr}/ws");
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+
+        ws.send(ClientMessage::Text(
+            json!({"type": "line", "text": "hi"}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+
+        let conn_id = loop {
+            match event_rx.recv().await.unwrap() {
+                NetEvent::Connected(_) => {}
+                NetEvent::Line(id, text) => {
+                    assert_eq!(text, "hi");
+                    break id;
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        };
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reclaim_tx.send((conn_id, reply_tx)).await.unwrap();
+        let reclaimed = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .expect("WS reclaim must answer promptly, not hang")
+            .expect("reclaim reply channel dropped");
+        assert!(
+            reclaimed.is_none(),
+            "a WS connection has no raw fd to hand off -- reclaim must answer None"
+        );
+
+        // Not a zombie: the session actually ends -- the client sees its
+        // socket close, and the registry still reports a real disconnect
+        // (so a bound object's `net_dead()` still runs; this session does
+        // not survive the copyover).
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("client should observe the server closing the socket");
+        assert!(
+            matches!(closed, Some(Ok(ClientMessage::Close(_))) | None),
+            "expected the server to close the WS session after an unsupported reclaim, got {closed:?}"
+        );
+
+        let disconnect_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let event = tokio::time::timeout_at(disconnect_deadline, event_rx.recv())
+                .await
+                .expect("timed out waiting for the post-reclaim Disconnected event")
+                .expect("event channel closed");
+            if let NetEvent::Disconnected(id) = event {
+                assert_eq!(id, conn_id);
+                break;
+            }
+        }
+    }
+
     async fn spawn_health_test_server() -> Router {
         let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
         let readiness = Readiness::new();
