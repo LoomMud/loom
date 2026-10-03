@@ -628,29 +628,45 @@ fn request_snapshot(snapshot_req_tx: &std::sync::mpsc::Sender<SnapshotRequest>) 
 }
 
 /// How long [`reclaim_and_readopt_all`] waits for `loom-net`'s
-/// `run_server_full` select loop to answer one reclaim or adopt request
-/// before giving up on that connection and moving on -- same bounded-
-/// wait principle as [`SNAPSHOT_REQUEST_TIMEOUT`]/`COPYOVER_CONTROL_
-/// TIMEOUT`: a `run_server_full` task that has wedged on one connection
-/// must not be allowed to wedge this whole reclaim pass, and therefore
-/// the control responder, indefinitely.
+/// `run_server_full` select loop to answer one reclaim request before
+/// moving on to the next connection without counting this one as
+/// reclaimed *yet* -- same bounded-wait principle as [`SNAPSHOT_REQUEST_
+/// TIMEOUT`]/`COPYOVER_CONTROL_TIMEOUT`: a `run_server_full` task that
+/// has wedged on one connection must not be allowed to wedge this whole
+/// reclaim pass, and therefore the control responder, indefinitely. A
+/// reply that arrives after this elapses is still re-adopted, never
+/// dropped -- see [`reclaim_and_readopt_all`]'s own doc comment.
 const RECLAIM_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reclaim every connection in `conn_ids` (via `reclaim_tx`) and
 /// immediately re-adopt each one back under the same `ConnId` (via
 /// `adopt_tx`) -- see [`run_control_responder`]'s doc comment for why
 /// this closed round trip, not yet a real hand-off, is this slice's
-/// honest scope. Returns how many connections were successfully
-/// reclaimed (whether or not they were still live to reclaim -- a
-/// connection that disconnected on its own in the gap between the
-/// snapshot and this call is not an error, just one fewer to carry
-/// forward, exactly as a real copyover would also need to tolerate).
+/// honest scope. Returns how many connections were confirmed reclaimed
+/// and re-adopted *within [`RECLAIM_REQUEST_TIMEOUT`]* (whether or not
+/// they were still live to reclaim at all -- a connection that
+/// disconnected on its own in the gap between the snapshot and this
+/// call is not an error, just one fewer to carry forward, exactly as a
+/// real copyover would also need to tolerate).
+///
+/// **A reclaim reply that arrives *after* the timeout is still re-
+/// adopted, never dropped (CTO review, OBI-266/B3):** dropping a
+/// `TcpStream` closes the live socket underneath a client who did
+/// nothing wrong, and leaves the world's own binding for that `ConnId`
+/// pointing at a connection that no longer exists anywhere -- a ghost
+/// binding, not a clean disconnect `net_dead()` could ever run for.
+/// Instead, each reclaim races against the timeout on a background
+/// thread that keeps waiting and re-adopts whatever arrives, however
+/// late; this function's own return value only ever reports what
+/// finished *in time*, so a late one isn't silently double-counted
+/// either.
 ///
 /// # Errors
 /// Only for a genuine failure of the channel/round-trip machinery
-/// itself (the `run_server_full` task is gone, or a single reclaim/
-/// adopt call timed out) -- never for an individual connection simply
-/// not being live anymore.
+/// itself (the `run_server_full` task is gone) -- never for an
+/// individual connection simply not being live anymore, and never for a
+/// single slow reply (that's handled per the paragraph above, not
+/// surfaced as an error at all).
 fn reclaim_and_readopt_all(
     reclaim_tx: &mpsc::Sender<ReclaimRequest>,
     adopt_tx: &mpsc::Sender<AdoptedConn>,
@@ -662,39 +678,69 @@ fn reclaim_and_readopt_all(
         reclaim_tx
             .blocking_send((conn_id, reply_tx))
             .map_err(|_| "loom-net's run_server_full task is gone (reclaim)".to_string())?;
-        let stream = match blocking_recv_with_timeout(reply_rx, RECLAIM_REQUEST_TIMEOUT)? {
-            Some(stream) => stream,
-            // Already gone on its own (client disconnected between the
-            // snapshot and this reclaim, or `run_server_full` never had
-            // this id to begin with) -- not an error, nothing to adopt.
-            None => continue,
-        };
-        adopt_tx
-            .blocking_send((conn_id, stream))
-            .map_err(|_| "loom-net's run_server_full task is gone (readopt)".to_string())?;
-        reclaimed += 1;
+
+        // `done_tx`/`done_rx` only ever report "finished within budget,
+        // and what happened" back to this loop -- the background thread
+        // below does not depend on this call ever reading `done_rx` at
+        // all; it owns the actual readopt unconditionally.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+        let adopt_tx_for_reply = adopt_tx.clone();
+        std::thread::spawn(move || match reply_rx.blocking_recv() {
+            Ok(Some(stream)) => {
+                // Always readopt, no matter how late this thread's own
+                // wait took -- see this function's doc comment.
+                match adopt_tx_for_reply.blocking_send((conn_id, stream)) {
+                    Ok(()) => {
+                        let _ = done_tx.send(true);
+                    }
+                    Err(_) => {
+                        warn!(
+                            conn_id,
+                            "loom serve: reclaimed a connection but loom-net's run_server_full \
+                             task was gone by the time of the (possibly late) readopt; the \
+                             connection is lost"
+                        );
+                        let _ = done_tx.send(false);
+                    }
+                }
+            }
+            Ok(None) => {
+                // Already gone on its own (client disconnected between
+                // the snapshot and this reclaim, or `run_server_full`
+                // never had this id to begin with) -- not an error,
+                // nothing to adopt.
+                let _ = done_tx.send(false);
+            }
+            Err(_) => {
+                // `reclaim_rx`'s side of `run_server_full` dropped the
+                // reply channel without answering (the task exited) --
+                // nothing to adopt, and the `reclaim_tx.blocking_send`
+                // above already proved the channel accepted the request,
+                // so this is reported the same as "gone", not escalated
+                // to an error for this one connection.
+                let _ = done_tx.send(false);
+            }
+        });
+
+        match done_rx.recv_timeout(RECLAIM_REQUEST_TIMEOUT) {
+            Ok(true) => reclaimed += 1,
+            Ok(false) => {}
+            Err(_) => {
+                // The background thread is still waiting (or has just
+                // finished and is racing this timeout) -- it will
+                // re-adopt on its own once the reply arrives, per this
+                // function's doc comment. Not counted as reclaimed by
+                // *this* pass, since we can't confirm it happened in
+                // time, but also not dropped.
+                warn!(
+                    conn_id,
+                    "loom serve: reclaim reply for this connection is late; it will still be \
+                     re-adopted once it arrives, but wasn't counted in this round trip"
+                );
+            }
+        }
     }
     Ok(reclaimed)
-}
-
-/// `tokio::sync::oneshot::Receiver::blocking_recv`, bounded by `timeout`
-/// -- `blocking_recv` itself has no timeout parameter, so this runs it
-/// on a helper thread and joins that thread with a deadline instead.
-/// Only used from `run_control_responder`'s own dedicated `std::thread`,
-/// never from an async context (`blocking_recv` would panic inside a
-/// Tokio worker thread).
-fn blocking_recv_with_timeout<T: Send + 'static>(
-    reply_rx: tokio::sync::oneshot::Receiver<T>,
-    timeout: Duration,
-) -> Result<T, String> {
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = done_tx.send(reply_rx.blocking_recv());
-    });
-    done_rx
-        .recv_timeout(timeout)
-        .map_err(|_| "timed out waiting for loom-net's run_server_full to reply".to_string())?
-        .map_err(|err| format!("loom-net's run_server_full dropped the reply channel: {err}"))
 }
 
 /// `loom supervise` (OBI-184, design §7.5/§9.2): the in-pod supervisor
