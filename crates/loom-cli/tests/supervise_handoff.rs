@@ -295,6 +295,55 @@ fn sigterm_during_crash_backoff_stops_the_supervisor_without_a_further_respawn()
     }
 }
 
+/// OBI-255 (CTO re-review of PR #104, filed as a pre-existing bug, not a
+/// PR #104 regression): the standby child writes its `R` ready byte --
+/// and the supervisor's `run_one_child_attempt` consequently reports the
+/// child's pid and starts forwarding shutdown signals to it -- well
+/// before that child has compiled its mudlib and reached `serve`'s final
+/// `select!`, which is the only place it installs its own `SIGTERM`
+/// handler. A `SIGTERM` the supervisor forwards into that window kills
+/// the child via the kernel's default action instead of a graceful
+/// shutdown; that must still count as the clean exit it functionally is
+/// (the supervisor asked for exactly this), not an error. `LOOM_TEST_
+/// BOOT_DELAY_MS` (a test-only hook, see `Supervisor::spawn_with_boot_
+/// delay`) widens that window deterministically instead of racing
+/// against however fast the `tworoom` fixture happens to compile; this
+/// sends `SIGTERM` to the supervisor as soon as the standby child's pid
+/// is found under `/proc` -- deliberately *not* waiting for a telnet
+/// connection first, unlike every other test in this file -- to land
+/// inside that pre-select! window, and checks the supervisor still
+/// exits 0.
+#[test]
+fn sigterm_before_the_child_installs_its_own_handler_is_still_a_clean_exit() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let mut supervisor =
+        Supervisor::spawn_with_boot_delay(&mudlib, &telnet_bind, &http_bind, Some(3000));
+
+    // Found via `/proc` the moment it exists -- this is well before the
+    // child (held in its artificial boot delay) has reached its own
+    // signal handler, unlike `connect_with_retry` on the telnet port
+    // (which waits for the child to be fully up) used by every other
+    // test here.
+    let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
+        .expect("did not find the standby child's pid under /proc");
+
+    loom_supervise::signal::send_sigterm(supervisor.child.id())
+        .expect("send SIGTERM to the supervisor right after the child's pid appeared");
+
+    let status = wait_with_timeout(&mut supervisor.child, Duration::from_secs(15))
+        .expect("supervisor did not exit after an early-forwarded SIGTERM within the timeout");
+    assert!(
+        status.success(),
+        "supervisor should exit successfully even when its forwarded SIGTERM kills the child \
+         before the child installs its own handler, got {status} (child pid {child_pid})"
+    );
+}
+
 /// Scans `/proc` for a process whose `ppid` (field 4 of `/proc/<pid>/stat`)
 /// is `parent_pid`, retrying until `timeout` since the child may not have
 /// been spawned (and the control-socket handoff completed) at the exact
@@ -385,12 +434,29 @@ struct Supervisor {
 
 impl Supervisor {
     fn spawn(mudlib: &Path, telnet_bind: &str, http_bind: &str) -> Self {
+        Self::spawn_with_boot_delay(mudlib, telnet_bind, http_bind, None)
+    }
+
+    /// Like [`Supervisor::spawn`], but additionally sets
+    /// `LOOM_TEST_BOOT_DELAY_MS` (inherited by the standby child `serve`
+    /// spawns in turn, since `spawn_and_handoff` does not clear the
+    /// supervisor's environment) when `boot_delay_ms` is `Some` -- a
+    /// test-only hook (OBI-255) that widens the window between the
+    /// child signalling ready and it installing its own SIGTERM handler,
+    /// so a test can deterministically land a signal in that window
+    /// instead of racing against a real mudlib's compile time.
+    fn spawn_with_boot_delay(
+        mudlib: &Path,
+        telnet_bind: &str,
+        http_bind: &str,
+        boot_delay_ms: Option<u64>,
+    ) -> Self {
         let loom_bin = std::env::var("CARGO_BIN_EXE_loom-cli")
             .or_else(|_| std::env::var("CARGO_BIN_EXE_loom_cli"))
             .expect("cargo binary path for loom-cli");
 
-        let child = Command::new(loom_bin)
-            .arg("supervise")
+        let mut cmd = Command::new(loom_bin);
+        cmd.arg("supervise")
             .arg("--mudlib")
             .arg(mudlib)
             .env("LOOM_TELNET_ADDR", telnet_bind)
@@ -400,9 +466,13 @@ impl Supervisor {
             .env("RUST_LOG", "")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn loom supervise");
+            .stderr(Stdio::null());
+        if let Some(delay_ms) = boot_delay_ms {
+            cmd.env("LOOM_TEST_BOOT_DELAY_MS", delay_ms.to_string());
+        } else {
+            cmd.env_remove("LOOM_TEST_BOOT_DELAY_MS");
+        }
+        let child = cmd.spawn().expect("spawn loom supervise");
 
         Self { child }
     }

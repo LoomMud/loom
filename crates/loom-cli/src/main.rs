@@ -3,6 +3,7 @@
 
 //! `loom` command-line entry point (`serve`, `check`, ...).
 
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -556,7 +557,18 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
 
         let status = match outcome {
             ChildAttemptOutcome::ShutdownRequested(status) => {
-                if !status.success() {
+                // A child killed by SIGTERM itself (rather than exiting
+                // 0 on its own) is still a clean shutdown here, not a
+                // failure: this arm only runs after *this* supervisor
+                // forwarded a shutdown signal, and the child may still
+                // be early enough in its boot (before `serve`'s own
+                // SIGTERM handler is installed, in its final `select!`)
+                // that the signal reaches it with the default "kill
+                // immediately" action instead of a graceful handler run.
+                // That is exactly what a forwarded shutdown signal is
+                // supposed to accomplish, so it must not be reported as
+                // an error.
+                if !status.success() && status.signal() != Some(libc::SIGTERM) {
                     return Err(format!(
                         "standby child exited with {status} after a forwarded shutdown signal"
                     ));
@@ -635,14 +647,18 @@ enum ChildAttemptOutcome {
 /// registration completing -- the same persistent listener must span
 /// every attempt (and the backoff sleep between them, in `supervise`).
 ///
-/// Known residual gap, not covered by this fix: a shutdown signal that
-/// arrives while this function is still waiting for the child's ready
-/// signal (inside [`spawn_handoff_and_wait`]'s blocking handoff, before
-/// this function even learns the child's pid) is not specifically
-/// detected here either -- that window is bounded by how long a `serve`
-/// process takes to compile its mudlib and signal ready, not by
-/// anything this function waits on per se, and was not part of OBI-253's
-/// reported repro (which was specifically the crash-backoff window).
+/// A shutdown signal that arrives while this function is still waiting
+/// for the child's ready signal (inside [`spawn_handoff_and_wait`]'s
+/// blocking handoff, before this function even learns the child's pid)
+/// is *not* missed: the persistent `shutdown` listener this function is
+/// given already holds it, and the `shutdown.recv()` arm of the
+/// `select!` below fires on it as soon as this function reaches that
+/// `select!`, forwarding `SIGTERM` to the child immediately. The child
+/// itself may still be early enough in its own boot (before `serve`'s
+/// SIGTERM handler is installed in its final `select!`) that it dies to
+/// the signal's default action rather than a graceful shutdown -- see
+/// the `ShutdownRequested` arm in [`supervise`], which treats that
+/// SIGTERM exit as the clean shutdown it is, not a crash.
 async fn run_one_child_attempt(
     mudlib_root: PathBuf,
     telnet_listener: &std::net::TcpListener,
@@ -882,6 +898,21 @@ async fn serve(
     adopt_control_fd: Option<std::os::fd::RawFd>,
 ) -> Result<(), String> {
     let (listener, http_listener) = acquire_listeners(adopt_control_fd).await?;
+
+    // Test-only hook (OBI-255): widens the window between the
+    // adopt-control-fd ready signal above and this process installing
+    // its own SIGTERM handler in this function's final `select!`, so an
+    // integration test can deterministically land a signal in that
+    // window instead of racing against however long a real mudlib
+    // happens to take to compile. Not read at all unless the env var is
+    // set, so it's a no-op outside tests that explicitly opt in.
+    if let Some(delay_ms) = std::env::var("LOOM_TEST_BOOT_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
+
     let actual_addr = listener
         .local_addr()
         .map_err(|err| format!("failed to read local addr: {err}"))?;
