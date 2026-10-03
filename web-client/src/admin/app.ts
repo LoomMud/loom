@@ -8,6 +8,7 @@ import { renderBroadcastPage } from "./pages/broadcast.js";
 import { renderErrorsPage } from "./pages/errors.js";
 import { renderObjectsPage } from "./pages/objects.js";
 import { renderRolesPage } from "./pages/roles.js";
+import { renderSignInPage } from "./pages/signin.js";
 import { renderWhoPage } from "./pages/who.js";
 import type { TokenStore } from "./tokenstore.js";
 
@@ -47,11 +48,33 @@ export function mountAdminApp(root: {
     getAccessToken: root.tokens.get,
   });
 
-  clear(root.nav);
-  for (const page of PAGES) {
-    const link = el("a", { href: `#/${page.name}` }, [page.label]);
-    root.nav.append(link, el("span", {}, [" "]));
-  }
+  const renderNav = () => {
+    clear(root.nav);
+    if (root.tokens.get() === null) {
+      return;
+    }
+    for (const page of PAGES) {
+      const link = el("a", { href: `#/${page.name}` }, [page.label]);
+      root.nav.append(link, el("span", {}, [" "]));
+    }
+    const signOut = el("button", { type: "button", class: "signout" }, [
+      `Sign out (${root.tokens.username() ?? "?"})`,
+    ]);
+    signOut.addEventListener("click", () => {
+      root.tokens.clear();
+      route();
+    });
+    root.nav.append(signOut);
+  };
+
+  const route = () => {
+    renderNav();
+    if (root.tokens.get() === null) {
+      renderSignInPage(root.main, api, root.tokens, route);
+      return;
+    }
+    render(pageFromHash(location.hash));
+  };
 
   const render = (name: AdminPageName) => {
     switch (name) {
@@ -76,6 +99,6 @@ export function mountAdminApp(root: {
     }
   };
 
-  window.addEventListener("hashchange", () => render(pageFromHash(location.hash)));
-  render(pageFromHash(location.hash));
+  window.addEventListener("hashchange", route);
+  route();
 }

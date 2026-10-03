@@ -149,8 +149,7 @@ export class AdminApi {
   }
 
   objectVars(path: string): Promise<ObjectVars> {
-    const trimmed = path.startsWith("/") ? path.slice(1) : path;
-    return this.request(`/api/v1/admin/objects/${trimmed}/vars`);
+    return this.request(objectVarsPath(path));
   }
 
   /** `program_prefix` matches the server's own optional query param
@@ -192,12 +191,13 @@ export class AdminApi {
     });
   }
 
-  /** The step-up round-trip itself: re-`/auth/login` with the staff
-   * member's password + current TOTP code. A successful reply's
+  /** Sign-in and the step-up round-trip: `/auth/login` with the staff
+   * member's **username** (not the token's `sub`, which is the uid),
+   * password + current TOTP code. A successful reply's
    * `access_token` carries a fresh `mfa_at` (OBI-174: TOTP-verified
    * login always sets it) -- `./stepup.ts` is what swaps it into
    * whatever token store the page uses. */
-  async reauth(
+  async login(
     username: string,
     password: string,
     totpCode: string,
@@ -208,7 +208,7 @@ export class AdminApi {
       body: JSON.stringify({
         username,
         password,
-        totp_code: totpCode,
+        totp_code: totpCode.length > 0 ? totpCode : null,
       }),
     });
     const text = await response.text();
@@ -218,6 +218,18 @@ export class AdminApi {
     }
     return body as LoginResponse;
   }
+}
+
+/** Builds `/api/v1/admin/objects/<path>/vars` with each path segment
+ * percent-encoded, so an object path containing `?`, `#`, `%` or a
+ * `..` segment can't re-target the bearer-authenticated request at a
+ * different admin route. */
+export function objectVarsPath(path: string): string {
+  const segments = path
+    .split("/")
+    .filter((s) => s.length > 0)
+    .map((s) => (s === "." || s === ".." ? encodeURIComponent(s).replace(/\./g, "%2E") : encodeURIComponent(s)));
+  return `/api/v1/admin/objects/${segments.join("/")}/vars`;
 }
 
 function safeJsonParse(text: string): unknown {

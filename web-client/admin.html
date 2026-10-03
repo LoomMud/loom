@@ -23,17 +23,7 @@
     <nav id="admin-nav"></nav>
     <main id="admin-main"></main>
     <div id="admin-modal" class="step-up-overlay"></div>
-    <script type="module">
-      import { mountAdminApp } from "./dist/admin/app.js";
-      import { localStorageTokenStore } from "./dist/admin/tokenstore.js";
-
-      mountAdminApp({
-        nav: document.getElementById("admin-nav"),
-        main: document.getElementById("admin-main"),
-        modal: document.getElementById("admin-modal"),
-        baseUrl: "",
-        tokens: localStorageTokenStore(window.localStorage),
-      });
-    </script>
+    <!-- External module only: `script-src 'self'` blocks inline scripts. -->
+    <script type="module" src="./dist/admin/main.js"></script>
   </body>
 </html>

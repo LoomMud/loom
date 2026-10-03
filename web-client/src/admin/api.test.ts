@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { AdminApiError, NoAccessTokenError, describeError } from "./api.js";
+import { AdminApiError, NoAccessTokenError, describeError, objectVarsPath } from "./api.js";
 
 test("describeError: no token", () => {
   assert.equal(describeError(new NoAccessTokenError()), "not signed in");
@@ -39,4 +39,10 @@ test("describeError: a plain Error uses its own message", () => {
 
 test("describeError: anything else is unknown", () => {
   assert.equal(describeError("oops"), "unknown error");
+});
+
+test("objectVarsPath percent-encodes each segment and neuters dot segments", () => {
+  assert.equal(objectVarsPath("/domains/shire/bag_end"), "/api/v1/admin/objects/domains/shire/bag_end/vars");
+  assert.equal(objectVarsPath("/a?b#c"), "/api/v1/admin/objects/a%3Fb%23c/vars");
+  assert.equal(objectVarsPath("/../../audit"), "/api/v1/admin/objects/%2E%2E/%2E%2E/audit/vars");
 });
