@@ -1,0 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// A clone with real state, readable by every euid (`secure/master.wf`'s
+// `valid_read` only denies `/std/vault`), so
+// `tests/obi_237_admin_query.rs` can check `World::admin_object_vars`'s
+// rendered output against a known value.
+var count: int = 42
+var label: string = "sword"
+
+pub fn create() {
+}
