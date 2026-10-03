@@ -1295,7 +1295,18 @@ fn parse_version_poll_interval_ms(raw: Option<&str>) -> Duration {
                 DEFAULT_VERSION_POLL_INTERVAL
             }
             Ok(ms) => Duration::from_millis(ms),
-            Err(_) => DEFAULT_VERSION_POLL_INTERVAL,
+            Err(err) => {
+                // CTO review (OBI-258 nit): a garbage value silently
+                // falling back is just as surprising as the zero case
+                // above -- warn here too, consistently.
+                warn!(
+                    %err,
+                    raw,
+                    "loom supervise: LOOM_VERSION_POLL_INTERVAL_MS is not a valid number of \
+                     milliseconds; using the default {DEFAULT_VERSION_POLL_INTERVAL:?} instead"
+                );
+                DEFAULT_VERSION_POLL_INTERVAL
+            }
         },
         None => DEFAULT_VERSION_POLL_INTERVAL,
     }
