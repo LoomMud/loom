@@ -473,17 +473,17 @@ async fn acquire_listeners(
 /// is a separate, tracked follow-up; this function is not a stand-in
 /// implementation of them.
 ///
-/// **Not yet safe as a container entrypoint** (CTO review, OBI-225),
-/// tracked on OBI-184: this process installs no signal handling of its
-/// own, so a `SIGTERM` (e.g. a pod shutdown) kills the supervisor
-/// immediately, the kernel then `SIGKILL`s the orphaned standby child
-/// (or leaves it running detached, depending on PID-namespace reaping
-/// behaviour), and `serve`'s own graceful `shutdown_signal` drain never
-/// runs -- a regression versus running `serve` directly. Before
-/// `supervise` replaces `serve` as the `Dockerfile`'s entrypoint, it
-/// needs to forward `SIGTERM`/`SIGINT` to the child and reap it, and the
-/// child should set `PR_SET_PDEATHSIG` so an unexpected supervisor exit
-/// doesn't orphan it either.
+/// **Signal handling (OBI-184, this slice):** `SIGTERM`/`SIGINT`
+/// delivered to this process are forwarded to the standby child (so
+/// `serve`'s own graceful `shutdown_signal` drain in the child still
+/// runs, instead of the supervisor exiting and leaving the child
+/// orphaned -- CTO review, OBI-225), and the child has
+/// `PR_SET_PDEATHSIG` installed so an unexpected supervisor death
+/// (crash, `SIGKILL`, OOM) terminates it too rather than leaving it
+/// running unsupervised. **Still not yet safe as a container entrypoint
+/// for everything else named in OBI-225/OBI-184**: no respawn-on-crash,
+/// no version watching, no cosign/GHCR staging, no copyover against an
+/// already-running process -- those remain separate, tracked follow-ups.
 async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     let bind_addr = loom_net::telnet_addr_from_env();
     let http_bind_addr = http_addr_from_env();
@@ -507,26 +507,69 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     // world thread, no other listeners) to protect from a blocking call,
     // and `std::process::Command`/`UnixStream` are themselves blocking
     // APIs -- `spawn_blocking` just keeps the async runtime's own
-    // bookkeeping honest about that.
-    tokio::task::spawn_blocking(move || {
+    // bookkeeping honest about that. Returns the still-running `Child`
+    // (rather than waiting on it inside the blocking closure) so the
+    // async side below can race that wait against a shutdown signal.
+    let mut child = tokio::task::spawn_blocking(move || {
         spawn_and_handoff(&mudlib_root, &telnet_listener, &http_listener)
     })
     .await
     .map_err(|err| format!("supervise: join: {err}"))??;
-    Ok(())
+
+    let child_pid = child.id();
+    info!(
+        child_pid,
+        "loom supervise: standby child is now the active server; forwarding shutdown signals to it until it exits"
+    );
+
+    // `child.wait()` is blocking, so it needs its own blocking task to
+    // race against `shutdown_signal()` -- a `SIGTERM`/`SIGINT` delivered
+    // to *this* (supervisor) process must reach the child doing the
+    // actual work (CTO review, OBI-225), not just kill the supervisor
+    // and leave `serve`'s own graceful `shutdown_signal` drain in the
+    // child never triggered.
+    let mut wait_handle = tokio::task::spawn_blocking(move || child.wait());
+
+    tokio::select! {
+        result = &mut wait_handle => {
+            let status = result
+                .map_err(|err| format!("supervise: wait join: {err}"))?
+                .map_err(|err| format!("supervise: wait on standby child: {err}"))?;
+            if !status.success() {
+                return Err(format!("standby child exited with {status}"));
+            }
+            Ok(())
+        }
+        () = shutdown_signal() => {
+            info!(child_pid, "loom supervise: received shutdown signal, forwarding SIGTERM to child");
+            loom_supervise::signal::send_sigterm(child_pid)
+                .map_err(|err| format!("supervise: forwarding SIGTERM to child {child_pid}: {err}"))?;
+            let status = wait_handle
+                .await
+                .map_err(|err| format!("supervise: wait join after signal: {err}"))?
+                .map_err(|err| format!("supervise: wait on standby child after signal: {err}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "standby child exited with {status} after forwarded shutdown signal"
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Spawn one `loom serve --adopt-control-fd <n>` standby child and hand
 /// it `telnet_listener`/`http_listener` over a dedicated control
 /// `UnixStream` pair. Blocks (by design -- see [`supervise`]'s doc) until
-/// the child signals it's ready to receive the fds, then again until the
-/// child process itself exits (this slice has nothing else for the
-/// supervisor to do once the handoff is done).
+/// the child signals it's ready to receive the fds, then returns the
+/// still-running `Child` for the caller to wait on (racing that wait
+/// against shutdown signals is the caller's job now, not this
+/// function's -- see [`supervise`]).
 fn spawn_and_handoff(
     mudlib_root: &std::path::Path,
     telnet_listener: &std::net::TcpListener,
     http_listener: &std::net::TcpListener,
-) -> Result<(), String> {
+) -> Result<std::process::Child, String> {
     use std::io::Read;
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
@@ -539,12 +582,20 @@ fn spawn_and_handoff(
 
     let self_exe =
         std::env::current_exe().map_err(|err| format!("supervise: current_exe: {err}"))?;
-    let mut child = std::process::Command::new(self_exe)
-        .arg("serve")
+    let mut cmd = std::process::Command::new(self_exe);
+    cmd.arg("serve")
         .arg("--mudlib")
         .arg(mudlib_root)
         .arg("--adopt-control-fd")
-        .arg(child_fd.to_string())
+        .arg(child_fd.to_string());
+    // CTO review (OBI-225): if this supervisor process dies without
+    // explicitly tearing the child down first (crash, `SIGKILL`,
+    // OOM-kill), the kernel delivers `SIGTERM` to the child
+    // automatically instead of leaving it an orphan nothing is
+    // supervising. `die_with_parent` registers against *this* spawn's
+    // parent -- the supervisor -- per `prctl(2)`'s semantics.
+    loom_supervise::signal::die_with_parent(&mut cmd);
+    let child = cmd
         .spawn()
         .map_err(|err| format!("supervise: spawn standby child: {err}"))?;
     // `Command::spawn` already duplicated the whole fd table (including
@@ -582,13 +633,7 @@ fn spawn_and_handoff(
         "loom supervise: listening sockets handed off to standby child"
     );
 
-    let status = child
-        .wait()
-        .map_err(|err| format!("supervise: wait on standby child: {err}"))?;
-    if !status.success() {
-        return Err(format!("standby child exited with {status}"));
-    }
-    Ok(())
+    Ok(child)
 }
 
 async fn serve(

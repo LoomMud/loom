@@ -48,6 +48,74 @@ fn supervise_hands_off_listening_sockets_to_a_standby_child() {
     supervisor.assert_alive();
 }
 
+/// OBI-184/OBI-225: `SIGTERM` delivered to the supervisor process must
+/// reach the standby child doing the actual work, not just kill the
+/// supervisor and leave the child (and its listening sockets) running
+/// unsupervised. Sends a real `SIGTERM` to the supervisor's pid (via
+/// `loom_supervise::signal::send_sigterm`, the same function `loom
+/// supervise` itself uses) and checks both halves of the contract: the
+/// supervisor exits with a *successful* status (the forwarded-signal
+/// path, not an error path), and the child it was supervising stops
+/// serving -- proven by the telnet port refusing new connections
+/// afterwards, since nothing else in this test binds it.
+#[test]
+fn sigterm_to_the_supervisor_is_forwarded_to_the_child_and_both_exit() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
+
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before sending SIGTERM");
+
+    loom_supervise::signal::send_sigterm(supervisor.child.id())
+        .expect("send SIGTERM to the supervisor process");
+
+    let status = wait_with_timeout(&mut supervisor.child, Duration::from_secs(10))
+        .expect("supervisor did not exit after SIGTERM within the timeout");
+    assert!(
+        status.success(),
+        "supervisor should exit successfully on a forwarded shutdown signal, got {status}"
+    );
+
+    // The standby child should have received the forwarded SIGTERM too
+    // and shut its own listener down -- give it a brief moment (its own
+    // graceful `shutdown_signal` drain) and then confirm nothing is
+    // listening on the telnet port anymore.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(&telnet_bind) {
+            Err(_) => break,
+            Ok(_) if Instant::now() >= deadline => panic!(
+                "standby child is still accepting connections after the supervisor forwarded SIGTERM"
+            ),
+            Ok(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll child process") {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
     let deadline = Instant::now() + timeout;
     loop {
@@ -112,10 +180,12 @@ impl Supervisor {
 
 impl Drop for Supervisor {
     fn drop(&mut self) {
-        // `loom supervise` itself has no shutdown signal handling yet
-        // (tracked as a follow-up alongside respawn/version-watching);
-        // killing it also takes down its standby child, since nothing
-        // here daemonizes.
+        // `loom supervise` forwards SIGTERM/SIGINT to its standby child
+        // (OBI-184/OBI-225) and exits once the child does -- but a test
+        // that panicked before reaching that point, or one that doesn't
+        // exercise the signal path at all, still needs a hard cleanup
+        // so it can't leak the process (and the listening sockets) past
+        // the test.
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
