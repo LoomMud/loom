@@ -118,7 +118,21 @@ pub(crate) async fn run_ws_connection(
                         // rather than silently dropping the request, so a
                         // caller that asks for a WS connection's socket
                         // gets a clear "not available", not a hang.
+                        //
+                        // Reviewed (OBI-227): `run_server_full` already
+                        // removed this connection's `ConnEntry` before
+                        // sending the `Reclaim` control, so nothing can
+                        // route further `NetCommand`s here even if this
+                        // loop kept running -- a zombie that still reads
+                        // the client's input and emits `NetEvent::Line`s
+                        // for a `conn_id` the registry no longer tracks.
+                        // Since a `None` reply means this session does
+                        // not survive the copyover, actually end it here:
+                        // close the socket and fall through to the normal
+                        // disconnect bookkeeping below.
                         let _ = reply_tx.send(None);
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
                     }
                 }
             }
