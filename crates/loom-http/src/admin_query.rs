@@ -115,6 +115,32 @@ pub struct ObjectVars {
     pub vars: Vec<VarEntry>,
 }
 
+/// One group from `GET /api/v1/admin/errors` (OBI-235) -- the HTTP-side
+/// mirror of [`crate::errors` in `loom-vm`]'s `ErrorRecord`/the `errors`
+/// efun's per-row shape (`loom-http` doesn't depend on `loom-vm`
+/// directly, so this is its own copy of the same fields, not a type
+/// alias). `message` is already capped/redacted and `line`/`function`
+/// already the innermost-frame attribution (M-ERR-1) by the time this
+/// crosses the channel -- `loom-http` never reinterprets any of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ErrorGroup {
+    pub program: String,
+    pub function: String,
+    /// `None` = no line attribution available (see `loom-vm`'s
+    /// `ErrorRecord::line` doc: `0` there maps to `None` here).
+    pub line: Option<u32>,
+    /// Already `"<redacted>"` if `redacted` is `true` and the caller's
+    /// tier is below 5 (M-ERR-1) -- the world side applies that rule
+    /// before replying, same as the `errors` efun does for in-world
+    /// callers.
+    pub message: String,
+    pub redacted: bool,
+    pub count: u64,
+    pub first_seen_unix_ms: u64,
+    pub last_seen_unix_ms: u64,
+    pub sample_trace: Vec<String>,
+}
+
 /// Why a [`WorldAdminQuery`] call didn't return data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorldQueryError {
@@ -168,6 +194,20 @@ pub trait WorldAdminQuery: Send + Sync {
         tier: i16,
         path: &str,
     ) -> Result<ObjectVars, WorldQueryError>;
+
+    /// `GET /api/v1/admin/errors` (OBI-235): every error-inbox group
+    /// `euid`/`tier` (already past the T3 floor by the time this is
+    /// called) passes `valid_read` for on the group's `program`,
+    /// optionally narrowed to `program_prefix` (same semantics as the
+    /// `errors` efun's own `filter` argument) -- same "world side is the
+    /// real filter" shape as `list_objects`. An empty `Vec` (not an
+    /// error) is the correct answer for "nothing readable".
+    async fn errors(
+        &self,
+        euid: &str,
+        tier: i16,
+        program_prefix: Option<&str>,
+    ) -> Result<Vec<ErrorGroup>, WorldQueryError>;
 }
 
 /// The wire request [`ChannelWorldQuery`] sends; the world-thread-side
@@ -187,6 +227,12 @@ pub enum WorldQueryRequest {
         tier: i16,
         path: String,
         reply: oneshot::Sender<Result<ObjectVars, WorldQueryError>>,
+    },
+    Errors {
+        euid: String,
+        tier: i16,
+        program_prefix: Option<String>,
+        reply: oneshot::Sender<Result<Vec<ErrorGroup>, WorldQueryError>>,
     },
 }
 
@@ -261,6 +307,25 @@ impl WorldAdminQuery for ChannelWorldQuery {
                 euid: euid.to_string(),
                 tier,
                 path: path.to_string(),
+                reply,
+            },
+            reply_rx,
+        )
+        .await
+    }
+
+    async fn errors(
+        &self,
+        euid: &str,
+        tier: i16,
+        program_prefix: Option<&str>,
+    ) -> Result<Vec<ErrorGroup>, WorldQueryError> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.roundtrip(
+            WorldQueryRequest::Errors {
+                euid: euid.to_string(),
+                tier,
+                program_prefix: program_prefix.map(|s| s.to_string()),
                 reply,
             },
             reply_rx,

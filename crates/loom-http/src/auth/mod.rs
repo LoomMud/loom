@@ -192,6 +192,13 @@ pub const OBJECT_VARS_MIN_TIER: i16 = 4;
 /// `/secure/` (OBI-234 scope: "`/secure` objects T5 only") -- on top of,
 /// not instead of, [`OBJECT_VARS_MIN_TIER`].
 pub const SECURE_VARS_MIN_TIER: i16 = 5;
+/// Tier floor for `GET /api/v1/admin/errors` (OBI-235 scope: "T3+,
+/// consistent with object listing"). As with [`OBJECT_LIST_MIN_TIER`],
+/// the real per-program filter (`valid_read`) and the `/secure`
+/// redaction rule both live on the world side (`errors` efun /
+/// `crate::admin_query::WorldAdminQuery::errors`); this is only the HTTP
+/// edge's cheap floor.
+pub const ERROR_INBOX_MIN_TIER: i16 = 3;
 /// Step-up MFA freshness window for role changes, grants, another user's
 /// TOTP reset, and broadcast (M-ADM-2): `mfa_at` must be within this many
 /// seconds of "now".
@@ -1089,6 +1096,65 @@ impl AuthService {
                     ctx,
                     "deny",
                     Some(format!("{detail} reason={err:?}")),
+                )
+                .await;
+                Err(err.into())
+            }
+        }
+    }
+
+    /// `GET /api/v1/admin/errors` (OBI-235, M-ADM-4): tier >= 3
+    /// ([`ERROR_INBOX_MIN_TIER`]), consistent with [`OBJECT_LIST_MIN_TIER`].
+    /// As with `admin_list_objects`, the per-program `valid_read` filter
+    /// and the `/secure` redaction rule (M-ERR-1) both run on the world
+    /// side (`query.errors`) -- this never re-derives or relaxes either
+    /// one. `program_prefix` is an optional caller-supplied filter (same
+    /// shape as the `errors` efun's own `filter` argument).
+    pub async fn admin_errors(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        query: &dyn crate::admin_query::WorldAdminQuery,
+        program_prefix: Option<&str>,
+    ) -> Result<Vec<crate::admin_query::ErrorGroup>, AdminError> {
+        let detail = program_prefix.map(|p| format!("program_prefix={p}"));
+        if claims.tier < ERROR_INBOX_MIN_TIER {
+            self.audit(
+                "admin.errors",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!(
+                    "{} reason=forbidden",
+                    detail.clone().unwrap_or_default()
+                )),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        match query.errors(&claims.sub, claims.tier, program_prefix).await {
+            Ok(rows) => {
+                self.audit(
+                    "admin.errors",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(format!(
+                        "{} count={}",
+                        detail.unwrap_or_default(),
+                        rows.len()
+                    )),
+                )
+                .await;
+                Ok(rows)
+            }
+            Err(err) => {
+                self.audit(
+                    "admin.errors",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(format!("{} reason={err:?}", detail.unwrap_or_default())),
                 )
                 .await;
                 Err(err.into())
