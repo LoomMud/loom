@@ -36,6 +36,8 @@ use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 use tracing::debug;
 
+mod admin;
+pub mod admin_query;
 pub mod auth;
 mod client_ip;
 mod handlers;
@@ -53,6 +55,7 @@ pub struct HttpState {
     auth: Option<auth::AuthService>,
     github: Option<std::sync::Arc<dyn auth::GithubIdentityProvider>>,
     github_webhook: Option<webhook::GithubWebhookConfig>,
+    world_query: Option<std::sync::Arc<dyn admin_query::WorldAdminQuery>>,
 }
 
 impl HttpState {
@@ -69,6 +72,7 @@ impl HttpState {
             auth: None,
             github: None,
             github_webhook: None,
+            world_query: None,
         }
     }
 
@@ -96,12 +100,37 @@ impl HttpState {
         self
     }
 
+    /// `Some` iff [`Self::with_auth`] was called -- shared by `handlers.rs`
+    /// and `admin.rs` (OBI-185) for bearer-token extraction.
+    pub(crate) fn auth_service(&self) -> Option<&auth::AuthService> {
+        self.auth.as_ref()
+    }
+
     /// Mount `POST /api/v1/hooks/github` (OBI-212, D-B3.12). Unset by
     /// default -- answers `503` until `loom-cli` configures a webhook
     /// secret and wires a `GitWorkerHandle`.
     pub fn with_github_webhook(mut self, config: webhook::GithubWebhookConfig) -> Self {
         self.github_webhook = Some(config);
         self
+    }
+
+    /// Wire the `who`/object-browser routes (OBI-234, P2-O2) to a real
+    /// world-thread query channel. Unset by default -- those routes
+    /// answer `503` (`AdminError::WorldUnavailable`) until `loom-cli`
+    /// configures the world-side receiver (see `admin_query`'s module
+    /// doc for the channel contract) and calls this.
+    pub fn with_world_query(
+        mut self,
+        world_query: std::sync::Arc<dyn admin_query::WorldAdminQuery>,
+    ) -> Self {
+        self.world_query = Some(world_query);
+        self
+    }
+
+    /// `Some` iff [`Self::with_world_query`] was called -- `admin.rs`'s
+    /// `who`/`objects`/`objects/:path/vars` handlers.
+    pub(crate) fn world_query(&self) -> Option<&dyn admin_query::WorldAdminQuery> {
+        self.world_query.as_deref()
     }
 }
 
@@ -113,6 +142,7 @@ pub fn app(state: HttpState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .merge(handlers::auth_router())
+        .merge(admin::admin_router())
         .merge(webhook::webhook_router())
         .with_state(state);
     match web_root {
