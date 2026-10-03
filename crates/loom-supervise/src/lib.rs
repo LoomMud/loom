@@ -60,6 +60,7 @@
 //!   respawn-on-crash, which only ever starts a fresh standby from
 //!   scratch, never attempts a live hand-off.
 
+pub mod control;
 pub mod fdpass;
 pub mod listener;
 pub mod signal;

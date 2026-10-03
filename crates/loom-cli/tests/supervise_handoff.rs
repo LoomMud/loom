@@ -454,6 +454,94 @@ fn version_file_change_is_detected_and_logged() {
     supervisor.assert_alive();
 }
 
+/// OBI-184 control-protocol slice: a detected version change is now
+/// forwarded as a real `ControlMessage::CopyoverRequested` over the
+/// control socket to the already-running child, and the child's own
+/// `run_control_responder` thread acknowledges it -- not yet an actual
+/// copyover (see `run_one_child_attempt`'s and `run_control_responder`'s
+/// own doc comments for the honest scope), but a real round trip over a
+/// control channel that stays open past the initial handoff, proven end
+/// to end: both the supervisor's "forwarding a copyover request" log and
+/// its "child acknowledged" log (the latter only possible if the
+/// request actually reached the child and the child's reply actually
+/// came back) must appear.
+#[test]
+fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let version_dir = scratch("version-watch-control");
+    let version_file = version_dir.join("desired-version");
+    std::fs::write(&version_file, "v1.0.0\n").expect("write initial desired-version");
+
+    let (mut supervisor, stdout) =
+        Supervisor::spawn_with_version_file(&mudlib, &telnet_bind, &http_bind, &version_file);
+
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before changing the version file");
+
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_forwarded = false;
+    let mut saw_acknowledged = false;
+    while Instant::now() < deadline && !(saw_forwarded && saw_acknowledged) {
+        match line_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                if line.contains("forwarding a copyover request") && line.contains("v2.0.0") {
+                    saw_forwarded = true;
+                }
+                if line.contains("child acknowledged the copyover request")
+                    && line.contains("v2.0.0")
+                {
+                    saw_acknowledged = true;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    assert!(
+        saw_forwarded,
+        "supervisor never logged forwarding the copyover request to the child"
+    );
+    assert!(
+        saw_acknowledged,
+        "supervisor never logged the child's acknowledgement -- the control-socket round trip did not complete"
+    );
+    // The control-protocol round trip doesn't touch the actual connection
+    // or the supervisor's own liveness -- both must still be fine.
+    let mut post_ack = [0_u8; 1];
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let _ = stream.read(&mut post_ack); // just draining; a timeout here is fine
+    supervisor.assert_alive();
+}
+
 fn reserve_local_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("read local addr").port()
