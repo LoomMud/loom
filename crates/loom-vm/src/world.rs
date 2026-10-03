@@ -29,6 +29,22 @@ use std::sync::Arc;
 /// Path of the master object.
 pub const MASTER_PATH: &str = "/secure/master";
 
+/// Default player-save root (spec §8.1, OBI-171): a `saves` directory
+/// *beside* the mudlib root, not inside it -- deliberately outside
+/// whatever directory `compile_object`/the Git-backed VFS (§8.5) treats
+/// as the mudlib's own working tree, so player save files are never
+/// candidates for `git add`, a `revert <file>`, or a recompile sweep.
+/// Falls back to a `saves` subdirectory of `mudlib_root` itself only if
+/// it has no parent at all (e.g. booted at a filesystem root, which
+/// real deployments never do -- `loom-cli`'s `--save-dir` is there for
+/// anyone who needs a different layout).
+fn default_save_root(mudlib_root: &Path) -> PathBuf {
+    match mudlib_root.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join("saves"),
+        _ => mudlib_root.join("saves"),
+    }
+}
+
 /// One [`AuditEntry`], resolved to owned strings, ready for a driver-side
 /// Postgres sink (OBI-36 D-S2.5; see [`World::drain_audit_since`]).
 /// `kind` and `apply` name the decision (`"unguarded"`,
@@ -243,6 +259,13 @@ pub struct AccountsCtx<'a> {
 /// so tests (and eventually builder config) can dial it down.
 pub const DEFAULT_HEARTBEAT_INTERVAL_TICKS: u64 = 20;
 
+/// Player autosave cadence (spec §8.1: "players autosave every 5 min",
+/// OBI-171): at the same 100 ms world-tick granularity, 5 minutes is
+/// 3,000 world ticks. A `Limits` field for the same reason
+/// `heartbeat_interval_ticks` is -- tests dial it down instead of
+/// waiting out a real 5 minutes of simulated ticks.
+pub const DEFAULT_AUTOSAVE_INTERVAL_TICKS: u64 = 3_000;
+
 /// Per-execution guard rails (§5.8).
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -261,6 +284,12 @@ pub struct Limits {
     /// many `World::tick()` calls (world ticks), not every tick (OBI-82).
     /// `call_out` delays remain in world ticks and are unaffected by this.
     pub heartbeat_interval_ticks: u64,
+    /// Every currently-connected (interactive) object gets an
+    /// `autosave()` apply once every this many world ticks (spec §8.1,
+    /// OBI-171) -- the driver-side half of "players autosave every 5
+    /// min"; see `World::tick`'s doc comment for the other two triggers
+    /// (quit, net-dead), both routed through `World::disconnect`.
+    pub autosave_interval_ticks: u64,
 }
 
 impl Default for Limits {
@@ -271,6 +300,7 @@ impl Default for Limits {
             mem_quota_bytes: VmLimits::default().mem_quota_bytes,
             eager_upgrade_batch: 200,
             heartbeat_interval_ticks: DEFAULT_HEARTBEAT_INTERVAL_TICKS,
+            autosave_interval_ticks: DEFAULT_AUTOSAVE_INTERVAL_TICKS,
         }
     }
 }
@@ -307,6 +337,13 @@ impl std::error::Error for BootError {}
 /// The game world. Driven by exactly one thread (the world thread, §3.3).
 pub struct World {
     root: PathBuf,
+    /// Player-save root for `save_object`/`restore_object` (spec §8.1,
+    /// OBI-171). Defaults to a `saves` directory *next to* (not inside)
+    /// the mudlib root -- see [`default_save_root`] -- so player save
+    /// data never lands inside the Git-backed `.wf` tree a `revert`/
+    /// recompile or `git pull` operates on; overridable with
+    /// [`World::set_save_root`] (`loom-cli`'s `--save-dir`).
+    save_root: PathBuf,
     registry: Registry,
     compiler: Compiler,
     master: Option<ObjectId>,
@@ -485,6 +522,7 @@ impl World {
         }
         let mut w = World {
             root: mudlib_root.to_path_buf(),
+            save_root: default_save_root(mudlib_root),
             registry: Registry::default(),
             compiler: Compiler::new(mudlib_root.to_path_buf()),
             master: None,
@@ -592,6 +630,7 @@ impl World {
             pending_recompile_sets: Vec::new(),
             finished_recompile_sets: Vec::new(),
             next_recompile_set_token: 0,
+            save_root: default_save_root(mudlib_root),
             account_auth: Box::new(NullAccountAuth),
             account_next_id: 0,
             account_pending: HashMap::new(),
@@ -732,6 +771,19 @@ impl World {
         &self.root
     }
 
+    /// The player-save root (spec §8.1, OBI-171) `save_object`/
+    /// `restore_object` read and write under.
+    pub fn save_root(&self) -> &Path {
+        &self.save_root
+    }
+
+    /// Override the player-save root (`loom-cli`'s `--save-dir`); defaults
+    /// to [`default_save_root`] of the mudlib root this world was booted
+    /// from. Takes effect for every save/restore from this call on.
+    pub fn set_save_root(&mut self, dir: PathBuf) {
+        self.save_root = dir;
+    }
+
     /// Run `body` against a fresh [`RegistryHost`] with driver context
     /// wired up (network host, `this_player`, bound connection, master).
     /// `acting` is the object whose own euid seeds this execution's guard
@@ -812,6 +864,7 @@ impl World {
             input_actor,
             &mut self.disk_usage,
             &mut self.errors,
+            self.save_root.clone(),
         );
         let result = body(&mut rh);
         // OBI-121 S2c `tick_share_per_min`: charge whatever ticks this
@@ -850,6 +903,10 @@ impl World {
     /// fails several frames deep inside something the caller could never
     /// read directly. The grouping key's `program` (and the redaction
     /// rule below) must both be keyed on the real origin.
+    ///
+    /// Grouped by `(program, line, message)` per spec §8.3 (OBI-231):
+    /// `line` comes from the same innermost frame as `program`
+    /// (`e.trace_lines`, parallel to `e.trace_programs`).
     fn note_error(&mut self, acting: ObjectId, e: &RtError) {
         let program = e.trace_programs.first().cloned().unwrap_or_else(|| {
             self.registry
@@ -858,6 +915,7 @@ impl World {
                 .unwrap_or_else(|| "?".to_string())
         });
         let function = crate::errors::function_of(e);
+        let line = crate::errors::line_of(e);
         let now_unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -866,6 +924,7 @@ impl World {
         self.errors.record(
             &program,
             &function,
+            line,
             &e.message,
             &e.trace,
             now_unix_ms,
@@ -1120,15 +1179,24 @@ impl World {
         conns
     }
 
-    /// The connection went away: unbind, then `net_dead()` on the object.
+    /// The connection went away: `autosave()` (spec §8.1, OBI-171: both
+    /// an explicit `quit` -- the mudlib's `quit` command calls the
+    /// `disconnect()` efun, which closes the connection and lands here
+    /// once the transport reports it closed -- and a real net-dead drop
+    /// end up on this exact path, so one hook covers both triggers), then
+    /// unbind, then `net_dead()` on the object. Each runs as its own
+    /// `exec` so an `autosave()` failure can never suppress `net_dead()`.
     pub fn disconnect(&mut self, conn: u64, host: &mut dyn Host) {
         let Some(ob) = self.registry.conns.remove(&conn) else {
             return;
         };
+        // Errors have nowhere to go (the connection is gone).
+        let _ = self.exec(host, ob, Some(ob), None, None, None, None, |h| {
+            h.call_apply(ob, "autosave", Vec::new())
+        });
         if let Some(o) = self.registry.get_mut(ob) {
             o.conn = None;
         }
-        // Errors have nowhere to go (the connection is gone).
         let _ = self.exec(host, ob, Some(ob), None, None, None, None, |h| {
             h.call_apply(ob, "net_dead", Vec::new())
         });
@@ -1205,6 +1273,45 @@ impl World {
                 );
             }
         }
+        // Player autosave (spec §8.1, OBI-171): every currently-connected
+        // object gets an `autosave()` apply once every
+        // `Limits::autosave_interval_ticks` world ticks (default 5 min).
+        // Collected into a `Vec` first -- `conns` borrows `self.registry`
+        // and `exec` needs `&mut self` -- sorted by connection id for a
+        // stable, reproducible order instead of whatever a `HashMap`
+        // iteration happens to produce.
+        let autosave_interval = self.limits.autosave_interval_ticks.max(1);
+        if world_tick.is_multiple_of(autosave_interval) {
+            let mut targets: Vec<(u64, ObjectId)> = self
+                .registry
+                .conns
+                .iter()
+                .map(|(&c, &ob)| (c, ob))
+                .collect();
+            targets.sort_by_key(|(c, _)| *c);
+            for (_, ob) in targets {
+                if self.registry.get(ob).is_none() {
+                    continue; // destructed since it connected
+                }
+                let autosave_quota_uid = self
+                    .registry
+                    .get(ob)
+                    .map_or(crate::security::ROOT, |o| o.owner);
+                if self.tick_share_breached(autosave_quota_uid) {
+                    continue;
+                }
+                let _ = self.exec(
+                    host,
+                    ob,
+                    Some(ob),
+                    None,
+                    None,
+                    None,
+                    Some(autosave_quota_uid),
+                    |h| h.call_apply(ob, "autosave", Vec::new()),
+                );
+            }
+        }
         for call in due {
             if self.registry.get(call.ob).is_none() {
                 continue; // destructed in the same tick it was scheduled for
@@ -1272,6 +1379,57 @@ impl World {
         // OBI-36: same reasoning for roles_result -- bounded latency even
         // on an otherwise idle world.
         self.drain_roles_results(host);
+        self.poll_canaries();
+    }
+
+    /// P2-B7 (OBI-182, spec §7.4): decide every in-flight canary's fate
+    /// for this tick -- auto-rollback the instant its new-error budget
+    /// (P2-B4) is exceeded, or auto-promote once its window has elapsed
+    /// without that happening. Runs every tick (cheap: one `HashMap`
+    /// lookup into the error inbox per active canary, and there is never
+    /// more than a handful of these live at once) rather than on its own
+    /// cadence, so a tight `max_new_errors: 0` budget rolls back within
+    /// one tick of the first new error, not up to a whole heartbeat
+    /// interval later.
+    fn poll_canaries(&mut self) {
+        if self.registry.canaries.is_empty() {
+            return;
+        }
+        let now_tick = self.scheduler.tick();
+        // Collect decisions before mutating `self.registry.canaries`
+        // (promote/rollback both remove the entry): iterating and
+        // mutating the same map at once would either not compile (an
+        // active borrow) or skip entries after a removal, depending on
+        // iteration order.
+        enum Decision {
+            Promote,
+            Rollback,
+        }
+        let mut decisions: Vec<(String, Decision)> = Vec::new();
+        for (path, canary) in self.registry.canaries.iter() {
+            let new_errors = self
+                .errors
+                .count_for_program(path)
+                .saturating_sub(canary.errors_at_start);
+            if new_errors > canary.max_new_errors {
+                decisions.push((path.clone(), Decision::Rollback));
+            } else if now_tick >= canary.started_tick + canary.window_ticks {
+                decisions.push((path.clone(), Decision::Promote));
+            }
+        }
+        for (path, decision) in decisions {
+            match decision {
+                Decision::Promote => {
+                    self.registry.promote_canary(&path);
+                    metrics::counter!("loom_canary_promoted_total", "program" => path).increment(1);
+                }
+                Decision::Rollback => {
+                    self.registry.rollback_canary(&path);
+                    metrics::counter!("loom_canary_rolled_back_total", "program" => path)
+                        .increment(1);
+                }
+            }
+        }
     }
 
     /// The current world tick (`Scheduler::advance`'s counter; advanced by
@@ -1372,6 +1530,13 @@ impl World {
     /// tick's batch (OBI-89, tests/introspection).
     pub fn eager_upgrade_queue_len(&self) -> usize {
         self.scheduler.eager_upgrade_queue_len()
+    }
+
+    /// Whether `path` has a canary in flight right now (P2-B7, OBI-182,
+    /// tests/introspection) -- cleared the instant `World::tick`
+    /// auto-promotes or auto-rolls-back.
+    pub fn canary_active(&self, path: &str) -> bool {
+        self.registry.canaries.contains_key(path)
     }
 
     /// Drain every warning recorded by a *lazy* per-instance upgrade since
@@ -1739,6 +1904,82 @@ impl World {
     /// constants (`max_ticks_exec`, `max_objects`, ...).
     pub fn quota_breach_count(&self, tier: u32, quota: &str) -> u64 {
         self.registry.quota_breaches.get(tier, quota)
+    }
+
+    /// `profile <program>` (spec Phase 2 B5, OBI-170): open a sampling
+    /// window on `program` (normalized, same rule as `compile_object`'s
+    /// path argument) -- mirrors the `profile_start` efun, for a
+    /// host-side (test/admin-command) caller that doesn't want to go
+    /// through a Weft call to use it.
+    ///
+    /// `owner` is this caller's principal (CTO review, OBI-170 PR #67
+    /// should-fix 4 / OBI-232): if a window is already open under a
+    /// *different* owner, this fails instead of silently discarding it
+    /// (no more "last write wins") -- the caller must have that owner
+    /// call `profile_stop` first, or call `profile_stop` here with
+    /// `force: true` themselves (a host-side caller is trusted to decide
+    /// that for itself; there is no master/efun-privilege gate at this
+    /// level, unlike the `profile_stop` efun's P3 check).
+    ///
+    /// Exception (OBI-238, follow-up to should-fix 5): a window that has
+    /// already hit its own auto-expiry cap is replaced outright, even by
+    /// a different owner, no `profile_stop`/`force` required -- an
+    /// expired window is not sampling anything anymore (`wants` already
+    /// answers `false` for it), so refusing to replace it would just let
+    /// a builder who forgot to close their window block everyone else's
+    /// profiling indefinitely.
+    pub fn profile_start(&mut self, program: &str, owner: &str) -> Result<(), String> {
+        let path = loom_compiler::mudlib::normalize_path(program)?;
+        if let Some(existing) = &self.registry.profiler
+            && existing.owner() != owner
+            && !existing.is_expired()
+        {
+            return Err(format!(
+                "profile: a window on {:?} is already open, owned by {} -- profile_stop() it \
+                 first (or force-close it)",
+                existing.program(),
+                existing.owner()
+            ));
+        }
+        self.registry.profiler = Some(crate::profiler::Profiler::new(path, owner.to_string()));
+        Ok(())
+    }
+
+    /// Close the window `profile_start` opened and render its report
+    /// (see `crate::profiler::ProfileReport::render`) -- mirrors the
+    /// `profile_stop` efun. `None` if no window was open.
+    ///
+    /// Refuses to close a window owned by a different `caller` unless
+    /// `force` is set (should-fix 4, OBI-232) -- the caller decides for
+    /// itself whether it is entitled to force (this host-side entry
+    /// point has no master/privilege model of its own to check against).
+    pub fn profile_stop(&mut self, caller: &str, force: bool) -> Option<String> {
+        let owner = self.registry.profiler.as_ref()?.owner().to_string();
+        if owner != caller && !force {
+            return Some(format!(
+                "profile_stop(): this window is owned by {owner}, not {caller} -- pass \
+                 force: true to close it anyway"
+            ));
+        }
+        self.registry.profiler.take().map(|p| p.report().render())
+    }
+
+    /// The program path a `profile` window is currently sampling, if one
+    /// is open.
+    pub fn profiling_program(&self) -> Option<&str> {
+        self.registry.profiler.as_ref().map(|p| p.program())
+    }
+
+    /// **Test-only.** Force the currently-open `profile` window straight
+    /// to expired -- see `Profiler::force_expire_for_test`'s doc for why
+    /// (OBI-238's integration test needs to exercise auto-expiry without
+    /// actually waiting `MAX_WINDOW` or making `MAX_CALLS` real calls).
+    /// A no-op if no window is open.
+    #[doc(hidden)]
+    pub fn force_expire_profiler_for_test(&mut self) {
+        if let Some(p) = self.registry.profiler.as_mut() {
+            p.force_expire_for_test();
+        }
     }
 
     /// `ob`'s owner uid (OBI-121 S2c: immutable, set at creation --

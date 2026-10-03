@@ -199,10 +199,11 @@ mod tests {
 
     #[test]
     fn member_items_include_inherited_std_functions() {
-        let (ast, diags) =
-            loom_syntax::parse("pub fn short() -> string {\n  return \"a thing\"\n}\n");
+        let parent_src = "pub fn short() -> string {\n  return \"a thing\"\n}\n";
+        let (ast, diags) = loom_syntax::parse(parent_src);
         assert!(diags.is_empty());
-        let parent = loom_compiler::check_program("/std/object", &ast, vec![], vec![]).unwrap();
+        let parent =
+            loom_compiler::check_program("/std/object", parent_src, &ast, vec![], vec![]).unwrap();
         let items = member_items(&parent.info);
         assert!(items.iter().any(|i| i.label == "short"));
     }

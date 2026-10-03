@@ -83,6 +83,11 @@ pub struct VarSpec {
     pub name: Rc<str>,
     pub ty: Ty,
     pub has_init: bool,
+    /// `persistent var` (spec §8.1, OBI-171): [`RegistryHost::save_object`]
+    /// writes only these, keyed the same (declaring program, name) way
+    /// hot-reload migration is (§7.2/§7.3) -- a persisted var and an
+    /// upgraded var share one identity.
+    pub persistent: bool,
 }
 
 /// One object whose migration to a newer program version failed and was
@@ -306,7 +311,10 @@ pub(crate) struct CompiledUnit {
 /// `$init` function (see [`synth_init_function`]) that lets
 /// [`Registry::instantiate`] run var initialisers on the bytecode VM
 /// instead of needing a separate tree-walking evaluator for them.
-pub(crate) fn compile_hir_unit(hir: &hir::Program) -> Result<CompiledUnit, CompileError> {
+pub(crate) fn compile_hir_unit(
+    hir: &hir::Program,
+    src: &str,
+) -> Result<CompiledUnit, CompileError> {
     let var_specs: Vec<VarSpec> = hir
         .vars
         .iter()
@@ -314,14 +322,15 @@ pub(crate) fn compile_hir_unit(hir: &hir::Program) -> Result<CompiledUnit, Compi
             name: v.name.clone(),
             ty: v.ty.clone(),
             has_init: v.init.is_some(),
+            persistent: v.persistent,
         })
         .collect();
     let module = if let Some(init_fn) = synth_init_function(hir) {
         let mut augmented = hir.clone();
         augmented.fns.push(init_fn);
-        compile_and_verify(&augmented)?
+        compile_and_verify(&augmented, src)?
     } else {
-        compile_and_verify(hir)?
+        compile_and_verify(hir, src)?
     };
     // `ob.f()` may only reach `pub` functions (spec §5.3; the deleted
     // tree-walker enforced this in `call_other` too). The synthetic
@@ -345,10 +354,11 @@ pub(crate) fn compile_hir_unit(hir: &hir::Program) -> Result<CompiledUnit, Compi
 /// See [`compile_hir_unit`] for the codegen+verify itself.
 pub fn compile_hir_program(
     hir: &hir::Program,
+    src: &str,
     version: u32,
     parent: Option<Rc<CompiledProgram>>,
 ) -> Result<CompiledProgram, CompileError> {
-    let unit = compile_hir_unit(hir)?;
+    let unit = compile_hir_unit(hir, src)?;
     let mut prog = CompiledProgram::new(unit.module, version, parent, unit.var_specs);
     prog.non_public = unit.non_public;
     Ok(prog)
@@ -427,8 +437,8 @@ impl Compiler {
             if registry.program(anc).is_some() {
                 continue;
             }
-            let anc_hir = match self.session.outcomes().get(&**anc) {
-                Some(Outcome::Ok(c)) => c.hir.clone(),
+            let (anc_hir, anc_src) = match self.session.outcomes().get(&**anc) {
+                Some(Outcome::Ok(c)) => (c.hir.clone(), c.src.clone()),
                 _ => {
                     return Err(format!(
                         "internal: {anc} missing from the compile session after compiling {path}"
@@ -442,8 +452,8 @@ impl Compiler {
                 .inherits
                 .first()
                 .and_then(|inh| registry.program(&inh.path));
-            let mut compiled =
-                compile_hir_program(&anc_hir, 1, parent).map_err(|e| format!("{anc}: {e}"))?;
+            let mut compiled = compile_hir_program(&anc_hir, &anc_src, 1, parent)
+                .map_err(|e| format!("{anc}: {e}"))?;
             compiled.source_hash = compile_worker::source_hash(&self.root, anc).unwrap_or(0);
             registry.register_program(Rc::new(compiled));
         }
@@ -546,6 +556,10 @@ impl Compiler {
                 Some(Outcome::Ok(c)) => c.hir.clone(),
                 _ => return Err(format!("internal: {p} missing from the compile session")),
             };
+            let anc_src = match self.session.outcomes().get(p) {
+                Some(Outcome::Ok(c)) => c.src.clone(),
+                _ => return Err(format!("internal: {p} missing from the compile session")),
+            };
             // Same Phase 0 restriction as `ensure_program`: only the first
             // `inherit` becomes this program's parent link.
             let parent = anc_hir.inherits.first().and_then(|inh| {
@@ -555,8 +569,8 @@ impl Compiler {
                     .or_else(|| registry.program(&inh.path))
             });
             let version = registry.program(p).map_or(1, |old| old.version + 1);
-            let mut compiled =
-                compile_hir_program(&anc_hir, version, parent).map_err(|e| format!("{p}: {e}"))?;
+            let mut compiled = compile_hir_program(&anc_hir, &anc_src, version, parent)
+                .map_err(|e| format!("{p}: {e}"))?;
             compiled.source_hash = compile_worker::source_hash(&self.root, p).unwrap_or(0);
             new_set.insert(p.clone(), Rc::new(compiled));
         }
@@ -714,8 +728,8 @@ impl Compiler {
 
         let mut new_set: HashMap<String, Rc<CompiledProgram>> = HashMap::new();
         for p in &to_compile {
-            let anc_hir = match self.session.outcomes().get(p) {
-                Some(Outcome::Ok(c)) => c.hir.clone(),
+            let (anc_hir, anc_src) = match self.session.outcomes().get(p) {
+                Some(Outcome::Ok(c)) => (c.hir.clone(), c.src.clone()),
                 _ => {
                     failures.push((
                         p.clone(),
@@ -733,7 +747,7 @@ impl Compiler {
                     .or_else(|| registry.program(&inh.path))
             });
             let version = registry.program(p).map_or(1, |old| old.version + 1);
-            match compile_hir_program(&anc_hir, version, parent) {
+            match compile_hir_program(&anc_hir, &anc_src, version, parent) {
                 Ok(mut compiled) => {
                     compiled.source_hash = compile_worker::source_hash(&self.root, p).unwrap_or(0);
                     new_set.insert(p.clone(), Rc::new(compiled));
@@ -899,6 +913,7 @@ impl Compiler {
                         ty: loom_compiler::bytecode::decode_ty(&v.ty_bytes)
                             .map_err(|e| format!("{}: corrupt var type: {e}", wp.path))?,
                         has_init: v.has_init,
+                        persistent: v.persistent,
                     })
                 })
                 .collect::<Result<_, String>>()?;
@@ -1051,6 +1066,7 @@ impl Compiler {
                             ty: loom_compiler::bytecode::decode_ty(&v.ty_bytes)
                                 .map_err(|e| format!("{}: corrupt var type: {e}", wp.path))?,
                             has_init: v.has_init,
+                            persistent: v.persistent,
                         })
                     })
                     .collect::<Result<_, String>>()?;
@@ -1542,6 +1558,86 @@ pub struct Registry {
     /// `loom_tier_quota_breaches_total{tier,quota}` (OBI-121 S2c); see
     /// `crate::quota::QuotaBreachMetrics`.
     pub quota_breaches: crate::quota::QuotaBreachMetrics,
+    /// `profile <program>`'s currently open sampling window (spec Phase
+    /// 2 B5, OBI-170), `None` the overwhelming rest of the time --
+    /// started by `World::profile_start`/the `profile_start` efun,
+    /// consumed by `World::profile_stop`/`profile_stop`. See
+    /// `crate::profiler`'s module doc for the "unmeasurable overhead
+    /// when off" cost argument this field's `Option` is central to.
+    pub profiler: Option<crate::profiler::Profiler>,
+    /// Canary updates in flight (P2-B7, OBI-182, spec §7.4), keyed by
+    /// program path. At most one per path: starting a new one for a path
+    /// that already has one active is refused by `RegistryHost::
+    /// canary_update_efun`, and any *plain* recompile of the path (not
+    /// through `canary_update`) implicitly cancels it (`Registry::
+    /// install`) rather than leaving it pointed at a candidate that is no
+    /// longer `programs[path]`.
+    pub canaries: HashMap<String, CanaryState>,
+}
+
+/// One in-flight canary (P2-B7, OBI-182, spec §7.4): `canary_update(path,
+/// ..)` installs `candidate` as `programs[path]` same as any recompile,
+/// but only `pct`% of instances (chosen by a deterministic hash of the
+/// object id, spec: "by object id hash") migrate to it on access while
+/// this is active -- the rest stay pinned to `stable` (see `RegistryHost::
+/// ensure_current`). `World::tick` watches `errors_at_start` vs. the
+/// error inbox's live count for `candidate`'s path (P2-B4) and either
+/// promotes (clears this, letting the remaining instances lazily migrate
+/// like a normal install) or rolls back (re-points `programs[path]` at
+/// `stable` and clears this, so every instance already on `candidate`
+/// lazily migrates *back* -- `RegistryHost::upgrade` is symmetric, it has
+/// no notion of "forward"/"backward").
+pub struct CanaryState {
+    /// The program that was live immediately before this canary started;
+    /// what a rollback re-installs.
+    pub stable: Rc<CompiledProgram>,
+    /// The new version being canaried; `programs[path]` for as long as
+    /// this canary is active (promotion is a no-op on `programs`, it only
+    /// clears this entry and lets the rest of the cohort catch up).
+    pub candidate: Rc<CompiledProgram>,
+    /// 1..=100: the percentage of accessed instances routed to
+    /// `candidate` while this is active.
+    pub pct: u8,
+    /// The world tick (`Scheduler::tick`) this canary started on --
+    /// ticks, not wall-clock time, deliberately (same deviation as
+    /// `TickShareWindow`, `World::tick`'s own doc comment: a world tick is
+    /// a fixed 100 ms when the driver is ticking on its normal timer, so
+    /// this is fully deterministic from the tick counter alone and a test
+    /// can drive a whole window with repeated `World::tick()` calls
+    /// instead of a real sleep).
+    pub started_tick: u64,
+    /// How many world ticks this canary watches for before auto-promoting
+    /// (if the error budget was never exceeded).
+    pub window_ticks: u64,
+    /// The error inbox's `count_for_program(candidate.path)` the instant
+    /// this canary started (P2-B4): `World::tick` compares the *current*
+    /// count against this baseline, not the raw count, so pre-existing
+    /// errors unrelated to this candidate never count against it.
+    pub errors_at_start: u64,
+    /// How many *new* errors (current count minus `errors_at_start`) this
+    /// candidate may accrue before `World::tick` rolls it back
+    /// immediately, without waiting for `window_ticks` to elapse.
+    pub max_new_errors: u64,
+}
+
+/// Spec §7.4: "installs the new version for a fraction of ... clones (by
+/// object id hash)". A fast, deterministic spread (Knuth's multiplicative
+/// hash) over `id`'s slot index -- stable for as long as the object lives
+/// (an index is only reused after the slot frees and is handed back out,
+/// at which point it is a different object with a different generation,
+/// so revisiting this function for it is correct, not a stale decision
+/// leaking across objects). `pct` is clamped to `0..=100` by the caller
+/// (`RegistryHost::canary_update_efun`); `0` never selects anything,
+/// `100` always does.
+pub fn canary_cohort(id: ObjectId, pct: u8) -> bool {
+    if pct == 0 {
+        return false;
+    }
+    if pct >= 100 {
+        return true;
+    }
+    let hashed = (id.index as u64).wrapping_mul(2_654_435_761);
+    (hashed % 100) < pct as u64
 }
 
 /// One undoable effect recorded while an `atomic fn` scope is open.
@@ -1686,6 +1782,36 @@ impl Registry {
 
     pub fn program(&self, path: &str) -> Option<Rc<CompiledProgram>> {
         self.programs.get(path).cloned()
+    }
+
+    /// P2-B7 (OBI-182): promote `path`'s in-flight canary -- clears the
+    /// entry and bumps `install_generation` so every instance still
+    /// pinned to `stable` (because it was not in the fraction cohort)
+    /// re-checks on its next access and lazily migrates to `candidate`,
+    /// which has been `programs[path]` all along. A no-op (returns
+    /// `false`) if `path` has no active canary.
+    pub fn promote_canary(&mut self, path: &str) -> bool {
+        if self.canaries.remove(path).is_none() {
+            return false;
+        }
+        self.install_generation += 1;
+        true
+    }
+
+    /// P2-B7 (OBI-182): roll `path`'s in-flight canary back -- re-points
+    /// `programs[path]` at `stable` and clears the entry, then bumps
+    /// `install_generation` so every instance already migrated to
+    /// `candidate` (the fraction cohort) re-checks on its next access and
+    /// lazily migrates *back* (`RegistryHost::upgrade` works on any
+    /// target program, not only a "newer" one). A no-op (returns `false`)
+    /// if `path` has no active canary.
+    pub fn rollback_canary(&mut self, path: &str) -> bool {
+        let Some(canary) = self.canaries.remove(path) else {
+            return false;
+        };
+        self.programs.insert(path.to_string(), canary.stable);
+        self.install_generation += 1;
+        true
     }
 
     pub fn insert(&mut self, obj: BcObject) -> ObjectId {
@@ -2281,6 +2407,13 @@ struct Driver<'a> {
     input_actor: Option<Sym>,
     /// Mudlib root, for the `read_file`/`write_file` VFS.
     root: PathBuf,
+    /// Player-save root for `save_object`/`restore_object` (spec §8.1,
+    /// OBI-171): deliberately **not** the mudlib VFS root above -- save
+    /// data is driver state, not mudlib source, and must never end up
+    /// inside the Git-backed `.wf` tree (§8.5) or get swept up by a
+    /// `revert`/recompile. Confined the same way (`crate::fileio`'s
+    /// lexical + symlink-escape checks), just against this root instead.
+    save_root: PathBuf,
     /// `disk_quota_mb`'s per-`<u>` byte counter (OBI-137 S1), owned by
     /// `World`; see `crate::disk_usage::DiskUsage`.
     disk_usage: &'a mut crate::disk_usage::DiskUsage,
@@ -2486,12 +2619,27 @@ impl<'a> RegistryHost<'a> {
         if self.has_live_frame(id) {
             return;
         }
-        let current = self.registry.programs.get(&*o.program.path).cloned();
-        if let Some(current) = current
-            && !Rc::ptr_eq(&current, &o.program)
-            && let Err(w) = self.upgrade(id, current)
-        {
-            self.registry.lazy_upgrade_warnings.push(w);
+        let path = o.program.path.clone();
+        let current = self.registry.programs.get(&*path).cloned();
+        if let Some(current) = current {
+            // P2-B7 (OBI-182): a path with an active canary routes by the
+            // object id hash instead of unconditionally migrating to
+            // `current` (which, for the duration of the canary, *is*
+            // `candidate` -- see `CanaryState`'s own doc comment). Not in
+            // the cohort means "stay on `stable`", which is a no-op here
+            // whenever that is already `o.program` (the overwhelmingly
+            // common case: an object this function has already stamped
+            // once during this same canary's window).
+            let target = match self.registry.canaries.get(&*path) {
+                Some(canary) if canary_cohort(id, canary.pct) => current.clone(),
+                Some(canary) => canary.stable.clone(),
+                None => current.clone(),
+            };
+            if !Rc::ptr_eq(&target, &o.program)
+                && let Err(w) = self.upgrade(id, target)
+            {
+                self.registry.lazy_upgrade_warnings.push(w);
+            }
         }
         if let Some(o) = self.registry.get_mut(id) {
             o.checked_generation = generation;
@@ -2553,6 +2701,7 @@ impl<'a> RegistryHost<'a> {
         input_actor: Option<Sym>,
         disk_usage: &'a mut crate::disk_usage::DiskUsage,
         errors: &'a mut crate::errors::ErrorInbox,
+        save_root: PathBuf,
     ) -> Self {
         let base = cut_guard
             .unwrap_or_else(|| GuardSet::empty().with(principal_of(registry, self_object)));
@@ -2581,6 +2730,7 @@ impl<'a> RegistryHost<'a> {
                 roles_ctx,
                 input_actor,
                 root,
+                save_root,
                 disk_usage,
                 errors,
             }),
@@ -3126,6 +3276,16 @@ impl<'a> RegistryHost<'a> {
     /// caller writes unconditionally right after this returns `true`, on
     /// the single-threaded world thread, so nothing else can race it in
     /// between).
+    ///
+    /// **OBI-236 fix:** the directory pool (`seeded_total`/`note_write`)
+    /// and the save pool (`DiskUsage::seeded_save_total`, used by
+    /// `check_save_disk_quota`) are seeded independently, so whichever of
+    /// the two a given `<u>` happens to hit first no longer determines
+    /// what the *other* pool starts from. `disk_quota_mb` still has to
+    /// cover everything `<u>` has on disk, so `projected` here folds in
+    /// `DiskUsage::save_total`'s current save-pool total (0 if `<u>` has
+    /// never gone through `check_save_disk_quota` yet -- this never
+    /// forces a save-file stat on an unrelated `write_file`).
     fn check_disk_quota(&mut self, path: &str, new_bytes: u64) -> R<bool> {
         let Some(driver) = self.driver.as_ref() else {
             return Ok(true);
@@ -3151,7 +3311,11 @@ impl<'a> RegistryHost<'a> {
         let max_bytes = max_mb.saturating_mul(crate::quota::MB);
         let driver = self.driver.as_mut().expect("checked above");
         let seeded = driver.disk_usage.seeded_total(&root, &u);
-        let projected = seeded.saturating_sub(old_bytes).saturating_add(new_bytes);
+        let save_now = driver.disk_usage.save_total(&u);
+        let projected = seeded
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes)
+            .saturating_add(save_now);
         if projected > max_bytes {
             self.registry
                 .quota_breaches
@@ -3167,6 +3331,75 @@ impl<'a> RegistryHost<'a> {
         }
         let driver = self.driver.as_mut().expect("checked above");
         driver.disk_usage.note_write(&u, old_bytes, new_bytes);
+        Ok(true)
+    }
+
+    /// `disk_quota_mb` for `save_object` (OBI-171, CTO review on PR #75,
+    /// must-fix 2): `check_disk_quota` attributes a write to the `<u>`
+    /// named *in the path* (`/builders/<u>/**`), but a save path carries
+    /// no uid in its text at all -- so without this, any P1 object could
+    /// fill the disk by calling `save_object` against arbitrarily many
+    /// paths, entirely outside `disk_quota_mb`. Instead this charges the
+    /// *writing* object's own uid (`principal_of(self_object()).uid`),
+    /// the same principal the master's save-path authorization contract
+    /// (`docs/save-objects.md`) is responsible for confining each save to
+    /// in the first place. Same seeded-once/`O(1)`-after contract and the
+    /// same non-raising `Ok(false)`-on-breach shape as `check_disk_quota`;
+    /// see [`crate::disk_usage::DiskUsage::seeded_save_total`] for why the
+    /// seed here is one `metadata()` stat instead of a directory walk.
+    ///
+    /// **OBI-236 fix:** this uses its own save pool
+    /// (`seeded_save_total`/`note_save_write`), seeded independently of
+    /// `check_disk_quota`'s directory pool -- whichever of the two runs
+    /// first for a given `<u>` no longer determines what the other
+    /// starts from. `projected` folds in the directory pool via
+    /// `seeded_total` (seeding it with one walk if `<u>` has never gone
+    /// through `check_disk_quota` yet, since the walk root is known here)
+    /// so a save is checked against everything `<u>` has on disk, not
+    /// just its own save file, even when the save runs first.
+    fn check_save_disk_quota(&mut self, save_file_rel: &str, new_bytes: u64) -> R<bool> {
+        let Some(driver) = self.driver.as_ref() else {
+            return Ok(true);
+        };
+        let uid = principal_of(self.registry, self.self_object()).uid;
+        let u = self.registry.syms.name(uid).to_string();
+        if crate::quota::is_unlimited_uid(&u) {
+            return Ok(true);
+        }
+        let tier = driver.roles.tier(&u);
+        let Some(max_mb) =
+            crate::quota::resolve(&driver.roles, &u, self.quota_defaults()).disk_quota_mb
+        else {
+            return Ok(true);
+        };
+        let save_root = driver.save_root.clone();
+        let root = driver.root.clone();
+        let old_bytes = crate::fileio::file_size_bytes(&save_root, save_file_rel).unwrap_or(0);
+        let max_bytes = max_mb.saturating_mul(crate::quota::MB);
+        let driver = self.driver.as_mut().expect("checked above");
+        let seeded = driver
+            .disk_usage
+            .seeded_save_total(&save_root, &u, save_file_rel);
+        let dir_now = driver.disk_usage.seeded_total(&root, &u);
+        let projected = seeded
+            .saturating_sub(old_bytes)
+            .saturating_add(new_bytes)
+            .saturating_add(dir_now);
+        if projected > max_bytes {
+            self.registry
+                .quota_breaches
+                .record(tier, crate::quota::DISK_QUOTA_MB);
+            self.audit_quota_denial(
+                crate::quota::DISK_QUOTA_MB,
+                format!(
+                    "disk_quota_mb quota exceeded for `{u}` ({projected} bytes would be in \
+                     use for save_object(\"{save_file_rel}\"), quota is {max_bytes} bytes)"
+                ),
+            );
+            return Ok(false);
+        }
+        let driver = self.driver.as_mut().expect("checked above");
+        driver.disk_usage.note_save_write(&u, old_bytes, new_bytes);
         Ok(true)
     }
 
@@ -3708,6 +3941,144 @@ impl<'a> RegistryHost<'a> {
                 }
                 Ok(Value::Int(queued))
             }
+            // Spec Phase 2 B5 (OBI-170), ownership added per CTO review
+            // should-fix 4 (OBI-232): open a per-function tick/time
+            // sampling window on `path`. The generic P1 `valid_efun`
+            // pre-check above already gated this call; no path-specific
+            // apply (it reads nothing it couldn't already see by calling
+            // into `path` itself, and writes only the profiler's own
+            // counters).
+            //
+            // No longer "last write wins" (the OBI-170 PR #67 should-fix
+            // this closes): a window already open, owned by a *different*
+            // principal than the one calling now, is left alone and this
+            // call fails -- one P1 caller (a builder debugging their own
+            // area) can no longer silently discard another's in-progress
+            // profile. The same owner re-calling `profile_start` (e.g. to
+            // retarget to a different program) still just replaces their
+            // own window, same as before.
+            //
+            // Exception (OBI-238): a window that has already hit its own
+            // auto-expiry cap (`Profiler::is_expired`) is replaced
+            // outright, even by a different principal -- it is not
+            // sampling anything anymore (`wants` already answers `false`
+            // for it), so holding the ownership lock on it would just let
+            // a builder who forgot to call `profile_stop` block everyone
+            // else's profiling indefinitely.
+            "profile_start" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("profile_start(): expected string"))?;
+                let path = mudlib::normalize_path(p).map_err(RtError::new)?;
+                let owner = self
+                    .registry
+                    .syms
+                    .name(principal_of(self.registry, self.self_object()).euid)
+                    .to_string();
+                if let Some(existing) = self.registry.profiler.as_ref()
+                    && existing.owner() != owner
+                    && !existing.is_expired()
+                {
+                    return Err(RtError::new(format!(
+                        "profile_start(): a profiling window on {:?} is already open, owned by \
+                         {} -- have them call profile_stop() first, or force-close it yourself \
+                         with profile_stop(true) if you hold P3 privilege",
+                        existing.program(),
+                        existing.owner()
+                    )));
+                }
+                self.registry.profiler = Some(crate::profiler::Profiler::new(path, owner));
+                Ok(Value::Null)
+            }
+            // Close the window opened by `profile_start` and return its
+            // report, already rendered as the in-game-readable text
+            // `crate::profiler::ProfileReport::render` produces (OBI-170
+            // acceptance: "output is readable in-game"). A string, not a
+            // struct, because Weft has no `profile`-shaped record type to
+            // hand one back as yet -- a builder command wraps this in a
+            // single `send(this_player(), profile_stop())`.
+            //
+            // `force` (should-fix 4, OBI-232): optional second arg,
+            // default `false`. A caller who isn't the window's owner
+            // normally gets a permission error instead of silently
+            // closing someone else's in-progress profile (mirrors
+            // `profile_start`'s new refusal); passing `true` still
+            // requires passing this efun's own P3 `valid_efun` check
+            // (same mechanism `seteuid`/`account_create` use), so only a
+            // caller the master actually grants P3 to can force-close
+            // another principal's window.
+            "profile_stop" => {
+                let force = matches!(a0, Value::Bool(true));
+                let Some(open_owner) = self
+                    .registry
+                    .profiler
+                    .as_ref()
+                    .map(|p| p.owner().to_string())
+                else {
+                    return Ok(Value::str(
+                        "profile: no sampling window is open (call profile_start() first)\n",
+                    ));
+                };
+                let caller_owner = self
+                    .registry
+                    .syms
+                    .name(principal_of(self.registry, self.self_object()).euid)
+                    .to_string();
+                if open_owner != caller_owner {
+                    if !force {
+                        return Err(RtError::new(format!(
+                            "profile_stop(): this window is owned by {open_owner}, not you -- \
+                             pass true to force-close it (requires P3 privilege)"
+                        )));
+                    }
+                    // A distinct `Operation::Efun` name from plain
+                    // "profile_stop" (not a registered efun -- it never
+                    // needs to be, `Operation::Efun`'s `name` is just an
+                    // opaque cache-key/describe() tag here): the policy
+                    // decision cache keys *only* on efun name, not
+                    // name+class (`Operation::cache_parts`, "the efun
+                    // class is not part of the key: it is fixed per efun
+                    // name") -- reusing "profile_stop" here would let the
+                    // generic P1 pre-check's cached `true` answer this
+                    // unrelated P3 question too, defeating the whole
+                    // check (caught by this file's own
+                    // `force_without_p3_is_still_denied` integration
+                    // test).
+                    self.authorize(
+                        "profile_stop",
+                        Privilege::P3,
+                        Operation::Efun {
+                            name: "profile_stop(force)",
+                            class: Privilege::P3,
+                        },
+                    )?;
+                }
+                let text = self
+                    .registry
+                    .profiler
+                    .take()
+                    .expect("checked Some above")
+                    .report()
+                    .render();
+                Ok(Value::str(&text))
+            }
+            // P2-B7 (OBI-182, spec §7.4): `update --canary N%` --
+            // recompile `path` same as `compile_object`, but only route
+            // `pct`% of accessed instances (by object id hash) to the new
+            // version while `World::tick` watches the P2-B4 error inbox
+            // for `window_ticks`, auto-promoting (if the new-error budget
+            // is never exceeded) or auto-rolling-back (the instant it is).
+            // Same tier as `compile_object`/`upgrade_all` (D-P1.6): a
+            // canary is strictly less exposure than either (it starts at
+            // a *fraction*, not everyone).
+            "canary_update" => self.canary_update_efun(&a0, &a1, &a2, &a3),
+            // Introspection for the builder command/web IDE driving the
+            // above: `null` if `path` has no canary in flight, else a map
+            // of its live state. Same `valid_upgrade`/P1 gate as
+            // `canary_update` -- whoever can manage a path's canary is who
+            // should be able to see its state; no separate `valid_read`
+            // dependency.
+            "canary_status" => self.canary_status_efun(&a0),
             "call_out" => {
                 let func = a0
                     .as_str()
@@ -3929,6 +4300,36 @@ impl<'a> RegistryHost<'a> {
                 crate::fileio::write_file(root, &p, text)
                     .map(Value::Bool)
                     .map_err(|e| RtError::new(format!("write_file(\"{p}\") failed: {e}")))
+            }
+            "save_object" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("save_object(): expected string path"))?;
+                let p = security::normalize_file_path(p).map_err(RtError::new)?;
+                self.authorize(
+                    name,
+                    Privilege::P1,
+                    Operation::Write {
+                        path: &p,
+                        op: "save_object",
+                    },
+                )?;
+                self.save_object(&p).map(Value::Bool)
+            }
+            "restore_object" => {
+                let p = a0
+                    .as_str()
+                    .ok_or_else(|| RtError::new("restore_object(): expected string path"))?;
+                let p = security::normalize_file_path(p).map_err(RtError::new)?;
+                self.authorize(
+                    name,
+                    Privilege::P0,
+                    Operation::Read {
+                        path: &p,
+                        op: "restore_object",
+                    },
+                )?;
+                self.restore_object(&p).map(Value::Bool)
             }
             "account_create" => self.issue_account_request(true, &a0, &a1),
             "account_login" => self.issue_account_request(false, &a0, &a1),
@@ -4515,6 +4916,14 @@ impl<'a> RegistryHost<'a> {
             let mut m = heap::MapData::default();
             m.insert(Value::str("program"), Value::str(&row.program));
             m.insert(Value::str("function"), Value::str(&row.function));
+            m.insert(
+                Value::str("line"),
+                if row.line == 0 {
+                    Value::Null
+                } else {
+                    Value::Int(row.line as i64)
+                },
+            );
             m.insert(Value::str("message"), Value::str(&message));
             m.insert(Value::str("redacted"), Value::Bool(row.redacted));
             m.insert(Value::str("count"), Value::Int(row.count as i64));
@@ -4533,6 +4942,132 @@ impl<'a> RegistryHost<'a> {
             out.push(Value::map(m));
         }
         Ok(Value::array(out))
+    }
+
+    /// `canary_update(path, pct, window_ticks, max_new_errors)` (P2-B7,
+    /// OBI-182, spec §7.4): compile `path` exactly like `compile_object`
+    /// (install is lazy either way, so nothing migrates synchronously
+    /// here), then start a canary that routes `pct`% of future accesses
+    /// (by object id hash) to the new version instead of all of them.
+    /// `window_ticks` is how long (in world ticks, `World::tick`'s own
+    /// counter -- not wall-clock time, same deviation as
+    /// `TickShareWindow`) the canary runs before auto-promoting if it
+    /// stays within budget; `max_new_errors` is how many *new*
+    /// `errors`-inbox occurrences (P2-B4) for `path` it may accrue before
+    /// `World::tick` rolls it back immediately instead of waiting out the
+    /// window. Returns `null` on success (a canary is now in flight) or a
+    /// diagnostics/error string, mirroring `compile_object`'s
+    /// `Optional<String>`.
+    fn canary_update_efun(
+        &mut self,
+        path: &Value,
+        pct: &Value,
+        window_ticks: &Value,
+        max_new_errors: &Value,
+    ) -> R<Value> {
+        let p = Self::want_str(path, "canary_update(): expected string path")?;
+        let path = mudlib::normalize_path(&p).map_err(RtError::new)?;
+        let pct = Self::want_int(pct, "canary_update(): expected int pct")?;
+        let window_ticks =
+            Self::want_int(window_ticks, "canary_update(): expected int window_ticks")?;
+        let max_new_errors = Self::want_int(
+            max_new_errors,
+            "canary_update(): expected int max_new_errors",
+        )?;
+        if !(1..=100).contains(&pct) {
+            return Err(RtError::new("canary_update(): pct must be 1..=100"));
+        }
+        if window_ticks < 1 {
+            return Err(RtError::new("canary_update(): window_ticks must be >= 1"));
+        }
+        if max_new_errors < 0 {
+            return Err(RtError::new("canary_update(): max_new_errors must be >= 0"));
+        }
+        self.authorize(
+            "canary_update",
+            Privilege::P1,
+            Operation::Upgrade { path: &path },
+        )?;
+        if self.registry.canaries.contains_key(&path) {
+            return Ok(Value::str(&format!(
+                "canary_update(): a canary is already in flight for {path}"
+            )));
+        }
+        if self.registry.program(&path).is_none() {
+            return Ok(Value::str(&format!(
+                "canary_update(): no program registered for {path}"
+            )));
+        }
+        // `self.recompile` both compiles (all-or-nothing, same as
+        // `compile_object`) and installs: install is lazy-only (OBI-89),
+        // so this never touches a single existing instance -- the
+        // `CanaryState` below is what then governs who, if anyone, moves
+        // to it before it is promoted or rolled back.
+        let stable = self.registry.program(&path).expect("checked above");
+        match self.recompile(&path) {
+            Err(e) => Ok(Value::str(&e)),
+            Ok(_warnings) => {
+                let candidate = self
+                    .registry
+                    .program(&path)
+                    .expect("recompile just installed it");
+                let driver = self.driver.as_ref().expect("checked above");
+                let started_tick = driver.scheduler.tick();
+                let errors_at_start = driver.errors.count_for_program(&path);
+                self.registry.canaries.insert(
+                    path.clone(),
+                    CanaryState {
+                        stable,
+                        candidate,
+                        pct: pct as u8,
+                        started_tick,
+                        window_ticks: window_ticks as u64,
+                        errors_at_start,
+                        max_new_errors: max_new_errors as u64,
+                    },
+                );
+                metrics::counter!("loom_canary_started_total", "program" => path.clone())
+                    .increment(1);
+                Ok(Value::Null)
+            }
+        }
+    }
+
+    /// `canary_status(path)`: `null` if `path` has no canary in flight,
+    /// else `{"program": string, "pct": int, "ticks_left": int,
+    /// "new_errors": int, "max_new_errors": int}` -- `ticks_left` is
+    /// already saturated at 0 (never negative) and `new_errors` is the
+    /// live `errors`-inbox delta `World::tick` itself compares against
+    /// `max_new_errors`, so a builder command can show progress without
+    /// duplicating that arithmetic.
+    fn canary_status_efun(&mut self, path: &Value) -> R<Value> {
+        let p = Self::want_str(path, "canary_status(): expected string path")?;
+        let path = mudlib::normalize_path(&p).map_err(RtError::new)?;
+        self.authorize(
+            "canary_status",
+            Privilege::P1,
+            Operation::Upgrade { path: &path },
+        )?;
+        let Some(canary) = self.registry.canaries.get(&path) else {
+            return Ok(Value::Null);
+        };
+        let driver = self.driver.as_ref().expect("checked above");
+        let now_tick = driver.scheduler.tick();
+        let new_errors = driver
+            .errors
+            .count_for_program(&path)
+            .saturating_sub(canary.errors_at_start);
+        let ticks_left = (canary.started_tick + canary.window_ticks).saturating_sub(now_tick);
+        let mut m = heap::MapData::default();
+        m.insert(Value::str("program"), Value::str(&path));
+        m.insert(Value::str("pct"), Value::Int(canary.pct as i64));
+        m.insert(Value::str("ticks_left"), Value::Int(ticks_left as i64));
+        m.insert(Value::str("new_errors"), Value::Int(new_errors as i64));
+        m.insert(
+            Value::str("max_new_errors"),
+            Value::Int(canary.max_new_errors as i64),
+        );
+        Ok(Value::map(m))
     }
 
     /// Run `name` declared in exactly `target` as `on` in a *fresh*
@@ -4558,6 +5093,7 @@ impl<'a> RegistryHost<'a> {
             );
             e.trace.push(format!("in {func_name}()"));
             e.trace_programs.push(target.path.to_string());
+            e.trace_lines.push(0);
             return Err(e);
         }
         self.push_self(on);
@@ -4860,6 +5396,16 @@ impl<'a> RegistryHost<'a> {
         for v in new_set.values() {
             self.registry.register_program(v.clone());
         }
+        // P2-B7 (OBI-182): a plain recompile of a path that has an active
+        // canary supersedes it -- `new_set`'s value just became the new
+        // `programs[path]` directly (not gated by the old canary's
+        // fraction any more), so the stale `CanaryState` (whose
+        // `candidate` is no longer what's installed) must not linger to
+        // confuse `ensure_current`'s routing or `World::tick`'s window
+        // check.
+        for path in new_set.keys() {
+            self.registry.canaries.remove(path);
+        }
         // OBI-121 S2c (CTO review B4): a recompiled path's cached
         // `program_flags` result is stale (the master may return
         // something different for the new code, or `program_flags` itself
@@ -5032,6 +5578,194 @@ impl<'a> RegistryHost<'a> {
             skipped_unloaded: set.skipped_unloaded,
             deleted_loaded: set.deleted_loaded,
             failures: Vec::new(),
+        }
+    }
+
+    /// `<path>` normalised to the on-disk save-file name `save_object`/
+    /// `restore_object` use under the save root: `.o` appended unless
+    /// already present (classic LPMud convention: `save_object("bob")`
+    /// and `save_object("bob.o")` name the same file).
+    fn save_file_name(path: &str) -> String {
+        if path.ends_with(".o") {
+            path.to_string()
+        } else {
+            format!("{path}.o")
+        }
+    }
+
+    /// `save_object(path)` (spec §8.1, OBI-171): serialise every
+    /// `persistent` var of `self()`, across its whole inherit chain, keyed
+    /// by *(declaring program, name)* -- the same identity hot-reload
+    /// migration uses, §7.2/§7.3 -- into a JSON document (`crate::bcvm::
+    /// persist::encode_value`, spec r5 §7.3's portable form) alongside
+    /// the declaring program's path/version/schema hash, and write it
+    /// atomically (write + rename, `crate::fileio::write_file_atomic`)
+    /// under the save root (never the mudlib VFS -- see
+    /// `World::save_root`'s docs) at `<path>.o`. `Ok(false)`: the write
+    /// failed (oversized, a filesystem error) -- this never mutates the
+    /// object itself, so a failed save can't corrupt live state.
+    fn save_object(&mut self, raw_path: &str) -> R<bool> {
+        let id = self.self_object();
+        let Some(obj) = self.registry.get(id) else {
+            return Err(RtError::new("save_object(): object was destructed"));
+        };
+        let program = obj.program.clone();
+        let mut vars = serde_json::Map::new();
+        for ancestor in &program.chain() {
+            for spec in &ancestor.var_specs {
+                if !spec.persistent {
+                    continue;
+                }
+                let key = (ancestor.path.clone(), spec.name.clone());
+                let v = self
+                    .registry
+                    .get(id)
+                    .and_then(|o| o.vars.get(&key))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                vars.insert(
+                    format!("{}\u{0}{}", ancestor.path, spec.name),
+                    crate::bcvm::persist::encode_value(&v),
+                );
+            }
+        }
+        let doc = serde_json::json!({
+            "program": &*program.path,
+            "version": program.version,
+            "schema_hash": program.schema_hash,
+            "vars": serde_json::Value::Object(vars),
+        });
+        let text =
+            serde_json::to_string(&doc).map_err(|e| RtError::new(format!("save_object(): {e}")))?;
+        let save_file = Self::save_file_name(raw_path);
+        if !self.check_save_disk_quota(&save_file, text.len() as u64)? {
+            // Same shape as `write_file`'s own `disk_quota_mb` breach
+            // (OBI-137 S1): over quota is not an error, so `upgrade()`'s
+            // caller-visible contract (never silently mutating on a
+            // rejected save) still holds -- this runs before the write,
+            // not after.
+            return Ok(false);
+        }
+        let save_root = self
+            .driver
+            .as_ref()
+            .expect("checked above")
+            .save_root
+            .clone();
+        crate::fileio::write_file_atomic(&save_root, &save_file, &text)
+            .map_err(|e| RtError::new(format!("save_object(\"{raw_path}\") failed: {e}")))
+    }
+
+    /// `restore_object(path)` (spec §8.1/§7.3, OBI-171): the converse of
+    /// [`Self::save_object`]. Reads `<path>.o` from the save root
+    /// (`Ok(false)`, not an error, if it does not exist or fails to
+    /// parse -- a missing/corrupt save is not a crash). For every
+    /// `persistent` var in `self()`'s *current* inherit chain, the saved
+    /// value (decoded to a type-erased portable form,
+    /// `crate::bcvm::persist::decode_value`) either carries straight over
+    /// if it still conforms to the var's declared type
+    /// (`crate::bcvm::schema_convert::hydrate`), or is hashed into
+    /// `upgrade(from_version, old)`'s `old` map in portable form --
+    /// exactly the §7.2/§7.3 hot-reload migration path, run here against
+    /// the save file's recorded version instead of a recompiled program
+    /// (spec: "restoring an old save into a new program runs the same
+    /// migration path"). A var the save has nothing for keeps whatever
+    /// it already holds (e.g. `create()`'s own default), unchanged.
+    ///
+    /// All-or-nothing for this object (spec §7.2 step 6.4's rollback
+    /// rule, mirrored here): if `upgrade()` is defined and raises, every
+    /// var this call touched reverts to what it held before the call and
+    /// `Ok(false)` is returned. There is no `runtime_error` apply wired up
+    /// yet to report this to (OBI-34 tracks that), so the detail goes to
+    /// stderr in the meantime, same as `compile_object`'s per-object
+    /// upgrade-warning reporting.
+    fn restore_object(&mut self, raw_path: &str) -> R<bool> {
+        let id = self.self_object();
+        let Some(obj) = self.registry.get(id) else {
+            return Err(RtError::new("restore_object(): object was destructed"));
+        };
+        let program = obj.program.clone();
+        let save_root = self
+            .driver
+            .as_ref()
+            .expect("checked above")
+            .save_root
+            .clone();
+        let text = match crate::fileio::read_file(&save_root, &Self::save_file_name(raw_path)) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Ok(false),
+            Err(e) => {
+                eprintln!("restore_object(\"{raw_path}\") failed: {e}");
+                return Ok(false);
+            }
+        };
+        let doc: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("restore_object(\"{raw_path}\"): corrupt save: {e}");
+                return Ok(false);
+            }
+        };
+        let from_version = doc.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let saved_vars = doc.get("vars").and_then(|v| v.as_object());
+        let old_vars_snapshot = obj.vars.clone();
+        let mut new_vars = old_vars_snapshot.clone();
+        let mut old_map = heap::MapData::default();
+        for ancestor in &program.chain() {
+            for spec in &ancestor.var_specs {
+                if !spec.persistent {
+                    continue;
+                }
+                let saved_key = format!("{}\u{0}{}", ancestor.path, spec.name);
+                let Some(saved_json) = saved_vars.and_then(|m| m.get(&saved_key)) else {
+                    continue;
+                };
+                let portable = crate::bcvm::persist::decode_value(saved_json);
+                match crate::bcvm::schema_convert::hydrate(&portable, &spec.ty) {
+                    crate::bcvm::schema_convert::Migrated::Lossless(v) => {
+                        new_vars.insert((ancestor.path.clone(), spec.name.clone()), v);
+                    }
+                    crate::bcvm::schema_convert::Migrated::Lossy { portable } => {
+                        old_map.insert(Value::str(&spec.name), portable);
+                    }
+                }
+            }
+        }
+        let outcome: R<()> = (|| {
+            if let Some(o) = self.registry.get_mut(id) {
+                o.vars = new_vars.clone();
+                o.recompute_mem_bytes();
+            }
+            self.call_cache.clear();
+            if !old_map.entries.is_empty()
+                && let Some((target, idx)) = program.resolve("upgrade")
+            {
+                let mark = self.begin_atomic();
+                let args = vec![Value::Int(from_version as i64), Value::map(old_map.clone())];
+                match self.call_in(id, &target, idx, args) {
+                    Ok(_) => self.commit_atomic(mark),
+                    Err(e) => {
+                        self.rollback_atomic(mark);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                if let Some(o) = self.registry.get_mut(id) {
+                    o.vars = old_vars_snapshot;
+                    o.recompute_mem_bytes();
+                }
+                self.call_cache.clear();
+                eprintln!(
+                    "restore_object(\"{raw_path}\"): upgrade() failed: {}",
+                    e.report()
+                );
+                Ok(false)
+            }
         }
     }
 }
@@ -5483,6 +6217,32 @@ impl Host for RegistryHost<'_> {
         self.registry.cow_metrics.record(program);
     }
 
+    /// Spec Phase 2 B5 (OBI-170): called on every Weft function call,
+    /// whether or not a `profile` window is open -- see
+    /// `crate::profiler`'s module doc for why `Registry::profiler` being
+    /// `None` (the default, and the rest of the time) makes this a
+    /// single cheap `is_some_and` and nothing else.
+    fn profiling_active(&self, program: &str) -> bool {
+        self.registry
+            .profiler
+            .as_ref()
+            .is_some_and(|p| p.wants(program))
+    }
+
+    fn profile_record(
+        &mut self,
+        _program: &str,
+        function: &str,
+        ticks: u64,
+        self_ticks: u64,
+        wall: std::time::Duration,
+        self_wall: std::time::Duration,
+    ) {
+        if let Some(p) = self.registry.profiler.as_mut() {
+            p.record(function, ticks, self_ticks, wall, self_wall);
+        }
+    }
+
     fn begin_atomic(&mut self) -> u64 {
         self.registry.journal_begin()
     }
@@ -5502,6 +6262,34 @@ mod tests {
     use crate::bcvm::vm::Exec;
     use loom_compiler::mudlib::{Outcome, Session};
     use proptest::prelude::*;
+
+    /// P2-B7 (OBI-182): `canary_cohort`'s endpoints are exact (0% never
+    /// selects, 100% always does) and an interior percentage selects
+    /// roughly its own share over a large id range -- the spread just
+    /// needs to be deterministic and non-degenerate, not a particular
+    /// distribution.
+    #[test]
+    fn canary_cohort_endpoints_are_exact_and_an_interior_pct_is_roughly_proportional() {
+        let ids: Vec<ObjectId> = (0..10_000)
+            .map(|i| ObjectId {
+                index: i,
+                generation: 0,
+            })
+            .collect();
+        assert!(
+            ids.iter().all(|&id| !canary_cohort(id, 0)),
+            "0% must never select anything"
+        );
+        assert!(
+            ids.iter().all(|&id| canary_cohort(id, 100)),
+            "100% must always select"
+        );
+        let selected = ids.iter().filter(|&&id| canary_cohort(id, 25)).count();
+        assert!(
+            (2_000..3_000).contains(&selected),
+            "25% of 10,000 ids should land near 2,500, got {selected}"
+        );
+    }
 
     #[test]
     fn self_recursive_virtual_call_hits_the_depth_guard_not_the_native_stack() {
@@ -5535,9 +6323,8 @@ pub fn go() -> int {
             .collect();
         let mut session = Session::new(map);
         match session.compile(path) {
-            Outcome::Ok(checked) => {
-                crate::bcvm::compile_and_verify(&checked.hir).expect("codegen + verify")
-            }
+            Outcome::Ok(checked) => crate::bcvm::compile_and_verify(&checked.hir, &checked.src)
+                .expect("codegen + verify"),
             Outcome::Failed(report) => panic!("check failed:\n{report}"),
             Outcome::Missing(msg) => panic!("{msg}"),
         }
@@ -5556,7 +6343,8 @@ pub fn go() -> int {
         let mut session = Session::new(map);
         match session.compile(path) {
             Outcome::Ok(checked) => {
-                compile_hir_program(&checked.hir, version, parent).expect("codegen + verify")
+                compile_hir_program(&checked.hir, &checked.src, version, parent)
+                    .expect("codegen + verify")
             }
             Outcome::Failed(report) => panic!("check failed:\n{report}"),
             Outcome::Missing(msg) => panic!("{msg}"),

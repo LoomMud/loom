@@ -1,0 +1,16 @@
+// Master object for the P2-B7 canary-update tests (OBI-182).
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}

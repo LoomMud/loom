@@ -237,10 +237,11 @@ mod tests {
 
     #[test]
     fn call_resolves_to_declaring_program_and_fn_span_in_it() {
-        let (parent_ast, _) =
-            loom_syntax::parse("pub fn greet() -> string {\n  return \"hi\"\n}\n");
+        let parent_src = "pub fn greet() -> string {\n  return \"hi\"\n}\n";
+        let (parent_ast, _) = loom_syntax::parse(parent_src);
         let parent =
-            loom_compiler::check_program("/std/object", &parent_ast, vec![], vec![]).unwrap();
+            loom_compiler::check_program("/std/object", parent_src, &parent_ast, vec![], vec![])
+                .unwrap();
         let child_src = "inherit /std/object\nfn f() {\n  greet()\n}\n";
         let (child_ast, _) = loom_syntax::parse(child_src);
         let parents = vec![loom_compiler::interface::ParentInfo {
@@ -248,7 +249,8 @@ mod tests {
             info: parent.info.clone(),
             span: Span::default(),
         }];
-        let child = loom_compiler::check_program("/t", &child_ast, parents, vec![]).unwrap();
+        let child =
+            loom_compiler::check_program("/t", child_src, &child_ast, parents, vec![]).unwrap();
         let offset = child_src.find("greet()").unwrap() as u32;
         let t = definition_for_identifier(&child.hir, &child.info, offset).unwrap();
         assert_eq!(t.path, "/std/object");

@@ -42,6 +42,40 @@ fn repeated_runtime_errors_on_the_same_program_function_message_group_and_count(
     });
 }
 
+/// OBI-231 (closes the OBI-169 flagged deviation): the error inbox now
+/// groups by the spec's literal `(program, line, message)`, not a
+/// `function`-name stand-in -- the offending `random(0)` call in the
+/// fixture's `process_input` is on a fixed source line, and that line
+/// number reaches both `World::errors_snapshot` and the trace string the
+/// player/efun caller sees.
+#[test]
+fn errors_are_grouped_and_reported_with_a_real_source_line() {
+    on_world_thread(|| {
+        let root = fixture("errors_inbox");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host);
+        host.take(1);
+
+        world.input(1, "boom", &mut host);
+        host.take(1);
+
+        let rows = world.errors_snapshot(None);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        // `std/player.wf`'s `random(0)` call that raises this error.
+        assert_eq!(
+            row.line, 15,
+            "the grouping key's line is the raising statement's"
+        );
+        assert!(
+            row.sample_trace[0].contains("/std/player:15"),
+            "the trace frame spells out path:line too: {:?}",
+            row.sample_trace
+        );
+    });
+}
+
 #[test]
 fn a_different_message_on_the_same_program_is_a_different_group() {
     on_world_thread(|| {

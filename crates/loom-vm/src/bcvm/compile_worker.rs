@@ -128,6 +128,7 @@ pub struct WireVarSpec {
     /// `loom_compiler::bytecode::encode_ty`.
     pub ty_bytes: Vec<u8>,
     pub has_init: bool,
+    pub persistent: bool,
 }
 
 /// A finished, not-yet-applied background recompile.
@@ -449,8 +450,16 @@ fn run_recompile(root: &Path, path: &str, snapshot: &ProgramSnapshot) -> Compile
                 ));
             }
         };
+        let anc_src = match session.outcomes().get(p) {
+            Some(Outcome::Ok(c)) => c.src.clone(),
+            _ => {
+                return CompileOutcome::Failed(format!(
+                    "internal: {p} missing from the compile session"
+                ));
+            }
+        };
         let parent_path = anc_hir.inherits.first().map(|inh| inh.path.to_string());
-        let unit = match compile_hir_unit(&anc_hir) {
+        let unit = match compile_hir_unit(&anc_hir, &anc_src) {
             Ok(u) => u,
             Err(e) => return CompileOutcome::Failed(format!("{p}: {e}")),
         };
@@ -461,6 +470,7 @@ fn run_recompile(root: &Path, path: &str, snapshot: &ProgramSnapshot) -> Compile
                 name: v.name.to_string(),
                 ty_bytes: bytecode::encode_ty(&v.ty),
                 has_init: v.has_init,
+                persistent: v.persistent,
             })
             .collect();
         out.push(WireProgram {
@@ -754,8 +764,8 @@ fn run_recompile_set(
     let in_batch: HashSet<String> = to_compile.iter().cloned().collect();
     let mut programs: Vec<WireProgram> = Vec::new();
     for p in &to_compile {
-        let anc_hir = match session.outcomes().get(p) {
-            Some(Outcome::Ok(c)) => c.hir.clone(),
+        let (anc_hir, anc_src) = match session.outcomes().get(p) {
+            Some(Outcome::Ok(c)) => (c.hir.clone(), c.src.clone()),
             _ => {
                 failures.push((
                     p.clone(),
@@ -765,7 +775,7 @@ fn run_recompile_set(
             }
         };
         let parent_path = anc_hir.inherits.first().map(|inh| inh.path.to_string());
-        let unit = match compile_hir_unit(&anc_hir) {
+        let unit = match compile_hir_unit(&anc_hir, &anc_src) {
             Ok(u) => u,
             Err(e) => {
                 failures.push((p.clone(), format!("{p}: {e}")));
@@ -779,6 +789,7 @@ fn run_recompile_set(
                 name: v.name.to_string(),
                 ty_bytes: bytecode::encode_ty(&v.ty),
                 has_init: v.has_init,
+                persistent: v.persistent,
             })
             .collect();
         programs.push(WireProgram {

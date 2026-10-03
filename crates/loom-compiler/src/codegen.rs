@@ -24,6 +24,7 @@ use crate::bytecode::{CalleeOp, ConstValue, FunctionCode, Module, Op};
 use crate::hir;
 use crate::ir::{self, BlockId, Callee, ConstOperand, Inst, Reg, Terminator};
 use crate::ty::Ty;
+use loom_syntax::Span;
 
 /// A HIR construct not yet lowered (tracked for a follow-up; not exercised
 /// by any Phase 0 mudlib program). See the module docs.
@@ -37,12 +38,12 @@ impl std::fmt::Display for Unsupported {
 }
 impl std::error::Error for Unsupported {}
 
-pub fn compile(p: &hir::Program) -> Result<Module, Unsupported> {
-    let ir = lower_program(p)?;
+pub fn compile(p: &hir::Program, src: &str) -> Result<Module, Unsupported> {
+    let ir = lower_program(p, src)?;
     Ok(assemble(&ir))
 }
 
-fn lower_program(p: &hir::Program) -> Result<ir::Program, Unsupported> {
+fn lower_program(p: &hir::Program, src: &str) -> Result<ir::Program, Unsupported> {
     // Closures found anywhere in the program (including inside other
     // closures) are lowered as ordinary `ir::Function`s and appended after
     // every named function (spec r5 §5.2.2, OBI-79): `base` is the index
@@ -54,7 +55,7 @@ fn lower_program(p: &hir::Program) -> Result<ir::Program, Unsupported> {
     let functions = p
         .fns
         .iter()
-        .map(|f| lower_function(f, base, &mut extra))
+        .map(|f| lower_function(f, base, &mut extra, src))
         .collect::<Result<Vec<_>, _>>()?;
     let mut functions = functions;
     functions.extend(extra);
@@ -68,6 +69,7 @@ fn lower_function(
     f: &hir::Function,
     base: u32,
     extra: &mut Vec<ir::Function>,
+    src: &str,
 ) -> Result<ir::Function, Unsupported> {
     let mut b = FnLower {
         reg_types: f.locals.iter().map(|l| l.ty.clone()).collect(),
@@ -76,6 +78,8 @@ fn lower_function(
         unreachable: false,
         base,
         extra,
+        src,
+        cur_line: 0,
     };
     b.block(&f.body)?;
     // Falling off the end of the body is only well-typed for a `void`
@@ -111,6 +115,7 @@ fn lower_function(
         let blk = b.new_block();
         b.switch(blk);
         b.unreachable = false;
+        b.cur_line = b.line_of(default.span);
         let r = b.expr(default)?;
         b.emit(Inst::Copy {
             dst: param.local,
@@ -151,6 +156,19 @@ struct FnLower<'e> {
     /// this `FnLower` is itself lowering a closure body, discovered inside
     /// it), shared with every closure nested inside it too (OBI-79).
     extra: &'e mut Vec<ir::Function>,
+    /// This program's source text (OBI-231): the only thing that turns a
+    /// HIR [`Span`] (a byte range) into a 1-based line number
+    /// ([`FnLower::line_of`]), for the per-instruction line table
+    /// (`crate::ir::Block::lines`) codegen attaches to every emitted
+    /// instruction and terminator.
+    src: &'e str,
+    /// The source line of the HIR statement currently being lowered (see
+    /// [`FnLower::stmt`]): every `Inst`/`Terminator` emitted while it is
+    /// set is attributed to this line (statement granularity, not
+    /// expression granularity -- simpler, and enough to satisfy the
+    /// spec's `(program, line, message)` error-inbox grouping; see
+    /// `crate::errors` in `loom-vm`).
+    cur_line: u32,
 }
 
 /// The result of [`FnLower::take_place`]: exactly the registers used to
@@ -180,7 +198,10 @@ impl FnLower<'_> {
     }
 
     fn emit(&mut self, inst: Inst) {
-        self.blocks[self.cur as usize].insts.push(inst);
+        let line = self.cur_line;
+        let blk = &mut self.blocks[self.cur as usize];
+        blk.insts.push(inst);
+        blk.lines.push(line);
     }
 
     fn switch(&mut self, blk: BlockId) {
@@ -191,13 +212,23 @@ impl FnLower<'_> {
     /// the block a caller last switched to: nested control flow may have
     /// moved `cur` on to its own join block first).
     fn seal_cur(&mut self, term: Terminator) {
-        self.blocks[self.cur as usize].term = term;
+        let blk = &mut self.blocks[self.cur as usize];
+        blk.term = term;
+        blk.term_line = self.cur_line;
     }
 
     fn const_reg(&mut self, ty: Ty, value: ConstOperand) -> Reg {
         let dst = self.new_reg(ty);
         self.emit(Inst::Const { dst, value });
         dst
+    }
+
+    /// 1-based source line of `span`'s start (`0` if, somehow, `span` is
+    /// past the end of `src` -- never true for a span `hir` actually
+    /// produced, but `line_col` clamps rather than panicking, so stay
+    /// consistent with that instead of asserting).
+    fn line_of(&self, span: Span) -> u32 {
+        loom_syntax::line_col(self.src, span.start as usize).0 as u32
     }
 
     fn block(&mut self, blk: &hir::Block) -> Result<(), Unsupported> {
@@ -211,6 +242,7 @@ impl FnLower<'_> {
     }
 
     fn stmt(&mut self, s: &hir::Stmt) -> Result<(), Unsupported> {
+        self.cur_line = self.line_of(s.span);
         match &s.kind {
             hir::StmtKind::Let { local, init } => {
                 match init {
@@ -779,7 +811,7 @@ impl FnLower<'_> {
             body: cf.body.clone(),
             span,
         };
-        let mut body_ir = lower_function(&synth, self.base, self.extra)?;
+        let mut body_ir = lower_function(&synth, self.base, self.extra, self.src)?;
         body_ir.capture_targets = cf.captures.clone();
         let idx = self.base + self.extra.len() as u32;
         self.extra.push(body_ir);
@@ -1258,12 +1290,14 @@ impl Assembler {
             }
         }
         let mut code = Vec::with_capacity(pc as usize);
+        let mut lines = Vec::with_capacity(pc as usize);
         for blk in &live {
             if matches!(blk.term, Terminator::Unset) {
                 continue;
             }
-            for inst in &blk.insts {
+            for (inst, line) in blk.insts.iter().zip(blk.lines.iter()) {
                 code.push(self.op(inst, &starts));
+                lines.push(*line);
             }
             code.push(match &blk.term {
                 Terminator::Jump(t) => Op::Jump {
@@ -1282,6 +1316,7 @@ impl Assembler {
                 Terminator::Throw(r) => Op::Throw { src: *r },
                 Terminator::Unset => unreachable!(),
             });
+            lines.push(blk.term_line);
         }
         let entry_points: Vec<u32> = f
             .default_entries
@@ -1298,6 +1333,7 @@ impl Assembler {
             reg_types: f.reg_types.clone(),
             entry_points,
             code: code.into(),
+            lines,
             capture_targets: f.capture_targets.clone(),
         }
     }
