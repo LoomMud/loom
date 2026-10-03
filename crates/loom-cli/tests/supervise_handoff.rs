@@ -11,7 +11,7 @@
 //! the connect would simply time out, since only `supervise` binds
 //! anything in this mode.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -592,6 +592,100 @@ fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
             "expected the telnet connection to still be open (a read timeout or more data), got {other:?}"
         ),
     }
+    supervisor.assert_alive();
+}
+
+/// OBI-184 (copyover-trigger slice): the reclaim/readopt round trip a
+/// copyover request now exercises must actually keep a live client
+/// connection alive, not just *claim* to in a log line -- §7.5's own
+/// acceptance bar is literally "zero disconnects". Proves it with a
+/// real write *through* the reclaimed-and-readopted connection after
+/// the round trip completes: if `loom-net`'s reclaim/adopt primitives
+/// had actually dropped the socket (rather than reuniting and handing
+/// it back), this would see a connection-reset/broken-pipe error
+/// instead of a successful round trip.
+#[test]
+fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let version_dir = scratch("version-watch-reclaim");
+    let version_file = version_dir.join("desired-version");
+    std::fs::write(&version_file, "v1.0.0\n").expect("write initial desired-version");
+
+    let (mut supervisor, stdout) =
+        Supervisor::spawn_with_version_file(&mudlib, &telnet_bind, &http_bind, &version_file);
+
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before changing the version file");
+
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut reclaimed_count: Option<usize> = None;
+    while Instant::now() < deadline && reclaimed_count.is_none() {
+        match line_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(raw_line) => {
+                let line = strip_ansi(&raw_line);
+                if line.contains("reclaim/readopt round trip complete") && line.contains("v2.0.0") {
+                    let reclaimed: usize = line
+                        .split("reclaimed=")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .and_then(|num| num.parse().ok())
+                        .unwrap_or_else(|| panic!("could not parse reclaimed out of: {line}"));
+                    reclaimed_count = Some(reclaimed);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    assert_eq!(
+        reclaimed_count,
+        Some(1),
+        "expected exactly the one connected test client to be reclaimed and readopted"
+    );
+
+    // The strongest possible proof the connection survived: write
+    // through it *after* the round trip and read a real response.
+    // Re-adopting resets telnet negotiation state (a documented
+    // limitation, OBI-227's review), so the first bytes back are a
+    // fresh negotiation preamble, not an echo of what was sent -- that's
+    // fine and expected; what matters is that *something* comes back at
+    // all, which only happens if the connection is still genuinely
+    // live end to end.
+    stream
+        .write_all(b"look\r\n")
+        .expect("write after the reclaim/readopt round trip must not error (broken pipe/reset)");
+    let mut post_round_trip = [0_u8; 12];
+    stream
+        .read_exact(&mut post_round_trip)
+        .expect("read after the reclaim/readopt round trip must not error (connection reset/EOF)");
+
     supervisor.assert_alive();
 }
 
