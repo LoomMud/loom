@@ -480,24 +480,11 @@ async fn acquire_listeners(
 /// control messages ([`loom_supervise::control`]) for as long as the
 /// control socket stays open.
 ///
-/// **Scope (OBI-184, this slice):** a `CopyoverRequested` is acknowledged
-/// immediately and unconditionally -- nothing actually reclaims
-/// connections, snapshots the world, or hands anything off yet. See
-/// `loom_supervise::control`'s module doc for why that's the honest,
-/// explicitly-not-hidden scope of this slice: it proves the control
-/// channel survives past startup and carries a real message both ways,
-/// which the actual copyover logic (a separate, not-yet-built follow-up)
-/// will need regardless of exactly how it ends up structured.
-/// Runs on its own dedicated `std::thread` (control-socket reads are
-/// blocking, and this loop lives for the rest of the process -- not a
-/// one-shot `spawn_blocking`): answers `loom supervise`'s post-handoff
-/// control messages ([`loom_supervise::control`]) for as long as the
-/// control socket stays open.
-///
 /// **Scope (OBI-184, this slice):** a `CopyoverRequested` now triggers a
 /// *real* snapshot of this process's own running world (via
-/// `snapshot_req_tx`, answered by the world thread's own event loop --
-/// see `spawn_world_thread`'s `drain_snapshot_requests`), proving the
+/// `snapshot_req_tx`, drained inline via `try_recv` on each tick of
+/// `spawn_world_thread`'s own event loop -- never blocking that loop
+/// waiting on a request that may never come), proving the
 /// control-socket trigger can reach all the way into live `World` state
 /// and back. It still does not reclaim any connections or actually hand
 /// anything off to a standby -- the snapshot bytes are logged (their
@@ -601,6 +588,7 @@ fn request_snapshot(
         .map_err(|err| format!("world thread did not answer the snapshot request: {err}"))?
 }
 
+/// `loom supervise` (OBI-184, design §7.5/§9.2): the in-pod supervisor
 /// that owns the listening sockets and spawns `loom serve` as a standby
 /// child, handing it those sockets over a private control-socket
 /// `SCM_RIGHTS` channel (`loom_supervise::fdpass`) rather than letting
