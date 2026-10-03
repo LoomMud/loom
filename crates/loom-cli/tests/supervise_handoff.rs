@@ -532,13 +532,29 @@ fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
         saw_acknowledged,
         "supervisor never logged the child's acknowledgement -- the control-socket round trip did not complete"
     );
-    // The control-protocol round trip doesn't touch the actual connection
-    // or the supervisor's own liveness -- both must still be fine.
+    // The control-protocol round trip doesn't touch the actual telnet
+    // connection -- CTO review (OBI-259 nit): assert that explicitly
+    // (a timeout here is the expected/correct outcome; an immediate `Ok`
+    // read of 0 bytes would mean the connection was unexpectedly closed)
+    // rather than silently discarding whatever `read` returns.
     let mut post_ack = [0_u8; 1];
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
-    let _ = stream.read(&mut post_ack); // just draining; a timeout here is fine
+    match stream.read(&mut post_ack) {
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) => {}
+        // Any further application bytes (e.g. trailing telnet
+        // negotiation) are fine too -- the only outcome that would mean
+        // the connection broke is a clean `Ok(0)` (EOF).
+        Ok(n) if n > 0 => {}
+        other => panic!(
+            "expected the telnet connection to still be open (a read timeout or more data), got {other:?}"
+        ),
+    }
     supervisor.assert_alive();
 }
 

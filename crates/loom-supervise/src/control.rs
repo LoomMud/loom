@@ -87,6 +87,18 @@ fn write_payload(writer: &mut impl Write, payload: &str) -> io::Result<()> {
             format!("control message payload too large ({} bytes)", bytes.len()),
         )
     })?;
+    // CTO review (OBI-259 nit): refuse here too, not just on the read
+    // side -- without this, a too-large payload (e.g. an absurdly long
+    // version string from an operator-editable file) would reach the
+    // peer, get rejected there as `InvalidData`, and poison the control
+    // channel over something the *sender* could have refused outright
+    // with a clear `InvalidInput` instead.
+    if len > MAX_PAYLOAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("control message payload length {len} exceeds {MAX_PAYLOAD_BYTES}"),
+        ));
+    }
     writer.write_all(&len.to_le_bytes())?;
     writer.write_all(bytes)
 }
@@ -224,5 +236,51 @@ mod tests {
         drop(a);
         let err = read_message(&mut b).expect_err("non-UTF-8 payload must error");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// A payload over [`MAX_PAYLOAD_BYTES`] is refused by the *writer*
+    /// too, not just the reader (CTO review, OBI-259 nit) -- an
+    /// oversized string should fail clearly at the sender, instead of
+    /// reaching the peer and getting rejected there, which (per the
+    /// supervisor's own poisoning rule) would tear down the whole
+    /// control channel over a message that should never have been sent.
+    #[test]
+    fn write_message_refuses_an_oversized_payload() {
+        let (mut a, _b) = UnixStream::pair().expect("UnixStream::pair");
+        let oversized = "x".repeat(MAX_PAYLOAD_BYTES as usize + 1);
+        let err = write_message(
+            &mut a,
+            &ControlMessage::CopyoverRequested { version: oversized },
+        )
+        .expect_err("an oversized payload must be refused before writing anything");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// CTO review (OBI-259): pins the error kind the supervisor's
+    /// control-socket round trip will actually see when a child stops
+    /// answering (`SIGSTOP`, a wedged responder thread, ...) -- a read
+    /// timeout, not a hang. This is the primitive the supervisor-side
+    /// fix builds on; it does not itself exercise `loom-cli`'s
+    /// `run_one_child_attempt` (a real stalled-child scenario needs a
+    /// real second process, better suited to an integration test if one
+    /// is ever added).
+    #[test]
+    fn read_message_times_out_against_a_silent_peer() {
+        let (a, mut b) = UnixStream::pair().expect("UnixStream::pair");
+        b.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .expect("set_read_timeout");
+        // `a` is kept alive (not dropped) so this is a real "peer is
+        // connected but silent" timeout, not an EOF-from-a-closed-peer
+        // case (already covered by `eof_before_any_byte_is_unexpected_eof`).
+        let err = read_message(&mut b).expect_err("a silent peer must time out, not hang");
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "expected WouldBlock or TimedOut, got {:?}",
+            err.kind()
+        );
+        drop(a);
     }
 }

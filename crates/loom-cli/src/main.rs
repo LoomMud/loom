@@ -489,6 +489,15 @@ async fn acquire_listeners(
 /// which the actual copyover logic (a separate, not-yet-built follow-up)
 /// will need regardless of exactly how it ends up structured.
 fn run_control_responder(mut control: std::os::unix::net::UnixStream) {
+    // CTO review (OBI-259): if a message this loop can't make sense of
+    // ever arrives (a future, as-yet-undefined variant, or a genuinely
+    // malformed stream), `read_message` returns `InvalidData` and this
+    // loop exits via the `Err(err)` arm below -- the supervisor then
+    // sees that as an EOF/error on its next request and (per its own
+    // poisoning rule) stops using this channel rather than desyncing
+    // against a reply that was never coming. Nothing special needs to
+    // happen here for that case beyond exiting cleanly, which the
+    // existing error handling already does.
     loop {
         match loom_supervise::control::read_message(&mut control) {
             Ok(loom_supervise::control::ControlMessage::CopyoverRequested { version }) => {
@@ -595,6 +604,17 @@ fn run_control_responder(mut control: std::os::unix::net::UnixStream) {
 const MAX_CONSECUTIVE_CRASHES: u32 = 5;
 const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(30);
 const DEFAULT_VERSION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// CTO review (OBI-259): a bound on the control-socket round trip
+/// (`write_message` + `read_message`) the version-change arm does
+/// inside `run_one_child_attempt`'s select loop. Without this, a child
+/// that stops answering (`SIGSTOP`, a wedged responder thread, a future
+/// child that holds the socket but never runs a responder at all) would
+/// leave that arm's body awaiting forever -- and since the loop only
+/// returns to `select!` once the current arm's body finishes, that also
+/// silently stops SIGTERM forwarding and child-exit detection, a
+/// liveness regression in the one process whose job is to stay alive
+/// and keep doing both.
+const COPYOVER_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     let bind_addr = loom_net::telnet_addr_from_env();
@@ -785,10 +805,36 @@ async fn run_one_child_attempt(
         })
         .map_err(|err| format!("supervise: spawn supervisor thread: {err}"))?;
 
-    let (child_pid, mut control_stream) = tokio::task::spawn_blocking(move || ready_rx.recv())
+    let (child_pid, control_stream) = tokio::task::spawn_blocking(move || ready_rx.recv())
         .await
         .map_err(|err| format!("supervise: ready-channel join: {err}"))?
         .map_err(|_| "supervise: supervisor thread exited before signalling ready".to_string())??;
+
+    // CTO review (OBI-259): `control_stream` is `Option` from here on,
+    // not because the handoff can ever hand back "no stream" (it can't
+    // -- `spawn_and_handoff` always returns one), but because any
+    // control-socket error or timeout *poisons* it to `None` for the
+    // rest of this attempt: a timed-out request followed by a late reply
+    // would otherwise desync the stream (the next request's `read_
+    // message` would read the *previous* request's stale reply as its
+    // own), so once anything goes wrong the only safe move is to stop
+    // using this stream at all, not retry it.
+    let mut control_stream = Some(control_stream);
+    if let Some(stream) = control_stream.as_ref() {
+        // Bounds the version-change arm's blocking round trip below --
+        // see `COPYOVER_CONTROL_TIMEOUT`'s own doc comment for why an
+        // unbounded wait here is a liveness regression, not just a slow
+        // copyover. `set_read_timeout`/`set_write_timeout` are plain
+        // `setsockopt` calls, not blocking I/O, so these run inline
+        // rather than needing their own `spawn_blocking`.
+        if let Err(err) = stream
+            .set_read_timeout(Some(COPYOVER_CONTROL_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(COPYOVER_CONTROL_TIMEOUT)))
+        {
+            warn!(child_pid, %err, "loom supervise: failed to set control-socket timeouts; treating control channel as unavailable");
+            control_stream = None;
+        }
+    }
 
     info!(
         child_pid,
@@ -849,35 +895,58 @@ async fn run_one_child_attempt(
                     new_version = %version,
                     "loom supervise: desired version changed -- forwarding a copyover request over the control socket (OBI-184: acknowledged only, no copyover action implemented yet)"
                 );
-                // Blocking write+read over the control `UnixStream`, off
-                // the async executor -- moving `control_stream` into
-                // `spawn_blocking` and getting it back out via the tuple
-                // keeps the same stream (and its underlying fd) for the
-                // next round, exactly like `spawn_version_watcher`'s own
-                // move-out-and-back pattern for its `VersionWatcher`.
-                let version_for_control = version.clone();
-                let (result, returned_stream) = tokio::task::spawn_blocking(move || {
-                    let result = loom_supervise::control::write_message(
-                        &mut control_stream,
-                        &loom_supervise::control::ControlMessage::CopyoverRequested {
-                            version: version_for_control,
-                        },
-                    )
-                    .and_then(|()| loom_supervise::control::read_message(&mut control_stream));
-                    (result, control_stream)
-                })
-                .await
-                .map_err(|err| format!("supervise: control-socket task join: {err}"))?;
-                control_stream = returned_stream;
-                match result {
-                    Ok(loom_supervise::control::ControlMessage::CopyoverAck) => {
-                        info!(child_pid, new_version = %version, "loom supervise: child acknowledged the copyover request");
+                match control_stream.take() {
+                    None => {
+                        warn!(
+                            child_pid,
+                            new_version = %version,
+                            "loom supervise: control channel unavailable (a previous request failed, timed out, or the socket could not be configured); cannot forward this copyover request"
+                        );
                     }
-                    Ok(other) => {
-                        warn!(child_pid, ?other, "loom supervise: child sent an unexpected reply to a copyover request");
-                    }
-                    Err(err) => {
-                        warn!(child_pid, %err, "loom supervise: failed to deliver a copyover request over the control socket");
+                    Some(mut stream) => {
+                        // Blocking write+read over the control
+                        // `UnixStream`, off the async executor, bounded
+                        // by `COPYOVER_CONTROL_TIMEOUT` (set on `stream`
+                        // right after the handoff) so a child that stops
+                        // answering can't stall this arm's body forever
+                        // -- see `COPYOVER_CONTROL_TIMEOUT`'s own doc
+                        // comment (CTO review, OBI-259). Moving `stream`
+                        // into `spawn_blocking` and getting it back out
+                        // via the tuple keeps the same stream (and its
+                        // underlying fd) for the next round, exactly
+                        // like `spawn_version_watcher`'s own
+                        // move-out-and-back pattern for its
+                        // `VersionWatcher`.
+                        let version_for_control = version.clone();
+                        let (result, stream) = tokio::task::spawn_blocking(move || {
+                            let result = loom_supervise::control::write_message(
+                                &mut stream,
+                                &loom_supervise::control::ControlMessage::CopyoverRequested {
+                                    version: version_for_control,
+                                },
+                            )
+                            .and_then(|()| loom_supervise::control::read_message(&mut stream));
+                            (result, stream)
+                        })
+                        .await
+                        .map_err(|err| format!("supervise: control-socket task join: {err}"))?;
+                        match result {
+                            Ok(loom_supervise::control::ControlMessage::CopyoverAck) => {
+                                info!(child_pid, new_version = %version, "loom supervise: child acknowledged the copyover request");
+                                // Only a clean ack puts the stream back in
+                                // play -- CTO review (OBI-259): any other
+                                // outcome (below) poisons it instead, so a
+                                // stale reply from this exchange can never
+                                // be misread as the reply to a later one.
+                                control_stream = Some(stream);
+                            }
+                            Ok(other) => {
+                                warn!(child_pid, ?other, "loom supervise: child sent an unexpected reply to a copyover request; treating control channel as unavailable from now on");
+                            }
+                            Err(err) => {
+                                warn!(child_pid, %err, "loom supervise: failed to deliver a copyover request over the control socket (possibly a timeout); treating control channel as unavailable from now on");
+                            }
+                        }
                     }
                 }
             }
