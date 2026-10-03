@@ -521,6 +521,7 @@ async fn acquire_listeners(
 /// to this `async fn` over plain channels.
 const MAX_CONSECUTIVE_CRASHES: u32 = 5;
 const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(30);
+const VERSION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     let bind_addr = loom_net::telnet_addr_from_env();
@@ -542,6 +543,27 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
         "loom supervise: listening sockets bound, spawning standby child"
     );
 
+    // Version-watching (OBI-184, this slice): detection only -- a
+    // detected change is logged by `run_one_child_attempt` below, not
+    // yet acted on (no copyover trigger exists). `None` when
+    // `LOOM_DESIRED_VERSION_FILE` isn't set keeps version watching
+    // fully disabled, matching this function's behavior before this
+    // slice.
+    let mut version_rx = desired_version_file_from_env().map(|path| {
+        let mut watcher =
+            loom_supervise::VersionWatcher::new(Box::new(loom_supervise::FileVersionSource::new(&path)), None);
+        // Establish the boot-time baseline synchronously (a single,
+        // cheap file read/stat): without this, the file's pre-existing
+        // content would be reported as a "change" on the very first
+        // poll, which is misleading -- the supervisor booted *with*
+        // that version, it didn't just switch to it.
+        if let Err(err) = watcher.poll_for_change() {
+            warn!(%err, path = %path.display(), "loom supervise: initial desired-version read failed; will keep retrying");
+        }
+        info!(path = %path.display(), current = ?watcher.current(), "loom supervise: version watching enabled");
+        spawn_version_watcher(watcher, VERSION_POLL_INTERVAL)
+    });
+
     let mut shutdown = ShutdownSignals::new()?;
     let mut consecutive_crashes: u32 = 0;
     loop {
@@ -551,6 +573,7 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
             &telnet_listener,
             &http_listener,
             &mut shutdown,
+            version_rx.as_mut(),
         )
         .await?;
 
@@ -648,6 +671,7 @@ async fn run_one_child_attempt(
     telnet_listener: &std::net::TcpListener,
     http_listener: &std::net::TcpListener,
     shutdown: &mut ShutdownSignals,
+    mut version_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
 ) -> Result<ChildAttemptOutcome, String> {
     // `spawn_handoff_and_wait` needs `'static` owned copies of the
     // listeners to move into its dedicated thread; `try_clone` is a
@@ -691,28 +715,50 @@ async fn run_one_child_attempt(
 
     let mut exit_handle = tokio::task::spawn_blocking(move || exit_rx.recv());
 
-    let outcome = tokio::select! {
-        result = &mut exit_handle => {
-            let status = result
-                .map_err(|err| format!("supervise: exit-channel join: {err}"))?
-                .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())??;
-            ChildAttemptOutcome::ChildExited(status)
-        }
-        () = shutdown.recv() => {
-            info!(child_pid, "loom supervise: received shutdown signal, forwarding SIGTERM to child");
-            // The supervisor thread does the actual `send_sigterm` (it
-            // already holds the live `Child`); this channel just wakes
-            // its wait loop up to do that instead of this async task
-            // calling `send_sigterm` itself from an unrelated thread --
-            // either would reach the same pid, but routing it through
-            // the owning thread keeps "who may act on this `Child`" to
-            // one place.
-            let _ = forward_signal_tx.send(());
-            let status = exit_handle
-                .await
-                .map_err(|err| format!("supervise: exit-channel join after signal: {err}"))?
-                .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())??;
-            ChildAttemptOutcome::ShutdownRequested(status)
+    // Looped (not a single `select!`) so a detected version change --
+    // logged only, nothing acts on it yet, see this function's doc
+    // comment and `loom-supervise`'s own "not yet implemented" list --
+    // doesn't end this attempt; it just reports and keeps waiting on
+    // the same child.
+    let outcome = loop {
+        tokio::select! {
+            result = &mut exit_handle => {
+                let status = result
+                    .map_err(|err| format!("supervise: exit-channel join: {err}"))?
+                    .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())??;
+                break ChildAttemptOutcome::ChildExited(status);
+            }
+            () = shutdown.recv() => {
+                info!(child_pid, "loom supervise: received shutdown signal, forwarding SIGTERM to child");
+                // The supervisor thread does the actual `send_sigterm` (it
+                // already holds the live `Child`); this channel just wakes
+                // its wait loop up to do that instead of this async task
+                // calling `send_sigterm` itself from an unrelated thread --
+                // either would reach the same pid, but routing it through
+                // the owning thread keeps "who may act on this `Child`" to
+                // one place.
+                let _ = forward_signal_tx.send(());
+                let status = exit_handle
+                    .await
+                    .map_err(|err| format!("supervise: exit-channel join after signal: {err}"))?
+                    .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())??;
+                break ChildAttemptOutcome::ShutdownRequested(status);
+            }
+            Some(version) = async {
+                match version_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    // No version watching configured: a `select!` arm
+                    // whose future never resolves is simply never
+                    // picked, same effect as not having this arm at all.
+                    None => std::future::pending().await,
+                }
+            } => {
+                info!(
+                    child_pid,
+                    new_version = %version,
+                    "loom supervise: desired version changed -- detected only, copyover not yet implemented (OBI-184); continuing to run the current child"
+                );
+            }
         }
     };
 
@@ -796,6 +842,66 @@ fn spawn_handoff_and_wait(
             }
         }
     }
+}
+
+/// Spawns a background task polling `watcher` on `poll_interval`,
+/// sending every *detected change* (not every poll -- see
+/// `VersionWatcher::poll_for_change`) through the returned channel.
+/// OBI-184 version-watching slice: this is detection-only plumbing --
+/// `run_one_child_attempt`'s only consumer of this channel today just
+/// logs what it receives. Driving an actual copyover off a detected
+/// change is a separate, not-yet-built follow-up.
+fn spawn_version_watcher(
+    mut watcher: loom_supervise::VersionWatcher,
+    poll_interval: Duration,
+) -> tokio::sync::mpsc::Receiver<String> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(poll_interval);
+        // The first tick fires immediately; this task already polled
+        // once synchronously (for the boot-time baseline) just before
+        // being spawned, so an immediate second poll here is harmless
+        // (it'll see no change) rather than wasteful.
+        loop {
+            interval.tick().await;
+            // `VersionWatcher::poll_for_change` does blocking file I/O
+            // (a `stat` and, on a changed mtime, a `read`); moving
+            // `watcher` into `spawn_blocking` and getting it back out
+            // via the tuple keeps that off this task's own (cooperative)
+            // poll, reusing the same watcher (with its change-tracking
+            // state) across every tick rather than rebuilding it.
+            let (result, returned_watcher) = match tokio::task::spawn_blocking(move || {
+                let result = watcher.poll_for_change();
+                (result, watcher)
+            })
+            .await
+            {
+                Ok(pair) => pair,
+                Err(err) => {
+                    warn!(%err, "loom supervise: version-watch poll task panicked; stopping version watching");
+                    return;
+                }
+            };
+            watcher = returned_watcher;
+
+            match result {
+                Ok(Some(version)) => {
+                    if tx.send(version).await.is_err() {
+                        // The receiving end (inside `supervise`'s respawn
+                        // loop) is gone -- `supervise` itself must have
+                        // already returned, so there is nothing left
+                        // for this task to report to.
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(%err, "loom supervise: version-watch poll failed (will retry next interval)");
+                }
+            }
+        }
+    });
+    rx
 }
 
 /// Spawn one `loom serve --adopt-control-fd <n>` standby child and hand
@@ -1092,6 +1198,18 @@ fn http_addr_from_env() -> String {
 /// runs that don't set it.
 fn web_root_from_env() -> Option<PathBuf> {
     std::env::var_os("LOOM_WEB_ROOT").map(PathBuf::from)
+}
+
+/// `loom supervise`'s desired-version file (OBI-184 version-watching
+/// slice, design §9.9): Docker-staging's `loom-gitops` reconciler writes
+/// the desired driver version to this path (`loom_supervise::
+/// FileVersionSource`'s own contract: trimmed, tolerant of a not-yet-
+/// existing file). Unset (the default) disables version watching
+/// entirely -- a safe default for tests, local runs, and any deployment
+/// that hasn't wired up a reconciler yet; `supervise` runs exactly as it
+/// did before this slice in that case.
+fn desired_version_file_from_env() -> Option<PathBuf> {
+    std::env::var_os("LOOM_DESIRED_VERSION_FILE").map(PathBuf::from)
 }
 
 /// Staff web auth's JWT signing keyset (OBI-174, OBI-197/M-AUTH-4, design
