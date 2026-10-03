@@ -42,6 +42,27 @@ use std::process::Command;
 /// silently land on one of those broadcast meanings too, rather than
 /// erroring the way an out-of-range pid should.
 pub fn send_sigterm(pid: u32) -> io::Result<()> {
+    send_signal(pid, libc::SIGTERM)
+}
+
+/// Send `SIGKILL` to a specific, known-live process by pid -- an
+/// unconditional, uncatchable kill, unlike [`send_sigterm`]. Exists
+/// mainly for tests that need to simulate a real crash (a `SIGTERM`
+/// gives the target a chance to exit 0 gracefully, which is a
+/// meaningfully different scenario from an actual crash) rather than
+/// for `loom supervise`'s own normal shutdown path, which always wants
+/// the graceful `SIGTERM` first.
+///
+/// Same validation and single-known-pid contract as [`send_sigterm`]
+/// -- see its doc for the full rationale.
+///
+/// # Errors
+/// Same as [`send_sigterm`].
+pub fn send_sigkill(pid: u32) -> io::Result<()> {
+    send_signal(pid, libc::SIGKILL)
+}
+
+fn send_signal(pid: u32, signal: libc::c_int) -> io::Result<()> {
     let pid = libc::pid_t::try_from(pid).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -65,7 +86,7 @@ pub fn send_sigterm(pid: u32) -> io::Result<()> {
     // (so its pid cannot have been reused by an unrelated process the
     // way a pid read from a file or another process' `/proc` listing
     // could race) for at least as long as this call.
-    let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
+    let ret = unsafe { libc::kill(pid, signal) };
     if ret != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -180,6 +201,37 @@ mod tests {
                 status.signal(),
                 Some(libc::SIGTERM),
                 "child should have been terminated by SIGTERM specifically"
+            );
+        }
+    }
+
+    /// `send_sigkill` actually terminates a real child with `SIGKILL`
+    /// specifically, not just "some signal" -- needed as a distinct
+    /// primitive from `send_sigterm` for tests that must simulate a
+    /// real crash (uncatchable, no graceful-exit chance) rather than a
+    /// cooperative shutdown.
+    #[test]
+    fn send_sigkill_actually_terminates_the_child() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("failed to spawn sleep");
+        let pid = child.id();
+
+        send_sigkill(pid).expect("send_sigkill failed");
+
+        let status = child.wait().expect("wait failed");
+        assert!(
+            !status.success(),
+            "child killed by SIGKILL should not report success"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "child should have been terminated by SIGKILL specifically"
             );
         }
     }

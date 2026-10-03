@@ -169,16 +169,18 @@ fn sigkill_the_supervisor_still_terminates_the_child_via_pdeathsig() {
     }
 }
 
-/// CTO review (OBI-184 respawn-on-crash slice): a standby child that
-/// exits without the supervisor ever having asked it to (a crash, here
-/// simulated by killing it directly rather than through the supervisor)
-/// is respawned against the *same* already-bound listening sockets, not
-/// left down. Proves this by killing the real standby child's real pid
-/// (found via `/proc`, not the supervisor's pid -- `send_sigterm`ing the
-/// supervisor itself is the already-covered graceful-shutdown path) and
-/// then reconnecting: a stale connection breaks, but the telnet port
-/// comes back up and serves a fresh connection again shortly after,
-/// without the test ever restarting `loom supervise` itself.
+/// CTO review (OBI-184 respawn-on-crash slice, revised per OBI-253):
+/// a standby child that exits without the supervisor ever having asked
+/// it to (a real crash, simulated here with `SIGKILL` -- not `SIGTERM`,
+/// which would let the child exit 0 gracefully instead of actually
+/// crashing) is respawned against the *same* already-bound listening
+/// sockets, not left down. Proves this by killing the real standby
+/// child's real pid (found via `/proc`, not the supervisor's pid --
+/// `send_sigterm`ing the supervisor itself is the already-covered
+/// graceful-shutdown path) and then reconnecting: a stale connection
+/// breaks, but the telnet port comes back up and serves a fresh
+/// connection again shortly after, without the test ever restarting
+/// `loom supervise` itself.
 #[test]
 fn standby_child_crash_is_respawned_against_the_same_listener() {
     let mudlib = fixture("tworoom");
@@ -200,7 +202,7 @@ fn standby_child_crash_is_respawned_against_the_same_listener() {
 
     let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
         .expect("did not find the standby child's pid under /proc");
-    loom_supervise::signal::send_sigterm(child_pid).expect("kill the standby child directly");
+    loom_supervise::signal::send_sigkill(child_pid).expect("SIGKILL the standby child directly");
 
     // The killed connection eventually observes EOF/an error -- not
     // asserted directly (timing against the exact moment of the kill is
@@ -215,16 +217,82 @@ fn standby_child_crash_is_respawned_against_the_same_listener() {
     // listener -- reconnecting (with its own generous retry budget,
     // since respawn involves another full mudlib compile) must succeed
     // again, and the supervisor process itself must still be running
-    // (not have given up and exited).
+    // (not have given up and exited). The read timeout here (unlike the
+    // plain handoff tests above) needs to cover the crash-respawn
+    // sequence's own 1s backoff plus a fresh mudlib compile, not just a
+    // single already-warm child's response time (CTO review, OBI-253).
     let mut reconnected = connect_with_retry(&telnet_bind, Duration::from_secs(15));
     reconnected
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
     reconnected
         .read_exact(&mut preamble)
         .expect("read telnet negotiation preamble from the respawned child");
 
     supervisor.assert_alive();
+}
+
+/// CTO review (OBI-253): a `SIGTERM`/`SIGINT` that arrives to the
+/// supervisor *during* the crash-backoff sleep between respawn attempts
+/// must not be silently dropped -- a previous version of `supervise`'s
+/// respawn loop created a fresh `shutdown_signal()` registration on
+/// every attempt (and had no listener at all during the backoff sleep
+/// itself), missing any signal delivered in that gap. `loom supervise`
+/// should exit promptly (without respawning again) even when the signal
+/// lands in that specific window, not just when it arrives while a
+/// child is actively running.
+#[test]
+fn sigterm_during_crash_backoff_stops_the_supervisor_without_a_further_respawn() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
+
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before crashing the child");
+
+    let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
+        .expect("did not find the standby child's pid under /proc");
+    loom_supervise::signal::send_sigkill(child_pid).expect("SIGKILL the standby child directly");
+
+    // Right after the crash, the supervisor is in (or about to enter)
+    // its 1s crash-backoff sleep -- send the shutdown signal into
+    // exactly that window, not before the crash (already covered by the
+    // plain SIGTERM test) and not long enough after that a respawned
+    // child would already be back up.
+    std::thread::sleep(Duration::from_millis(200));
+    loom_supervise::signal::send_sigterm(supervisor.child.id())
+        .expect("send SIGTERM to the supervisor during crash-backoff");
+
+    let status = wait_with_timeout(&mut supervisor.child, Duration::from_secs(10))
+        .expect("supervisor did not exit after a SIGTERM sent during crash-backoff");
+    assert!(
+        status.success(),
+        "supervisor should exit successfully on a shutdown signal received during crash-backoff, got {status}"
+    );
+
+    // No further respawn should have happened -- confirm the telnet
+    // port stays down rather than a new child coming up after the
+    // supervisor has already (correctly) decided to exit instead.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if TcpStream::connect(&telnet_bind).is_ok() {
+            panic!(
+                "a new standby child came up after the supervisor received a shutdown signal \
+                 during crash-backoff -- it should have exited instead of respawning again"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Scans `/proc` for a process whose `ppid` (field 4 of `/proc/<pid>/stat`)

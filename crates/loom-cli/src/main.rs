@@ -485,18 +485,26 @@ async fn acquire_listeners(
 /// process -- those remain separate, tracked follow-ups.
 ///
 /// **Respawn-on-crash (OBI-184, this slice):** a child that exits
-/// without the supervisor having asked it to (a crash, or any exit the
-/// supervisor itself never requested via a forwarded shutdown signal)
-/// is treated as transient and respawned against the *same already-
-/// bound* listening sockets -- `telnet_listener`/`http_listener` are
-/// owned by this function for its whole lifetime and only ever lent out
-/// (as fds, over `fdpass::send_fds`) to each successive child, so a
-/// respawn needs no rebind and no client-visible gap beyond however
-/// long the crashed child's own connections take to notice. Bounded by
-/// [`MAX_CONSECUTIVE_CRASHES`] crashes within [`CRASH_LOOP_WINDOW`] of
-/// each other -- past that, this gives up and returns an error rather
-/// than spinning forever against a child that can never start
-/// successfully (a bad binary, a broken mudlib, ...).
+/// without the supervisor having asked it to -- a crash, *or a clean
+/// exit the supervisor itself never requested via a forwarded shutdown
+/// signal (also respawned, exactly like a crash; this supervisor is the
+/// only thing that should ever stop a child on purpose, so any other
+/// exit is unexpected)* -- is treated as transient and respawned
+/// against the *same already-bound* listening sockets --
+/// `telnet_listener`/`http_listener` are owned by this function for its
+/// whole lifetime and only ever lent out (as fds, over
+/// `fdpass::send_fds`) to each successive child, so a respawn needs no
+/// rebind and no client-visible gap beyond however long the crashed
+/// child's own connections take to notice. Bounded by
+/// [`MAX_CONSECUTIVE_CRASHES`] exits within [`CRASH_LOOP_WINDOW`] of
+/// each other (a streak that resets once a child has run stably for at
+/// least that long) -- past that, this gives up and returns an error
+/// rather than spinning forever against a child that can never start
+/// successfully (a bad binary, a broken mudlib, ...). A failure in the
+/// spawn-and-handoff step itself (before the child is even a tracked
+/// attempt -- e.g. `fork`/`exec` failing outright) is **not** retried
+/// and propagates as a hard error immediately: only an already-running
+/// child that then exits counts toward the crash-loop budget above.
 ///
 /// **Dedicated OS thread, not Tokio's blocking pool (CTO review,
 /// OBI-251):** `loom_supervise::signal::set_death_signal_on_parent_exit`
@@ -534,11 +542,17 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
         "loom supervise: listening sockets bound, spawning standby child"
     );
 
+    let mut shutdown = ShutdownSignals::new()?;
     let mut consecutive_crashes: u32 = 0;
     loop {
         let attempt_started = tokio::time::Instant::now();
-        let outcome =
-            run_one_child_attempt(mudlib_root.clone(), &telnet_listener, &http_listener).await?;
+        let outcome = run_one_child_attempt(
+            mudlib_root.clone(),
+            &telnet_listener,
+            &http_listener,
+            &mut shutdown,
+        )
+        .await?;
 
         let status = match outcome {
             ChildAttemptOutcome::ShutdownRequested(status) => {
@@ -563,10 +577,11 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
         warn!(
             %status,
             consecutive_crashes,
-            "loom supervise: standby child exited without a shutdown request; respawning"
+            "loom supervise: standby child exited without a shutdown request (a crash, or any exit this \
+             supervisor never asked for -- a clean exit is respawned exactly the same as a crashing one); respawning"
         );
 
-        if consecutive_crashes > MAX_CONSECUTIVE_CRASHES {
+        if consecutive_crashes >= MAX_CONSECUTIVE_CRASHES {
             return Err(format!(
                 "standby child exited {consecutive_crashes} times within {CRASH_LOOP_WINDOW:?} of each other (most recently with {status}); giving up after {MAX_CONSECUTIVE_CRASHES} consecutive crashes"
             ));
@@ -577,7 +592,22 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
         // supervisor would want (tracked separately if it turns out to
         // matter) -- just enough to keep a hard crash loop from busy-
         // spinning `fork`/`exec` calls.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        //
+        // CTO review (OBI-253): this sleep must itself be interruptible
+        // by a shutdown signal using the *same* persistent `shutdown`
+        // listener as `run_one_child_attempt` -- a fresh `shutdown_
+        // signal()` call here (as a previous version of this function
+        // had) would have silently missed any signal delivered in the
+        // window between that call being made and its `signal()`
+        // registration completing, exactly the race a real `SIGTERM`
+        // sent to the supervisor during this backoff would hit.
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+            () = shutdown.recv() => {
+                info!("loom supervise: received shutdown signal during crash-backoff; exiting without respawning");
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -597,10 +627,27 @@ enum ChildAttemptOutcome {
 /// respawn loop. See [`supervise`]'s doc comment for why the actual
 /// spawn+wait happens on a dedicated `std::thread`
 /// ([`spawn_handoff_and_wait`]) rather than Tokio's blocking pool.
+///
+/// Takes `shutdown` as `&mut` from the caller rather than creating its
+/// own (CTO review, OBI-253): a fresh `tokio::signal::unix::signal`
+/// registration per call/per attempt would miss any signal delivered
+/// between one attempt's handling finishing and the next one's
+/// registration completing -- the same persistent listener must span
+/// every attempt (and the backoff sleep between them, in `supervise`).
+///
+/// Known residual gap, not covered by this fix: a shutdown signal that
+/// arrives while this function is still waiting for the child's ready
+/// signal (inside [`spawn_handoff_and_wait`]'s blocking handoff, before
+/// this function even learns the child's pid) is not specifically
+/// detected here either -- that window is bounded by how long a `serve`
+/// process takes to compile its mudlib and signal ready, not by
+/// anything this function waits on per se, and was not part of OBI-253's
+/// reported repro (which was specifically the crash-backoff window).
 async fn run_one_child_attempt(
     mudlib_root: PathBuf,
     telnet_listener: &std::net::TcpListener,
     http_listener: &std::net::TcpListener,
+    shutdown: &mut ShutdownSignals,
 ) -> Result<ChildAttemptOutcome, String> {
     // `spawn_handoff_and_wait` needs `'static` owned copies of the
     // listeners to move into its dedicated thread; `try_clone` is a
@@ -651,7 +698,7 @@ async fn run_one_child_attempt(
                 .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())??;
             ChildAttemptOutcome::ChildExited(status)
         }
-        () = shutdown_signal() => {
+        () = shutdown.recv() => {
             info!(child_pid, "loom supervise: received shutdown signal, forwarding SIGTERM to child");
             // The supervisor thread does the actual `send_sigterm` (it
             // already holds the live `Child`); this channel just wakes
@@ -1794,6 +1841,63 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Persistent `SIGINT`/`SIGTERM` listener, for callers that need to
+/// `recv()` more than once over their lifetime (CTO review, OBI-253):
+/// unlike the one-shot [`shutdown_signal`] (fine for `serve`, which only
+/// ever waits for a shutdown signal once), `tokio::signal::unix::signal`
+/// streams must be created exactly once and reused -- each call installs
+/// a fresh stream that only observes signals delivered *after* it was
+/// created, so calling [`shutdown_signal`] repeatedly (as `supervise`'s
+/// respawn loop originally did, once per attempt and again around its
+/// backoff sleep) silently drops any signal that arrives in the gap
+/// between one call returning and the next one's `signal()` call
+/// finishing -- exactly the window `supervise`'s crash-backoff sleep sat
+/// in.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    sigint: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    sigterm: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                sigint: signal(SignalKind::interrupt())
+                    .map_err(|err| format!("install SIGINT handler: {err}"))?,
+                sigterm: signal(SignalKind::terminate())
+                    .map_err(|err| format!("install SIGTERM handler: {err}"))?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    /// Waits for the next `SIGINT`/`SIGTERM` (Unix) or Ctrl-C (other
+    /// platforms). Safe to call repeatedly across the lifetime of the
+    /// one `ShutdownSignals` that owns the underlying stream(s) --
+    /// unlike re-running [`shutdown_signal`], no signal delivered
+    /// between calls is missed.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.sigint.recv() => {}
+                _ = self.sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 
