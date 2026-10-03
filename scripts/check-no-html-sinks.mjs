@@ -15,8 +15,22 @@
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const SINKS = [/\.innerHTML\s*=/, /\.outerHTML\s*=/, /insertAdjacentHTML\s*\(/, /document\.write\s*\(/];
+// Any mention of these is a violation (assignment, `+=`, or read-then-
+// write): the admin UI has no legitimate use for any of them.
+const SINKS = [
+  /\binnerHTML\b/,
+  /\bouterHTML\b/,
+  /\binsertAdjacentHTML\b/,
+  /\bdocument\.write(ln)?\s*\(/,
+  /\bcreateContextualFragment\b/,
+  /\bDOMParser\b/,
+  /\bsrcdoc\b/,
+  /\beval\s*\(/,
+  /\bnew\s+Function\s*\(/,
+  /setAttribute\(\s*["'`]on/i,
+];
 
 function walk(dir) {
   const out = [];
@@ -32,11 +46,15 @@ function walk(dir) {
   return out;
 }
 
-const root = join(new URL(".", import.meta.url).pathname, "..", "web-client", "src");
+const root = join(fileURLToPath(new URL(".", import.meta.url)), "..", "web-client", "src");
 let violations = 0;
 
 for (const file of walk(root)) {
-  const text = readFileSync(file, "utf8");
+  // Strip comments (keeping line numbers) so doc comments that *name*
+  // the banned sinks don't trip the check.
+  const text = readFileSync(file, "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, (block) => block.replace(/[^\n]/g, " "))
+    .replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
   const lines = text.split("\n");
   lines.forEach((line, i) => {
     for (const sink of SINKS) {

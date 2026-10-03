@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { decodeAccessToken, isStepUpFresh, STEP_UP_WINDOW_SECS } from "./stepup.js";
+import { decodeAccessToken, isStepUpFresh, sameSubject, STEP_UP_WINDOW_SECS } from "./stepup.js";
 
 function fakeToken(claims: Record<string, unknown>): string {
   const header = Buffer.from(JSON.stringify({ alg: "EdDSA" })).toString("base64url");
@@ -40,4 +40,14 @@ test("isStepUpFresh is false with no token, no mfa_at, or a malformed token", ()
   assert.equal(isStepUpFresh(null), false);
   assert.equal(isStepUpFresh(fakeToken({ sub: "lead", tier: 1, mfa_at: null, exp: 999999 })), false);
   assert.equal(isStepUpFresh("garbage"), false);
+});
+
+test("sameSubject only accepts a fresh token for the same uid", () => {
+  const a = fakeToken({ sub: "uid-1", tier: 3, mfa_at: 1, exp: 9 });
+  const a2 = fakeToken({ sub: "uid-1", tier: 3, mfa_at: 2, exp: 9 });
+  const b = fakeToken({ sub: "uid-2", tier: 4, mfa_at: 2, exp: 9 });
+  assert.equal(sameSubject(a, a2), true);
+  assert.equal(sameSubject(a, b), false);
+  assert.equal(sameSubject(null, a2), false);
+  assert.equal(sameSubject("garbage", a2), false);
 });

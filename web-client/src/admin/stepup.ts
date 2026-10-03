@@ -82,3 +82,16 @@ export function isStepUpFresh(
   }
   return nowUnixSecs - claims.mfa_at <= STEP_UP_WINDOW_SECS;
 }
+
+/** `true` only if both tokens decode and carry the same `sub`. Step-up
+ * must re-prove the *current* session's identity: a re-auth that comes
+ * back as a different staff member is refused rather than silently
+ * swapping who the pending action runs as. */
+export function sameSubject(current: string | null, fresh: string): boolean {
+  if (current === null) {
+    return false;
+  }
+  const a = decodeAccessToken(current);
+  const b = decodeAccessToken(fresh);
+  return a !== null && b !== null && a.sub === b.sub;
+}

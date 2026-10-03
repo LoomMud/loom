@@ -3,7 +3,7 @@
 
 import { AdminApi, describeError } from "./api.js";
 import { el, clear, errorBanner } from "./dom.js";
-import { decodeAccessToken, isStepUpFresh } from "./stepup.js";
+import { isStepUpFresh, sameSubject } from "./stepup.js";
 import type { TokenStore } from "./tokenstore.js";
 
 /**
@@ -37,8 +37,9 @@ function showStepUpModal(
   tokens: TokenStore,
 ): Promise<boolean> {
   return new Promise((resolve) => {
-    const claims = decodeAccessToken(tokens.get() ?? "");
-    const username = claims?.sub ?? "";
+    // The token's `sub` is the staff uid; `/auth/login` wants the
+    // username the session signed in with (`TokenStore.username`).
+    const username = tokens.username() ?? "";
 
     const passwordInput = el("input", {
       type: "password",
@@ -82,7 +83,11 @@ function showStepUpModal(
       clear(status);
       void (async () => {
         try {
-          const result = await api.reauth(username, passwordInput.value, totpInput.value);
+          const result = await api.login(username, passwordInput.value, totpInput.value);
+          if (!sameSubject(tokens.get(), result.access_token)) {
+            status.append(errorBanner("re-authenticated as a different account -- refused"));
+            return;
+          }
           tokens.set(result.access_token);
           finish(true);
         } catch (err) {
