@@ -10,7 +10,8 @@ use std::thread;
 use std::time::Duration;
 
 use loom_http::admin_query::{
-    ADMIN_QUERY_QUEUE_DEPTH, ChannelWorldQuery, ObjectVars, VarEntry, WhoEntry, WorldQueryRequest,
+    ADMIN_QUERY_QUEUE_DEPTH, ChannelWorldQuery, ErrorGroup, ObjectVars, VarEntry, WhoEntry,
+    WorldQueryRequest,
 };
 use loom_net::{GmcpMessage, NetCommand, NetConfig, NetEvent};
 use loom_persist::{DbEvent, DbRequest, Password, Persist};
@@ -1502,6 +1503,29 @@ fn spawn_world_thread(
                                 }
                             };
                             let _ = reply.send(result);
+                        }
+                        WorldQueryRequest::Errors {
+                            euid,
+                            tier,
+                            program_prefix,
+                            reply,
+                        } => {
+                            let groups = world
+                                .admin_errors(&euid, tier, program_prefix.as_deref(), host)
+                                .into_iter()
+                                .map(|g| ErrorGroup {
+                                    program: g.program,
+                                    function: g.function,
+                                    line: g.line,
+                                    message: g.message,
+                                    redacted: g.redacted,
+                                    count: g.count,
+                                    first_seen_unix_ms: g.first_seen_unix_ms,
+                                    last_seen_unix_ms: g.last_seen_unix_ms,
+                                    sample_trace: g.sample_trace,
+                                })
+                                .collect();
+                            let _ = reply.send(Ok(groups));
                         }
                     }
                 }

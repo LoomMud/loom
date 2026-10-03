@@ -114,6 +114,25 @@ pub struct AdminObjectVars {
     pub vars: Vec<AdminVarEntry>,
 }
 
+/// One group in the OBI-235/OBI-237 admin-query `errors` answer, already
+/// `valid_read`-filtered per program and M-ERR-1-redacted (see
+/// [`World::admin_errors`]). Mirrors `loom_http::admin_query::ErrorGroup`
+/// field-for-field (which itself mirrors `crate::errors::ErrorRecord`,
+/// except `line` is `Option<u32>` here/there vs. `ErrorRecord`'s `0`-for-
+/// unknown convention).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminErrorGroup {
+    pub program: String,
+    pub function: String,
+    pub line: Option<u32>,
+    pub message: String,
+    pub redacted: bool,
+    pub count: u64,
+    pub first_seen_unix_ms: u64,
+    pub last_seen_unix_ms: u64,
+    pub sample_trace: Vec<String>,
+}
+
 /// A connection's session timing (OBI-237): `connected_at` is wall-clock
 /// (what `who` reports), `last_activity` is monotonic (`Instant`, so
 /// `idle_secs` can never go backwards under a clock adjustment). Kept
@@ -1182,6 +1201,73 @@ impl World {
             }))
         })
         .unwrap_or(None)
+    }
+
+    /// `GET /api/v1/admin/errors`'s real data (OBI-235, OBI-237): every
+    /// error-inbox group (`World::errors_snapshot`, OBI-169) whose
+    /// *program* `caller_euid` can `valid_read`, optionally narrowed to
+    /// `program_prefix` first (`errors_snapshot`'s own filter -- same
+    /// semantics as the `errors` efun's own `filter` argument). Exactly
+    /// `errors_efun`'s own per-program permission filter and M-ERR-1
+    /// redaction rule, just invoked for an HTTP admin caller instead of
+    /// an in-game one: a denied program's groups are silently omitted,
+    /// not an error, and a `/secure/**` origin's message is redacted to
+    /// any caller below `caller_tier` 5, independent of whether
+    /// `valid_read` itself already let a lower tier through (see
+    /// `errors_efun`'s own doc comment for why that floor is
+    /// driver-enforced, not conditioned on the master's policy).
+    ///
+    /// `caller_tier` here *is* used (unlike `admin_list_objects`/
+    /// `admin_object_vars`'s `_caller_tier`): M-ERR-1's redaction rule is
+    /// specifically tier-keyed, not `valid_read`-keyed, both in the
+    /// `errors` efun and here -- the HTTP-authenticated staff tier is
+    /// the same tier space the master's roles snapshot uses (T5 is
+    /// `/secure`'s own floor throughout the admin-query surface, e.g.
+    /// `loom-http`'s `SECURE_VARS_MIN_TIER`).
+    pub fn admin_errors(
+        &mut self,
+        caller_euid: &str,
+        caller_tier: i16,
+        program_prefix: Option<&str>,
+        host: &mut dyn Host,
+    ) -> Vec<AdminErrorGroup> {
+        let master = self.master_or_sentinel();
+        let euid_sym = self.registry.syms.intern(caller_euid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: euid_sym,
+            euid: euid_sym,
+        });
+        let rows = self.errors_snapshot(program_prefix);
+        self.exec(host, master, None, None, Some(guard), None, None, |h| {
+            let mut decided: HashMap<String, bool> = HashMap::new();
+            let mut out = Vec::new();
+            for row in rows {
+                let allowed = *decided
+                    .entry(row.program.clone())
+                    .or_insert_with(|| h.admin_valid_read("errors", &row.program));
+                if !allowed {
+                    continue;
+                }
+                let message = if row.redacted && caller_tier < 5 {
+                    "<redacted>".to_string()
+                } else {
+                    row.message
+                };
+                out.push(AdminErrorGroup {
+                    program: row.program,
+                    function: row.function,
+                    line: if row.line == 0 { None } else { Some(row.line) },
+                    message,
+                    redacted: row.redacted,
+                    count: row.count,
+                    first_seen_unix_ms: row.first_seen_unix_ms,
+                    last_seen_unix_ms: row.last_seen_unix_ms,
+                    sample_trace: row.sample_trace,
+                });
+            }
+            Ok(out)
+        })
+        .unwrap_or_default()
     }
 
     /// `tick_share_per_min` (OBI-121 S2c §3, OBI-137 S2): does `uid`'s
