@@ -480,15 +480,22 @@ async fn acquire_listeners(
 /// control messages ([`loom_supervise::control`]) for as long as the
 /// control socket stays open.
 ///
-/// **Scope (OBI-184, this slice):** a `CopyoverRequested` is acknowledged
-/// immediately and unconditionally -- nothing actually reclaims
-/// connections, snapshots the world, or hands anything off yet. See
-/// `loom_supervise::control`'s module doc for why that's the honest,
-/// explicitly-not-hidden scope of this slice: it proves the control
-/// channel survives past startup and carries a real message both ways,
-/// which the actual copyover logic (a separate, not-yet-built follow-up)
-/// will need regardless of exactly how it ends up structured.
-fn run_control_responder(mut control: std::os::unix::net::UnixStream) {
+/// **Scope (OBI-184, this slice):** a `CopyoverRequested` now triggers a
+/// *real* snapshot of this process's own running world (via
+/// `snapshot_req_tx`, drained inline via `try_recv` on each tick of
+/// `spawn_world_thread`'s own event loop -- never blocking that loop
+/// waiting on a request that may never come), proving the
+/// control-socket trigger can reach all the way into live `World` state
+/// and back. It still does not reclaim any connections or actually hand
+/// anything off to a standby -- the snapshot bytes are logged (their
+/// length, not their content) and then dropped. The next, not-yet-built
+/// follow-up is doing something real with them: reclaiming this
+/// process's live connections via `fdpass::send_fds` and routing both
+/// (plus the snapshot) to a freshly-spawned standby.
+fn run_control_responder(
+    mut control: std::os::unix::net::UnixStream,
+    snapshot_req_tx: std::sync::mpsc::Sender<std::sync::mpsc::Sender<Result<Vec<u8>, String>>>,
+) {
     // CTO review (OBI-259): if a message this loop can't make sense of
     // ever arrives (a future, as-yet-undefined variant, or a genuinely
     // malformed stream), `read_message` returns `InvalidData` and this
@@ -504,13 +511,27 @@ fn run_control_responder(mut control: std::os::unix::net::UnixStream) {
                 info!(
                     version,
                     "loom serve: received a copyover request over the control socket -- \
-                     acknowledging only (OBI-184: no copyover action implemented yet)"
+                     taking a real world snapshot (OBI-184: logged only, no reclaim/handoff \
+                     implemented yet)"
                 );
-                if let Err(err) = loom_supervise::control::write_message(
-                    &mut control,
-                    &loom_supervise::control::ControlMessage::CopyoverAck,
-                ) {
-                    warn!(%err, "loom serve: failed to ack a copyover request; control responder exiting");
+                let reply = request_snapshot(&snapshot_req_tx);
+                let ack_or_nack = match reply {
+                    Ok(bytes) => {
+                        info!(
+                            version,
+                            snapshot_bytes = bytes.len(),
+                            "loom serve: world snapshot taken for the copyover request"
+                        );
+                        loom_supervise::control::ControlMessage::CopyoverAck
+                    }
+                    Err(reason) => {
+                        warn!(version, %reason, "loom serve: failed to snapshot the world for a copyover request");
+                        loom_supervise::control::ControlMessage::CopyoverNack { reason }
+                    }
+                };
+                if let Err(err) = loom_supervise::control::write_message(&mut control, &ack_or_nack)
+                {
+                    warn!(%err, "loom serve: failed to reply to a copyover request; control responder exiting");
                     return;
                 }
             }
@@ -539,6 +560,32 @@ fn run_control_responder(mut control: std::os::unix::net::UnixStream) {
             }
         }
     }
+}
+
+/// How long [`run_control_responder`] waits for the world thread to
+/// answer a snapshot request before giving up and `CopyoverNack`ing
+/// (CTO review pattern established for `COPYOVER_CONTROL_TIMEOUT`:
+/// nothing in this control-protocol path should ever wait unbounded on
+/// another thread/process). A world thread that cannot even respond
+/// within this long is already in enough trouble that a `Nack` here is
+/// the least of its problems -- this bound exists so *this* thread
+/// doesn't also wedge waiting on it.
+const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Ask the world thread (whose event loop in `spawn_world_thread` drains
+/// `snapshot_req_rx` inline via `try_recv`) for a fresh snapshot of its
+/// current state, blocking this (control-responder) thread until it
+/// answers or [`SNAPSHOT_REQUEST_TIMEOUT`] elapses.
+fn request_snapshot(
+    snapshot_req_tx: &std::sync::mpsc::Sender<std::sync::mpsc::Sender<Result<Vec<u8>, String>>>,
+) -> Result<Vec<u8>, String> {
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    snapshot_req_tx
+        .send(reply_tx)
+        .map_err(|_| "world thread's snapshot-request channel is gone".to_string())?;
+    reply_rx
+        .recv_timeout(SNAPSHOT_REQUEST_TIMEOUT)
+        .map_err(|err| format!("world thread did not answer the snapshot request: {err}"))?
 }
 
 /// `loom supervise` (OBI-184, design §7.5/§9.2): the in-pod supervisor
@@ -1197,19 +1244,6 @@ async fn serve(
     adopt_control_fd: Option<std::os::fd::RawFd>,
 ) -> Result<(), String> {
     let (listener, http_listener, control_stream) = acquire_listeners(adopt_control_fd).await?;
-    // OBI-184 control-protocol slice: if this process was handed off to
-    // by `loom supervise` (not the fresh-bind path), the control socket
-    // stays open after the handoff handshake -- spawn a dedicated thread
-    // to answer post-startup control messages on it for the rest of this
-    // process's life. Blocking reads, so its own `std::thread`, not a
-    // tokio task (same reasoning as `loom-supervise`'s dedicated-thread
-    // doc comments elsewhere in this file).
-    if let Some(control) = control_stream {
-        std::thread::Builder::new()
-            .name("loom-serve-control".to_string())
-            .spawn(move || run_control_responder(control))
-            .map_err(|err| format!("failed to spawn control-responder thread: {err}"))?;
-    }
     let actual_addr = listener
         .local_addr()
         .map_err(|err| format!("failed to read local addr: {err}"))?;
@@ -1271,6 +1305,15 @@ async fn serve(
         tokio::spawn(run_audit_sink(p, audit_rx, shutdown_rx.clone()));
     }
 
+    // OBI-184 (copyover-trigger slice): the world thread answers
+    // snapshot requests from the control responder over this channel --
+    // created before `spawn_world_thread` (which drains the receiving
+    // end) and before the responder thread below (which holds the
+    // sending end), so neither constructor needs an `Option`/placeholder
+    // for the other side.
+    let (snapshot_req_tx, snapshot_req_rx) =
+        std::sync::mpsc::channel::<std::sync::mpsc::Sender<Result<Vec<u8>, String>>>();
+
     let world_handle = spawn_world_thread(
         mudlib_root.clone(),
         save_dir,
@@ -1284,7 +1327,23 @@ async fn serve(
         audit_tx,
         persist.is_some(),
         persist.is_none(),
+        snapshot_req_rx,
     )?;
+
+    // OBI-184 control-protocol slice: if this process was handed off to
+    // by `loom supervise` (not the fresh-bind path), the control socket
+    // stays open after the handoff handshake -- spawn a dedicated thread
+    // to answer post-startup control messages on it for the rest of this
+    // process's life. Blocking reads, so its own `std::thread`, not a
+    // tokio task (same reasoning as `loom-supervise`'s dedicated-thread
+    // doc comments elsewhere in this file). Spawned after the world
+    // thread so it always has a live `snapshot_req_tx` to send to.
+    if let Some(control) = control_stream {
+        std::thread::Builder::new()
+            .name("loom-serve-control".to_string())
+            .spawn(move || run_control_responder(control, snapshot_req_tx))
+            .map_err(|err| format!("failed to spawn control-responder thread: {err}"))?;
+    }
 
     info!(bind = %actual_addr, http_bind = %http_actual_addr, mudlib = %mudlib_root.display(), "loom server started");
 
@@ -2072,6 +2131,7 @@ fn spawn_world_thread(
     audit_tx: mpsc::Sender<Vec<loom_vm::AuditRow>>,
     has_audit_sink: bool,
     load_roles_seed: bool,
+    snapshot_req_rx: std::sync::mpsc::Receiver<std::sync::mpsc::Sender<Result<Vec<u8>, String>>>,
 ) -> Result<thread::JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let handle = thread::Builder::new()
@@ -2241,6 +2301,19 @@ fn spawn_world_thread(
                     world.set_roles_snapshot(snap);
                 }
                 drain_db_events(&mut world, &mut host);
+                // OBI-184 (copyover-trigger slice): a snapshot request
+                // from `run_control_responder`'s control socket, drained
+                // the same way as every other side-channel input to this
+                // loop -- `try_recv`, never blocking, so an idle (or
+                // never-sent) channel costs nothing and a request can
+                // never stall a tick waiting on it.
+                while let Ok(reply_tx) = snapshot_req_rx.try_recv() {
+                    let result = world
+                        .begin_snapshot()
+                        .map_err(|err| err.to_string())
+                        .and_then(|job| job.encode_all().map_err(|err| err.to_string()));
+                    let _ = reply_tx.send(result);
+                }
             }
         })
         .map_err(|err| format!("failed to spawn world thread: {err}"))?;
