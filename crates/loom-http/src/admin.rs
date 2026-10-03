@@ -46,6 +46,7 @@ pub fn admin_router() -> Router<HttpState> {
         .route("/api/v1/admin/who", get(who))
         .route("/api/v1/admin/objects", get(list_objects))
         .route("/api/v1/admin/objects/{*rest}", get(object_vars))
+        .route("/api/v1/admin/errors", get(errors))
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,34 +315,6 @@ async fn list_objects(
     }
 }
 
-#[derive(Debug, Serialize)]
-struct VarEntryResponse {
-    name: String,
-    value: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ObjectVarsResponse {
-    path: String,
-    vars: Vec<VarEntryResponse>,
-}
-
-impl From<crate::admin_query::ObjectVars> for ObjectVarsResponse {
-    fn from(entry: crate::admin_query::ObjectVars) -> Self {
-        ObjectVarsResponse {
-            path: entry.path,
-            vars: entry
-                .vars
-                .into_iter()
-                .map(|v| VarEntryResponse {
-                    name: v.name,
-                    value: v.value,
-                })
-                .collect(),
-        }
-    }
-}
-
 /// `GET /api/v1/admin/objects/:path/vars`, mounted as the
 /// `/api/v1/admin/objects/{*rest}` wildcard (axum has no way to express
 /// a static suffix after a variable-length path segment): `rest` is
@@ -377,6 +350,102 @@ async fn object_vars(
         .await
     {
         Ok(vars) => (StatusCode::OK, Json(ObjectVarsResponse::from(vars))).into_response(),
+        Err(error) => admin_error_response(error).into_response(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct VarEntryResponse {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ObjectVarsResponse {
+    path: String,
+    vars: Vec<VarEntryResponse>,
+}
+
+impl From<crate::admin_query::ObjectVars> for ObjectVarsResponse {
+    fn from(entry: crate::admin_query::ObjectVars) -> Self {
+        ObjectVarsResponse {
+            path: entry.path,
+            vars: entry
+                .vars
+                .into_iter()
+                .map(|v| VarEntryResponse {
+                    name: v.name,
+                    value: v.value,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorsQuery {
+    #[serde(default)]
+    program_prefix: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorGroupResponse {
+    program: String,
+    function: String,
+    line: Option<u32>,
+    message: String,
+    redacted: bool,
+    count: u64,
+    first_seen_unix_ms: u64,
+    last_seen_unix_ms: u64,
+    sample_trace: Vec<String>,
+}
+
+impl From<crate::admin_query::ErrorGroup> for ErrorGroupResponse {
+    fn from(entry: crate::admin_query::ErrorGroup) -> Self {
+        ErrorGroupResponse {
+            program: entry.program,
+            function: entry.function,
+            line: entry.line,
+            message: entry.message,
+            redacted: entry.redacted,
+            count: entry.count,
+            first_seen_unix_ms: entry.first_seen_unix_ms,
+            last_seen_unix_ms: entry.last_seen_unix_ms,
+            sample_trace: entry.sample_trace,
+        }
+    }
+}
+
+/// `GET /api/v1/admin/errors` (OBI-235, P2-O2): the HTTP wiring for the
+/// grouped runtime-error inbox `loom-vm` built for the `errors` efun
+/// (OBI-169) -- T3+ (same floor as object listing, [`crate::auth::
+/// ERROR_INBOX_MIN_TIER`]), filtered/redacted entirely on the world
+/// side (`query.errors`), audited allow and deny alike (M-ADM-4).
+async fn errors(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Query(query_params): Query<ErrorsQuery>,
+) -> impl IntoResponse {
+    let Some(auth) = state.auth_service() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
+    };
+    let Some(claims) = bearer_claims(&headers, &state) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(query) = state.world_query() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
+    };
+    let ctx = auth_context(&headers, Some(peer));
+    match auth
+        .admin_errors(&claims, &ctx, query, query_params.program_prefix.as_deref())
+        .await
+    {
+        Ok(rows) => {
+            let rows: Vec<ErrorGroupResponse> = rows.into_iter().map(Into::into).collect();
+            (StatusCode::OK, Json(rows)).into_response()
+        }
         Err(error) => admin_error_response(error).into_response(),
     }
 }
@@ -582,6 +651,48 @@ mod tests {
                     value: "100".to_string(),
                 }],
             })
+        }
+
+        async fn errors(
+            &self,
+            euid: &str,
+            _tier: i16,
+            program_prefix: Option<&str>,
+        ) -> Result<Vec<crate::admin_query::ErrorGroup>, crate::admin_query::WorldQueryError>
+        {
+            let all = vec![
+                crate::admin_query::ErrorGroup {
+                    program: "/d/shire/calc.wf".to_string(),
+                    function: "calc".to_string(),
+                    line: Some(42),
+                    message: "division by zero".to_string(),
+                    redacted: false,
+                    count: 3,
+                    first_seen_unix_ms: 1_000,
+                    last_seen_unix_ms: 2_000,
+                    sample_trace: vec!["in calc()".to_string()],
+                },
+                crate::admin_query::ErrorGroup {
+                    program: "/secure/master".to_string(),
+                    function: "boot".to_string(),
+                    line: None,
+                    message: if euid == "lead" {
+                        "real secret detail".to_string()
+                    } else {
+                        "<redacted>".to_string()
+                    },
+                    redacted: true,
+                    count: 1,
+                    first_seen_unix_ms: 500,
+                    last_seen_unix_ms: 500,
+                    sample_trace: vec![],
+                },
+            ];
+            Ok(all
+                .into_iter()
+                .filter(|e| euid == "lead" || !e.program.starts_with("/secure/"))
+                .filter(|e| program_prefix.is_none_or(|p| e.program.starts_with(p)))
+                .collect())
         }
     }
 
@@ -996,5 +1107,125 @@ mod tests {
         let request = with_peer(request);
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn errors_below_tier_3_is_forbidden() {
+        let (app, auth, dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "builder", 2, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/errors")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let audits = dir.audits.lock().unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.kind == "admin.errors" && e.verdict == "deny")
+        );
+    }
+
+    #[tokio::test]
+    async fn errors_at_tier_3_is_filtered_and_redacted_by_world_query() {
+        let (app, auth, dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        // `domainlead` is T3 but not `lead`: `FakeWorldQuery::errors`
+        // hides `/secure/master`'s group entirely for non-`lead` callers
+        // -- proves the HTTP layer passes the real `euid` through and
+        // doesn't widen the result.
+        let token = access_token(&auth, "domainlead", 3, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/errors")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["program"], "/d/shire/calc.wf");
+        assert_eq!(rows[0]["count"], 3);
+        let audits = dir.audits.lock().unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.kind == "admin.errors" && e.verdict == "allow")
+        );
+    }
+
+    #[tokio::test]
+    async fn errors_at_tier_3_for_lead_sees_the_redacted_secure_group_too() {
+        let (app, auth, _dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "lead", 3, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/errors")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|r| r["program"] == "/secure/master" && r["redacted"] == true)
+        );
+    }
+
+    #[tokio::test]
+    async fn errors_program_prefix_query_param_is_forwarded() {
+        let (app, auth, _dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "domainlead", 3, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/errors?program_prefix=/d/shire")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/errors?program_prefix=/nowhere")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn errors_without_bearer_is_401() {
+        let (app, _auth, _dir) = test_app();
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/errors")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
