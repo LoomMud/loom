@@ -385,6 +385,14 @@ impl GitWorker {
     }
 }
 
+/// OBI-210 R1 (CTO review of PR #82): the pure doubling-and-cap step
+/// `run`'s main loop uses to schedule the next dirty-tree retry, pulled
+/// out so a test can exercise exactly what the worker calls rather than
+/// re-implementing the formula.
+fn next_dirty_retry_backoff(current: Duration, cap: Duration) -> Duration {
+    current.saturating_mul(2).min(cap)
+}
+
 fn run(
     config: GitConfig,
     rx: Receiver<Msg>,
@@ -529,7 +537,7 @@ fn run(
                     // unthrottled re-fetch loop against the remote.
                     let backoff = dirty_retry_backoff;
                     dirty_retry_due = Some(Instant::now() + backoff);
-                    dirty_retry_backoff = backoff.saturating_mul(2).min(config.sync_poll);
+                    dirty_retry_backoff = next_dirty_retry_backoff(backoff, config.sync_poll);
                     if last_dirty_warn.is_none_or(|t| t.elapsed() >= backoff) {
                         tracing::warn!(
                             paths = ?dirty_paths,
@@ -917,9 +925,16 @@ fn run_sync_main(
             .git(&["checkout", "-f", "--detach", &new_live])
             .is_err()
         {
-            // Work tree may be left mid-checkout, but `refs/heads/live`
-            // and `HEAD` are both still exactly as they were (`live` at
-            // `old_live`): nothing to roll back, just retry.
+            // OBI-210 follow-up (CTO review of PR #82): a `checkout -f
+            // --detach` that fails partway can leave the work tree
+            // mid-checkout even though `refs/heads/live`/`HEAD` are
+            // still exactly as they were (`live` at `old_live`). Left
+            // alone, the *next* pass would see that half-updated tree as
+            // dirty and back off forever instead of self-healing. `live`
+            // itself is still `old_live` here, so a best-effort
+            // `checkout -f live` is safe and gives the tree a chance to
+            // recover before the next retry.
+            let _ = repo.git(&["checkout", "-f", "live"]);
             needs_retry = true;
         } else if repo
             .git(&["update-ref", "refs/heads/live", &new_live])
@@ -1251,6 +1266,12 @@ mod tests {
     /// `HEAD` then fails, `live` must be rolled back to `old_live` rather
     /// than left pointing at a commit the work tree (and `HEAD`) don't
     /// actually reflect.
+    ///
+    /// Root-sensitive (CTO review of PR #82): relies on a `0o555`
+    /// `refs/heads` directory actually denying the write that forces the
+    /// ref-move failure this test exercises -- root ignores Unix
+    /// permission bits, so this would silently pass for the wrong reason
+    /// under a root test runner. CI runs as non-root.
     #[test]
     fn checkout_succeeds_but_ref_move_fails_rolls_live_back() {
         let fx = setup();
@@ -1351,7 +1372,7 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..10 {
             seen.push(backoff);
-            backoff = backoff.saturating_mul(2).min(cap);
+            backoff = next_dirty_retry_backoff(backoff, cap);
         }
         assert_eq!(
             seen,

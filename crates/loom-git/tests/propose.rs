@@ -304,6 +304,12 @@ fn default_config(fx: &Fixture, env: &str) -> GitConfig {
     config.push_debounce = Duration::from_millis(10);
     config.sync_poll = Duration::from_secs(3600);
     config.tick = Duration::from_millis(10);
+    // OBI-210 R4: `GitWorker::spawn`/`spawn_with_propose` refuse to
+    // start with a `TokenProvider` configured unless `remote_url` is
+    // `https://` -- these tests use a `TokenProvider` against a local
+    // bare-repo path remote, so this placeholder satisfies the gate
+    // without claiming the local path remote is itself `https://`.
+    config.remote_url = "https://github.com/example/warp-mudlib.git".to_string();
     config
 }
 
@@ -340,7 +346,8 @@ fn happy_path_opens_a_pr_with_expected_branch_and_body_shape() {
                 repo: "warp".to_string(),
             }),
         },
-    );
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
 
     let result = handle
         .propose(base_request(vec!["/domains/x/a.wf"]))
@@ -410,7 +417,8 @@ fn mapping_rewrites_paths_and_counts_content_rewrites() {
                 repo: "warp".to_string(),
             }),
         },
-    );
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
 
     let mut req = base_request(vec!["/domains/x"]);
     req.target_prefix = Some("/domains/y".to_string());
@@ -451,7 +459,8 @@ fn t2_denied_proposing_into_protected() {
             limits: ProposeLimits::default(),
             github: None,
         },
-    );
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
     let mut req = base_request(vec!["/protected/secret.wf"]);
     req.tier = "T2".to_string();
     let err = handle.propose(req).unwrap_err();
@@ -479,7 +488,8 @@ fn t1_denied_proposing_into_domain_live() {
             limits: ProposeLimits::default(),
             github: None,
         },
-    );
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
     let mut req = base_request(vec!["/domain_live/room.wf"]);
     req.tier = "T1".to_string();
     let err = handle.propose(req).unwrap_err();
@@ -510,7 +520,8 @@ fn too_many_files_limit_is_enforced() {
             },
             github: None,
         },
-    );
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
     // `/domains/x` expands to both a.wf and b.wf -- two files, over the
     // limit of one.
     let err = handle
@@ -537,7 +548,8 @@ fn too_large_limit_is_enforced() {
             },
             github: None,
         },
-    );
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
     let err = handle
         .propose(base_request(vec!["/domains/x/b.wf"]))
         .unwrap_err();
@@ -562,7 +574,8 @@ fn too_many_open_proposals_limit_is_enforced() {
             limits: ProposeLimits::default(),
             github: None,
         },
-    );
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
     let err = handle
         .propose(base_request(vec!["/domains/x/a.wf"]))
         .unwrap_err();
@@ -584,7 +597,8 @@ fn daily_limit_is_enforced() {
             limits: ProposeLimits::default(),
             github: None,
         },
-    );
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
     let err = handle
         .propose(base_request(vec!["/domains/x/a.wf"]))
         .unwrap_err();
@@ -601,7 +615,8 @@ fn no_github_app_configured_keeps_the_commit_locally_for_retry() {
         Box::new(NoopHost),
         Box::new(NoopAudit),
         ProposeConfig::disabled(),
-    );
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
     let err = handle
         .propose(base_request(vec!["/domains/x/a.wf"]))
         .unwrap_err();
