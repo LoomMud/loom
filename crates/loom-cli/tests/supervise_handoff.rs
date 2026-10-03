@@ -456,15 +456,18 @@ fn version_file_change_is_detected_and_logged() {
 
 /// OBI-184 control-protocol slice: a detected version change is now
 /// forwarded as a real `ControlMessage::CopyoverRequested` over the
-/// control socket to the already-running child, and the child's own
-/// `run_control_responder` thread acknowledges it -- not yet an actual
-/// copyover (see `run_one_child_attempt`'s and `run_control_responder`'s
-/// own doc comments for the honest scope), but a real round trip over a
-/// control channel that stays open past the initial handoff, proven end
-/// to end: both the supervisor's "forwarding a copyover request" log and
-/// its "child acknowledged" log (the latter only possible if the
-/// request actually reached the child and the child's reply actually
-/// came back) must appear.
+/// control socket to the already-running child, which now takes a real
+/// snapshot of its own running world (via the world thread's snapshot-
+/// request channel) before acknowledging -- not yet an actual copyover
+/// (see `run_one_child_attempt`'s and `run_control_responder`'s own doc
+/// comments for the honest scope: no reclaim, no handoff to a standby
+/// yet), but a real round trip over a control channel that stays open
+/// past the initial handoff, proven end to end: the supervisor's
+/// "forwarding a copyover request" log, the child's own "world snapshot
+/// taken" log (with a real, nonzero byte count -- not a stand-in value),
+/// and the supervisor's "child acknowledged" log (only possible if the
+/// request reached the child, a real snapshot was taken, and the reply
+/// came back) must all appear.
 #[test]
 fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
     let mudlib = fixture("tworoom");
@@ -506,12 +509,42 @@ fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut saw_forwarded = false;
+    let mut saw_snapshot_taken = false;
     let mut saw_acknowledged = false;
-    while Instant::now() < deadline && !(saw_forwarded && saw_acknowledged) {
+    while Instant::now() < deadline && !(saw_forwarded && saw_snapshot_taken && saw_acknowledged) {
         match line_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(line) => {
+            Ok(raw_line) => {
+                // `tracing_subscriber`'s `fmt` layer applies ANSI colour
+                // codes unconditionally (not just when the writer is a
+                // terminal), which would otherwise split a literal
+                // `"snapshot_bytes="` search across escape sequences --
+                // strip them once up front so every check below can use
+                // plain substring/field matching.
+                let line = strip_ansi(&raw_line);
                 if line.contains("forwarding a copyover request") && line.contains("v2.0.0") {
                     saw_forwarded = true;
+                }
+                if line.contains("world snapshot taken for the copyover request")
+                    && line.contains("v2.0.0")
+                {
+                    // `snapshot_bytes=0` would itself match a bare
+                    // `.contains("snapshot_bytes")` check, so this
+                    // extracts the actual field value and asserts it's
+                    // nonzero -- a real `tworoom` boot has at least a
+                    // master object and the connected player, so an
+                    // empty/stub snapshot would be a real bug here, not
+                    // a fluke of what got connected.
+                    let bytes: usize = line
+                        .split("snapshot_bytes=")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .and_then(|num| num.parse().ok())
+                        .unwrap_or_else(|| panic!("could not parse snapshot_bytes out of: {line}"));
+                    assert!(
+                        bytes > 0,
+                        "expected a real, nonzero snapshot size, got {bytes} (line: {line})"
+                    );
+                    saw_snapshot_taken = true;
                 }
                 if line.contains("child acknowledged the copyover request")
                     && line.contains("v2.0.0")
@@ -527,6 +560,10 @@ fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
     assert!(
         saw_forwarded,
         "supervisor never logged forwarding the copyover request to the child"
+    );
+    assert!(
+        saw_snapshot_taken,
+        "child never logged taking a real world snapshot for the copyover request"
     );
     assert!(
         saw_acknowledged,
@@ -556,6 +593,30 @@ fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
         ),
     }
     supervisor.assert_alive();
+}
+
+/// Strips `ESC [ ... m` ANSI SGR (colour) escape sequences --
+/// `tracing_subscriber`'s `fmt` layer applies them unconditionally, not
+/// just when the writer is a real terminal, so any test that wants to
+/// pattern-match a log line's *fields* (as opposed to substrings that
+/// happen to survive being interrupted by escape codes, like a field's
+/// own value) needs this first.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn reserve_local_port() -> u16 {
