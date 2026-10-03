@@ -40,13 +40,16 @@
 //!   takeover).
 //! - Version-watching (`VersionSource` exists but nothing polls it yet)
 //!   and respawn-on-crash.
-//! - Signal forwarding (SIGTERM/SIGINT to the child, `PR_SET_PDEATHSIG`)
-//!   -- required before `supervise` can become the container entrypoint
-//!   without regressing `serve`'s graceful-shutdown path (CTO review,
-//!   OBI-225).
+//! - [`signal`]: `SIGTERM`/`SIGINT` forwarding from the supervisor to its
+//!   child, and `PR_SET_PDEATHSIG` so an unexpected supervisor exit
+//!   doesn't orphan the child -- required before `supervise` can become
+//!   the container entrypoint without regressing `serve`'s graceful-
+//!   shutdown path (CTO review, OBI-225). Wired into `loom-cli`'s
+//!   `supervise`/`spawn_and_handoff`.
 
 pub mod fdpass;
 pub mod listener;
+pub mod signal;
 pub mod version_source;
 
 pub use version_source::{FileVersionSource, VersionSource};
