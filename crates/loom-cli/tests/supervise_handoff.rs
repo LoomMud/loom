@@ -169,6 +169,176 @@ fn sigkill_the_supervisor_still_terminates_the_child_via_pdeathsig() {
     }
 }
 
+/// CTO review (OBI-184 respawn-on-crash slice, revised per OBI-253):
+/// a standby child that exits without the supervisor ever having asked
+/// it to (a real crash, simulated here with `SIGKILL` -- not `SIGTERM`,
+/// which would let the child exit 0 gracefully instead of actually
+/// crashing) is respawned against the *same* already-bound listening
+/// sockets, not left down. Proves this by killing the real standby
+/// child's real pid (found via `/proc`, not the supervisor's pid --
+/// `send_sigterm`ing the supervisor itself is the already-covered
+/// graceful-shutdown path) and then reconnecting: a stale connection
+/// breaks, but the telnet port comes back up and serves a fresh
+/// connection again shortly after, without the test ever restarting
+/// `loom supervise` itself.
+#[test]
+fn standby_child_crash_is_respawned_against_the_same_listener() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
+
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before crashing the child");
+
+    let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
+        .expect("did not find the standby child's pid under /proc");
+    loom_supervise::signal::send_sigkill(child_pid).expect("SIGKILL the standby child directly");
+
+    // The killed connection eventually observes EOF/an error -- not
+    // asserted directly (timing against the exact moment of the kill is
+    // racy and isn't the point of this test), just drained so it can't
+    // block anything below.
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut discard = [0_u8; 64];
+    use std::io::Read as _;
+    let _ = stream.read(&mut discard);
+
+    // The supervisor should respawn a fresh standby against the same
+    // listener -- reconnecting (with its own generous retry budget,
+    // since respawn involves another full mudlib compile) must succeed
+    // again, and the supervisor process itself must still be running
+    // (not have given up and exited). The read timeout here (unlike the
+    // plain handoff tests above) needs to cover the crash-respawn
+    // sequence's own 1s backoff plus a fresh mudlib compile, not just a
+    // single already-warm child's response time (CTO review, OBI-253).
+    let mut reconnected = connect_with_retry(&telnet_bind, Duration::from_secs(15));
+    reconnected
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    reconnected
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble from the respawned child");
+
+    supervisor.assert_alive();
+}
+
+/// CTO review (OBI-253): a `SIGTERM`/`SIGINT` that arrives to the
+/// supervisor *during* the crash-backoff sleep between respawn attempts
+/// must not be silently dropped -- a previous version of `supervise`'s
+/// respawn loop created a fresh `shutdown_signal()` registration on
+/// every attempt (and had no listener at all during the backoff sleep
+/// itself), missing any signal delivered in that gap. `loom supervise`
+/// should exit promptly (without respawning again) even when the signal
+/// lands in that specific window, not just when it arrives while a
+/// child is actively running.
+#[test]
+fn sigterm_during_crash_backoff_stops_the_supervisor_without_a_further_respawn() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
+
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before crashing the child");
+
+    let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
+        .expect("did not find the standby child's pid under /proc");
+    loom_supervise::signal::send_sigkill(child_pid).expect("SIGKILL the standby child directly");
+
+    // Right after the crash, the supervisor is in (or about to enter)
+    // its 1s crash-backoff sleep -- send the shutdown signal into
+    // exactly that window, not before the crash (already covered by the
+    // plain SIGTERM test) and not long enough after that a respawned
+    // child would already be back up.
+    std::thread::sleep(Duration::from_millis(200));
+    loom_supervise::signal::send_sigterm(supervisor.child.id())
+        .expect("send SIGTERM to the supervisor during crash-backoff");
+
+    let status = wait_with_timeout(&mut supervisor.child, Duration::from_secs(10))
+        .expect("supervisor did not exit after a SIGTERM sent during crash-backoff");
+    assert!(
+        status.success(),
+        "supervisor should exit successfully on a shutdown signal received during crash-backoff, got {status}"
+    );
+
+    // No further respawn should have happened -- confirm the telnet
+    // port stays down rather than a new child coming up after the
+    // supervisor has already (correctly) decided to exit instead.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if TcpStream::connect(&telnet_bind).is_ok() {
+            panic!(
+                "a new standby child came up after the supervisor received a shutdown signal \
+                 during crash-backoff -- it should have exited instead of respawning again"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Scans `/proc` for a process whose `ppid` (field 4 of `/proc/<pid>/stat`)
+/// is `parent_pid`, retrying until `timeout` since the child may not have
+/// been spawned (and the control-socket handoff completed) at the exact
+/// moment this is called.
+fn find_child_pid(parent_pid: u32, timeout: Duration) -> Option<u32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(pid) = scan_proc_for_child(parent_pid) {
+            return Some(pid);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn scan_proc_for_child(parent_pid: u32) -> Option<u32> {
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // Field 2 (`comm`) is parenthesized and may itself contain
+        // spaces/parens, so the only reliable split point is the *last*
+        // `)` -- everything after it is space-separated fixed fields,
+        // and `ppid` is the first of those (field 4 overall).
+        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            continue;
+        };
+        let mut fields = after_comm.split_whitespace();
+        let _state = fields.next();
+        let Some(ppid_str) = fields.next() else {
+            continue;
+        };
+        if ppid_str.parse::<u32>() == Ok(parent_pid) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
