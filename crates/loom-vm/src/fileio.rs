@@ -47,7 +47,7 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
         // driver's own git dir is a *separate* `GIT_DIR`
         // (`/mudlib-git/warp.git`), never a path under the mudlib root a
         // builder can reach through `read_file`/`write_file`.
-        if seg == ".git" {
+        if seg.eq_ignore_ascii_case(".git") {
             return Err("path must not contain a `.git` segment".to_string());
         }
         out.push(seg);
@@ -370,6 +370,8 @@ mod tests {
         assert!(read_file(&root, "/domains/x/.git/config").is_err());
         assert!(write_file(&root, "/.git/config", "x").is_err());
         assert!(write_file(&root, "/domains/x/.git/HEAD.txt", "x").is_err());
+        assert!(read_file(&root, "/domains/x/.GIT/config").is_err());
+        assert!(write_file(&root, "/.GIT/config", "x").is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

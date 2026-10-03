@@ -248,6 +248,15 @@ fn spawn_worker(fx: &Fixture, env: &str) -> (GitWorkerHandle, Arc<Mutex<Vec<Reco
     config.push_debounce = Duration::from_millis(20);
     config.sync_poll = Duration::from_secs(3600); // only via kick() in tests
     config.tick = Duration::from_millis(15);
+    // OBI-210 R4: `GitWorker::spawn` refuses to start with a
+    // `TokenProvider` configured unless `remote_url` is `https://`. The
+    // fixture's actual `remote` is a local bare-repo *path* (no network,
+    // no real scheme) for speed -- this placeholder satisfies the gate
+    // without claiming the local path remote is itself `https://`;
+    // `http.<remote_url>.extraHeader` simply never matches the local
+    // `file://`-style transport these tests exercise, same as
+    // production code pointed at the wrong host would see.
+    config.remote_url = "https://github.com/example/warp-mudlib.git".to_string();
     let host = RecordingHost {
         calls: calls.clone(),
     };
@@ -256,7 +265,8 @@ fn spawn_worker(fx: &Fixture, env: &str) -> (GitWorkerHandle, Arc<Mutex<Vec<Reco
         Some(Box::new(FixedToken("super-secret-token"))),
         Box::new(host),
         Box::new(RecordingAudit::default()),
-    );
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
     (handle, calls)
 }
 
@@ -281,7 +291,8 @@ fn spawn_worker_no_token(
         None,
         Box::new(host),
         Box::new(RecordingAudit::default()),
-    );
+    )
+    .expect("spawn with no TokenProvider must always succeed regardless of remote_url");
     (handle, calls)
 }
 
@@ -799,5 +810,156 @@ fn no_token_provider_disables_push_entirely() {
         "push must be skipped with no TokenProvider, not fall back unauthenticated"
     );
 
+    handle.shutdown();
+}
+
+/// OBI-210 R1 (CTO re-review of PR #81): a dirty tree that no
+/// `Msg::Write` will ever commit (here: a stray untracked file) must
+/// make the sync retry back off exponentially, not re-fetch every
+/// `tick` forever (previously ~10 authenticated fetches/sec against the
+/// remote, unbounded).
+#[test]
+fn dirty_tree_retry_backs_off_instead_of_spinning() {
+    let fx = setup();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let host = RecordingHost {
+        calls: calls.clone(),
+    };
+    let mut config = GitConfig::new(fx.git_dir(), fx.work_tree(), "origin", "test");
+    config.commit_coalesce = Duration::from_millis(10);
+    config.push_debounce = Duration::from_millis(10);
+    config.sync_poll = Duration::from_secs(3600); // only via kick()/backoff in this test
+    config.tick = Duration::from_millis(20);
+    config.remote_url = "https://github.com/example/warp-mudlib.git".to_string();
+    let tick = config.tick;
+    let handle = GitWorker::spawn(
+        config,
+        Some(Box::new(FixedToken("super-secret-token"))),
+        Box::new(host),
+        Box::new(RecordingAudit::default()),
+    )
+    .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
+
+    // Let the boot sync pass (nothing to do yet) finish before we set up
+    // the race.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // A real upstream `main` move, so the sync pass has something to
+    // fast-forward onto -- an unchanged `main` returns `no_change` before
+    // ever reaching the dirty-tree check at all.
+    let clone = fx.tmp.path().join("reviewer-clone-dirty-tree");
+    let out = Command::new("git")
+        .args([
+            "clone",
+            "--quiet",
+            &fx.bare_path().to_string_lossy(),
+            &clone.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    std::fs::write(clone.join("hall.wf"), "object hall;\n").unwrap();
+    git(&clone, &["add", "-A"]);
+    let mut commit = Command::new("git");
+    commit
+        .current_dir(&clone)
+        .args(["commit", "-m", "add hall (#2)"]);
+    commit
+        .env("GIT_AUTHOR_NAME", "reviewer")
+        .env("GIT_AUTHOR_EMAIL", "reviewer@loommud.com");
+    commit
+        .env("GIT_COMMITTER_NAME", "reviewer")
+        .env("GIT_COMMITTER_EMAIL", "reviewer@loommud.com");
+    assert!(commit.output().unwrap().status.success());
+    git(&clone, &["push", "origin", "main"]);
+
+    // Dirty the work tree with a stray untracked file no `Msg::Write`
+    // will ever commit (a driver artifact, a rejected write, ...).
+    std::fs::write(fx.work_tree().join("stray.tmp"), "oops\n").unwrap();
+
+    handle.kick();
+    // Give the first (failing) sync pass a head start.
+    std::thread::sleep(Duration::from_millis(100));
+
+    let fetch_head = fx.git_dir().join("FETCH_HEAD");
+    let count_fetches_in = |window: Duration| -> u32 {
+        let start = Instant::now();
+        let mut last_mtime = std::fs::metadata(&fetch_head)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let mut count = 0;
+        while start.elapsed() < window {
+            if let Ok(meta) = std::fs::metadata(&fetch_head)
+                && let Ok(mtime) = meta.modified()
+                && Some(mtime) != last_mtime
+            {
+                count += 1;
+                last_mtime = Some(mtime);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        count
+    };
+
+    let fetches = count_fetches_in(Duration::from_secs(2));
+    // Unthrottled spinning at `tick` (20 ms) would produce on the order
+    // of 100 fetches in 2 s; exponential backoff starting at `tick` and
+    // doubling (20, 40, 80, 160, 320, 640, 1280 ms, ...) produces a
+    // handful before the window elapses.
+    assert!(
+        fetches < 20,
+        "expected backoff to bound fetch attempts well under 2s/tick={tick:?}, got {fetches}"
+    );
+
+    // The dirty tree must never be force-overwritten: the stray file is
+    // still there, and `live` must not have been fast-forwarded out from
+    // under it.
+    assert!(
+        fx.work_tree().join("stray.tmp").exists(),
+        "a dirty tree must never be force-overwritten by the fast-forward"
+    );
+
+    handle.shutdown();
+}
+
+/// OBI-210 R4 (CTO decision: belongs here, not just B3.5's bootstrap
+/// wiring): refuse to start rather than ever send an installation token
+/// to a non-`https://` remote.
+#[test]
+fn spawn_refuses_a_token_provider_with_a_non_https_remote() {
+    let fx = setup();
+    let mut config = GitConfig::new(fx.git_dir(), fx.work_tree(), "origin", "test");
+    config.remote_url = fx.bare_path().to_string_lossy().into_owned();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let host = RecordingHost { calls };
+    let result = GitWorker::spawn(
+        config,
+        Some(Box::new(FixedToken("super-secret-token"))),
+        Box::new(host),
+        Box::new(RecordingAudit::default()),
+    );
+    assert!(
+        result.is_err(),
+        "a TokenProvider with a non-https:// remote_url must refuse to start"
+    );
+}
+
+/// The same non-`https://` `remote_url` is fine when no `TokenProvider`
+/// is configured at all -- nothing is ever sent, so there is no
+/// credential to misdirect.
+#[test]
+fn spawn_allows_a_non_https_remote_with_no_token_provider() {
+    let fx = setup();
+    let mut config = GitConfig::new(fx.git_dir(), fx.work_tree(), "origin", "test");
+    config.remote_url = fx.bare_path().to_string_lossy().into_owned();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let host = RecordingHost { calls };
+    let handle = GitWorker::spawn(
+        config,
+        None,
+        Box::new(host),
+        Box::new(RecordingAudit::default()),
+    )
+    .expect("no TokenProvider means no credential to misdirect -- must not refuse to start");
     handle.shutdown();
 }

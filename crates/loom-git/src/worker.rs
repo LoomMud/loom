@@ -101,6 +101,18 @@ pub struct GitConfig {
     pub work_tree: PathBuf,
     /// Remote name (`git remote add <remote> ...`), usually `origin`.
     pub remote: String,
+    /// The remote's URL (OBI-210 R4, CTO decision: belongs in loom-git,
+    /// not just B3.5's bootstrap wiring). Used to scope the credential
+    /// header to exactly this remote via
+    /// `http.<remote_url>.extraHeader` instead of a global
+    /// `http.extraHeader` that every `git` invocation (including ones
+    /// talking to an entirely different host, e.g. a submodule or a
+    /// future second remote) would also pick up. [`GitWorker::spawn`]
+    /// refuses to start with a [`TokenProvider`] configured unless this
+    /// is `https://`: an installation token must never be sent to a
+    /// plain-`http://`/`git://`/`ssh://` remote where it could leak in
+    /// the clear or to the wrong host.
+    pub remote_url: String,
     /// `<env>` in `live/<env>` (D-B3.3): `staging`, `prod`, or a test env.
     pub env_name: String,
     /// Per-`(uid, path)` commit coalescing window (D-B3.4: 2 s default).
@@ -131,10 +143,19 @@ impl GitConfig {
         remote: impl Into<String>,
         env_name: impl Into<String>,
     ) -> Self {
+        let remote = remote.into();
         Self {
             git_dir: git_dir.into(),
             work_tree: work_tree.into(),
-            remote: remote.into(),
+            // Callers that need the credential header scoped correctly
+            // (anything with a `TokenProvider`) must set `remote_url`
+            // explicitly -- this constructor has no way to know the URL
+            // a bare `remote` *name* resolves to, and defaulting it to
+            // the name itself is a safe, inert placeholder for the
+            // `allow_unauthenticated_remote`/no-token test paths that
+            // never read it.
+            remote_url: remote.clone(),
+            remote,
             env_name: env_name.into(),
             commit_coalesce: Duration::from_secs(2),
             push_debounce: Duration::from_secs(30),
@@ -300,12 +321,21 @@ impl GitWorker {
     /// Spawn the worker thread and return a handle. `token_provider`
     /// absent means push/fetch-with-auth is disabled (D-B3.5); the caller
     /// is expected to have already logged the boot warning.
+    ///
+    /// Refuses to start (OBI-210 R4, CTO decision) when a
+    /// [`TokenProvider`] is configured but `config.remote_url` is not an
+    /// `https://` URL: an installation token is HTTP(S)-bearer-shaped
+    /// (`Authorization: Basic ...` over `http.extraHeader`) and must
+    /// never be pointed at a plain-`http://` remote (sent in the clear)
+    /// or an `ssh://`/`git://` one (the header would simply be ignored,
+    /// silently downgrading to push/fetch disabled -- surprising enough
+    /// on its own to fail loudly instead).
     pub fn spawn(
         config: GitConfig,
         token_provider: Option<Box<dyn TokenProvider>>,
         recompile_host: Box<dyn RecompileHost>,
         audit: Box<dyn AuditSink>,
-    ) -> GitWorkerHandle {
+    ) -> Result<GitWorkerHandle, String> {
         Self::spawn_with_propose(
             config,
             token_provider,
@@ -322,7 +352,14 @@ impl GitWorker {
         recompile_host: Box<dyn RecompileHost>,
         audit: Box<dyn AuditSink>,
         propose_config: ProposeConfig,
-    ) -> GitWorkerHandle {
+    ) -> Result<GitWorkerHandle, String> {
+        if token_provider.is_some() && !config.remote_url.starts_with("https://") {
+            return Err(format!(
+                "loom-git: refusing to start -- a TokenProvider is configured but \
+                 remote_url {:?} is not an https:// URL (OBI-210 R4)",
+                config.remote_url
+            ));
+        }
         let (tx, rx) = sync_channel(4096);
         let tree_lock = TreeLock::new();
         let worker_lock = tree_lock.clone();
@@ -340,12 +377,20 @@ impl GitWorker {
                 );
             })
             .expect("spawn loom-git worker thread");
-        GitWorkerHandle {
+        Ok(GitWorkerHandle {
             tx,
             tree_lock,
             join: Arc::new(Mutex::new(Some(join))),
-        }
+        })
     }
+}
+
+/// OBI-210 R1 (CTO review of PR #82): the pure doubling-and-cap step
+/// `run`'s main loop uses to schedule the next dirty-tree retry, pulled
+/// out so a test can exercise exactly what the worker calls rather than
+/// re-implementing the formula.
+fn next_dirty_retry_backoff(current: Duration, cap: Duration) -> Duration {
+    current.saturating_mul(2).min(cap)
 }
 
 fn run(
@@ -364,6 +409,15 @@ fn run(
     let mut push_deadline: Option<Instant> = None;
     let mut last_sync = Instant::now();
     let mut sync_requested = true; // run one sync pass on boot
+    // OBI-210 R1 (CTO re-review): a dirty tree that no `Msg::Write` will
+    // ever commit (a stray untracked file, a rejected write, a driver
+    // artifact) must not turn `retry=true` into an unthrottled re-fetch
+    // every `tick`. `dirty_retry_backoff` starts at `config.tick` and
+    // doubles on every consecutive retry, capped at `config.sync_poll`;
+    // it resets the moment a sync pass settles (retry no longer needed).
+    let mut dirty_retry_backoff = config.tick.max(Duration::from_millis(1));
+    let mut dirty_retry_due: Option<Instant> = None;
+    let mut last_dirty_warn: Option<Instant> = None;
 
     loop {
         match rx.recv_timeout(config.tick) {
@@ -458,8 +512,10 @@ fn run(
 
         flush_due_commits(&repo, &mut pending, &mut push_dirty, &mut push_deadline);
 
-        if sync_requested || last_sync.elapsed() >= config.sync_poll {
+        let retry_due = dirty_retry_due.is_some_and(|d| Instant::now() >= d);
+        if sync_requested || retry_due || last_sync.elapsed() >= config.sync_poll {
             sync_requested = false;
+            dirty_retry_due = None;
             last_sync = Instant::now();
             // D-B3.7: pending commits drain before the lock is taken.
             flush_all_commits(&repo, &mut pending, &mut push_dirty, &mut push_deadline);
@@ -472,12 +528,32 @@ fn run(
                 &*recompile_host,
                 &*audit,
             );
-            if retry {
-                // R4: the tree wasn't clean (or `live` moved) right when
-                // we were about to fast-forward it -- try again next
-                // tick instead of ever force-overwriting a write that
-                // landed in that window.
-                sync_requested = true;
+            match retry {
+                Some(dirty_paths) => {
+                    // OBI-210 R1: back off instead of retrying every
+                    // `tick` -- a dirty tree that no `Msg::Write` will
+                    // ever commit (a stray untracked file, a rejected
+                    // write, a driver artifact) must not turn into an
+                    // unthrottled re-fetch loop against the remote.
+                    let backoff = dirty_retry_backoff;
+                    dirty_retry_due = Some(Instant::now() + backoff);
+                    dirty_retry_backoff = next_dirty_retry_backoff(backoff, config.sync_poll);
+                    if last_dirty_warn.is_none_or(|t| t.elapsed() >= backoff) {
+                        tracing::warn!(
+                            paths = ?dirty_paths,
+                            backoff_ms = backoff.as_millis(),
+                            "loom-git: work tree not clean, backing off the fast-forward retry"
+                        );
+                        last_dirty_warn = Some(Instant::now());
+                    }
+                }
+                None => {
+                    // Settled (or a failure unrelated to a dirty tree,
+                    // e.g. fetch failed): a fresh dirty-tree episode
+                    // should start backing off from the bottom again.
+                    dirty_retry_backoff = config.tick.max(Duration::from_millis(1));
+                    last_dirty_warn = None;
+                }
             }
             // D-B3.5: push after every sync too.
             push_dirty = true;
@@ -628,7 +704,7 @@ fn push_live(repo: &Repo, config: &GitConfig, token_status: &TokenStatus) -> &'s
     let refspec = format!("live:refs/heads/live/{}", config.env_name);
     let args = ["push", "--force-with-lease", &config.remote, &refspec];
     match token_status {
-        TokenStatus::Ok(t) => match repo.git_authed(&args, Some(t)) {
+        TokenStatus::Ok(t) => match repo.git_authed(&args, Some(t), &config.remote_url) {
             Ok(_) => "ok",
             Err(_) => "failed",
         },
@@ -665,7 +741,7 @@ fn remote_git(
     args: &[&str],
 ) -> Option<Result<std::process::Output, GitError>> {
     match token_status {
-        TokenStatus::Ok(t) => Some(repo.git_authed(args, Some(t))),
+        TokenStatus::Ok(t) => Some(repo.git_authed(args, Some(t), &config.remote_url)),
         TokenStatus::Err(e) => {
             tracing::warn!(error = %e, "loom-git: token provider failed");
             None
@@ -713,18 +789,18 @@ fn run_sync_main(
     token_status: &TokenStatus,
     recompile_host: &dyn RecompileHost,
     audit: &dyn AuditSink,
-) -> bool {
+) -> Option<Vec<String>> {
     let fetch_args = ["fetch", config.remote.as_str(), "main"];
     match remote_git(repo, config, token_status, &fetch_args) {
         Some(Ok(_)) => {}
         Some(Err(e)) => {
             tracing::warn!(error = %e, "loom-git: fetch main failed");
             crate::metrics::record_sync("fetch_failed");
-            return false;
+            return None;
         }
         None => {
             crate::metrics::record_sync("disabled");
-            return false;
+            return None;
         }
     }
 
@@ -733,20 +809,20 @@ fn run_sync_main(
         Err(e) => {
             tracing::warn!(error = %e, "loom-git: could not resolve FETCH_HEAD");
             crate::metrics::record_sync("fetch_failed");
-            return false;
+            return None;
         }
     };
     let old_main = rev_parse(repo, "refs/loom/last-main").ok();
     if old_main.as_deref() == Some(new_main.as_str()) {
         crate::metrics::record_sync("no_change");
-        return false;
+        return None;
     }
     let old_live = match rev_parse(repo, "live") {
         Ok(sha) => sha,
         Err(e) => {
             tracing::warn!(error = %e, "loom-git: no `live` ref");
             crate::metrics::record_sync("fetch_failed");
-            return false;
+            return None;
         }
     };
 
@@ -762,7 +838,7 @@ fn run_sync_main(
     ]) {
         tracing::warn!(error = %e, "loom-git: worktree add failed");
         crate::metrics::record_sync("fetch_failed");
-        return false;
+        return None;
     }
     let scratch_repo = WorktreeRepo::new(&scratch);
     let rebase_ok = scratch_repo.git(&["rebase", &new_main]).is_ok();
@@ -792,7 +868,7 @@ fn run_sync_main(
         } else {
             "conflict_resolved"
         });
-        return false;
+        return None;
     }
 
     let (changed, deleted) = diff_name_status(repo, &old_live, &new_live);
@@ -805,31 +881,88 @@ fn run_sync_main(
     // that window: if either check fails, some other write raced us, so
     // we abandon this fast-forward rather than silently discarding it
     // with `checkout -f`/`clean -fd`, and ask the caller to retry.
-    let needs_retry;
+    //
+    // OBI-210 R2 (CTO re-review): `live` must only ever point somewhere
+    // the work tree actually reflects. Detach HEAD and check out
+    // `new_live` *first* -- while `refs/heads/live` still points at
+    // `old_live`, so a checkout failure leaves both the ref and the
+    // branch untouched -- and only then move `refs/heads/live` and
+    // re-attach `HEAD` to it. The previous order (`update-ref` then
+    // `checkout -f live`) could leave `live` already moved to `new_live`
+    // while the work tree was still on `old_live`'s contents if the
+    // checkout step failed; the next pass would then see
+    // `new_live == old_live`'s *old* value no longer matching `live` and
+    // limp along with a stale tree forever, since `refs/loom/last-main`
+    // is only advanced below this block.
+    let mut needs_retry = false;
+    let dirty_paths: Vec<String>;
     {
         let _guard = tree_lock.write_guard();
-        let status_clean = repo
+        let status_output = repo
             .git(&["status", "--porcelain"])
             .ok()
-            .and_then(|o| stdout_string(&o).ok())
+            .and_then(|o| stdout_string(&o).ok());
+        let status_clean = status_output
+            .as_deref()
             .map(|s| s.trim().is_empty())
             .unwrap_or(false);
+        dirty_paths = status_output
+            .as_deref()
+            .map(|s| {
+                s.lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         let live_unchanged = rev_parse(repo, "live")
             .map(|s| s == old_live)
             .unwrap_or(false);
         let tree_safe = status_clean && live_unchanged;
-        needs_retry = !tree_safe
+        if !tree_safe {
+            needs_retry = true;
+        } else if repo
+            .git(&["checkout", "-f", "--detach", &new_live])
+            .is_err()
+        {
+            // OBI-210 follow-up (CTO review of PR #82): a `checkout -f
+            // --detach` that fails partway can leave the work tree
+            // mid-checkout even though `refs/heads/live`/`HEAD` are
+            // still exactly as they were (`live` at `old_live`). Left
+            // alone, the *next* pass would see that half-updated tree as
+            // dirty and back off forever instead of self-healing. `live`
+            // itself is still `old_live` here, so a best-effort
+            // `checkout -f live` is safe and gives the tree a chance to
+            // recover before the next retry.
+            let _ = repo.git(&["checkout", "-f", "live"]);
+            needs_retry = true;
+        } else if repo
+            .git(&["update-ref", "refs/heads/live", &new_live])
+            .is_err()
             || repo
-                .git(&["update-ref", "refs/heads/live", &new_live])
+                .git(&["symbolic-ref", "HEAD", "refs/heads/live"])
                 .is_err()
-            || repo.git(&["checkout", "-f", "live"]).is_err();
-        if !needs_retry {
+        {
+            // Checkout succeeded (work tree now matches `new_live`) but
+            // moving the ref/re-attaching HEAD failed -- roll `live`
+            // back to `old_live` and re-detach there so the ref and the
+            // work tree stay consistent with each other rather than
+            // advancing one without the other.
+            let _ = repo.git(&["update-ref", "refs/heads/live", &old_live]);
+            let _ = repo.git(&["checkout", "-f", "live"]);
+            needs_retry = true;
+        } else {
             let _ = repo.git(&["clean", "-fd"]);
         }
     }
     if needs_retry {
         crate::metrics::record_sync("retry_dirty_tree");
-        return true;
+        // OBI-210 R1: the caller backs this off exponentially (capped at
+        // `sync_poll`) instead of retrying every `tick` -- a stray
+        // untracked file, a rejected write, or a driver artifact that no
+        // `Msg::Write` will ever commit must not turn into an
+        // unthrottled re-fetch loop against the remote.
+        return Some(dirty_paths);
     }
     let _ = repo.git(&["update-ref", "refs/loom/last-main", &new_main]);
 
@@ -845,7 +978,7 @@ fn run_sync_main(
             "compile_failed"
         });
     }
-    false
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1032,4 +1165,229 @@ fn diff_name_status(repo: &dyn GitRunner, old: &str, new: &str) -> (Vec<String>,
         }
     }
     (changed, deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::Command;
+
+    struct NullHost;
+    impl RecompileHost for NullHost {
+        fn recompile_set(&self, changed: Vec<String>, deleted: Vec<String>) -> RecompileOutcome {
+            RecompileOutcome {
+                ok: true,
+                recompiled: changed,
+                failures: deleted.into_iter().map(|d| (d, String::new())).collect(),
+            }
+        }
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A bare `main` + a driver repo already on `live` (same shape as
+    /// `tests/integration.rs::setup`, trimmed for a white-box unit test
+    /// that needs to reach into `git_dir` directly).
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        bare: PathBuf,
+        git_dir: PathBuf,
+        work_tree: PathBuf,
+    }
+
+    fn setup() -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("remote.git");
+        git_ok(
+            tmp.path(),
+            &[
+                "init",
+                "--quiet",
+                "--bare",
+                "-b",
+                "main",
+                bare.to_str().unwrap(),
+            ],
+        );
+
+        let work_tree = tmp.path().join("work");
+        std::fs::create_dir_all(&work_tree).unwrap();
+        let git_dir = work_tree.join(".git");
+        git_ok(&work_tree, &["init", "--quiet", "-b", "main"]);
+        std::fs::write(work_tree.join("room.wf"), "object room;\n").unwrap();
+        git_ok(&work_tree, &["add", "-A"]);
+        let mut commit = Command::new("git");
+        commit
+            .current_dir(&work_tree)
+            .args(["commit", "-m", "init"]);
+        commit
+            .env("GIT_AUTHOR_NAME", "driver")
+            .env("GIT_AUTHOR_EMAIL", "driver@loommud.com")
+            .env("GIT_COMMITTER_NAME", "driver")
+            .env("GIT_COMMITTER_EMAIL", "driver@loommud.com");
+        assert!(commit.output().unwrap().status.success());
+        git_ok(
+            &work_tree,
+            &["remote", "add", "origin", bare.to_str().unwrap()],
+        );
+        git_ok(&work_tree, &["push", "origin", "main"]);
+        git_ok(&work_tree, &["branch", "live"]);
+        git_ok(&work_tree, &["checkout", "live"]);
+
+        Fixture {
+            _tmp: tmp,
+            bare,
+            git_dir,
+            work_tree,
+        }
+    }
+
+    fn test_config(fx: &Fixture) -> GitConfig {
+        let mut config = GitConfig::new(fx.git_dir.clone(), fx.work_tree.clone(), "origin", "test");
+        config.allow_unauthenticated_remote = true;
+        config
+    }
+
+    /// OBI-210 R2 (CTO re-review of PR #81): if `checkout -f --detach
+    /// <new_live>` succeeds but moving `refs/heads/live`/re-attaching
+    /// `HEAD` then fails, `live` must be rolled back to `old_live` rather
+    /// than left pointing at a commit the work tree (and `HEAD`) don't
+    /// actually reflect.
+    ///
+    /// Root-sensitive (CTO review of PR #82): relies on a `0o555`
+    /// `refs/heads` directory actually denying the write that forces the
+    /// ref-move failure this test exercises -- root ignores Unix
+    /// permission bits, so this would silently pass for the wrong reason
+    /// under a root test runner. CI runs as non-root.
+    #[test]
+    fn checkout_succeeds_but_ref_move_fails_rolls_live_back() {
+        let fx = setup();
+        let config = test_config(&fx);
+        let repo = Repo::new(&fx.git_dir, &fx.work_tree);
+        let tree_lock = TreeLock::new();
+
+        // A real upstream `main` move so the sync pass has something to
+        // fast-forward onto.
+        let clone = fx.work_tree.parent().unwrap().join("reviewer-clone");
+        git_ok(
+            fx.work_tree.parent().unwrap(),
+            &[
+                "clone",
+                "--quiet",
+                fx.bare.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(clone.join("hall.wf"), "object hall;\n").unwrap();
+        git_ok(&clone, &["add", "-A"]);
+        let mut commit = Command::new("git");
+        commit
+            .current_dir(&clone)
+            .args(["commit", "-m", "add hall"]);
+        commit
+            .env("GIT_AUTHOR_NAME", "reviewer")
+            .env("GIT_AUTHOR_EMAIL", "reviewer@loommud.com")
+            .env("GIT_COMMITTER_NAME", "reviewer")
+            .env("GIT_COMMITTER_EMAIL", "reviewer@loommud.com");
+        assert!(commit.output().unwrap().status.success());
+        git_ok(&clone, &["push", "origin", "main"]);
+
+        let old_live = rev_parse(&repo, "live").unwrap();
+
+        // Make `refs/heads` unwritable (but still readable/traversable)
+        // so `checkout -f --detach <sha>` -- which only rewrites `HEAD`
+        // and the index, neither of which live under `refs/` -- still
+        // succeeds, but the subsequent `update-ref refs/heads/live` (a
+        // write under `refs/heads/`) fails.
+        let refs_heads = fx.git_dir.join("refs").join("heads");
+        let mut perms = std::fs::metadata(&refs_heads).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&refs_heads, perms).unwrap();
+
+        let token_status = TokenStatus::Absent;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_sync_main(
+                &repo,
+                &config,
+                &tree_lock,
+                &token_status,
+                &NullHost,
+                &NoopAudit,
+            )
+        }));
+
+        // Always restore permissions before asserting/unwinding further,
+        // so a failing assertion doesn't leave the temp dir impossible
+        // for `tempfile` to clean up.
+        let mut perms = std::fs::metadata(&refs_heads).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&refs_heads, perms).unwrap();
+
+        let outcome = result.unwrap();
+        assert!(
+            outcome.is_some(),
+            "a failed ref move must ask the caller to retry, not silently settle"
+        );
+
+        let live_after = rev_parse(&repo, "live").unwrap();
+        assert_eq!(
+            live_after, old_live,
+            "`live` must be rolled back to `old_live`, not left dangling at `new_live`"
+        );
+
+        let head_out = repo.git(&["symbolic-ref", "HEAD"]).unwrap();
+        let head = stdout_string(&head_out).unwrap();
+        assert_eq!(
+            head.trim(),
+            "refs/heads/live",
+            "HEAD must be re-attached to `refs/heads/live`, not left detached"
+        );
+
+        // The work tree must match whatever `live`/`HEAD` actually points
+        // to -- no stale mismatch between the ref and the checked-out
+        // content.
+        assert!(!fx.work_tree.join("hall.wf").exists());
+        assert!(fx.work_tree.join("room.wf").exists());
+    }
+
+    /// OBI-210 R1: the backoff computed by the worker's main loop grows
+    /// and is capped at `sync_poll`.
+    #[test]
+    fn dirty_retry_backoff_doubles_and_caps() {
+        let cap = Duration::from_secs(1);
+        let mut backoff = Duration::from_millis(20);
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            seen.push(backoff);
+            backoff = next_dirty_retry_backoff(backoff, cap);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                Duration::from_millis(20),
+                Duration::from_millis(40),
+                Duration::from_millis(80),
+                Duration::from_millis(160),
+                Duration::from_millis(320),
+                Duration::from_millis(640),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            ]
+        );
+    }
 }

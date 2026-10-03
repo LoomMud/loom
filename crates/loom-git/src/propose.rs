@@ -357,6 +357,7 @@ pub fn run_propose(
             &format!("{commit_sha}:refs/heads/{branch}"),
         ],
         Some(&token),
+        &config.remote_url,
     )
     .map_err(ProposeError::Git)?;
 
@@ -473,8 +474,12 @@ fn resolve_main_sha(
     token: Option<&str>,
 ) -> Result<String, ProposeError> {
     if let Some(t) = token {
-        repo.git_authed(&["fetch", &config.remote, "main"], Some(t))
-            .map_err(ProposeError::Git)?;
+        repo.git_authed(
+            &["fetch", &config.remote, "main"],
+            Some(t),
+            &config.remote_url,
+        )
+        .map_err(ProposeError::Git)?;
         return rev_parse(repo, "FETCH_HEAD").map_err(ProposeError::Git);
     }
     for candidate in [
