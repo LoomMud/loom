@@ -169,6 +169,108 @@ fn sigkill_the_supervisor_still_terminates_the_child_via_pdeathsig() {
     }
 }
 
+/// CTO review (OBI-184 respawn-on-crash slice): a standby child that
+/// exits without the supervisor ever having asked it to (a crash, here
+/// simulated by killing it directly rather than through the supervisor)
+/// is respawned against the *same* already-bound listening sockets, not
+/// left down. Proves this by killing the real standby child's real pid
+/// (found via `/proc`, not the supervisor's pid -- `send_sigterm`ing the
+/// supervisor itself is the already-covered graceful-shutdown path) and
+/// then reconnecting: a stale connection breaks, but the telnet port
+/// comes back up and serves a fresh connection again shortly after,
+/// without the test ever restarting `loom supervise` itself.
+#[test]
+fn standby_child_crash_is_respawned_against_the_same_listener() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
+
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before crashing the child");
+
+    let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
+        .expect("did not find the standby child's pid under /proc");
+    loom_supervise::signal::send_sigterm(child_pid).expect("kill the standby child directly");
+
+    // The killed connection eventually observes EOF/an error -- not
+    // asserted directly (timing against the exact moment of the kill is
+    // racy and isn't the point of this test), just drained so it can't
+    // block anything below.
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut discard = [0_u8; 64];
+    use std::io::Read as _;
+    let _ = stream.read(&mut discard);
+
+    // The supervisor should respawn a fresh standby against the same
+    // listener -- reconnecting (with its own generous retry budget,
+    // since respawn involves another full mudlib compile) must succeed
+    // again, and the supervisor process itself must still be running
+    // (not have given up and exited).
+    let mut reconnected = connect_with_retry(&telnet_bind, Duration::from_secs(15));
+    reconnected
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    reconnected
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble from the respawned child");
+
+    supervisor.assert_alive();
+}
+
+/// Scans `/proc` for a process whose `ppid` (field 4 of `/proc/<pid>/stat`)
+/// is `parent_pid`, retrying until `timeout` since the child may not have
+/// been spawned (and the control-socket handoff completed) at the exact
+/// moment this is called.
+fn find_child_pid(parent_pid: u32, timeout: Duration) -> Option<u32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(pid) = scan_proc_for_child(parent_pid) {
+            return Some(pid);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn scan_proc_for_child(parent_pid: u32) -> Option<u32> {
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // Field 2 (`comm`) is parenthesized and may itself contain
+        // spaces/parens, so the only reliable split point is the *last*
+        // `)` -- everything after it is space-separated fixed fields,
+        // and `ppid` is the first of those (field 4 overall).
+        let Some(after_comm) = stat.rsplit_once(')').map(|(_, rest)| rest) else {
+            continue;
+        };
+        let mut fields = after_comm.split_whitespace();
+        let _state = fields.next();
+        let Some(ppid_str) = fields.next() else {
+            continue;
+        };
+        if ppid_str.parse::<u32>() == Ok(parent_pid) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {

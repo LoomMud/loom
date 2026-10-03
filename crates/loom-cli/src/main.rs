@@ -469,9 +469,8 @@ async fn acquire_listeners(
 /// proves the handoff mechanism end to end against one child and then
 /// just waits for it to exit -- there is deliberately no version
 /// watching, no cosign/GHCR artifact staging, no standby-vs-already-
-/// running-process copyover, and no respawn-on-crash yet. Each of those
-/// is a separate, tracked follow-up; this function is not a stand-in
-/// implementation of them.
+/// running-process copyover yet. Each of those is a separate, tracked
+/// follow-up; this function is not a stand-in implementation of them.
 ///
 /// **Signal handling (OBI-184, this slice):** `SIGTERM`/`SIGINT`
 /// delivered to this process are forwarded to the standby child (so
@@ -481,9 +480,23 @@ async fn acquire_listeners(
 /// `PR_SET_PDEATHSIG` installed so an unexpected supervisor death
 /// (crash, `SIGKILL`, OOM) terminates it too rather than leaving it
 /// running unsupervised. **Still not yet safe as a container entrypoint
-/// for everything else named in OBI-225/OBI-184**: no respawn-on-crash,
-/// no version watching, no cosign/GHCR staging, no copyover against an
-/// already-running process -- those remain separate, tracked follow-ups.
+/// for everything else named in OBI-225/OBI-184**: no version watching,
+/// no cosign/GHCR staging, no copyover against an already-running
+/// process -- those remain separate, tracked follow-ups.
+///
+/// **Respawn-on-crash (OBI-184, this slice):** a child that exits
+/// without the supervisor having asked it to (a crash, or any exit the
+/// supervisor itself never requested via a forwarded shutdown signal)
+/// is treated as transient and respawned against the *same already-
+/// bound* listening sockets -- `telnet_listener`/`http_listener` are
+/// owned by this function for its whole lifetime and only ever lent out
+/// (as fds, over `fdpass::send_fds`) to each successive child, so a
+/// respawn needs no rebind and no client-visible gap beyond however
+/// long the crashed child's own connections take to notice. Bounded by
+/// [`MAX_CONSECUTIVE_CRASHES`] crashes within [`CRASH_LOOP_WINDOW`] of
+/// each other -- past that, this gives up and returns an error rather
+/// than spinning forever against a child that can never start
+/// successfully (a bad binary, a broken mudlib, ...).
 ///
 /// **Dedicated OS thread, not Tokio's blocking pool (CTO review,
 /// OBI-251):** `loom_supervise::signal::set_death_signal_on_parent_exit`
@@ -495,16 +508,22 @@ async fn acquire_listeners(
 /// keep-alive by default), which would fire the death signal against a
 /// perfectly healthy, still-running supervisor and silently tear down
 /// the active server. `spawn_handoff_and_wait` below runs on one
-/// `std::thread` that is spawned once and stays alive for the entire
-/// spawn-through-`wait()` lifetime of the child, communicating back to
-/// this `async fn` over plain channels.
+/// `std::thread`, spawned fresh per attempt but each one alive for that
+/// attempt's entire spawn-through-`wait()` lifetime, communicating back
+/// to this `async fn` over plain channels.
+const MAX_CONSECUTIVE_CRASHES: u32 = 5;
+const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(30);
+
 async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     let bind_addr = loom_net::telnet_addr_from_env();
     let http_bind_addr = http_addr_from_env();
 
     // Bound with the plain `std` listener, not Tokio's: handed off to
     // the dedicated supervisor thread below, and the fds need to be
-    // `BorrowedFd`-able for `fdpass::send_fds` regardless.
+    // `BorrowedFd`-able for `fdpass::send_fds` regardless. Bound once,
+    // for this function's entire lifetime -- every respawn attempt
+    // below lends the *same* listener fds to a fresh child, not new
+    // ones, so there is no rebind gap between crash and respawn.
     let telnet_listener = std::net::TcpListener::bind(&bind_addr)
         .map_err(|err| format!("supervise: failed to bind {bind_addr}: {err}"))?;
     let http_listener = std::net::TcpListener::bind(&http_bind_addr)
@@ -515,13 +534,90 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
         "loom supervise: listening sockets bound, spawning standby child"
     );
 
+    let mut consecutive_crashes: u32 = 0;
+    loop {
+        let attempt_started = tokio::time::Instant::now();
+        let outcome =
+            run_one_child_attempt(mudlib_root.clone(), &telnet_listener, &http_listener).await?;
+
+        let status = match outcome {
+            ChildAttemptOutcome::ShutdownRequested(status) => {
+                if !status.success() {
+                    return Err(format!(
+                        "standby child exited with {status} after a forwarded shutdown signal"
+                    ));
+                }
+                return Ok(());
+            }
+            ChildAttemptOutcome::ChildExited(status) => status,
+        };
+
+        // A child that ran for a while before exiting on its own is a
+        // fresh problem, not a continuation of an earlier crash loop --
+        // don't let an old streak count against it.
+        if attempt_started.elapsed() >= CRASH_LOOP_WINDOW {
+            consecutive_crashes = 0;
+        }
+        consecutive_crashes += 1;
+
+        warn!(
+            %status,
+            consecutive_crashes,
+            "loom supervise: standby child exited without a shutdown request; respawning"
+        );
+
+        if consecutive_crashes > MAX_CONSECUTIVE_CRASHES {
+            return Err(format!(
+                "standby child exited {consecutive_crashes} times within {CRASH_LOOP_WINDOW:?} of each other (most recently with {status}); giving up after {MAX_CONSECUTIVE_CRASHES} consecutive crashes"
+            ));
+        }
+
+        // A short, fixed backoff before respawning: this is deliberately
+        // not the full exponential-backoff-with-jitter a longer-lived
+        // supervisor would want (tracked separately if it turns out to
+        // matter) -- just enough to keep a hard crash loop from busy-
+        // spinning `fork`/`exec` calls.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// One outcome of [`run_one_child_attempt`]: either the supervisor
+/// itself asked the child to stop (a forwarded shutdown signal), or the
+/// child exited on its own for some other reason (crash, or any exit the
+/// supervisor never requested) and [`supervise`]'s respawn loop must
+/// decide whether to try again.
+enum ChildAttemptOutcome {
+    ShutdownRequested(std::process::ExitStatus),
+    ChildExited(std::process::ExitStatus),
+}
+
+/// Spawn one standby child, hand off the listening sockets, and wait for
+/// either the child to exit on its own or a shutdown signal to arrive
+/// (forwarded to the child if so) -- one full attempt of [`supervise`]'s
+/// respawn loop. See [`supervise`]'s doc comment for why the actual
+/// spawn+wait happens on a dedicated `std::thread`
+/// ([`spawn_handoff_and_wait`]) rather than Tokio's blocking pool.
+async fn run_one_child_attempt(
+    mudlib_root: PathBuf,
+    telnet_listener: &std::net::TcpListener,
+    http_listener: &std::net::TcpListener,
+) -> Result<ChildAttemptOutcome, String> {
+    // `spawn_handoff_and_wait` needs `'static` owned copies of the
+    // listeners to move into its dedicated thread; `try_clone` is a
+    // real `dup(2)`, the same primitive `fdpass::send_fds` itself uses
+    // to hand a listener to the *child* process, just kept in this
+    // process instead.
+    let telnet_listener = telnet_listener
+        .try_clone()
+        .map_err(|err| format!("supervise: try_clone telnet listener: {err}"))?;
+    let http_listener = http_listener
+        .try_clone()
+        .map_err(|err| format!("supervise: try_clone http listener: {err}"))?;
+
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
     let (forward_signal_tx, forward_signal_rx) = std::sync::mpsc::channel::<()>();
     let (exit_tx, exit_rx) = std::sync::mpsc::channel::<Result<std::process::ExitStatus, String>>();
 
-    // The one thread that owns the whole child lifecycle -- see this
-    // function's doc comment for why it must be a plain, dedicated
-    // `std::thread` and not Tokio's blocking pool.
     let supervisor_thread = std::thread::Builder::new()
         .name("loom-supervise-child".to_string())
         .spawn(move || {
@@ -548,11 +644,12 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
 
     let mut exit_handle = tokio::task::spawn_blocking(move || exit_rx.recv());
 
-    let result = tokio::select! {
+    let outcome = tokio::select! {
         result = &mut exit_handle => {
-            result
+            let status = result
                 .map_err(|err| format!("supervise: exit-channel join: {err}"))?
-                .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())?
+                .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())??;
+            ChildAttemptOutcome::ChildExited(status)
         }
         () = shutdown_signal() => {
             info!(child_pid, "loom supervise: received shutdown signal, forwarding SIGTERM to child");
@@ -564,10 +661,11 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
             // the owning thread keeps "who may act on this `Child`" to
             // one place.
             let _ = forward_signal_tx.send(());
-            exit_handle
+            let status = exit_handle
                 .await
                 .map_err(|err| format!("supervise: exit-channel join after signal: {err}"))?
-                .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())?
+                .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())??;
+            ChildAttemptOutcome::ShutdownRequested(status)
         }
     };
 
@@ -578,11 +676,7 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
         return Err(format!("supervise: supervisor thread panicked: {panic:?}"));
     }
 
-    let status = result?;
-    if !status.success() {
-        return Err(format!("standby child exited with {status}"));
-    }
-    Ok(())
+    Ok(outcome)
 }
 
 /// Runs on the one dedicated `std::thread` [`supervise`] spawns (see its
