@@ -103,6 +103,72 @@ fn sigterm_to_the_supervisor_is_forwarded_to_the_child_and_both_exit() {
     }
 }
 
+/// CTO review (OBI-251): the previous unit-test-local `prctl` check in
+/// `loom_supervise::signal` couldn't prove the actual kernel behaviour
+/// `PR_SET_PDEATHSIG` exists for, and that module's own docs previously
+/// described the wrong scope for it (process, not thread). This test
+/// proves the real end-to-end property against the real supervisor
+/// binary: `SIGKILL`ing the supervisor (an ungraceful death it cannot
+/// catch or forward anything for -- unlike the `SIGTERM` case above,
+/// where the supervisor's own signal-forwarding code runs) still leaves
+/// the standby child terminated, because the kernel's `PDEATHSIG`
+/// delivery doesn't go through the supervisor's own code at all. This
+/// is also the regression test for the OBI-251 bug itself: with the
+/// previous `spawn_blocking`-pool-thread implementation, the pool
+/// thread that registered `PR_SET_PDEATHSIG` could have already exited
+/// well before this point, which would have fired the death signal
+/// early rather than only now -- not something this specific test
+/// distinguishes from "it works", but the dedicated-thread fix is what
+/// makes the *timing* of this test (sending `SIGKILL` only after the
+/// child is confirmed up and serving) a meaningful check at all, rather
+/// than passing coincidentally.
+#[test]
+fn sigkill_the_supervisor_still_terminates_the_child_via_pdeathsig() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
+
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before SIGKILLing the supervisor");
+
+    // `Child::kill()` is `SIGKILL`, not `SIGTERM` -- the supervisor gets
+    // no chance to run any of its own forwarding code.
+    supervisor
+        .child
+        .kill()
+        .expect("SIGKILL the supervisor process");
+    let status = wait_with_timeout(&mut supervisor.child, Duration::from_secs(10))
+        .expect("supervisor did not exit after SIGKILL within the timeout");
+    assert!(
+        !status.success(),
+        "a SIGKILLed supervisor should not report a successful exit status"
+    );
+
+    // The kernel delivers PDEATHSIG to the child independently of
+    // anything the (now-dead) supervisor's own code does -- give that a
+    // moment and confirm the telnet port stops accepting.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(&telnet_bind) {
+            Err(_) => break,
+            Ok(_) if Instant::now() >= deadline => panic!(
+                "standby child is still accepting connections after its supervisor was SIGKILLed -- PR_SET_PDEATHSIG did not fire"
+            ),
+            Ok(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {

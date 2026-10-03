@@ -18,6 +18,12 @@
 //! is a raw `prctl` call), so -- like [`crate::fdpass`] and
 //! [`crate::listener`] -- the `unsafe` is confined to this module, with
 //! every block documented.
+//!
+//! **Important, and previously wrong in this module's own docs (CTO
+//! review, OBI-251):** `PR_SET_PDEATHSIG` tracks the specific OS
+//! *thread* that registered it, not the supervisor *process* as a
+//! whole. See [`set_death_signal_on_parent_exit`]'s doc for the full
+//! contract this imposes on callers.
 
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -27,39 +33,80 @@ use std::process::Command;
 ///
 /// # Errors
 /// Returns the `io::Error` from `kill(2)` if the signal could not be
-/// delivered (e.g. the pid has already been reaped).
+/// delivered (e.g. the pid has already been reaped), or an
+/// `InvalidInput` error without calling `kill(2)` at all if `pid` is `0`
+/// or doesn't fit in `pid_t` -- `kill`'s pid argument treats `0` and
+/// negative values as process-group or "every process this caller may
+/// signal" broadcasts, not a single target (CTO review, OBI-251); a
+/// `u32::MAX`-range value wrapping around through `as pid_t` could
+/// silently land on one of those broadcast meanings too, rather than
+/// erroring the way an out-of-range pid should.
 pub fn send_sigterm(pid: u32) -> io::Result<()> {
-    // SAFETY: `libc::kill` has no safe wrapper. The pid is the caller's
-    // own direct child (never a wildcard/process-group target, which
-    // `kill`'s pid argument supports but this function deliberately
-    // does not expose), and the caller is required to hold that child's
-    // `std::process::Child` handle alive (so its pid cannot have been
-    // reused by an unrelated process the way a pid read from a file or
-    // another process' `/proc` listing could race) for at least as long
-    // as this call -- `loom-cli`'s only caller does, via the
-    // `tokio::task::spawn_blocking(move || child.wait())` handle it
-    // still owns when it calls this.
-    let ret = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let pid = libc::pid_t::try_from(pid).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("pid {pid} does not fit in pid_t"),
+        )
+    })?;
+    if pid <= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to signal non-positive pid {pid}: 0/negative kill() targets are a \
+                 process-group or broadcast send, not this function's single-known-child contract"
+            ),
+        ));
+    }
+
+    // SAFETY: `libc::kill` has no safe wrapper. `pid` has just been
+    // checked above to be strictly positive, so this is a single-target
+    // signal, never a wildcard/process-group send. The caller is
+    // required to hold that child's `std::process::Child` handle alive
+    // (so its pid cannot have been reused by an unrelated process the
+    // way a pid read from a file or another process' `/proc` listing
+    // could race) for at least as long as this call.
+    let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
     if ret != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
 }
 
+/// Whether `err` is `ESRCH` ("no such process") -- i.e. the pid
+/// [`send_sigterm`] was asked to signal had already exited on its own
+/// before the `kill(2)` call reached the kernel. Exposed so callers
+/// outside this crate (`loom-cli`, which has no `libc` dependency of its
+/// own and whose workspace lints wouldn't let it reach into `libc`
+/// error-number constants directly even if it did) can treat that
+/// specific, expected race as benign without matching on
+/// `io::Error::raw_os_error()`'s platform-specific integer themselves.
+pub fn is_no_such_process(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ESRCH)
+}
+
 /// Install `PR_SET_PDEATHSIG(SIGTERM)` in the *calling* process (meant to
 /// run inside a freshly-`fork`ed child, before `exec`, via
-/// `std::os::unix::process::CommandExt::pre_exec`): if the parent that
-/// installed this (the supervisor) exits for any reason without
-/// explicitly tearing the child down first, the kernel delivers
-/// `SIGTERM` to this process automatically, rather than leaving an
-/// orphaned standby/active server nothing is supervising anymore.
+/// `std::os::unix::process::CommandExt::pre_exec`): if the thread that
+/// installed this exits for any reason without explicitly tearing the
+/// child down first, the kernel delivers `SIGTERM` to this process
+/// automatically, rather than leaving an orphaned standby/active server
+/// nothing is supervising anymore.
 ///
-/// Per `prctl(2)`, the "parent" `PR_SET_PDEATHSIG` tracks is specifically
-/// the thread that called it, re-parented to whatever reaps it -- for a
-/// `pre_exec` callback (which `std` always runs on the single forked
-/// child thread, immediately before `execve`) that is exactly "the
-/// supervisor process that spawned this child", which is the intended
-/// scope here.
+/// **The tracked "parent" is a specific OS *thread*, not the supervisor
+/// *process* as a whole (CTO review, OBI-251 -- this module's docs
+/// previously got this wrong):** per `prctl(2)`, `PR_SET_PDEATHSIG`'s
+/// signal fires when the thread that called it terminates, independent
+/// of whether the process containing that thread is still running.
+/// `pre_exec` runs this call once, in the single-threaded forked child,
+/// which registers against whichever specific thread in the supervisor
+/// called `fork` (i.e. ran `Command::spawn`). **Callers must keep that
+/// exact spawning thread alive for as long as the child should be
+/// tracked** -- a `tokio::task::spawn_blocking` pool thread does *not*
+/// satisfy this: idle blocking-pool threads can and do exit (Tokio's
+/// default keep-alive is 10s), which would silently fire `PR_SET_
+/// PDEATHSIG` against a supervisor that is still very much running.
+/// `loom-cli`'s caller uses one dedicated, long-lived `std::thread`
+/// spanning spawn through `wait()` for exactly this reason.
 ///
 /// # Errors
 /// Returns the `io::Error` from `prctl(2)` on failure. A caller using
@@ -159,20 +206,36 @@ mod tests {
         );
     }
 
+    /// Signalling pid `0` (a process-group broadcast, not a single
+    /// target) is refused before `kill(2)` is ever called -- CTO review,
+    /// OBI-251.
+    #[test]
+    fn send_sigterm_refuses_pid_zero() {
+        let err = send_sigterm(0).expect_err("pid 0 must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// A `u32` pid too large to fit in `pid_t` (`i32` on Linux) must be
+    /// rejected by range-checked conversion, not silently wrapped by an
+    /// `as` cast into some other, possibly meaningful, `pid_t` value
+    /// (CTO review, OBI-251).
+    #[test]
+    fn send_sigterm_refuses_a_pid_too_large_for_pid_t() {
+        let err = send_sigterm(u32::MAX).expect_err("an out-of-range pid must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
     /// `set_death_signal_on_parent_exit`'s `prctl` call itself succeeds
-    /// when invoked directly (not through `pre_exec`, which this test
-    /// deliberately avoids): the actual "child dies when its parent
-    /// exits" kernel behaviour needs a real supervisor-exits-while-
-    /// child-is-running scenario (two real, separately-reaped processes)
-    /// to observe, which a `fork()`-in-a-multithreaded-test-harness
-    /// approach can exercise but only by taking on real flakiness risk
-    /// (locks held by other threads at fork time, CI sandboxes that
-    /// restrict `prctl`) for a property better proven on the real
-    /// supervisor/child process pair -- exactly what E2.2-docker's
-    /// staging run already needs to exercise end to end. This test's
-    /// scope is narrower and unconditionally safe to run anywhere: the
-    /// syscall this module's only non-`kill` `unsafe` block makes is a
-    /// valid call that doesn't error.
+    /// when invoked directly (not through `pre_exec`): a narrow,
+    /// unconditionally-safe-anywhere sanity check that the syscall this
+    /// module's only non-`kill` `unsafe` block makes is valid and
+    /// doesn't error. The full "child dies when its specific parent
+    /// *thread* exits" kernel behaviour (including the spawning-thread
+    /// scoping bug this module's docs previously got wrong -- CTO
+    /// review, OBI-251) is proven end to end by `loom-cli`'s
+    /// `sigkill_the_supervisor_still_terminates_the_child_via_pdeathsig`
+    /// integration test, against the real dedicated-thread supervisor,
+    /// not a unit-test-local `fork()`.
     #[test]
     fn set_death_signal_on_parent_exit_succeeds() {
         set_death_signal_on_parent_exit().expect("prctl(PR_SET_PDEATHSIG) failed");

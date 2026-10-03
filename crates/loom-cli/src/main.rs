@@ -484,13 +484,26 @@ async fn acquire_listeners(
 /// for everything else named in OBI-225/OBI-184**: no respawn-on-crash,
 /// no version watching, no cosign/GHCR staging, no copyover against an
 /// already-running process -- those remain separate, tracked follow-ups.
+///
+/// **Dedicated OS thread, not Tokio's blocking pool (CTO review,
+/// OBI-251):** `loom_supervise::signal::set_death_signal_on_parent_exit`
+/// (installed on the child via `pre_exec`) ties `PR_SET_PDEATHSIG` to
+/// the specific OS *thread* that called `Command::spawn`, not to the
+/// supervisor process as a whole -- see that function's doc for the
+/// full contract. A `tokio::task::spawn_blocking` pool thread does not
+/// satisfy it: Tokio's blocking pool lets idle threads exit (10s
+/// keep-alive by default), which would fire the death signal against a
+/// perfectly healthy, still-running supervisor and silently tear down
+/// the active server. `spawn_handoff_and_wait` below runs on one
+/// `std::thread` that is spawned once and stays alive for the entire
+/// spawn-through-`wait()` lifetime of the child, communicating back to
+/// this `async fn` over plain channels.
 async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     let bind_addr = loom_net::telnet_addr_from_env();
     let http_bind_addr = http_addr_from_env();
 
-    // Bound with the plain `std` listener, not Tokio's: this supervisor
-    // process does almost no async work of its own (one blocking
-    // handshake, then a blocking `wait()`) and the fds need to be
+    // Bound with the plain `std` listener, not Tokio's: handed off to
+    // the dedicated supervisor thread below, and the fds need to be
     // `BorrowedFd`-able for `fdpass::send_fds` regardless.
     let telnet_listener = std::net::TcpListener::bind(&bind_addr)
         .map_err(|err| format!("supervise: failed to bind {bind_addr}: {err}"))?;
@@ -502,58 +515,144 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
         "loom supervise: listening sockets bound, spawning standby child"
     );
 
-    // A blocking spawn-and-handoff on a dedicated blocking thread: this
-    // whole function has nothing else running concurrently yet (no
-    // world thread, no other listeners) to protect from a blocking call,
-    // and `std::process::Command`/`UnixStream` are themselves blocking
-    // APIs -- `spawn_blocking` just keeps the async runtime's own
-    // bookkeeping honest about that. Returns the still-running `Child`
-    // (rather than waiting on it inside the blocking closure) so the
-    // async side below can race that wait against a shutdown signal.
-    let mut child = tokio::task::spawn_blocking(move || {
-        spawn_and_handoff(&mudlib_root, &telnet_listener, &http_listener)
-    })
-    .await
-    .map_err(|err| format!("supervise: join: {err}"))??;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    let (forward_signal_tx, forward_signal_rx) = std::sync::mpsc::channel::<()>();
+    let (exit_tx, exit_rx) = std::sync::mpsc::channel::<Result<std::process::ExitStatus, String>>();
 
-    let child_pid = child.id();
+    // The one thread that owns the whole child lifecycle -- see this
+    // function's doc comment for why it must be a plain, dedicated
+    // `std::thread` and not Tokio's blocking pool.
+    let supervisor_thread = std::thread::Builder::new()
+        .name("loom-supervise-child".to_string())
+        .spawn(move || {
+            spawn_handoff_and_wait(
+                &mudlib_root,
+                &telnet_listener,
+                &http_listener,
+                &ready_tx,
+                &forward_signal_rx,
+                &exit_tx,
+            );
+        })
+        .map_err(|err| format!("supervise: spawn supervisor thread: {err}"))?;
+
+    let child_pid = tokio::task::spawn_blocking(move || ready_rx.recv())
+        .await
+        .map_err(|err| format!("supervise: ready-channel join: {err}"))?
+        .map_err(|_| "supervise: supervisor thread exited before signalling ready".to_string())??;
+
     info!(
         child_pid,
         "loom supervise: standby child is now the active server; forwarding shutdown signals to it until it exits"
     );
 
-    // `child.wait()` is blocking, so it needs its own blocking task to
-    // race against `shutdown_signal()` -- a `SIGTERM`/`SIGINT` delivered
-    // to *this* (supervisor) process must reach the child doing the
-    // actual work (CTO review, OBI-225), not just kill the supervisor
-    // and leave `serve`'s own graceful `shutdown_signal` drain in the
-    // child never triggered.
-    let mut wait_handle = tokio::task::spawn_blocking(move || child.wait());
+    let mut exit_handle = tokio::task::spawn_blocking(move || exit_rx.recv());
 
-    tokio::select! {
-        result = &mut wait_handle => {
-            let status = result
-                .map_err(|err| format!("supervise: wait join: {err}"))?
-                .map_err(|err| format!("supervise: wait on standby child: {err}"))?;
-            if !status.success() {
-                return Err(format!("standby child exited with {status}"));
-            }
-            Ok(())
+    let result = tokio::select! {
+        result = &mut exit_handle => {
+            result
+                .map_err(|err| format!("supervise: exit-channel join: {err}"))?
+                .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())?
         }
         () = shutdown_signal() => {
             info!(child_pid, "loom supervise: received shutdown signal, forwarding SIGTERM to child");
-            loom_supervise::signal::send_sigterm(child_pid)
-                .map_err(|err| format!("supervise: forwarding SIGTERM to child {child_pid}: {err}"))?;
-            let status = wait_handle
+            // The supervisor thread does the actual `send_sigterm` (it
+            // already holds the live `Child`); this channel just wakes
+            // its wait loop up to do that instead of this async task
+            // calling `send_sigterm` itself from an unrelated thread --
+            // either would reach the same pid, but routing it through
+            // the owning thread keeps "who may act on this `Child`" to
+            // one place.
+            let _ = forward_signal_tx.send(());
+            exit_handle
                 .await
-                .map_err(|err| format!("supervise: wait join after signal: {err}"))?
-                .map_err(|err| format!("supervise: wait on standby child after signal: {err}"))?;
-            if !status.success() {
-                return Err(format!(
-                    "standby child exited with {status} after forwarded shutdown signal"
-                ));
+                .map_err(|err| format!("supervise: exit-channel join after signal: {err}"))?
+                .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())?
+        }
+    };
+
+    // The thread's job is done once it has reported the child's exit;
+    // join it so a panic inside it (which `recv()` on a dropped sender
+    // would otherwise just look like a closed channel for) surfaces.
+    if let Err(panic) = supervisor_thread.join() {
+        return Err(format!("supervise: supervisor thread panicked: {panic:?}"));
+    }
+
+    let status = result?;
+    if !status.success() {
+        return Err(format!("standby child exited with {status}"));
+    }
+    Ok(())
+}
+
+/// Runs on the one dedicated `std::thread` [`supervise`] spawns (see its
+/// doc comment for why it must be this and not `spawn_blocking`): spawn
+/// the standby child and hand off the listening sockets ([`spawn_and_
+/// handoff`]), report the child's pid over `ready_tx`, then loop,
+/// polling the child's exit status and `forward_signal_rx` (a request
+/// from the async side to forward `SIGTERM`), until the child exits --
+/// reporting the final status (or any error along the way) over
+/// `exit_tx`.
+fn spawn_handoff_and_wait(
+    mudlib_root: &std::path::Path,
+    telnet_listener: &std::net::TcpListener,
+    http_listener: &std::net::TcpListener,
+    ready_tx: &std::sync::mpsc::Sender<Result<u32, String>>,
+    forward_signal_rx: &std::sync::mpsc::Receiver<()>,
+    exit_tx: &std::sync::mpsc::Sender<Result<std::process::ExitStatus, String>>,
+) {
+    let mut child = match spawn_and_handoff(mudlib_root, telnet_listener, http_listener) {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
+    let _ = ready_tx.send(Ok(child.id()));
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = exit_tx.send(Ok(status));
+                return;
             }
-            Ok(())
+            Ok(None) => {}
+            Err(err) => {
+                let _ = exit_tx.send(Err(format!("supervise: wait on standby child: {err}")));
+                return;
+            }
+        }
+
+        // Short poll interval: just needs to be responsive enough to a
+        // forwarded shutdown signal to keep the measured copyover/
+        // shutdown pause well under the design's 5s budget, not tight
+        // enough to matter for CPU usage in what is otherwise an idle
+        // wait.
+        match forward_signal_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(()) => match loom_supervise::signal::send_sigterm(child.id()) {
+                Ok(()) => {}
+                Err(err) if loom_supervise::signal::is_no_such_process(&err) => {
+                    // CTO review (OBI-251): the child had already exited
+                    // on its own in the small window between our last
+                    // `try_wait` and this `send_sigterm` -- benign, the
+                    // next loop iteration's `try_wait` will observe it.
+                }
+                Err(err) => {
+                    let _ = exit_tx.send(Err(format!(
+                        "supervise: forwarding SIGTERM to child {}: {err}",
+                        child.id()
+                    )));
+                    return;
+                }
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The async side is gone (e.g. it already errored out of
+                // `supervise` some other way) -- no further signal will
+                // ever arrive, but the child itself still needs to be
+                // waited on to avoid leaving a zombie; keep looping on
+                // `try_wait` alone.
+            }
         }
     }
 }
