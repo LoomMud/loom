@@ -410,7 +410,7 @@ fn version_file_change_is_detected_and_logged() {
         .read_exact(&mut preamble)
         .expect("read telnet negotiation preamble before changing the version file");
 
-    // A background thread drains stderr into a channel, since reading
+    // A background thread drains stdout into a channel, since reading
     // it directly on this thread would block waiting for more output
     // right when the test needs to also act (write the file) and poll
     // (read lines with an overall timeout).
@@ -515,6 +515,11 @@ impl Supervisor {
             .env("LOOM_TELNET_ADDR", telnet_bind)
             .env("LOOM_HTTP_ADDR", http_bind)
             .env("LOOM_DESIRED_VERSION_FILE", version_file)
+            // CTO review (OBI-256 nit): overridable rather than a fixed
+            // 5s production default, so this test has real slack
+            // against its own timeout instead of racing CI's timing
+            // margin at the production cadence.
+            .env("LOOM_VERSION_POLL_INTERVAL_MS", "200")
             .env_remove("DATABASE_URL")
             .env_remove("LOOM_SMOKE_DATABASE_URL")
             .env("RUST_LOG", "loom_cli=info")

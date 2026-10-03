@@ -11,7 +11,6 @@
 //! never a file path or a Kubernetes API directly.
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 /// Where `loom supervise` currently believes the desired driver version
 /// comes from. Both implementations here are polling, not push -- a
@@ -37,21 +36,17 @@ pub trait VersionSource: Send {
 /// parse the same).
 pub struct FileVersionSource {
     path: PathBuf,
-    last_mtime: Option<SystemTime>,
 }
 
 impl FileVersionSource {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            last_mtime: None,
-        }
+        Self { path: path.into() }
     }
 }
 
 impl VersionSource for FileVersionSource {
     fn poll(&mut self) -> std::io::Result<Option<String>> {
-        read_version_file(&self.path, &mut self.last_mtime)
+        read_version_file(&self.path)
     }
 }
 
@@ -62,8 +57,13 @@ impl VersionSource for FileVersionSource {
 /// for a source, but not what a reconcile loop wants to act on directly
 /// (it would otherwise need its own "is this actually new" bookkeeping
 /// at every call site). `VersionWatcher` does that bookkeeping once:
-/// [`poll_for_change`](Self::poll_for_change) only ever returns
-/// `Some` the first time a given version string is observed.
+/// [`poll_for_change`](Self::poll_for_change) only ever returns `Some`
+/// when the source's current value differs from the version this
+/// watcher currently tracks -- including a *rollback*: A -> B -> A is
+/// correctly reported as two changes, not "A was already seen, ignore
+/// it" (CTO review, OBI-256 -- a previous version of this doc
+/// described it as "the first time a given version string is observed",
+/// which reads as never re-reporting A, the wrong behavior).
 pub struct VersionWatcher {
     source: Box<dyn VersionSource>,
     current: Option<String>,
@@ -114,33 +114,18 @@ impl VersionWatcher {
 }
 
 /// Split out from [`FileVersionSource::poll`] so it's unit-testable
-/// without constructing the whole struct, and reused by
-/// [`FileVersionSource`] only (kept private: the mtime-skip optimisation
-/// is an implementation detail, not something callers should rely on --
-/// `poll` always returns the current content, mtime-skip or not).
-fn read_version_file(
-    path: &Path,
-    last_mtime: &mut Option<SystemTime>,
-) -> std::io::Result<Option<String>> {
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
+/// without constructing the whole struct. Always re-reads the file on
+/// every call (no mtime-based skip, removed per CTO review, OBI-256: a
+/// tiny file is cheap enough to just read, and an mtime check only
+/// racing at the granularity some filesystems report it would have been
+/// a correctness trap, not a real optimisation, for no measurable
+/// benefit).
+fn read_version_file(path: &Path) -> std::io::Result<Option<String>> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    // Best-effort change detection: a reconciler that rewrites the file
-    // with identical content on every poll is still safe (the caller
-    // compares the returned string to what it already runs, same as a
-    // `None` mtime), so a `mtime()` failure (some filesystems/platforms)
-    // just means every poll re-reads, not an error.
-    if let Ok(mtime) = metadata.modified() {
-        if *last_mtime == Some(mtime) {
-            // Unchanged since last poll -- still return the value (not
-            // `None`): the caller decides whether "unchanged" matters,
-            // this source only reports what's on disk right now.
-        }
-        *last_mtime = Some(mtime);
-    }
-    let raw = std::fs::read_to_string(path)?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(None);
