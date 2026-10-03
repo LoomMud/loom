@@ -521,7 +521,7 @@ async fn acquire_listeners(
 /// to this `async fn` over plain channels.
 const MAX_CONSECUTIVE_CRASHES: u32 = 5;
 const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(30);
-const VERSION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_VERSION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     let bind_addr = loom_net::telnet_addr_from_env();
@@ -549,19 +549,27 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     // `LOOM_DESIRED_VERSION_FILE` isn't set keeps version watching
     // fully disabled, matching this function's behavior before this
     // slice.
+    //
+    // CTO review (OBI-256): seeded with the *running build's own*
+    // version (`running_version_from_env`), not the desired-version
+    // file's content at boot -- the whole point of §9.9's reconcile
+    // loop is noticing a mismatch between "what's running" and "what's
+    // desired", and seeding from the file itself would make a desired-
+    // version write that happened while the supervisor was down
+    // invisible (the file and the "baseline" would already agree by the
+    // time anything polls).
+    let running_version = running_version_from_env();
     let mut version_rx = desired_version_file_from_env().map(|path| {
-        let mut watcher =
-            loom_supervise::VersionWatcher::new(Box::new(loom_supervise::FileVersionSource::new(&path)), None);
-        // Establish the boot-time baseline synchronously (a single,
-        // cheap file read/stat): without this, the file's pre-existing
-        // content would be reported as a "change" on the very first
-        // poll, which is misleading -- the supervisor booted *with*
-        // that version, it didn't just switch to it.
-        if let Err(err) = watcher.poll_for_change() {
-            warn!(%err, path = %path.display(), "loom supervise: initial desired-version read failed; will keep retrying");
-        }
-        info!(path = %path.display(), current = ?watcher.current(), "loom supervise: version watching enabled");
-        spawn_version_watcher(watcher, VERSION_POLL_INTERVAL)
+        let watcher = loom_supervise::VersionWatcher::new(
+            Box::new(loom_supervise::FileVersionSource::new(&path)),
+            Some(running_version.clone()),
+        );
+        info!(
+            path = %path.display(),
+            running_version,
+            "loom supervise: version watching enabled"
+        );
+        spawn_version_watcher(watcher, version_poll_interval_from_env())
     });
 
     let mut shutdown = ShutdownSignals::new()?;
@@ -671,7 +679,7 @@ async fn run_one_child_attempt(
     telnet_listener: &std::net::TcpListener,
     http_listener: &std::net::TcpListener,
     shutdown: &mut ShutdownSignals,
-    mut version_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+    mut version_rx: Option<&mut tokio::sync::watch::Receiver<String>>,
 ) -> Result<ChildAttemptOutcome, String> {
     // `spawn_handoff_and_wait` needs `'static` owned copies of the
     // listeners to move into its dedicated thread; `try_clone` is a
@@ -744,9 +752,18 @@ async fn run_one_child_attempt(
                     .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())??;
                 break ChildAttemptOutcome::ShutdownRequested(status);
             }
-            Some(version) = async {
+            version = async {
                 match version_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
+                    Some(rx) => match rx.changed().await {
+                        Ok(()) => rx.borrow_and_update().clone(),
+                        // CTO review (OBI-256): the watcher task died --
+                        // never resolving again has the same effect as
+                        // `version_rx` being `None` (this arm is simply
+                        // never picked again), rather than this `async`
+                        // block returning immediately on every future
+                        // poll and spinning the surrounding `loop`.
+                        Err(_) => std::future::pending().await,
+                    },
                     // No version watching configured: a `select!` arm
                     // whose future never resolves is simply never
                     // picked, same effect as not having this arm at all.
@@ -854,22 +871,33 @@ fn spawn_handoff_and_wait(
 fn spawn_version_watcher(
     mut watcher: loom_supervise::VersionWatcher,
     poll_interval: Duration,
-) -> tokio::sync::mpsc::Receiver<String> {
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+) -> tokio::sync::watch::Receiver<String> {
+    // CTO review (OBI-256): `watch`, not `mpsc`, is the right channel
+    // shape for a desired-state signal -- `watch::Sender::send` always
+    // overwrites with the latest value (no queue to go stale in), so a
+    // consumer that's busy elsewhere (e.g. `supervise`'s crash-backoff
+    // sleep) when several changes land in a row still only ever acts on
+    // the newest one once it does check, never an older queued one.
+    // Seeded with `watcher.current()`'s baseline (the running version,
+    // per this function's caller) so the first real change is the first
+    // thing `changed()` ever reports.
+    let initial = watcher.current().unwrap_or_default().to_string();
+    let (tx, rx) = tokio::sync::watch::channel(initial);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
-        // The first tick fires immediately; this task already polled
-        // once synchronously (for the boot-time baseline) just before
-        // being spawned, so an immediate second poll here is harmless
-        // (it'll see no change) rather than wasteful.
+        // CTO review (OBI-256): `Delay`, not the default `Burst` --
+        // a single slow poll (e.g. a stalled NFS/bind mount under the
+        // blocking file read below) must not cause a run of immediate
+        // catch-up ticks once it finally returns.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            // `VersionWatcher::poll_for_change` does blocking file I/O
-            // (a `stat` and, on a changed mtime, a `read`); moving
-            // `watcher` into `spawn_blocking` and getting it back out
-            // via the tuple keeps that off this task's own (cooperative)
-            // poll, reusing the same watcher (with its change-tracking
-            // state) across every tick rather than rebuilding it.
+            // `VersionWatcher::poll_for_change` does blocking file I/O;
+            // moving `watcher` into `spawn_blocking` and getting it back
+            // out via the tuple keeps that off this task's own
+            // (cooperative) poll, reusing the same watcher (with its
+            // change-tracking state) across every tick rather than
+            // rebuilding it.
             let (result, returned_watcher) = match tokio::task::spawn_blocking(move || {
                 let result = watcher.poll_for_change();
                 (result, watcher)
@@ -886,7 +914,7 @@ fn spawn_version_watcher(
 
             match result {
                 Ok(Some(version)) => {
-                    if tx.send(version).await.is_err() {
+                    if tx.send(version).is_err() {
                         // The receiving end (inside `supervise`'s respawn
                         // loop) is gone -- `supervise` itself must have
                         // already returned, so there is nothing left
@@ -1210,6 +1238,38 @@ fn web_root_from_env() -> Option<PathBuf> {
 /// did before this slice in that case.
 fn desired_version_file_from_env() -> Option<PathBuf> {
     std::env::var_os("LOOM_DESIRED_VERSION_FILE").map(PathBuf::from)
+}
+
+/// This process's own running version, for seeding [`VersionWatcher`]
+/// (CTO review, OBI-256; `VersionWatcher` here refers to
+/// `loom_supervise::VersionWatcher`): §9.9's reconcile loop exists to
+/// notice a mismatch between "what's running" and "what's desired", so
+/// the baseline must be *this process's own identity*, not whatever the
+/// desired-version file happens to say at boot (which would make a
+/// desired-version write that happened while the supervisor was down
+/// invisible -- see `supervise`'s own doc comment for the concrete
+/// scenario). `LOOM_RUNNING_VERSION` is meant to be set by whatever
+/// staged this specific build (the Docker-staging reconciler today;
+/// cosign/GHCR artifact staging, not yet built, would be the eventual
+/// source once it exists) to the version string that build actually is.
+/// Falling back to the crate's own `CARGO_PKG_VERSION` keeps local/dev
+/// runs (which never set this) working, though it's not a meaningful
+/// "build identity" the way a staged artifact's tag/digest would be.
+fn running_version_from_env() -> String {
+    std::env::var("LOOM_RUNNING_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Override for [`DEFAULT_VERSION_POLL_INTERVAL`] (CTO review, OBI-256's
+/// nits): exists so a flaky CI timing margin can be tightened without
+/// touching the default production cadence, and so a future test that
+/// wants the version-watch loop to react faster than every 5s doesn't
+/// have to wait on it.
+fn version_poll_interval_from_env() -> Duration {
+    std::env::var("LOOM_VERSION_POLL_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_VERSION_POLL_INTERVAL)
 }
 
 /// Staff web auth's JWT signing keyset (OBI-174, OBI-197/M-AUTH-4, design
