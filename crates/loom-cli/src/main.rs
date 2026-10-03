@@ -1265,11 +1265,77 @@ fn running_version_from_env() -> String {
 /// wants the version-watch loop to react faster than every 5s doesn't
 /// have to wait on it.
 fn version_poll_interval_from_env() -> Duration {
-    std::env::var("LOOM_VERSION_POLL_INTERVAL_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(DEFAULT_VERSION_POLL_INTERVAL)
+    parse_version_poll_interval_ms(
+        std::env::var("LOOM_VERSION_POLL_INTERVAL_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parsing logic split out from [`version_poll_interval_from_env`]
+/// so it's unit-testable without mutating process-global env vars (which
+/// would race other tests in the same binary -- `cargo test` runs tests
+/// in parallel threads by default).
+fn parse_version_poll_interval_ms(raw: Option<&str>) -> Duration {
+    match raw {
+        Some(raw) => match raw.parse::<u64>() {
+            // CTO review (OBI-257): `tokio::time::interval` panics on a
+            // zero period. Refusing it here (falling back to the
+            // default, with a warning) keeps an operator/reconciler typo
+            // from crashing the whole version-watch task -- which would
+            // otherwise silently disable version watching entirely (the
+            // channel's sender just drops, and the consumer side's dead-
+            // sender handling, by design, looks identical to "nothing
+            // configured").
+            Ok(0) => {
+                warn!(
+                    "loom supervise: LOOM_VERSION_POLL_INTERVAL_MS=0 is invalid (tokio::time::interval \
+                     panics on a zero period); using the default {DEFAULT_VERSION_POLL_INTERVAL:?} instead"
+                );
+                DEFAULT_VERSION_POLL_INTERVAL
+            }
+            Ok(ms) => Duration::from_millis(ms),
+            Err(_) => DEFAULT_VERSION_POLL_INTERVAL,
+        },
+        None => DEFAULT_VERSION_POLL_INTERVAL,
+    }
+}
+
+#[cfg(test)]
+mod version_poll_interval_tests {
+    use super::*;
+
+    #[test]
+    fn unset_is_the_default() {
+        assert_eq!(
+            parse_version_poll_interval_ms(None),
+            DEFAULT_VERSION_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn zero_is_refused_and_falls_back_to_the_default() {
+        assert_eq!(
+            parse_version_poll_interval_ms(Some("0")),
+            DEFAULT_VERSION_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn garbage_falls_back_to_the_default() {
+        assert_eq!(
+            parse_version_poll_interval_ms(Some("not-a-number")),
+            DEFAULT_VERSION_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn a_positive_value_is_used_as_milliseconds() {
+        assert_eq!(
+            parse_version_poll_interval_ms(Some("250")),
+            Duration::from_millis(250)
+        );
+    }
 }
 
 /// Staff web auth's JWT signing keyset (OBI-174, OBI-197/M-AUTH-4, design
