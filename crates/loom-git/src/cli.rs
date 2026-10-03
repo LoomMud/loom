@@ -147,7 +147,15 @@ impl Repo {
     /// [`crate::TokenProvider`] is configured (push/fetch disabled,
     /// D-B3.5) -- callers must not fall back to an unauthenticated
     /// remote call in that case (R2).
-    pub fn build_authed(&self, args: &[&str], token: &str) -> Command {
+    ///
+    /// `remote_url` scopes the credential header to exactly that remote
+    /// via `http.<remote_url>.extraHeader` (OBI-210 R4, CTO decision:
+    /// belongs here, not just B3.5's bootstrap wiring) -- a global
+    /// `http.extraHeader` would also be sent on any other `http(s)://`
+    /// request this same process ever made (a submodule, a future
+    /// second remote, anything), leaking the installation token to a
+    /// host it was never scoped for.
+    pub fn build_authed(&self, args: &[&str], token: &str, remote_url: &str) -> Command {
         let mut cmd = self.base_command();
         cmd.args(args);
         // `x-access-token:<token>` is the scheme GitHub Apps document for
@@ -155,8 +163,9 @@ impl Repo {
         // `Authorization` header value through env-only git config so it
         // never lands in argv, the URL, or the repo's on-disk config.
         let header = format!("Authorization: Basic {}", basic_auth(token));
+        let scoped_key = format!("http.{remote_url}.extraHeader");
         cmd.env("GIT_CONFIG_COUNT", "2");
-        cmd.env("GIT_CONFIG_KEY_0", "http.extraHeader");
+        cmd.env("GIT_CONFIG_KEY_0", scoped_key);
         cmd.env("GIT_CONFIG_VALUE_0", header);
         // R2: an empty `credential.helper` plus `GIT_TERMINAL_PROMPT=0`
         // (set globally by `harden`, repeated here for emphasis) means
@@ -178,15 +187,22 @@ impl Repo {
     /// Run a `git` subcommand that talks to a remote, with credentials
     /// (D-B3.11) injected **only** through the child's environment via
     /// `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*`
-    /// (`http.extraHeader`), never in argv, the remote URL, or
-    /// `.git/config`. `token` is `None` when no [`crate::TokenProvider`]
-    /// is configured; returns [`GitError::NoToken`] rather than ever
-    /// silently running `args` unauthenticated (R2, CTO review OBI-209).
-    pub fn git_authed(&self, args: &[&str], token: Option<&str>) -> Result<Output, GitError> {
+    /// (`http.<remote_url>.extraHeader`, scoped to `remote_url` --
+    /// OBI-210 R4 -- never a global `http.extraHeader`), never in argv,
+    /// the remote URL, or `.git/config`. `token` is `None` when no
+    /// [`crate::TokenProvider`] is configured; returns
+    /// [`GitError::NoToken`] rather than ever silently running `args`
+    /// unauthenticated (R2, CTO review OBI-209).
+    pub fn git_authed(
+        &self,
+        args: &[&str],
+        token: Option<&str>,
+        remote_url: &str,
+    ) -> Result<Output, GitError> {
         let Some(token) = token else {
             return Err(GitError::NoToken);
         };
-        run(self.build_authed(args, token), args)
+        run(self.build_authed(args, token, remote_url), args)
     }
 
     /// Run `args` with extra environment variables and/or stdin bytes,
@@ -427,14 +443,22 @@ mod tests {
     #[test]
     fn git_authed_without_token_is_an_error() {
         let repo = Repo::new("/nonexistent.git", "/nonexistent");
-        assert_eq!(repo.git_authed(&["fetch"], None), Err(GitError::NoToken));
+        assert_eq!(
+            repo.git_authed(&["fetch"], None, "https://github.com/example/repo.git"),
+            Err(GitError::NoToken)
+        );
     }
 
     #[test]
     fn authed_command_never_carries_the_token_in_argv() {
         let repo = Repo::new("/nonexistent.git", "/nonexistent");
         let token = "super-secret-token";
-        let cmd = repo.build_authed(&["push", "origin", "live:refs/heads/live/test"], token);
+        let remote_url = "https://github.com/example/repo.git";
+        let cmd = repo.build_authed(
+            &["push", "origin", "live:refs/heads/live/test"],
+            token,
+            remote_url,
+        );
         let argv: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -460,6 +484,14 @@ mod tests {
             .and_then(|(_, v)| v.clone())
             .expect("GIT_CONFIG_VALUE_0 must be set");
         assert_eq!(header_value, format!("Authorization: Basic {encoded}"));
+        // OBI-210 R4: the header key is scoped to this exact remote URL,
+        // never a bare/global `http.extraHeader`.
+        let header_key = envs
+            .iter()
+            .find(|(k, _)| k == "GIT_CONFIG_KEY_0")
+            .and_then(|(_, v)| v.clone())
+            .expect("GIT_CONFIG_KEY_0 must be set");
+        assert_eq!(header_key, format!("http.{remote_url}.extraHeader"));
         assert!(
             !envs
                 .iter()
