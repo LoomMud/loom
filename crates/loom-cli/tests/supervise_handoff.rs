@@ -374,6 +374,86 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
     }
 }
 
+/// OBI-184 version-watching slice: `loom supervise`, given
+/// `LOOM_DESIRED_VERSION_FILE`, actually detects a change written to
+/// that file while it's running -- not just "the unit-tested
+/// `VersionWatcher` logic is correct in isolation", but that `supervise`
+/// really reads the env var, builds a real `FileVersionSource` against
+/// the real path, and its background poll task really observes a real
+/// write. Detection is the only thing to assert on (no copyover is
+/// triggered yet -- see `run_one_child_attempt`'s doc comment), so this
+/// greps the supervisor's own log output for the change it reports.
+#[test]
+fn version_file_change_is_detected_and_logged() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let version_dir = scratch("version-watch");
+    let version_file = version_dir.join("desired-version");
+    std::fs::write(&version_file, "v1.0.0\n").expect("write initial desired-version");
+
+    let (mut supervisor, stdout) =
+        Supervisor::spawn_with_version_file(&mudlib, &telnet_bind, &http_bind, &version_file);
+
+    // Confirm the standby child is really up before touching the
+    // version file, so a later failure can't be "it never booted" in
+    // disguise.
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before changing the version file");
+
+    // A background thread drains stderr into a channel, since reading
+    // it directly on this thread would block waiting for more output
+    // right when the test needs to also act (write the file) and poll
+    // (read lines with an overall timeout).
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_change = false;
+    while Instant::now() < deadline {
+        match line_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                if line.contains("desired version changed") && line.contains("v2.0.0") {
+                    saw_change = true;
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    assert!(
+        saw_change,
+        "supervisor never logged detecting the desired-version file change to v2.0.0"
+    );
+    // Detection-only: the original child must still be the one serving
+    // (no copyover was triggered), and the supervisor itself must still
+    // be running.
+    supervisor.assert_alive();
+}
+
 fn reserve_local_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("read local addr").port()
@@ -405,6 +485,47 @@ impl Supervisor {
             .expect("spawn loom supervise");
 
         Self { child }
+    }
+
+    /// Like [`Self::spawn`], but with `LOOM_DESIRED_VERSION_FILE` set
+    /// and `stdout` piped (not discarded) with logging turned up to
+    /// `info` -- needed by the version-watch test, which has nothing
+    /// else observable to assert on (OBI-184's version-watching slice
+    /// is detection-only: a log line is the only externally visible
+    /// effect of a detected change today). `tracing_subscriber::fmt`'s
+    /// default `MakeWriter` is `io::stdout`, not `io::stderr` -- despite
+    /// every other test in this file discarding both, so this is the
+    /// first one where the distinction actually matters. Returns the
+    /// piped stdout handle alongside the `Supervisor` so the caller can
+    /// read it.
+    fn spawn_with_version_file(
+        mudlib: &Path,
+        telnet_bind: &str,
+        http_bind: &str,
+        version_file: &Path,
+    ) -> (Self, std::process::ChildStdout) {
+        let loom_bin = std::env::var("CARGO_BIN_EXE_loom-cli")
+            .or_else(|_| std::env::var("CARGO_BIN_EXE_loom_cli"))
+            .expect("cargo binary path for loom-cli");
+
+        let mut child = Command::new(loom_bin)
+            .arg("supervise")
+            .arg("--mudlib")
+            .arg(mudlib)
+            .env("LOOM_TELNET_ADDR", telnet_bind)
+            .env("LOOM_HTTP_ADDR", http_bind)
+            .env("LOOM_DESIRED_VERSION_FILE", version_file)
+            .env_remove("DATABASE_URL")
+            .env_remove("LOOM_SMOKE_DATABASE_URL")
+            .env("RUST_LOG", "loom_cli=info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn loom supervise");
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        (Self { child }, stdout)
     }
 
     fn assert_alive(&mut self) {

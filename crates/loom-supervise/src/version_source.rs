@@ -55,6 +55,64 @@ impl VersionSource for FileVersionSource {
     }
 }
 
+/// Change detection on top of any [`VersionSource`] (OBI-184's
+/// version-watching slice): a bare [`VersionSource::poll`] just reports
+/// whatever is currently on disk/in the ConfigMap, every time, whether
+/// or not it moved since the last poll -- exactly the right primitive
+/// for a source, but not what a reconcile loop wants to act on directly
+/// (it would otherwise need its own "is this actually new" bookkeeping
+/// at every call site). `VersionWatcher` does that bookkeeping once:
+/// [`poll_for_change`](Self::poll_for_change) only ever returns
+/// `Some` the first time a given version string is observed.
+pub struct VersionWatcher {
+    source: Box<dyn VersionSource>,
+    current: Option<String>,
+}
+
+impl VersionWatcher {
+    /// `initial` is the version to treat as already-running (typically
+    /// "whatever this supervisor process itself was started with"), so
+    /// the very first poll doesn't spuriously report a "change" just
+    /// because the source has *always* said that version -- only an
+    /// actual difference from `initial` is a change worth reporting.
+    pub fn new(source: Box<dyn VersionSource>, initial: Option<String>) -> Self {
+        Self {
+            source,
+            current: initial,
+        }
+    }
+
+    /// The version this watcher currently believes is running (either
+    /// `initial`, or the most recent value a prior
+    /// [`poll_for_change`](Self::poll_for_change) reported as a change).
+    pub fn current(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
+
+    /// Poll the underlying source once. Returns `Ok(Some(version))` only
+    /// if the source reports a version and it differs from the one this
+    /// watcher currently tracks (which is then updated to match); `Ok
+    /// (None)` if the source has nothing yet or reports the same version
+    /// as before -- the common case on every poll where nothing changed.
+    ///
+    /// # Errors
+    /// Propagates any `io::Error` from the underlying
+    /// [`VersionSource::poll`] (e.g. a permissions error reading the
+    /// file) without updating the tracked version -- a transient read
+    /// failure must not be confused with "the version actually changed
+    /// to nothing".
+    pub fn poll_for_change(&mut self) -> std::io::Result<Option<String>> {
+        let polled = self.source.poll()?;
+        match polled {
+            Some(version) if Some(version.as_str()) != self.current.as_deref() => {
+                self.current = Some(version.clone());
+                Ok(Some(version))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
 /// Split out from [`FileVersionSource::poll`] so it's unit-testable
 /// without constructing the whole struct, and reused by
 /// [`FileVersionSource`] only (kept private: the mtime-skip optimisation
@@ -127,5 +185,90 @@ mod tests {
         assert_eq!(src.poll().unwrap(), Some("v1.0.0".to_string()));
         std::fs::write(&path, "v1.1.0").unwrap();
         assert_eq!(src.poll().unwrap(), Some("v1.1.0".to_string()));
+    }
+
+    /// A trivial, fully in-memory [`VersionSource`] for [`VersionWatcher`]
+    /// tests -- queueing exact poll results (including errors) gives
+    /// tighter control than writing files for each case, and keeps these
+    /// tests from depending on `FileVersionSource`'s own behavior (which
+    /// has its own tests above).
+    struct ScriptedSource {
+        results: std::collections::VecDeque<std::io::Result<Option<String>>>,
+    }
+
+    impl ScriptedSource {
+        fn new(results: Vec<std::io::Result<Option<String>>>) -> Self {
+            Self {
+                results: results.into(),
+            }
+        }
+    }
+
+    impl VersionSource for ScriptedSource {
+        fn poll(&mut self) -> std::io::Result<Option<String>> {
+            self.results.pop_front().unwrap_or(Ok(None))
+        }
+    }
+
+    #[test]
+    fn version_watcher_reports_the_first_differing_value_as_a_change() {
+        let source = ScriptedSource::new(vec![Ok(Some("v1".to_string()))]);
+        let mut watcher = VersionWatcher::new(Box::new(source), None);
+        assert_eq!(watcher.poll_for_change().unwrap(), Some("v1".to_string()));
+        assert_eq!(watcher.current(), Some("v1"));
+    }
+
+    #[test]
+    fn version_watcher_does_not_report_a_change_if_the_initial_version_already_matches() {
+        let source = ScriptedSource::new(vec![Ok(Some("v1".to_string()))]);
+        let mut watcher = VersionWatcher::new(Box::new(source), Some("v1".to_string()));
+        assert_eq!(watcher.poll_for_change().unwrap(), None);
+    }
+
+    #[test]
+    fn version_watcher_does_not_report_the_same_version_twice() {
+        let source =
+            ScriptedSource::new(vec![Ok(Some("v1".to_string())), Ok(Some("v1".to_string()))]);
+        let mut watcher = VersionWatcher::new(Box::new(source), None);
+        assert_eq!(watcher.poll_for_change().unwrap(), Some("v1".to_string()));
+        assert_eq!(watcher.poll_for_change().unwrap(), None);
+    }
+
+    #[test]
+    fn version_watcher_reports_each_subsequent_change() {
+        let source = ScriptedSource::new(vec![
+            Ok(Some("v1".to_string())),
+            Ok(Some("v1".to_string())),
+            Ok(Some("v2".to_string())),
+        ]);
+        let mut watcher = VersionWatcher::new(Box::new(source), None);
+        assert_eq!(watcher.poll_for_change().unwrap(), Some("v1".to_string()));
+        assert_eq!(watcher.poll_for_change().unwrap(), None);
+        assert_eq!(watcher.poll_for_change().unwrap(), Some("v2".to_string()));
+        assert_eq!(watcher.current(), Some("v2"));
+    }
+
+    #[test]
+    fn version_watcher_ignores_a_source_reporting_nothing_yet() {
+        let source = ScriptedSource::new(vec![Ok(None), Ok(Some("v1".to_string()))]);
+        let mut watcher = VersionWatcher::new(Box::new(source), None);
+        assert_eq!(watcher.poll_for_change().unwrap(), None);
+        assert_eq!(watcher.poll_for_change().unwrap(), Some("v1".to_string()));
+    }
+
+    #[test]
+    fn version_watcher_propagates_a_source_error_without_updating_current() {
+        let source = ScriptedSource::new(vec![
+            Err(std::io::Error::other("boom")),
+            Ok(Some("v1".to_string())),
+        ]);
+        let mut watcher = VersionWatcher::new(Box::new(source), Some("v0".to_string()));
+        assert!(watcher.poll_for_change().is_err());
+        assert_eq!(
+            watcher.current(),
+            Some("v0"),
+            "a poll error must not clobber the previously tracked version"
+        );
+        assert_eq!(watcher.poll_for_change().unwrap(), Some("v1".to_string()));
     }
 }
