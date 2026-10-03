@@ -572,10 +572,10 @@ fn run_control_responder(
 /// doesn't also wedge waiting on it.
 const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Ask the world thread (via `spawn_world_thread`'s `drain_snapshot_
-/// requests`) for a fresh snapshot of its current state, blocking this
-/// (control-responder) thread until it answers or [`SNAPSHOT_REQUEST_
-/// TIMEOUT`] elapses.
+/// Ask the world thread (whose event loop in `spawn_world_thread` drains
+/// `snapshot_req_rx` inline via `try_recv`) for a fresh snapshot of its
+/// current state, blocking this (control-responder) thread until it
+/// answers or [`SNAPSHOT_REQUEST_TIMEOUT`] elapses.
 fn request_snapshot(
     snapshot_req_tx: &std::sync::mpsc::Sender<std::sync::mpsc::Sender<Result<Vec<u8>, String>>>,
 ) -> Result<Vec<u8>, String> {
