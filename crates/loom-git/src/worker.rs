@@ -294,6 +294,13 @@ pub struct ProposeGitHubConfig {
     pub pr_opener: Box<dyn PullRequestOpener>,
     pub owner: String,
     pub repo: String,
+    /// The same dedicated App (D-B3.9), used for the post-merge
+    /// `SyncMain` PR report (OBI-213/OBI-272: `merged_commits` +
+    /// `report_recompile`). `None` here means that report is skipped
+    /// entirely -- distinct from `pr_opener`, since a `propose`-only test
+    /// double doesn't necessarily also implement
+    /// [`crate::report::ReportGitHub`].
+    pub report_client: Option<Box<dyn crate::report::ReportGitHub>>,
 }
 
 /// Everything `propose` (B3.3) needs beyond the commit/push/sync config
@@ -532,6 +539,7 @@ fn run(
                 &token_status,
                 &*recompile_host,
                 &*audit,
+                &propose_config,
             );
             match retry {
                 Some(dirty_paths) => {
@@ -794,6 +802,7 @@ fn run_sync_main(
     token_status: &TokenStatus,
     recompile_host: &dyn RecompileHost,
     audit: &dyn AuditSink,
+    propose_config: &ProposeConfig,
 ) -> Option<Vec<String>> {
     let fetch_args = ["fetch", config.remote.as_str(), "main"];
     match remote_git(repo, config, token_status, &fetch_args) {
@@ -868,6 +877,15 @@ fn run_sync_main(
     if new_live == old_live {
         // Nothing survived (shouldn't normally happen -- `main` itself is
         // always in the result -- but guard against an empty rebuild).
+        //
+        // `main` itself did move (we already returned above when it
+        // hadn't) even though `live` didn't need to change for it --
+        // record that now, not just on the fast-forward path below, or
+        // `old_main` never advances past `None` until the *next* `main`
+        // move that actually touches `live`, and every pass in between
+        // wrongly looks like "first sync" to `report_post_merge`
+        // (OBI-272).
+        let _ = repo.git(&["update-ref", "refs/loom/last-main", &new_main]);
         crate::metrics::record_sync(if rebase_ok {
             "no_change"
         } else {
@@ -982,8 +1000,70 @@ fn run_sync_main(
         } else {
             "compile_failed"
         });
+        // OBI-272 (B3.3 slice 5): best-effort post-merge PR report --
+        // off the tree lock (already released above), and a GitHub
+        // failure here must never fail the sync itself.
+        report_post_merge(
+            repo,
+            config,
+            propose_config,
+            old_main.as_deref(),
+            &new_main,
+            &new_live,
+            &outcome,
+        );
     }
     None
+}
+
+/// OBI-213/OBI-272 (D-B3.13/D-B3.14): after a successful recompile,
+/// comment on whatever PR(s) just merged into the moved range of `main`
+/// with what happened. Skipped entirely (not an error) when there's no
+/// `GitHubAppClient` configured for this ([`ProposeGitHubConfig`]'s
+/// `report_client`), or when `old_main` is `None` (first sync: nothing
+/// to diff against). Every failure here (a bad `merged_commits` range,
+/// a GitHub 5xx) is logged and otherwise swallowed -- this must never
+/// fail the `SyncMain` pass it's reporting on.
+fn report_post_merge(
+    repo: &Repo,
+    config: &GitConfig,
+    propose_config: &ProposeConfig,
+    old_main: Option<&str>,
+    new_main: &str,
+    new_live: &str,
+    outcome: &RecompileOutcome,
+) {
+    let Some(gh_cfg) = propose_config.github.as_ref() else {
+        return;
+    };
+    let Some(report_client) = gh_cfg.report_client.as_deref() else {
+        return;
+    };
+    let Some(old_main) = old_main else {
+        tracing::debug!(
+            "loom-git: no prior `main` SHA on record, skipping post-merge PR report (first sync)"
+        );
+        return;
+    };
+    let commits = match crate::report::merged_commits(repo, old_main, new_main) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "loom-git: merged_commits failed, skipping post-merge PR report");
+            return;
+        }
+    };
+    if commits.is_empty() {
+        return;
+    }
+    let _ = crate::report::report_recompile(
+        report_client,
+        &gh_cfg.owner,
+        &gh_cfg.repo,
+        &config.env_name,
+        new_live,
+        &commits,
+        outcome,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1324,6 +1404,7 @@ mod tests {
         std::fs::set_permissions(&refs_heads, perms).unwrap();
 
         let token_status = TokenStatus::Absent;
+        let propose_config = ProposeConfig::disabled();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_sync_main(
                 &repo,
@@ -1332,6 +1413,7 @@ mod tests {
                 &token_status,
                 &NullHost,
                 &NoopAudit,
+                &propose_config,
             )
         }));
 

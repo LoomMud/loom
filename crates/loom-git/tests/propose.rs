@@ -345,6 +345,7 @@ fn happy_path_opens_a_pr_with_expected_branch_and_body_shape() {
                 pr_opener: Box::new(PrAdapter(client.clone())),
                 owner: "LoomMud".to_string(),
                 repo: "warp".to_string(),
+                report_client: None,
             }),
         },
     )
@@ -416,6 +417,7 @@ fn mapping_rewrites_paths_and_counts_content_rewrites() {
                 pr_opener: Box::new(PrAdapter(client.clone())),
                 owner: "LoomMud".to_string(),
                 repo: "warp".to_string(),
+                report_client: None,
             }),
         },
     )

@@ -53,7 +53,7 @@ pub use propose::{
     ProposeLimits, ProposeQuota, ProposeRequest, ProposeResult,
 };
 pub use report::{
-    MergedCommit, ResolvedCommit, comment_body, extract_pr_number, merged_commits,
+    MergedCommit, ReportGitHub, ResolvedCommit, comment_body, extract_pr_number, merged_commits,
     report_recompile, resolve_pull_requests,
 };
 pub use worker::{
