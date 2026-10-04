@@ -343,9 +343,28 @@ pub async fn run_server_full(
                 if conn_id >= next_conn_id {
                     next_conn_id = conn_id + 1;
                 }
-                if event_tx.send(NetEvent::Connected(conn_id)).await.is_err() {
-                    break;
-                }
+                // CTO review (OBI-266): deliberately *not*
+                // `event_tx.send(NetEvent::Connected(conn_id))` here,
+                // unlike every other connection source in this loop.
+                // An adopted connection is, by definition, one the world
+                // already has (or is about to have, via `World::
+                // load_snapshot`) a real binding for -- `Connected`
+                // driving `World::connect` would call master `connect()`
+                // unconditionally and bind a *second*, fresh player to
+                // this id, orphaning whatever was already bound (no
+                // `net_dead`, no autosave) regardless of whether this is
+                // a same-process reclaim/readopt round trip or a real
+                // cross-process copyover landing on a freshly-restored
+                // `World`. The whole point of adopting under a caller-
+                // chosen `ConnId` instead of the auto-increment counter
+                // is that the caller (and the `World`) already knows
+                // what this connection *is* -- `World::reconnect_all`
+                // (OBI-221) is the mechanism that re-attaches a restored
+                // binding to its (re)adopted connection, not `connect`.
+                // The connection is still fully live and reachable below
+                // (`conns.insert`) the moment this arm finishes --
+                // nothing here waits for a "ready" signal that doesn't
+                // exist.
 
                 let (tx, rx) = mpsc::channel(config.output_queue_depth);
                 let conn_event_tx = event_tx.clone();
@@ -2008,16 +2027,24 @@ mod tests {
     /// (standing in for one `loom-supervise::fdpass` handed over as a raw
     /// fd, already converted to a `TcpStream` by the copyover driver --
     /// see `run_server_full`'s doc comment for why that conversion isn't
-    /// this crate's job) shows up as `NetEvent::Connected` under *that*
-    /// id, not an auto-incremented one, and every `NetCommand` keyed by
-    /// it reaches the right socket.
+    /// this crate's job) is immediately live and reachable under *that*
+    /// id, not an auto-incremented one -- every `NetCommand` keyed by it
+    /// reaches the right socket. Deliberately does **not** wait for a
+    /// `NetEvent::Connected` (CTO review, OBI-266/B1: an adopted
+    /// connection must never fire one at all -- see the dedicated
+    /// `adopted_connection_never_emits_a_connected_event` test and
+    /// `adopt_rx`'s own arm comment in `run_server_full` for why).
+    /// Retries the first `NetCommand::Send` briefly: nothing here signals
+    /// "the connection is registered and its task has started", so a
+    /// send immediately after `adopt_tx.send` can legitimately race the
+    /// task spawn by a few scheduler ticks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn adopted_connection_is_keyed_by_the_caller_chosen_conn_id() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _addr = listener.local_addr().unwrap();
 
         let config = NetConfig::default();
-        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (event_tx, _event_rx) = mpsc::channel(256);
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (_ws_tx, ws_rx) = mpsc::channel(1);
@@ -2051,27 +2078,110 @@ mod tests {
             .await
             .unwrap();
 
-        let conn = loop {
-            match event_rx.recv().await.expect("event channel closed") {
-                NetEvent::Connected(id) => break id,
-                _ => continue,
-            }
-        };
-        assert_eq!(
-            conn, RECONNECTED_ID,
-            "adopted connection must keep its caller-chosen id"
-        );
-
         // The adopted session is a real, live `loom-net` connection:
         // `NetCommand::Send` keyed by its id reaches `client`'s socket.
-        cmd_tx
-            .send(NetCommand::Send(RECONNECTED_ID, "hi\n".to_string()))
-            .await
-            .unwrap();
+        // Retried briefly (no `Connected` event to wait on anymore, see
+        // this test's own doc comment) -- `try_send` on a not-yet-
+        // registered id is simply dropped by `run_server_full` (there is
+        // no entry in `conns` yet), not an error, so this polls until it
+        // lands.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         drain_preamble(&mut client).await;
         let mut buf = [0_u8; 8];
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"hi\r\n");
+        loop {
+            let _ = cmd_tx
+                .send(NetCommand::Send(RECONNECTED_ID, "hi\n".to_string()))
+                .await;
+            match tokio::time::timeout(std::time::Duration::from_millis(100), client.read(&mut buf))
+                .await
+            {
+                Ok(Ok(n)) if n > 0 => {
+                    assert_eq!(&buf[..n], b"hi\r\n");
+                    break;
+                }
+                _ if tokio::time::Instant::now() >= deadline => {
+                    panic!("adopted connection never became reachable via NetCommand::Send")
+                }
+                _ => continue,
+            }
+        }
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    /// CTO review (OBI-266/B1): the actual regression this guards
+    /// against -- `run_server_full` firing `NetEvent::Connected` for an
+    /// adopted connection drives `World::connect`, which unconditionally
+    /// calls master `connect()` and binds a *fresh* player to that
+    /// `ConnId`, orphaning whatever object a restored snapshot (or a
+    /// same-process reclaim/readopt round trip) already bound there --
+    /// no `net_dead`, no autosave, every player effectively logged out
+    /// and replaced on every adoption. Proves the absence directly:
+    /// adopt a connection, then confirm no `NetEvent::Connected` for its
+    /// id arrives in a generous window, while other event traffic
+    /// (a `Line` from real client input) still flows normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adopted_connection_never_emits_a_connected_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_ws_tx, ws_rx) = mpsc::channel(1);
+        let (adopt_tx, adopt_rx) = mpsc::channel(4);
+        let (_reclaim_tx, reclaim_rx) = mpsc::channel(4);
+
+        let server = tokio::spawn(run_server_full(
+            listener,
+            config,
+            event_tx,
+            cmd_rx,
+            shutdown_rx,
+            ws_rx,
+            adopt_rx,
+            reclaim_rx,
+        ));
+
+        let stub_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stub_addr = stub_listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(stub_addr).await.unwrap();
+        let (server_side, _peer) = stub_listener.accept().unwrap();
+        server_side.set_nonblocking(true).unwrap();
+
+        const RECONNECTED_ID: ConnId = 4343;
+        adopt_tx
+            .send((RECONNECTED_ID, TcpStream::from_std(server_side).unwrap()))
+            .await
+            .unwrap();
+
+        // Real client input still flows (proving the connection is
+        // genuinely live and the event loop is running, not just
+        // silent), while we watch for the one event that must never
+        // appear.
+        drain_preamble(&mut client).await;
+        client.write_all(b"hello\r\n").await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut saw_line = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv()).await
+            {
+                Ok(Some(NetEvent::Connected(id))) if id == RECONNECTED_ID => panic!(
+                    "adopted connection must never emit NetEvent::Connected (CTO review, OBI-266/B1)"
+                ),
+                Ok(Some(NetEvent::Line(id, _))) if id == RECONNECTED_ID => saw_line = true,
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        assert!(
+            saw_line,
+            "never saw the adopted connection's own input -- the connection wasn't actually live, so the absence of Connected proves nothing"
+        );
 
         shutdown_tx.send(true).unwrap();
         server.await.unwrap().unwrap();

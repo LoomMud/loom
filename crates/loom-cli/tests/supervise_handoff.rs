@@ -11,7 +11,7 @@
 //! the connect would simply time out, since only `supervise` binds
 //! anything in this mode.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -410,7 +410,7 @@ fn version_file_change_is_detected_and_logged() {
         .read_exact(&mut preamble)
         .expect("read telnet negotiation preamble before changing the version file");
 
-    // A background thread drains stderr into a channel, since reading
+    // A background thread drains stdout into a channel, since reading
     // it directly on this thread would block waiting for more output
     // right when the test needs to also act (write the file) and poll
     // (read lines with an overall timeout).
@@ -452,6 +452,347 @@ fn version_file_change_is_detected_and_logged() {
     // (no copyover was triggered), and the supervisor itself must still
     // be running.
     supervisor.assert_alive();
+}
+
+/// OBI-184 control-protocol slice: a detected version change is now
+/// forwarded as a real `ControlMessage::CopyoverRequested` over the
+/// control socket to the already-running child, which now takes a real
+/// snapshot of its own running world (via the world thread's snapshot-
+/// request channel) before acknowledging -- not yet an actual copyover
+/// (see `run_one_child_attempt`'s and `run_control_responder`'s own doc
+/// comments for the honest scope: no reclaim, no handoff to a standby
+/// yet), but a real round trip over a control channel that stays open
+/// past the initial handoff, proven end to end: the supervisor's
+/// "forwarding a copyover request" log, the child's own "world snapshot
+/// taken" log (with a real, nonzero byte count -- not a stand-in value),
+/// and the supervisor's "child acknowledged" log (only possible if the
+/// request reached the child, a real snapshot was taken, and the reply
+/// came back) must all appear.
+#[test]
+fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let version_dir = scratch("version-watch-control");
+    let version_file = version_dir.join("desired-version");
+    std::fs::write(&version_file, "v1.0.0\n").expect("write initial desired-version");
+
+    let (mut supervisor, stdout) =
+        Supervisor::spawn_with_version_file(&mudlib, &telnet_bind, &http_bind, &version_file);
+
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before changing the version file");
+
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_forwarded = false;
+    let mut saw_snapshot_taken = false;
+    let mut saw_acknowledged = false;
+    while Instant::now() < deadline && !(saw_forwarded && saw_snapshot_taken && saw_acknowledged) {
+        match line_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(raw_line) => {
+                // `tracing_subscriber`'s `fmt` layer applies ANSI colour
+                // codes unconditionally (not just when the writer is a
+                // terminal), which would otherwise split a literal
+                // `"snapshot_bytes="` search across escape sequences --
+                // strip them once up front so every check below can use
+                // plain substring/field matching.
+                let line = strip_ansi(&raw_line);
+                if line.contains("forwarding a copyover request") && line.contains("v2.0.0") {
+                    saw_forwarded = true;
+                }
+                if line.contains("world snapshot taken for the copyover request")
+                    && line.contains("v2.0.0")
+                {
+                    // `snapshot_bytes=0` would itself match a bare
+                    // `.contains("snapshot_bytes")` check, so this
+                    // extracts the actual field value and asserts it's
+                    // nonzero -- a real `tworoom` boot has at least a
+                    // master object and the connected player, so an
+                    // empty/stub snapshot would be a real bug here, not
+                    // a fluke of what got connected.
+                    let bytes: usize = line
+                        .split("snapshot_bytes=")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .and_then(|num| num.parse().ok())
+                        .unwrap_or_else(|| panic!("could not parse snapshot_bytes out of: {line}"));
+                    assert!(
+                        bytes > 0,
+                        "expected a real, nonzero snapshot size, got {bytes} (line: {line})"
+                    );
+                    saw_snapshot_taken = true;
+                }
+                if line.contains("child acknowledged the copyover request")
+                    && line.contains("v2.0.0")
+                {
+                    saw_acknowledged = true;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    assert!(
+        saw_forwarded,
+        "supervisor never logged forwarding the copyover request to the child"
+    );
+    assert!(
+        saw_snapshot_taken,
+        "child never logged taking a real world snapshot for the copyover request"
+    );
+    assert!(
+        saw_acknowledged,
+        "supervisor never logged the child's acknowledgement -- the control-socket round trip did not complete"
+    );
+    // The control-protocol round trip doesn't touch the actual telnet
+    // connection -- CTO review (OBI-259 nit): assert that explicitly
+    // (a timeout here is the expected/correct outcome; an immediate `Ok`
+    // read of 0 bytes would mean the connection was unexpectedly closed)
+    // rather than silently discarding whatever `read` returns.
+    let mut post_ack = [0_u8; 1];
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    match stream.read(&mut post_ack) {
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) => {}
+        // Any further application bytes (e.g. trailing telnet
+        // negotiation) are fine too -- the only outcome that would mean
+        // the connection broke is a clean `Ok(0)` (EOF).
+        Ok(n) if n > 0 => {}
+        other => panic!(
+            "expected the telnet connection to still be open (a read timeout or more data), got {other:?}"
+        ),
+    }
+    supervisor.assert_alive();
+}
+
+/// OBI-184 (copyover-trigger slice): the reclaim/readopt round trip a
+/// copyover request now exercises must actually keep a live client
+/// connection alive, not just *claim* to in a log line -- §7.5's own
+/// acceptance bar is literally "zero disconnects". Proves it with a
+/// real write *through* the reclaimed-and-readopted connection after
+/// the round trip completes: if `loom-net`'s reclaim/adopt primitives
+/// had actually dropped the socket (rather than reuniting and handing
+/// it back), this would see a connection-reset/broken-pipe error
+/// instead of a successful round trip.
+#[test]
+fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
+    let mudlib = fixture("tworoom");
+    let telnet_port = reserve_local_port();
+    let http_port = reserve_local_port();
+    let telnet_bind = format!("127.0.0.1:{telnet_port}");
+    let http_bind = format!("127.0.0.1:{http_port}");
+
+    let version_dir = scratch("version-watch-reclaim");
+    let version_file = version_dir.join("desired-version");
+    std::fs::write(&version_file, "v1.0.0\n").expect("write initial desired-version");
+
+    let (mut supervisor, stdout) =
+        Supervisor::spawn_with_version_file(&mudlib, &telnet_bind, &http_bind, &version_file);
+
+    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut preamble = [0_u8; 12];
+    stream
+        .read_exact(&mut preamble)
+        .expect("read telnet negotiation preamble before changing the version file");
+    let mut reader = std::io::BufReader::new(stream);
+
+    // CTO review (OBI-266/B2): the real regression this test must be
+    // able to catch is session state -- `NetEvent::Connected` firing on
+    // readopt would log the player back in as a *fresh* character via
+    // master `connect()`, not just drop the connection. Detecting that
+    // needs to check what the session actually is, not just that bytes
+    // came back. Establish real, specific state first: `logon()` sends
+    // "Welcome to Loom!" and starts the player in the hall; move north
+    // into the yard before triggering the round trip.
+    read_until_contains(&mut reader, "Welcome to Loom!", Duration::from_secs(5));
+    read_until_contains(&mut reader, "Exits:", Duration::from_secs(2)); // the hall's own look()
+    send_line(&mut reader, "go north");
+    let moved = read_until_contains(&mut reader, "Exits:", Duration::from_secs(2));
+    assert!(
+        moved.contains("The Yard"),
+        "expected 'go north' to move into the yard, got:\n{moved}"
+    );
+
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut reclaimed_count: Option<usize> = None;
+    while Instant::now() < deadline && reclaimed_count.is_none() {
+        match line_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(raw_line) => {
+                let line = strip_ansi(&raw_line);
+                if line.contains("reclaim/readopt round trip complete") && line.contains("v2.0.0") {
+                    let reclaimed: usize = line
+                        .split("reclaimed=")
+                        .nth(1)
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .and_then(|num| num.parse().ok())
+                        .unwrap_or_else(|| panic!("could not parse reclaimed out of: {line}"));
+                    reclaimed_count = Some(reclaimed);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    assert_eq!(
+        reclaimed_count,
+        Some(1),
+        "expected exactly the one connected test client to be reclaimed and readopted"
+    );
+
+    // CTO review (OBI-266/B2): the actual assertion that would have
+    // caught B1 -- `look` right after the round trip must show the
+    // *same session*, still in the yard (not teleported back to the
+    // hall by a fresh `logon()`), and must *not* see a second "Welcome
+    // to Loom!" anywhere in the transcript (a fresh `connect()`/`logon()`
+    // would send exactly that). Re-adopting does still reset the telnet
+    // *codec*'s own negotiation state (a separate, already-documented
+    // limitation, OBI-227's review) -- drain that fresh preamble first
+    // (same fixed 12-byte shape as the very first one, since it's the
+    // same `TelnetCodec::start()` call every new `run_connection` task
+    // makes) so the line-based reads below see only real text.
+    let mut fresh_preamble = [0_u8; 12];
+    reader
+        .get_mut()
+        .read_exact(&mut fresh_preamble)
+        .expect("read the fresh telnet negotiation preamble the readopt triggers");
+    send_line(&mut reader, "look");
+    let transcript = read_until_contains(&mut reader, "Exits:", Duration::from_secs(5));
+    assert!(
+        transcript.contains("The Yard"),
+        "expected the reclaimed/readopted session to still be in the yard, got:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("Welcome to Loom!"),
+        "a second 'Welcome to Loom!' means the reclaim/readopt round trip re-ran logon() on a \
+         fresh player instead of preserving the existing session (CTO review, OBI-266/B1), got:\n{transcript}"
+    );
+
+    supervisor.assert_alive();
+}
+
+/// `BufReader<TcpStream>`-based line read with a needle, tolerating
+/// `\r\n`/`\n` and any leading binary noise (e.g. a fresh telnet
+/// negotiation preamble after a reclaim/readopt round trip resets codec
+/// state) ahead of real text -- same pattern as `net_tick.rs`'s own
+/// helper of the same name, duplicated here rather than shared across
+/// test binaries (each integration test file is its own crate).
+fn read_until_contains(
+    reader: &mut std::io::BufReader<TcpStream>,
+    needle: &str,
+    timeout: Duration,
+) -> String {
+    use std::io::BufRead;
+    let deadline = Instant::now() + timeout;
+    let mut transcript = String::new();
+    loop {
+        if Instant::now() > deadline {
+            panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
+        }
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!(
+                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
+            ),
+            Ok(_) => {
+                transcript.push_str(&line.replace("\r\n", "\n"));
+                if transcript.contains(needle) {
+                    return transcript;
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
+        }
+    }
+}
+
+fn send_line(reader: &mut std::io::BufReader<TcpStream>, line: &str) {
+    let stream = reader.get_mut();
+    stream
+        .write_all(line.as_bytes())
+        .unwrap_or_else(|err| panic!("write command `{line}` failed: {err}"));
+    stream
+        .write_all(b"\n")
+        .unwrap_or_else(|err| panic!("write newline for `{line}` failed: {err}"));
+    stream
+        .flush()
+        .unwrap_or_else(|err| panic!("flush command `{line}` failed: {err}"));
+}
+
+/// Strips `ESC [ ... m` ANSI SGR (colour) escape sequences --
+/// `tracing_subscriber`'s `fmt` layer applies them unconditionally, not
+/// just when the writer is a real terminal, so any test that wants to
+/// pattern-match a log line's *fields* (as opposed to substrings that
+/// happen to survive being interrupted by escape codes, like a field's
+/// own value) needs this first.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn reserve_local_port() -> u16 {
@@ -515,6 +856,11 @@ impl Supervisor {
             .env("LOOM_TELNET_ADDR", telnet_bind)
             .env("LOOM_HTTP_ADDR", http_bind)
             .env("LOOM_DESIRED_VERSION_FILE", version_file)
+            // CTO review (OBI-256 nit): overridable rather than a fixed
+            // 5s production default, so this test has real slack
+            // against its own timeout instead of racing CI's timing
+            // margin at the production cadence.
+            .env("LOOM_VERSION_POLL_INTERVAL_MS", "200")
             .env_remove("DATABASE_URL")
             .env_remove("LOOM_SMOKE_DATABASE_URL")
             .env("RUST_LOG", "loom_cli=info")

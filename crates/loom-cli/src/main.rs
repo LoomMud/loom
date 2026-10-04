@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use loom_net::{GmcpMessage, NetCommand, NetConfig, NetEvent};
+use loom_net::{AdoptedConn, GmcpMessage, NetCommand, NetConfig, NetEvent, ReclaimRequest};
 use loom_persist::{DbEvent, DbRequest, Password, Persist};
 use loom_vm::{AccountAuth, Host, RolesMutations, RolesSnapshot, World};
 use time::OffsetDateTime;
@@ -35,6 +35,13 @@ const DB_QUEUE_DEPTH: usize = 256;
 /// entries (see `World::drain_audit_since`'s doc for what a fallen-behind
 /// sink loses instead: the ring's own bound, not this queue's).
 const AUDIT_QUEUE_DEPTH: usize = 64;
+
+/// Bound on `reclaim_tx`/`adopt_tx` (OBI-184 copyover-trigger slice): a
+/// copyover deliberately quiesces/drains before reclaiming, so this
+/// never needs to carry more than one request at a time in practice --
+/// sized the same as `AUDIT_QUEUE_DEPTH` for a comfortable margin rather
+/// than tuning it tightly against a workload that doesn't exist yet.
+const RECLAIM_QUEUE_DEPTH: usize = 64;
 
 /// World tick granularity (spec r5 N2): `World::tick` (heartbeats,
 /// `call_out`s) is driven once per this interval by `serve()`'s timer
@@ -365,9 +372,24 @@ fn parse_serve_args(mut args: impl Iterator<Item = String>) -> Result<ServeArgs,
 /// Tokio listeners ready for `axum::serve`/`loom_net::run_server_with_ws`
 /// exactly as before; callers downstream of this function never need to
 /// know which path was taken.
+///
+/// The third return value is the control socket itself, kept alive (not
+/// dropped once the handoff handshake finishes) when `adopt_control_fd`
+/// is `Some` -- `loom supervise` (OBI-184's control-protocol slice) uses
+/// it for messages sent *after* startup, not just the one-shot ready/
+/// `SCM_RIGHTS` exchange this function itself performs. `None` in the
+/// fresh-bind path: there is no supervisor on the other end of anything
+/// to receive further messages from.
 async fn acquire_listeners(
     adopt_control_fd: Option<std::os::fd::RawFd>,
-) -> Result<(TcpListener, TcpListener), String> {
+) -> Result<
+    (
+        TcpListener,
+        TcpListener,
+        Option<std::os::unix::net::UnixStream>,
+    ),
+    String,
+> {
     match adopt_control_fd {
         None => {
             let bind_addr = loom_net::telnet_addr_from_env();
@@ -378,7 +400,7 @@ async fn acquire_listeners(
             let http_listener = TcpListener::bind(&http_bind_addr)
                 .await
                 .map_err(|err| format!("failed to bind {http_bind_addr}: {err}"))?;
-            Ok((listener, http_listener))
+            Ok((listener, http_listener, None))
         }
         Some(fd) => {
             // The handshake with `loom supervise` is a handful of
@@ -386,7 +408,7 @@ async fn acquire_listeners(
             // `spawn_blocking` so they cannot stall the async runtime's
             // worker threads -- this is a one-time startup cost, not
             // something steady-state traffic ever waits on.
-            let (std_telnet, std_http) = tokio::task::spawn_blocking(move || {
+            let (std_telnet, std_http, control) = tokio::task::spawn_blocking(move || {
                 use std::io::Write;
                 // SAFETY: `fd` is the number `loom supervise` itself
                 // passed down via `--adopt-control-fd`, inherited at
@@ -443,7 +465,7 @@ async fn acquire_listeners(
                     .map_err(|err| format!("adopt-control-fd: set_nonblocking (telnet): {err}"))?;
                 http.set_nonblocking(true)
                     .map_err(|err| format!("adopt-control-fd: set_nonblocking (http): {err}"))?;
-                Ok::<_, String>((telnet, http))
+                Ok::<_, String>((telnet, http, control))
             })
             .await
             .map_err(|err| format!("adopt-control-fd: join: {err}"))??;
@@ -454,9 +476,271 @@ async fn acquire_listeners(
             let http_listener = TcpListener::from_std(std_http).map_err(|err| {
                 format!("adopt-control-fd: tokio TcpListener::from_std (http): {err}")
             })?;
-            Ok((listener, http_listener))
+            Ok((listener, http_listener, Some(control)))
         }
     }
+}
+
+/// Runs on its own dedicated `std::thread` (control-socket reads are
+/// blocking, and this loop lives for the rest of the process -- not a
+/// one-shot `spawn_blocking`): answers `loom supervise`'s post-handoff
+/// control messages ([`loom_supervise::control`]) for as long as the
+/// control socket stays open.
+///
+/// **Scope (OBI-184, this slice):** a `CopyoverRequested` now takes a
+/// *real* snapshot of this process's own running world (via
+/// `snapshot_req_tx`, see `request_snapshot`'s doc) and then reclaims
+/// *every* connection `World::live_connections()` reported as live at
+/// that same instant (`loom_net::ReclaimRequest`, OBI-94/OBI-221 --
+/// previously merged but unreachable from `loom-cli`) and immediately
+/// re-adopts each one back into this same process under its original
+/// `ConnId` (`loom_net::AdoptedConn`). That reclaim-then-readopt round
+/// trip is deliberately a closed loop, not yet "send the reclaimed
+/// connection to a standby": it proves `loom-net`'s own reclaim/adopt
+/// primitives round-trip a real, live client connection with *no*
+/// `NetEvent::Disconnected` anywhere in the middle (the actual
+/// requirement §7.5 states: "zero disconnects"), before trusting them to
+/// carry a connection across a process boundary in a later, not-yet-
+/// built follow-up. A caller who was mid-session when this runs will see
+/// their telnet codec state (GMCP/NAWS/echo negotiation) reset, since
+/// re-adopting spins up a fresh `run_connection` task for that fd -- a
+/// known, already-documented limitation (OBI-227's review), not new
+/// here, and still not a disconnect.
+fn run_control_responder(
+    mut control: std::os::unix::net::UnixStream,
+    snapshot_req_tx: std::sync::mpsc::Sender<SnapshotRequest>,
+    reclaim_tx: mpsc::Sender<ReclaimRequest>,
+    adopt_tx: mpsc::Sender<AdoptedConn>,
+) {
+    // CTO review (OBI-259): if a message this loop can't make sense of
+    // ever arrives (a future, as-yet-undefined variant, or a genuinely
+    // malformed stream), `read_message` returns `InvalidData` and this
+    // loop exits via the `Err(err)` arm below -- the supervisor then
+    // sees that as an EOF/error on its next request and (per its own
+    // poisoning rule) stops using this channel rather than desyncing
+    // against a reply that was never coming. Nothing special needs to
+    // happen here for that case beyond exiting cleanly, which the
+    // existing error handling already does.
+    loop {
+        match loom_supervise::control::read_message(&mut control) {
+            Ok(loom_supervise::control::ControlMessage::CopyoverRequested { version }) => {
+                info!(
+                    version,
+                    "loom serve: received a copyover request over the control socket -- \
+                     taking a real world snapshot and exercising a reclaim/readopt round trip \
+                     on every live connection (OBI-184: still no actual handoff to a standby)"
+                );
+                let ack_or_nack = match request_snapshot(&snapshot_req_tx) {
+                    Ok((bytes, conn_ids)) => {
+                        info!(
+                            version,
+                            snapshot_bytes = bytes.len(),
+                            live_connections = conn_ids.len(),
+                            "loom serve: world snapshot taken for the copyover request"
+                        );
+                        match reclaim_and_readopt_all(&reclaim_tx, &adopt_tx, &conn_ids) {
+                            Ok(reclaimed) => {
+                                info!(
+                                    version,
+                                    reclaimed,
+                                    total = conn_ids.len(),
+                                    "loom serve: reclaim/readopt round trip complete for the copyover request"
+                                );
+                                loom_supervise::control::ControlMessage::CopyoverAck
+                            }
+                            Err(reason) => {
+                                warn!(version, %reason, "loom serve: reclaim/readopt round trip failed for a copyover request");
+                                loom_supervise::control::ControlMessage::CopyoverNack { reason }
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        warn!(version, %reason, "loom serve: failed to snapshot the world for a copyover request");
+                        loom_supervise::control::ControlMessage::CopyoverNack { reason }
+                    }
+                };
+                if let Err(err) = loom_supervise::control::write_message(&mut control, &ack_or_nack)
+                {
+                    warn!(%err, "loom serve: failed to reply to a copyover request; control responder exiting");
+                    return;
+                }
+            }
+            Ok(other) => {
+                // The supervisor is only ever a client, never asked to
+                // ack/nack anything of its own on this socket -- any
+                // other message variant arriving here is out of protocol
+                // for this direction.
+                warn!(
+                    ?other,
+                    "loom serve: unexpected control message direction; ignoring"
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // The supervisor closed its end (process exited, or a
+                // copyover replaced it) -- this is an ordinary, expected
+                // way for this loop to end, not a failure.
+                debug!(
+                    "loom serve: control socket closed by supervisor; control responder exiting"
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(%err, "loom serve: control socket read failed; control responder exiting");
+                return;
+            }
+        }
+    }
+}
+
+/// How long [`run_control_responder`] waits for the world thread to
+/// answer a snapshot request before giving up and `CopyoverNack`ing
+/// (CTO review pattern established for `COPYOVER_CONTROL_TIMEOUT`:
+/// nothing in this control-protocol path should ever wait unbounded on
+/// another thread/process). A world thread that cannot even respond
+/// within this long is already in enough trouble that a `Nack` here is
+/// the least of its problems -- this bound exists so *this* thread
+/// doesn't also wedge waiting on it.
+const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A snapshot-request reply: the encoded world bytes plus the `ConnId`s
+/// `World::live_connections()` reported live at that same instant (see
+/// `request_snapshot`'s own doc). Named so the channel types that carry
+/// it (and the one-shot reply channel for each individual request)
+/// don't read as clippy's "very complex type" nested-generic soup.
+type SnapshotResult = Result<(Vec<u8>, Vec<u64>), String>;
+/// One pending snapshot request: the control responder's reply-to
+/// channel, sent to the world thread over `snapshot_req_tx`/`_rx`.
+type SnapshotRequest = std::sync::mpsc::Sender<SnapshotResult>;
+
+/// Ask the world thread (via `spawn_world_thread`'s inline `snapshot_
+/// req_rx` drain) for a fresh snapshot of its current state plus the
+/// `ConnId`s it considers live at that same instant, blocking this
+/// (control-responder) thread until it answers or [`SNAPSHOT_REQUEST_
+/// TIMEOUT`] elapses.
+fn request_snapshot(snapshot_req_tx: &std::sync::mpsc::Sender<SnapshotRequest>) -> SnapshotResult {
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    snapshot_req_tx
+        .send(reply_tx)
+        .map_err(|_| "world thread's snapshot-request channel is gone".to_string())?;
+    reply_rx
+        .recv_timeout(SNAPSHOT_REQUEST_TIMEOUT)
+        .map_err(|err| format!("world thread did not answer the snapshot request: {err}"))?
+}
+
+/// How long [`reclaim_and_readopt_all`] waits for `loom-net`'s
+/// `run_server_full` select loop to answer one reclaim request before
+/// moving on to the next connection without counting this one as
+/// reclaimed *yet* -- same bounded-wait principle as [`SNAPSHOT_REQUEST_
+/// TIMEOUT`]/`COPYOVER_CONTROL_TIMEOUT`: a `run_server_full` task that
+/// has wedged on one connection must not be allowed to wedge this whole
+/// reclaim pass, and therefore the control responder, indefinitely. A
+/// reply that arrives after this elapses is still re-adopted, never
+/// dropped -- see [`reclaim_and_readopt_all`]'s own doc comment.
+const RECLAIM_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reclaim every connection in `conn_ids` (via `reclaim_tx`) and
+/// immediately re-adopt each one back under the same `ConnId` (via
+/// `adopt_tx`) -- see [`run_control_responder`]'s doc comment for why
+/// this closed round trip, not yet a real hand-off, is this slice's
+/// honest scope. Returns how many connections were confirmed reclaimed
+/// and re-adopted *within [`RECLAIM_REQUEST_TIMEOUT`]* (whether or not
+/// they were still live to reclaim at all -- a connection that
+/// disconnected on its own in the gap between the snapshot and this
+/// call is not an error, just one fewer to carry forward, exactly as a
+/// real copyover would also need to tolerate).
+///
+/// **A reclaim reply that arrives *after* the timeout is still re-
+/// adopted, never dropped (CTO review, OBI-266/B3):** dropping a
+/// `TcpStream` closes the live socket underneath a client who did
+/// nothing wrong, and leaves the world's own binding for that `ConnId`
+/// pointing at a connection that no longer exists anywhere -- a ghost
+/// binding, not a clean disconnect `net_dead()` could ever run for.
+/// Instead, each reclaim races against the timeout on a background
+/// thread that keeps waiting and re-adopts whatever arrives, however
+/// late; this function's own return value only ever reports what
+/// finished *in time*, so a late one isn't silently double-counted
+/// either.
+///
+/// # Errors
+/// Only for a genuine failure of the channel/round-trip machinery
+/// itself (the `run_server_full` task is gone) -- never for an
+/// individual connection simply not being live anymore, and never for a
+/// single slow reply (that's handled per the paragraph above, not
+/// surfaced as an error at all).
+fn reclaim_and_readopt_all(
+    reclaim_tx: &mpsc::Sender<ReclaimRequest>,
+    adopt_tx: &mpsc::Sender<AdoptedConn>,
+    conn_ids: &[u64],
+) -> Result<usize, String> {
+    let mut reclaimed = 0usize;
+    for &conn_id in conn_ids {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reclaim_tx
+            .blocking_send((conn_id, reply_tx))
+            .map_err(|_| "loom-net's run_server_full task is gone (reclaim)".to_string())?;
+
+        // `done_tx`/`done_rx` only ever report "finished within budget,
+        // and what happened" back to this loop -- the background thread
+        // below does not depend on this call ever reading `done_rx` at
+        // all; it owns the actual readopt unconditionally.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<bool>();
+        let adopt_tx_for_reply = adopt_tx.clone();
+        std::thread::spawn(move || match reply_rx.blocking_recv() {
+            Ok(Some(stream)) => {
+                // Always readopt, no matter how late this thread's own
+                // wait took -- see this function's doc comment.
+                match adopt_tx_for_reply.blocking_send((conn_id, stream)) {
+                    Ok(()) => {
+                        let _ = done_tx.send(true);
+                    }
+                    Err(_) => {
+                        warn!(
+                            conn_id,
+                            "loom serve: reclaimed a connection but loom-net's run_server_full \
+                             task was gone by the time of the (possibly late) readopt; the \
+                             connection is lost"
+                        );
+                        let _ = done_tx.send(false);
+                    }
+                }
+            }
+            Ok(None) => {
+                // Already gone on its own (client disconnected between
+                // the snapshot and this reclaim, or `run_server_full`
+                // never had this id to begin with) -- not an error,
+                // nothing to adopt.
+                let _ = done_tx.send(false);
+            }
+            Err(_) => {
+                // `reclaim_rx`'s side of `run_server_full` dropped the
+                // reply channel without answering (the task exited) --
+                // nothing to adopt, and the `reclaim_tx.blocking_send`
+                // above already proved the channel accepted the request,
+                // so this is reported the same as "gone", not escalated
+                // to an error for this one connection.
+                let _ = done_tx.send(false);
+            }
+        });
+
+        match done_rx.recv_timeout(RECLAIM_REQUEST_TIMEOUT) {
+            Ok(true) => reclaimed += 1,
+            Ok(false) => {}
+            Err(_) => {
+                // The background thread is still waiting (or has just
+                // finished and is racing this timeout) -- it will
+                // re-adopt on its own once the reply arrives, per this
+                // function's doc comment. Not counted as reclaimed by
+                // *this* pass, since we can't confirm it happened in
+                // time, but also not dropped.
+                warn!(
+                    conn_id,
+                    "loom serve: reclaim reply for this connection is late; it will still be \
+                     re-adopted once it arrives, but wasn't counted in this round trip"
+                );
+            }
+        }
+    }
+    Ok(reclaimed)
 }
 
 /// `loom supervise` (OBI-184, design §7.5/§9.2): the in-pod supervisor
@@ -521,7 +805,18 @@ async fn acquire_listeners(
 /// to this `async fn` over plain channels.
 const MAX_CONSECUTIVE_CRASHES: u32 = 5;
 const CRASH_LOOP_WINDOW: Duration = Duration::from_secs(30);
-const VERSION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_VERSION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// CTO review (OBI-259): a bound on the control-socket round trip
+/// (`write_message` + `read_message`) the version-change arm does
+/// inside `run_one_child_attempt`'s select loop. Without this, a child
+/// that stops answering (`SIGSTOP`, a wedged responder thread, a future
+/// child that holds the socket but never runs a responder at all) would
+/// leave that arm's body awaiting forever -- and since the loop only
+/// returns to `select!` once the current arm's body finishes, that also
+/// silently stops SIGTERM forwarding and child-exit detection, a
+/// liveness regression in the one process whose job is to stay alive
+/// and keep doing both.
+const COPYOVER_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     let bind_addr = loom_net::telnet_addr_from_env();
@@ -549,19 +844,27 @@ async fn supervise(mudlib_root: PathBuf) -> Result<(), String> {
     // `LOOM_DESIRED_VERSION_FILE` isn't set keeps version watching
     // fully disabled, matching this function's behavior before this
     // slice.
+    //
+    // CTO review (OBI-256): seeded with the *running build's own*
+    // version (`running_version_from_env`), not the desired-version
+    // file's content at boot -- the whole point of §9.9's reconcile
+    // loop is noticing a mismatch between "what's running" and "what's
+    // desired", and seeding from the file itself would make a desired-
+    // version write that happened while the supervisor was down
+    // invisible (the file and the "baseline" would already agree by the
+    // time anything polls).
+    let running_version = running_version_from_env();
     let mut version_rx = desired_version_file_from_env().map(|path| {
-        let mut watcher =
-            loom_supervise::VersionWatcher::new(Box::new(loom_supervise::FileVersionSource::new(&path)), None);
-        // Establish the boot-time baseline synchronously (a single,
-        // cheap file read/stat): without this, the file's pre-existing
-        // content would be reported as a "change" on the very first
-        // poll, which is misleading -- the supervisor booted *with*
-        // that version, it didn't just switch to it.
-        if let Err(err) = watcher.poll_for_change() {
-            warn!(%err, path = %path.display(), "loom supervise: initial desired-version read failed; will keep retrying");
-        }
-        info!(path = %path.display(), current = ?watcher.current(), "loom supervise: version watching enabled");
-        spawn_version_watcher(watcher, VERSION_POLL_INTERVAL)
+        let watcher = loom_supervise::VersionWatcher::new(
+            Box::new(loom_supervise::FileVersionSource::new(&path)),
+            Some(running_version.clone()),
+        );
+        info!(
+            path = %path.display(),
+            running_version,
+            "loom supervise: version watching enabled"
+        );
+        spawn_version_watcher(watcher, version_poll_interval_from_env())
     });
 
     let mut shutdown = ShutdownSignals::new()?;
@@ -671,7 +974,7 @@ async fn run_one_child_attempt(
     telnet_listener: &std::net::TcpListener,
     http_listener: &std::net::TcpListener,
     shutdown: &mut ShutdownSignals,
-    mut version_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+    mut version_rx: Option<&mut tokio::sync::watch::Receiver<String>>,
 ) -> Result<ChildAttemptOutcome, String> {
     // `spawn_handoff_and_wait` needs `'static` owned copies of the
     // listeners to move into its dedicated thread; `try_clone` is a
@@ -685,7 +988,8 @@ async fn run_one_child_attempt(
         .try_clone()
         .map_err(|err| format!("supervise: try_clone http listener: {err}"))?;
 
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+    let (ready_tx, ready_rx) =
+        std::sync::mpsc::channel::<Result<(u32, std::os::unix::net::UnixStream), String>>();
     let (forward_signal_tx, forward_signal_rx) = std::sync::mpsc::channel::<()>();
     let (exit_tx, exit_rx) = std::sync::mpsc::channel::<Result<std::process::ExitStatus, String>>();
 
@@ -703,10 +1007,36 @@ async fn run_one_child_attempt(
         })
         .map_err(|err| format!("supervise: spawn supervisor thread: {err}"))?;
 
-    let child_pid = tokio::task::spawn_blocking(move || ready_rx.recv())
+    let (child_pid, control_stream) = tokio::task::spawn_blocking(move || ready_rx.recv())
         .await
         .map_err(|err| format!("supervise: ready-channel join: {err}"))?
         .map_err(|_| "supervise: supervisor thread exited before signalling ready".to_string())??;
+
+    // CTO review (OBI-259): `control_stream` is `Option` from here on,
+    // not because the handoff can ever hand back "no stream" (it can't
+    // -- `spawn_and_handoff` always returns one), but because any
+    // control-socket error or timeout *poisons* it to `None` for the
+    // rest of this attempt: a timed-out request followed by a late reply
+    // would otherwise desync the stream (the next request's `read_
+    // message` would read the *previous* request's stale reply as its
+    // own), so once anything goes wrong the only safe move is to stop
+    // using this stream at all, not retry it.
+    let mut control_stream = Some(control_stream);
+    if let Some(stream) = control_stream.as_ref() {
+        // Bounds the version-change arm's blocking round trip below --
+        // see `COPYOVER_CONTROL_TIMEOUT`'s own doc comment for why an
+        // unbounded wait here is a liveness regression, not just a slow
+        // copyover. `set_read_timeout`/`set_write_timeout` are plain
+        // `setsockopt` calls, not blocking I/O, so these run inline
+        // rather than needing their own `spawn_blocking`.
+        if let Err(err) = stream
+            .set_read_timeout(Some(COPYOVER_CONTROL_TIMEOUT))
+            .and_then(|()| stream.set_write_timeout(Some(COPYOVER_CONTROL_TIMEOUT)))
+        {
+            warn!(child_pid, %err, "loom supervise: failed to set control-socket timeouts; treating control channel as unavailable");
+            control_stream = None;
+        }
+    }
 
     info!(
         child_pid,
@@ -744,9 +1074,18 @@ async fn run_one_child_attempt(
                     .map_err(|_| "supervise: supervisor thread exited before reporting the child's status".to_string())??;
                 break ChildAttemptOutcome::ShutdownRequested(status);
             }
-            Some(version) = async {
+            version = async {
                 match version_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
+                    Some(rx) => match rx.changed().await {
+                        Ok(()) => rx.borrow_and_update().clone(),
+                        // CTO review (OBI-256): the watcher task died --
+                        // never resolving again has the same effect as
+                        // `version_rx` being `None` (this arm is simply
+                        // never picked again), rather than this `async`
+                        // block returning immediately on every future
+                        // poll and spinning the surrounding `loop`.
+                        Err(_) => std::future::pending().await,
+                    },
                     // No version watching configured: a `select!` arm
                     // whose future never resolves is simply never
                     // picked, same effect as not having this arm at all.
@@ -756,8 +1095,62 @@ async fn run_one_child_attempt(
                 info!(
                     child_pid,
                     new_version = %version,
-                    "loom supervise: desired version changed -- detected only, copyover not yet implemented (OBI-184); continuing to run the current child"
+                    "loom supervise: desired version changed -- forwarding a copyover request over the control socket (OBI-184: acknowledged only, no copyover action implemented yet)"
                 );
+                match control_stream.take() {
+                    None => {
+                        warn!(
+                            child_pid,
+                            new_version = %version,
+                            "loom supervise: control channel unavailable (a previous request failed, timed out, or the socket could not be configured); cannot forward this copyover request"
+                        );
+                    }
+                    Some(mut stream) => {
+                        // Blocking write+read over the control
+                        // `UnixStream`, off the async executor, bounded
+                        // by `COPYOVER_CONTROL_TIMEOUT` (set on `stream`
+                        // right after the handoff) so a child that stops
+                        // answering can't stall this arm's body forever
+                        // -- see `COPYOVER_CONTROL_TIMEOUT`'s own doc
+                        // comment (CTO review, OBI-259). Moving `stream`
+                        // into `spawn_blocking` and getting it back out
+                        // via the tuple keeps the same stream (and its
+                        // underlying fd) for the next round, exactly
+                        // like `spawn_version_watcher`'s own
+                        // move-out-and-back pattern for its
+                        // `VersionWatcher`.
+                        let version_for_control = version.clone();
+                        let (result, stream) = tokio::task::spawn_blocking(move || {
+                            let result = loom_supervise::control::write_message(
+                                &mut stream,
+                                &loom_supervise::control::ControlMessage::CopyoverRequested {
+                                    version: version_for_control,
+                                },
+                            )
+                            .and_then(|()| loom_supervise::control::read_message(&mut stream));
+                            (result, stream)
+                        })
+                        .await
+                        .map_err(|err| format!("supervise: control-socket task join: {err}"))?;
+                        match result {
+                            Ok(loom_supervise::control::ControlMessage::CopyoverAck) => {
+                                info!(child_pid, new_version = %version, "loom supervise: child acknowledged the copyover request");
+                                // Only a clean ack puts the stream back in
+                                // play -- CTO review (OBI-259): any other
+                                // outcome (below) poisons it instead, so a
+                                // stale reply from this exchange can never
+                                // be misread as the reply to a later one.
+                                control_stream = Some(stream);
+                            }
+                            Ok(other) => {
+                                warn!(child_pid, ?other, "loom supervise: child sent an unexpected reply to a copyover request; treating control channel as unavailable from now on");
+                            }
+                            Err(err) => {
+                                warn!(child_pid, %err, "loom supervise: failed to deliver a copyover request over the control socket (possibly a timeout); treating control channel as unavailable from now on");
+                            }
+                        }
+                    }
+                }
             }
         }
     };
@@ -784,18 +1177,19 @@ fn spawn_handoff_and_wait(
     mudlib_root: &std::path::Path,
     telnet_listener: &std::net::TcpListener,
     http_listener: &std::net::TcpListener,
-    ready_tx: &std::sync::mpsc::Sender<Result<u32, String>>,
+    ready_tx: &std::sync::mpsc::Sender<Result<(u32, std::os::unix::net::UnixStream), String>>,
     forward_signal_rx: &std::sync::mpsc::Receiver<()>,
     exit_tx: &std::sync::mpsc::Sender<Result<std::process::ExitStatus, String>>,
 ) {
-    let mut child = match spawn_and_handoff(mudlib_root, telnet_listener, http_listener) {
-        Ok(child) => child,
-        Err(err) => {
-            let _ = ready_tx.send(Err(err));
-            return;
-        }
-    };
-    let _ = ready_tx.send(Ok(child.id()));
+    let (mut child, control_stream) =
+        match spawn_and_handoff(mudlib_root, telnet_listener, http_listener) {
+            Ok(pair) => pair,
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+                return;
+            }
+        };
+    let _ = ready_tx.send(Ok((child.id(), control_stream)));
 
     loop {
         match child.try_wait() {
@@ -854,22 +1248,33 @@ fn spawn_handoff_and_wait(
 fn spawn_version_watcher(
     mut watcher: loom_supervise::VersionWatcher,
     poll_interval: Duration,
-) -> tokio::sync::mpsc::Receiver<String> {
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+) -> tokio::sync::watch::Receiver<String> {
+    // CTO review (OBI-256): `watch`, not `mpsc`, is the right channel
+    // shape for a desired-state signal -- `watch::Sender::send` always
+    // overwrites with the latest value (no queue to go stale in), so a
+    // consumer that's busy elsewhere (e.g. `supervise`'s crash-backoff
+    // sleep) when several changes land in a row still only ever acts on
+    // the newest one once it does check, never an older queued one.
+    // Seeded with `watcher.current()`'s baseline (the running version,
+    // per this function's caller) so the first real change is the first
+    // thing `changed()` ever reports.
+    let initial = watcher.current().unwrap_or_default().to_string();
+    let (tx, rx) = tokio::sync::watch::channel(initial);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
-        // The first tick fires immediately; this task already polled
-        // once synchronously (for the boot-time baseline) just before
-        // being spawned, so an immediate second poll here is harmless
-        // (it'll see no change) rather than wasteful.
+        // CTO review (OBI-256): `Delay`, not the default `Burst` --
+        // a single slow poll (e.g. a stalled NFS/bind mount under the
+        // blocking file read below) must not cause a run of immediate
+        // catch-up ticks once it finally returns.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            // `VersionWatcher::poll_for_change` does blocking file I/O
-            // (a `stat` and, on a changed mtime, a `read`); moving
-            // `watcher` into `spawn_blocking` and getting it back out
-            // via the tuple keeps that off this task's own (cooperative)
-            // poll, reusing the same watcher (with its change-tracking
-            // state) across every tick rather than rebuilding it.
+            // `VersionWatcher::poll_for_change` does blocking file I/O;
+            // moving `watcher` into `spawn_blocking` and getting it back
+            // out via the tuple keeps that off this task's own
+            // (cooperative) poll, reusing the same watcher (with its
+            // change-tracking state) across every tick rather than
+            // rebuilding it.
             let (result, returned_watcher) = match tokio::task::spawn_blocking(move || {
                 let result = watcher.poll_for_change();
                 (result, watcher)
@@ -886,7 +1291,7 @@ fn spawn_version_watcher(
 
             match result {
                 Ok(Some(version)) => {
-                    if tx.send(version).await.is_err() {
+                    if tx.send(version).is_err() {
                         // The receiving end (inside `supervise`'s respawn
                         // loop) is gone -- `supervise` itself must have
                         // already returned, so there is nothing left
@@ -915,7 +1320,7 @@ fn spawn_and_handoff(
     mudlib_root: &std::path::Path,
     telnet_listener: &std::net::TcpListener,
     http_listener: &std::net::TcpListener,
-) -> Result<std::process::Child, String> {
+) -> Result<(std::process::Child, std::os::unix::net::UnixStream), String> {
     use std::io::Read;
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
@@ -979,7 +1384,13 @@ fn spawn_and_handoff(
         "loom supervise: listening sockets handed off to standby child"
     );
 
-    Ok(child)
+    // OBI-184 control-protocol slice: unlike the earlier implementation,
+    // `supervisor_end` is *not* dropped here -- the caller keeps it open
+    // for the rest of this child's life, to send post-handoff control
+    // messages (`loom_supervise::control`) to it, which the child's own
+    // `run_control_responder` thread is listening for on its matching
+    // end.
+    Ok((child, supervisor_end))
 }
 
 async fn serve(
@@ -987,7 +1398,7 @@ async fn serve(
     save_dir: Option<PathBuf>,
     adopt_control_fd: Option<std::os::fd::RawFd>,
 ) -> Result<(), String> {
-    let (listener, http_listener) = acquire_listeners(adopt_control_fd).await?;
+    let (listener, http_listener, control_stream) = acquire_listeners(adopt_control_fd).await?;
     let actual_addr = listener
         .local_addr()
         .map_err(|err| format!("failed to read local addr: {err}"))?;
@@ -1049,6 +1460,31 @@ async fn serve(
         tokio::spawn(run_audit_sink(p, audit_rx, shutdown_rx.clone()));
     }
 
+    // OBI-184 (copyover-trigger slice): the world thread answers
+    // snapshot requests from the control responder over this channel --
+    // created before `spawn_world_thread` (which drains the receiving
+    // end) and before the responder thread below (which holds the
+    // sending end), so neither constructor needs an `Option`/placeholder
+    // for the other side. The reply carries `World::live_connections()`
+    // alongside the snapshot bytes -- both read from the same consistent
+    // instant of world state, which is exactly the connection-id list a
+    // reclaim pass needs to agree with.
+    let (snapshot_req_tx, snapshot_req_rx) = std::sync::mpsc::channel::<SnapshotRequest>();
+
+    // OBI-184 (copyover-trigger slice): real handles to `loom-net`'s
+    // reclaim/adopt primitives (OBI-94/OBI-221, merged but previously
+    // unreachable from `loom-cli` -- `run_server_with_ws` only ever wired
+    // up placeholder channels nothing could use). `reclaim_tx` lets the
+    // control responder pull a live connection's `TcpStream` back out
+    // without a `NetEvent::Disconnected`; `adopt_tx` re-inserts a
+    // `TcpStream` under a caller-chosen `ConnId`. This slice only uses
+    // both together, *within this same process*, to prove a reclaim-
+    // then-readopt round trip never disconnects a real client -- see
+    // `run_control_responder`'s own doc comment for why that is
+    // deliberately not yet "send the reclaimed connection to a standby".
+    let (reclaim_tx, reclaim_rx) = mpsc::channel::<ReclaimRequest>(RECLAIM_QUEUE_DEPTH);
+    let (adopt_tx, adopt_rx) = mpsc::channel::<AdoptedConn>(RECLAIM_QUEUE_DEPTH);
+
     let world_handle = spawn_world_thread(
         mudlib_root.clone(),
         save_dir,
@@ -1062,7 +1498,23 @@ async fn serve(
         audit_tx,
         persist.is_some(),
         persist.is_none(),
+        snapshot_req_rx,
     )?;
+
+    // OBI-184 control-protocol slice: if this process was handed off to
+    // by `loom supervise` (not the fresh-bind path), the control socket
+    // stays open after the handoff handshake -- spawn a dedicated thread
+    // to answer post-startup control messages on it for the rest of this
+    // process's life. Blocking reads, so its own `std::thread`, not a
+    // tokio task (same reasoning as `loom-supervise`'s dedicated-thread
+    // doc comments elsewhere in this file). Spawned after the world
+    // thread so it always has a live `snapshot_req_tx` to send to.
+    if let Some(control) = control_stream {
+        std::thread::Builder::new()
+            .name("loom-serve-control".to_string())
+            .spawn(move || run_control_responder(control, snapshot_req_tx, reclaim_tx, adopt_tx))
+            .map_err(|err| format!("failed to spawn control-responder thread: {err}"))?;
+    }
 
     info!(bind = %actual_addr, http_bind = %http_actual_addr, mudlib = %mudlib_root.display(), "loom server started");
 
@@ -1121,7 +1573,7 @@ async fn serve(
         .map_err(|err| format!("HTTP server failed: {err}"))
     });
 
-    let mut server = tokio::spawn(loom_net::run_server_with_ws(
+    let mut server = tokio::spawn(loom_net::run_server_full(
         listener,
         NetConfig {
             mssp_fields: vec![
@@ -1135,6 +1587,8 @@ async fn serve(
         command_rx,
         shutdown_rx.clone(),
         ws_accept_rx,
+        adopt_rx,
+        reclaim_rx,
     ));
     let mut ticker = tokio::spawn(run_world_tick_timer(
         event_tx,
@@ -1210,6 +1664,114 @@ fn web_root_from_env() -> Option<PathBuf> {
 /// did before this slice in that case.
 fn desired_version_file_from_env() -> Option<PathBuf> {
     std::env::var_os("LOOM_DESIRED_VERSION_FILE").map(PathBuf::from)
+}
+
+/// This process's own running version, for seeding
+/// [`loom_supervise::VersionWatcher`] (CTO review, OBI-256): §9.9's reconcile loop exists to
+/// notice a mismatch between "what's running" and "what's desired", so
+/// the baseline must be *this process's own identity*, not whatever the
+/// desired-version file happens to say at boot (which would make a
+/// desired-version write that happened while the supervisor was down
+/// invisible -- see `supervise`'s own doc comment for the concrete
+/// scenario). `LOOM_RUNNING_VERSION` is meant to be set by whatever
+/// staged this specific build (the Docker-staging reconciler today;
+/// cosign/GHCR artifact staging, not yet built, would be the eventual
+/// source once it exists) to the version string that build actually is.
+/// Falling back to the crate's own `CARGO_PKG_VERSION` keeps local/dev
+/// runs (which never set this) working, though it's not a meaningful
+/// "build identity" the way a staged artifact's tag/digest would be.
+fn running_version_from_env() -> String {
+    std::env::var("LOOM_RUNNING_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Override for [`DEFAULT_VERSION_POLL_INTERVAL`] (CTO review, OBI-256's
+/// nits): exists so a flaky CI timing margin can be tightened without
+/// touching the default production cadence, and so a future test that
+/// wants the version-watch loop to react faster than every 5s doesn't
+/// have to wait on it.
+fn version_poll_interval_from_env() -> Duration {
+    parse_version_poll_interval_ms(
+        std::env::var("LOOM_VERSION_POLL_INTERVAL_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parsing logic split out from [`version_poll_interval_from_env`]
+/// so it's unit-testable without mutating process-global env vars (which
+/// would race other tests in the same binary -- `cargo test` runs tests
+/// in parallel threads by default).
+fn parse_version_poll_interval_ms(raw: Option<&str>) -> Duration {
+    match raw {
+        Some(raw) => match raw.parse::<u64>() {
+            // CTO review (OBI-257): `tokio::time::interval` panics on a
+            // zero period. Refusing it here (falling back to the
+            // default, with a warning) keeps an operator/reconciler typo
+            // from crashing the whole version-watch task -- which would
+            // otherwise silently disable version watching entirely (the
+            // channel's sender just drops, and the consumer side's dead-
+            // sender handling, by design, looks identical to "nothing
+            // configured").
+            Ok(0) => {
+                warn!(
+                    "loom supervise: LOOM_VERSION_POLL_INTERVAL_MS=0 is invalid (tokio::time::interval \
+                     panics on a zero period); using the default {DEFAULT_VERSION_POLL_INTERVAL:?} instead"
+                );
+                DEFAULT_VERSION_POLL_INTERVAL
+            }
+            Ok(ms) => Duration::from_millis(ms),
+            Err(err) => {
+                // CTO review (OBI-258 nit): a garbage value silently
+                // falling back is just as surprising as the zero case
+                // above -- warn here too, consistently.
+                warn!(
+                    %err,
+                    raw,
+                    "loom supervise: LOOM_VERSION_POLL_INTERVAL_MS is not a valid number of \
+                     milliseconds; using the default {DEFAULT_VERSION_POLL_INTERVAL:?} instead"
+                );
+                DEFAULT_VERSION_POLL_INTERVAL
+            }
+        },
+        None => DEFAULT_VERSION_POLL_INTERVAL,
+    }
+}
+
+#[cfg(test)]
+mod version_poll_interval_tests {
+    use super::*;
+
+    #[test]
+    fn unset_is_the_default() {
+        assert_eq!(
+            parse_version_poll_interval_ms(None),
+            DEFAULT_VERSION_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn zero_is_refused_and_falls_back_to_the_default() {
+        assert_eq!(
+            parse_version_poll_interval_ms(Some("0")),
+            DEFAULT_VERSION_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn garbage_falls_back_to_the_default() {
+        assert_eq!(
+            parse_version_poll_interval_ms(Some("not-a-number")),
+            DEFAULT_VERSION_POLL_INTERVAL
+        );
+    }
+
+    #[test]
+    fn a_positive_value_is_used_as_milliseconds() {
+        assert_eq!(
+            parse_version_poll_interval_ms(Some("250")),
+            Duration::from_millis(250)
+        );
+    }
 }
 
 /// Staff web auth's JWT signing keyset (OBI-174, OBI-197/M-AUTH-4, design
@@ -1741,6 +2303,7 @@ fn spawn_world_thread(
     audit_tx: mpsc::Sender<Vec<loom_vm::AuditRow>>,
     has_audit_sink: bool,
     load_roles_seed: bool,
+    snapshot_req_rx: std::sync::mpsc::Receiver<SnapshotRequest>,
 ) -> Result<thread::JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let handle = thread::Builder::new()
@@ -1910,6 +2473,20 @@ fn spawn_world_thread(
                     world.set_roles_snapshot(snap);
                 }
                 drain_db_events(&mut world, &mut host);
+                // OBI-184 (copyover-trigger slice): a snapshot request
+                // from `run_control_responder`'s control socket, drained
+                // the same way as every other side-channel input to this
+                // loop -- `try_recv`, never blocking, so an idle (or
+                // never-sent) channel costs nothing and a request can
+                // never stall a tick waiting on it.
+                while let Ok(reply_tx) = snapshot_req_rx.try_recv() {
+                    let result = world
+                        .begin_snapshot()
+                        .map_err(|err| err.to_string())
+                        .and_then(|job| job.encode_all().map_err(|err| err.to_string()))
+                        .map(|bytes| (bytes, world.live_connections()));
+                    let _ = reply_tx.send(result);
+                }
             }
         })
         .map_err(|err| format!("failed to spawn world thread: {err}"))?;
