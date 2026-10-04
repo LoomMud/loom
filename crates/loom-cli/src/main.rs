@@ -1666,9 +1666,8 @@ fn desired_version_file_from_env() -> Option<PathBuf> {
     std::env::var_os("LOOM_DESIRED_VERSION_FILE").map(PathBuf::from)
 }
 
-/// This process's own running version, for seeding [`VersionWatcher`]
-/// (CTO review, OBI-256; `VersionWatcher` here refers to
-/// `loom_supervise::VersionWatcher`): §9.9's reconcile loop exists to
+/// This process's own running version, for seeding
+/// [`loom_supervise::VersionWatcher`] (CTO review, OBI-256): §9.9's reconcile loop exists to
 /// notice a mismatch between "what's running" and "what's desired", so
 /// the baseline must be *this process's own identity*, not whatever the
 /// desired-version file happens to say at boot (which would make a
