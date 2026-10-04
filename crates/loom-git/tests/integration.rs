@@ -964,3 +964,372 @@ fn spawn_allows_a_non_https_remote_with_no_token_provider() {
     .expect("no TokenProvider means no credential to misdirect -- must not refuse to start");
     handle.shutdown();
 }
+
+// --- OBI-272 (B3.3 slice 5): post-merge PR report wired into `SyncMain`.
+// A loopback fake GitHub server standing in for the real API, same
+// pattern as `tests/propose.rs`'s `spawn_fake_github`.
+
+mod post_merge_report {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    use loom_git::{
+        GitHubAppClient, GitHubAppError, ProposeConfig, ProposeGitHubConfig, PullRequest,
+        PullRequestOpener, ReportGitHub, TokenProvider, UreqClient,
+    };
+
+    struct FakeGitHub {
+        addr: String,
+        comments: Arc<Mutex<Vec<(u64, String)>>>,
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn read_full_request(stream: &mut TcpStream) -> Option<String> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            if let Some(end) = find_subslice(&buf, b"\r\n\r\n") {
+                let header_text = String::from_utf8_lossy(&buf[..end]);
+                let content_length: usize = header_text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length: "))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len().saturating_sub(end + 4) >= content_length {
+                    break;
+                }
+            }
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        if buf.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&buf).into_owned())
+        }
+    }
+
+    /// `respond_5xx_once` lets the "a GitHub 5xx must not fail the sync"
+    /// acceptance case force exactly one failing response before the
+    /// server starts behaving normally.
+    fn spawn_fake_github(respond_5xx_once: bool) -> FakeGitHub {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let comments = Arc::new(Mutex::new(Vec::new()));
+        let comments_clone = comments.clone();
+        let failed_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let req = match read_full_request(&mut stream) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let (head, body) = req.split_once("\r\n\r\n").unwrap_or((&req, ""));
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let (status, resp_body) = if path.contains("access_tokens") {
+                    (
+                        201,
+                        r#"{"token":"ghs_abc","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
+                    )
+                } else if path.ends_with("/pulls") && path.contains("/commits/") {
+                    // Commits-to-pulls fallback -- not expected to be hit
+                    // by this test's merge-commit subject, but answered
+                    // anyway so an unexpected call fails loudly on the
+                    // assertion instead of hanging.
+                    (200, "[]".to_string())
+                } else if path.contains("/issues/") && path.ends_with("/comments") {
+                    if respond_5xx_once
+                        && !failed_once.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        (503, r#"{"message":"server error"}"#.to_string())
+                    } else {
+                        let number: u64 = path
+                            .trim_start_matches("/repos/LoomMud/warp/issues/")
+                            .trim_end_matches("/comments")
+                            .parse()
+                            .unwrap_or(0);
+                        comments_clone
+                            .lock()
+                            .unwrap()
+                            .push((number, body.to_string()));
+                        (201, "{}".to_string())
+                    }
+                } else {
+                    (404, "{}".to_string())
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    resp_body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(resp_body.as_bytes());
+            }
+        });
+        FakeGitHub { addr, comments }
+    }
+
+    // Shared throwaway test fixture (see `loom_git`'s own jwt test module
+    // docs): not a real GitHub App key, just something
+    // `GitHubAppClient::new` accepts.
+    fn test_pem() -> String {
+        include_str!("testdata/test_key.pkcs8.pem").to_string()
+    }
+
+    fn github_client(server: &FakeGitHub) -> Arc<GitHubAppClient<UreqClient>> {
+        Arc::new(
+            GitHubAppClient::new("1", "2", &test_pem(), UreqClient::default())
+                .unwrap()
+                .with_api_base(format!("http://{}", server.addr)),
+        )
+    }
+
+    struct TokenAdapter(Arc<GitHubAppClient<UreqClient>>);
+    impl TokenProvider for TokenAdapter {
+        fn token(&self) -> Result<String, String> {
+            self.0.token()
+        }
+    }
+
+    struct ReportAdapter(Arc<GitHubAppClient<UreqClient>>);
+    impl ReportGitHub for ReportAdapter {
+        fn commit_pulls(
+            &self,
+            owner: &str,
+            repo: &str,
+            sha: &str,
+        ) -> Result<Vec<loom_git::PullRef>, GitHubAppError> {
+            self.0.commit_pulls(owner, repo, sha)
+        }
+        fn create_issue_comment(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: u64,
+            body: &str,
+        ) -> Result<(), GitHubAppError> {
+            self.0.create_issue_comment(owner, repo, number, body)
+        }
+    }
+
+    /// `propose` itself is never exercised by these tests -- this is
+    /// only here because [`ProposeGitHubConfig::pr_opener`] isn't an
+    /// `Option`.
+    struct UnusedPrOpener;
+    impl PullRequestOpener for UnusedPrOpener {
+        fn open_pull_request(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _head: &str,
+            _base: &str,
+            _title: &str,
+            _body: &str,
+        ) -> Result<PullRequest, GitHubAppError> {
+            panic!("post_merge_report tests never call propose()")
+        }
+    }
+
+    struct FixedInstancesHost {
+        calls: Arc<Mutex<Vec<RecompileCall>>>,
+        upgraded_instances: usize,
+    }
+    impl RecompileHost for FixedInstancesHost {
+        fn recompile_set(&self, changed: Vec<String>, deleted: Vec<String>) -> RecompileOutcome {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((changed.clone(), deleted.clone()));
+            RecompileOutcome {
+                ok: true,
+                recompiled: changed,
+                upgraded_instances: self.upgraded_instances,
+                failures: Vec::new(),
+            }
+        }
+    }
+
+    fn spawn_reporting_worker(
+        fx: &Fixture,
+        server: &FakeGitHub,
+        env: &str,
+        upgraded_instances: usize,
+    ) -> (GitWorkerHandle, Arc<Mutex<Vec<RecompileCall>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let host = FixedInstancesHost {
+            calls: calls.clone(),
+            upgraded_instances,
+        };
+        let mut config = GitConfig::new(fx.git_dir(), fx.work_tree(), "origin", env);
+        config.commit_coalesce = Duration::from_millis(10);
+        config.push_debounce = Duration::from_millis(10);
+        config.sync_poll = Duration::from_secs(3600); // only via kick() in tests
+        config.tick = Duration::from_millis(10);
+        config.remote_url = "https://github.com/example/warp-mudlib.git".to_string();
+        let client = github_client(server);
+        let handle = GitWorker::spawn_with_propose(
+            config,
+            Some(Box::new(TokenAdapter(client.clone()))),
+            Box::new(host),
+            Box::new(RecordingAudit::default()),
+            ProposeConfig {
+                authorizer: Box::new(loom_git::AllowAllAuthorizer),
+                quota: Box::new(loom_git::InMemoryQuota::new()),
+                limits: loom_git::ProposeLimits::default(),
+                github: Some(ProposeGitHubConfig {
+                    pr_opener: Box::new(UnusedPrOpener),
+                    owner: "LoomMud".to_string(),
+                    repo: "warp".to_string(),
+                    report_client: Some(Box::new(ReportAdapter(client))),
+                }),
+            },
+        )
+        .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
+        (handle, calls)
+    }
+
+    /// Merges a feature branch into `main` (on the bare remote) with
+    /// GitHub's own `--no-ff` merge-commit subject
+    /// (`Merge pull request #<n> from ...`), the same convention
+    /// `merged_commits`/`extract_merge_commit_pr_number` are built
+    /// around.
+    fn merge_a_pr_into_main(fx: &Fixture, clone_name: &str, pr_number: u64) {
+        let clone = fx.tmp.path().join(clone_name);
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                &fx.bare_path().to_string_lossy(),
+                &clone.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        git(&clone, &["checkout", "-b", "feature"]);
+        std::fs::write(clone.join("hall.wf"), "object hall;\n").unwrap();
+        git(&clone, &["add", "-A"]);
+        let mut commit = Command::new("git");
+        commit
+            .current_dir(&clone)
+            .args(["commit", "-m", "add hall"]);
+        commit
+            .env("GIT_AUTHOR_NAME", "reviewer")
+            .env("GIT_AUTHOR_EMAIL", "reviewer@loommud.com");
+        commit
+            .env("GIT_COMMITTER_NAME", "reviewer")
+            .env("GIT_COMMITTER_EMAIL", "reviewer@loommud.com");
+        assert!(commit.output().unwrap().status.success());
+        git(&clone, &["checkout", "main"]);
+        let mut merge = Command::new("git");
+        merge.current_dir(&clone).args([
+            "merge",
+            "--no-ff",
+            "-m",
+            &format!("Merge pull request #{pr_number} from LoomMud/feature"),
+            "feature",
+        ]);
+        merge
+            .env("GIT_AUTHOR_NAME", "reviewer")
+            .env("GIT_AUTHOR_EMAIL", "reviewer@loommud.com");
+        merge
+            .env("GIT_COMMITTER_NAME", "reviewer")
+            .env("GIT_COMMITTER_EMAIL", "reviewer@loommud.com");
+        assert!(merge.output().unwrap().status.success());
+        git(&clone, &["push", "origin", "main"]);
+    }
+
+    /// Acceptance: a `SyncMain` over a `--no-ff` merge against the
+    /// loopback fake GitHub posts exactly one comment on the right PR,
+    /// carrying the instance count.
+    #[test]
+    fn no_ff_merge_posts_exactly_one_comment_with_instance_count() {
+        let fx = setup();
+        let server = spawn_fake_github(false);
+        let (handle, calls) = spawn_reporting_worker(&fx, &server, "test", 3);
+
+        // Establish a known `refs/loom/last-main` via the boot sync
+        // (first sync has no prior `main` SHA on record, so it must
+        // never try to report).
+        handle.barrier();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            server.comments.lock().unwrap().is_empty(),
+            "first sync must never report (no prior `main` SHA)"
+        );
+
+        merge_a_pr_into_main(&fx, "reviewer-clone-report", 42);
+
+        handle.kick();
+        wait_for(
+            || !calls.lock().unwrap().is_empty(),
+            "recompile_set to be called after the merge sync",
+        );
+        wait_for(
+            || !server.comments.lock().unwrap().is_empty(),
+            "a PR comment to be posted after the merge sync",
+        );
+
+        // Give any stray extra delivery a moment to show up before
+        // asserting "exactly one".
+        std::thread::sleep(Duration::from_millis(200));
+        let comments = server.comments.lock().unwrap();
+        assert_eq!(
+            comments.len(),
+            1,
+            "expected exactly one comment, got {comments:?}"
+        );
+        let (pr_number, body) = &comments[0];
+        assert_eq!(
+            *pr_number, 42,
+            "comment must land on PR #42, not another one"
+        );
+        assert!(
+            body.contains("3 live instance"),
+            "comment body must carry the instance count: {body}"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Acceptance: a GitHub 5xx while posting the report must never fail
+    /// the `SyncMain` pass -- the fast-forward and recompile still
+    /// happen, only the comment attempt itself fails (and is logged).
+    #[test]
+    fn github_5xx_during_report_does_not_fail_sync_main() {
+        let fx = setup();
+        let server = spawn_fake_github(true);
+        let (handle, calls) = spawn_reporting_worker(&fx, &server, "test", 1);
+
+        handle.barrier();
+        std::thread::sleep(Duration::from_millis(100));
+
+        merge_a_pr_into_main(&fx, "reviewer-clone-report-5xx", 7);
+
+        handle.kick();
+        wait_for(
+            || !calls.lock().unwrap().is_empty(),
+            "recompile_set to be called even though the report will 5xx",
+        );
+        wait_for(
+            || fx.work_tree().join("hall.wf").exists(),
+            "the fast-forwarded work tree to contain the new file regardless of the report outcome",
+        );
+
+        handle.shutdown();
+    }
+}

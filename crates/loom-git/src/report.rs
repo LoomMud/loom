@@ -38,9 +38,55 @@
 
 use crate::cli::{GitError, Repo, stdout_string};
 use crate::github::GitHubAppClient;
+use crate::github::GitHubAppError;
 use crate::github::issues::PullRef;
 use crate::github::transport::HttpClient;
 use crate::worker::RecompileOutcome;
+
+/// What the post-merge PR report (slice 4/OBI-213, slice 5/OBI-272)
+/// needs from a GitHub client: resolve a commit to its PR(s), then
+/// comment on one. A trait (same pattern as
+/// [`crate::github::pulls::PullRequestOpener`]) so `GitWorker`'s
+/// `SyncMain` wiring does not need to carry [`GitHubAppClient`]'s
+/// `HttpClient` type parameter around, and so tests can substitute a
+/// fake that never hits the network.
+pub trait ReportGitHub: Send + Sync {
+    fn commit_pulls(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<PullRef>, GitHubAppError>;
+
+    fn create_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<(), GitHubAppError>;
+}
+
+impl<C: HttpClient> ReportGitHub for GitHubAppClient<C> {
+    fn commit_pulls(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<PullRef>, GitHubAppError> {
+        GitHubAppClient::commit_pulls(self, owner, repo, sha)
+    }
+
+    fn create_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<(), GitHubAppError> {
+        GitHubAppClient::create_issue_comment(self, owner, repo, number, body)
+    }
+}
 
 /// Past this many commits in the moved range, `report_recompile` logs a
 /// warning and comments on nothing: almost certainly a long outage, a
@@ -146,8 +192,8 @@ pub struct ResolvedCommit {
 /// lookup failure (transport error, non-2xx) is logged and treated the
 /// same as "no PR found" -- this must never panic the sync loop over a
 /// GitHub API hiccup.
-pub fn resolve_pull_requests<C: HttpClient>(
-    client: &GitHubAppClient<C>,
+pub fn resolve_pull_requests(
+    client: &dyn ReportGitHub,
     owner: &str,
     repo: &str,
     commits: &[MergedCommit],
@@ -273,8 +319,8 @@ pub fn comment_body(env_name: &str, live_sha: &str, outcome: &RecompileOutcome) 
 /// that case. Returns one entry per PR actually commented on (success or
 /// [`crate::github::GitHubAppError`]), so the caller can decide
 /// whether/how to surface a comment failure.
-pub fn report_recompile<C: HttpClient>(
-    client: &GitHubAppClient<C>,
+pub fn report_recompile(
+    client: &dyn ReportGitHub,
     owner: &str,
     repo: &str,
     env_name: &str,
