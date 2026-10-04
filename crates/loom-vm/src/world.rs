@@ -1102,6 +1102,22 @@ impl World {
         _caller_tier: i16,
         host: &mut dyn Host,
     ) -> Vec<AdminObjectSummary> {
+        // CTO review (OBI-237 PR #102, must-fix B1): `caller_euid` is an
+        // HTTP-authenticated staff `sub`, never validated against the
+        // driver's reserved-principal rule the way an in-game `seteuid`
+        // is (`bcvm::registry::RegistryHost::check_reserved_euid`,
+        // D-S3.1/M-FS-1). Refused *before* interning: `syms.intern("root")`
+        // reuses `security::ROOT` (sym 0), which `GuardSet::with` drops
+        // as the identity element, leaving an **empty** guard -- D-S1.2's
+        // "an all-root stack is allowed without asking the master" rule,
+        // meaning a staff account literally named `root` (or `mudlib`, or
+        // any `domain:*`) would silently get root's own unconditional
+        // `valid_read` pass, `/secure` included, instead of being denied.
+        // `is_reserved_principal` denies exactly those names, the same
+        // check `check_reserved_euid` applies to an in-game `seteuid`.
+        if crate::security::is_reserved_principal(caller_euid) {
+            return Vec::new();
+        }
         let master = self.master_or_sentinel();
         let euid_sym = self.registry.syms.intern(caller_euid);
         let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
@@ -1149,6 +1165,21 @@ impl World {
     /// enforced -- the HTTP edge's T5 tier floor is a convenience, not
     /// the real boundary; a master whose `valid_read` denies a
     /// `/secure/**` program to a tier-5 caller is still obeyed here.
+    ///
+    /// CTO review (OBI-237 PR #102, non-blocking note): this renders
+    /// *every* variable `valid_read` lets the caller see, with no
+    /// credential-shaped-name scrubbing of its own (e.g. `/secure/login`'s
+    /// transient `pending_pw` would render like any other var). That is
+    /// deliberate, not an oversight: `valid_read` is the one real
+    /// confidentiality boundary this method enforces (the line above),
+    /// and a master whose policy lets a caller read a program at all is
+    /// trusted to have already decided that caller may see its state --
+    /// adding a second, driver-guessed "looks like a credential" filter
+    /// on top would be exactly the kind of parallel permission rule this
+    /// issue's design note says not to invent. A mudlib that stores a
+    /// real secret in a plain (non-`persistent`, non-`/secure`-gated)
+    /// var is a mudlib-side `valid_read` policy bug, not something this
+    /// method can detect from here.
     pub fn admin_object_vars(
         &mut self,
         caller_euid: &str,
@@ -1156,6 +1187,12 @@ impl World {
         path: &str,
         host: &mut dyn Host,
     ) -> Option<AdminObjectVars> {
+        // CTO review (OBI-237 PR #102, must-fix B1): see
+        // `admin_list_objects`'s doc comment for why this check must run
+        // before `syms.intern(caller_euid)`, not after.
+        if crate::security::is_reserved_principal(caller_euid) {
+            return None;
+        }
         let master = self.master_or_sentinel();
         let euid_sym = self.registry.syms.intern(caller_euid);
         let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
@@ -1231,6 +1268,12 @@ impl World {
         program_prefix: Option<&str>,
         host: &mut dyn Host,
     ) -> Vec<AdminErrorGroup> {
+        // CTO review (OBI-237 PR #102, must-fix B1): see
+        // `admin_list_objects`'s doc comment for why this check must run
+        // before `syms.intern(caller_euid)`, not after.
+        if crate::security::is_reserved_principal(caller_euid) {
+            return Vec::new();
+        }
         let master = self.master_or_sentinel();
         let euid_sym = self.registry.syms.intern(caller_euid);
         let guard = crate::security::GuardSet::empty().with(crate::security::Principal {

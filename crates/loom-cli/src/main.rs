@@ -1444,15 +1444,25 @@ fn spawn_world_thread(
             };
 
             // OBI-237 (OBI-234 follow-up): drain every pending admin
-            // `who`/`objects`/`objects/:path/vars` request, same `try_recv`
-            // shape as `drain_db_events` above -- never `blocking_recv`,
-            // drained once per event-loop iteration, so a flood of admin
-            // queries degrades to the HTTP side's own `Busy`/503 once
-            // `admin_query_rx`'s bounded channel fills, never world-thread
-            // latency. Each reply is answered with its own tick-budgeted
-            // `valid_read` apply (`World::admin_list_objects`/
-            // `admin_object_vars`'s own doc comments) and sent on a
-            // `oneshot`, which cannot block either.
+            // `who`/`objects`/`objects/:path/vars`/`errors` request, same
+            // `try_recv` shape as `drain_db_events` above -- never
+            // `blocking_recv`, drained once per event-loop iteration, so a
+            // flood of admin queries degrades to the HTTP side's own
+            // `Busy`/503 once `admin_query_rx`'s bounded channel fills,
+            // never world-thread latency. Each reply is answered with its
+            // own tick-budgeted `valid_read` apply (`World::
+            // admin_list_objects`/`admin_object_vars`/`admin_errors`'s own
+            // doc comments) and sent on a `oneshot`, which cannot block
+            // either.
+            //
+            // CTO review (OBI-237 PR #102, non-blocking note): drained
+            // once per event-loop iteration, same as `drain_db_events` --
+            // on an otherwise-idle server that means once per
+            // `NetEvent::Tick` (`WORLD_TICK_INTERVAL`, 100 ms), not
+            // instantly on send; a query answered between two ticks still
+            // meets the HTTP side's 2s `ADMIN_QUERY_TIMEOUT` with ample
+            // margin, but this is the latency floor an admin request
+            // actually has, not "as soon as it's sent".
             let mut drain_admin_queries = |world: &mut World, host: &mut NetHost| {
                 while let Ok(request) = admin_query_rx.try_recv() {
                     match request {
