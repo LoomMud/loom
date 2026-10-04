@@ -42,18 +42,36 @@
 //!   on `supervise`/`run_one_child_attempt` for exactly what's built and
 //!   what isn't).
 //!
+//! - [`copyover`]: the two-child, two-phase copyover state machine
+//!   (design doc "OBI-184: copyover standby hand-off design", rev 2,
+//!   CTO-approved incl. amendments A1-A6). [`copyover::Phase`] and
+//!   [`copyover::CopyoverState`] encode amendment A3's explicit
+//!   `active`/`Option<standby>`/phase representation and amendment A1's
+//!   no-split-brain ordering (a standby that never received `Go` cannot
+//!   be aborted-around unsafely, because reaching the decision point is
+//!   the only way to leave the last abortable phase) -- unit-tested, not
+//!   yet wired into `loom-cli`'s real supervise loop or given real
+//!   `Child`/`UnixStream` handles (next slice).
+//!
 //! Not yet implemented (each is its own follow-up slice/issue, not
 //! silently deferred -- see OBI-184's tracking comments):
 //! - Staging a cosign-verified driver artifact + `abi.json` from GHCR.
-//! - The standby-boot / snapshot hand-off / `reconnect()` orchestration
-//!   against an *already-running* old process -- the snapshot save/load
-//!   and `reconnect()` apply themselves are OBI-221/Gimli's piece,
-//!   merged; this crate's remaining job is actually *driving* that
-//!   interface from a live copyover (quiesce -> drain -> reclaim fds via
-//!   `fdpass::send_fds` -> snapshot -> spawn standby -> adopt fds/
-//!   snapshot -> `reconnect_all` -> accept new conns), triggered by
-//!   `VersionWatcher` detecting a change -- today a detected change is
-//!   only logged, nothing acts on it yet.
+//! - Actually wiring [`copyover::CopyoverState`] into `loom-cli`'s real
+//!   supervise loop: spawning a genuine standby for `Preparing`, routing
+//!   the new `HandoffReady`/`HandoffGo`/`HandoffAbort`/`HandoffCommitted`
+//!   control messages ([`control::ControlMessage`]) to/from the right
+//!   process at the right phase, and the full quiesce -> drain -> reclaim
+//!   -> snapshot -> send -> (await Ready) -> (Go | Abort) -> accept
+//!   sequence the design doc's §3/§5 lay out. The snapshot save/load and
+//!   `reconnect()` apply themselves are OBI-221/Gimli's piece, merged;
+//!   this crate's remaining job is driving that interface from a live
+//!   copyover.
+//! - Relaying the snapshot file and reclaimed-connection fds through the
+//!   supervisor process itself (design doc §4: "relay through the
+//!   supervisor... don't open a direct old<->new channel") -- today's
+//!   `fdpass` calls are all single-hop (supervisor<->one child); a real
+//!   hand-off needs the supervisor to receive from the old process and
+//!   re-send to the standby.
 //! - Abort/fallback paths specific to a *copyover* failing partway
 //!   through (old driver keeps running; a re-exec fallback if the *new*
 //!   process fails after takeover) -- distinct from the already-built
@@ -61,11 +79,13 @@
 //!   scratch, never attempts a live hand-off.
 
 pub mod control;
+pub mod copyover;
 pub mod fdpass;
 pub mod listener;
 pub mod signal;
 pub mod version_source;
 
+pub use copyover::{CopyoverState, Phase};
 pub use version_source::{FileVersionSource, VersionSource, VersionWatcher};
 
 // Loom only ever runs on Linux (the runtime image is debian/distroless,

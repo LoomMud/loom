@@ -32,6 +32,10 @@ use std::io::{self, Read, Write};
 const TAG_COPYOVER_REQUESTED: u8 = 1;
 const TAG_COPYOVER_ACK: u8 = 2;
 const TAG_COPYOVER_NACK: u8 = 3;
+const TAG_HANDOFF_READY: u8 = 4;
+const TAG_HANDOFF_GO: u8 = 5;
+const TAG_HANDOFF_ABORT: u8 = 6;
+const TAG_HANDOFF_COMMITTED: u8 = 7;
 
 /// The longest payload (e.g. a version string) this protocol will read
 /// before refusing the message -- a sanity bound against a corrupt
@@ -58,6 +62,47 @@ pub enum ControlMessage {
     /// start so adding a real rejection reason later doesn't need a
     /// framing change.
     CopyoverNack { reason: String },
+
+    /// Standby -> supervisor, phase 1 complete (design doc §5 step 3,
+    /// OBI-184 plan rev 2 / CTO amendment A1): the snapshot is loaded and
+    /// `conn_ids` are registered as adopted connections, but **not yet
+    /// polled/read** -- the standby has touched no socket I/O at this
+    /// point. `conn_ids` is carried here (not inferred from fd order) so
+    /// the supervisor can log/verify it matches the set it told the
+    /// standby to expect; the fds themselves still travel over the
+    /// existing `fdpass::send_fds`/`recv_fds` call, paired 1:1 in list
+    /// order with this message's `conn_ids` (both sides iterate the same
+    /// list). This closes the fd<->`ConnId` desync gap OBI-227's review
+    /// flagged against `fdpass`'s original fd-only framing, without
+    /// changing `fdpass`'s own wire format.
+    HandoffReady { conn_ids: Vec<u64> },
+
+    /// Supervisor -> standby: the decision point has been reached (old
+    /// process's `HandoffReady` arrived within the phase deadline) --
+    /// proceed to phase 2: `reconnect_all`, start reading the adopted
+    /// conns, start accepting new connections. Per amendment A1, the
+    /// supervisor sends this (and the matching `CopyoverCommitted` to the
+    /// old process queued right behind it, same decision instant) before
+    /// the standby does any socket I/O at all -- never the other way
+    /// around.
+    HandoffGo,
+
+    /// Supervisor -> old (active) process: the hand-off failed or timed
+    /// out before the decision point (or the standby never answered) --
+    /// resume as the active process. Per amendment A1, the supervisor
+    /// only ever sends this *after* it has SIGKILLed and reaped the
+    /// standby, so a `HandoffAbort` recipient can safely re-adopt its
+    /// parked connections (PR #111's reclaim/readopt code path) knowing
+    /// no other process is already live on the same fds.
+    HandoffAbort,
+
+    /// Standby -> supervisor: phase 2 is complete (`reconnect_all` ran,
+    /// now accepting). Bookkeeping/observability only, per amendment A1 --
+    /// by the time this arrives the supervisor has already committed (it
+    /// sent `HandoffGo` to the standby and the matching commit to the old
+    /// process at the same decision instant), so this ack does not gate
+    /// anything further.
+    HandoffCommitted,
 }
 
 /// Write one [`ControlMessage`] to `writer`.
@@ -76,7 +121,62 @@ pub fn write_message(writer: &mut impl Write, message: &ControlMessage) -> io::R
             writer.write_all(&[TAG_COPYOVER_NACK])?;
             write_payload(writer, reason)
         }
+        ControlMessage::HandoffReady { conn_ids } => {
+            writer.write_all(&[TAG_HANDOFF_READY])?;
+            write_conn_ids(writer, conn_ids)
+        }
+        ControlMessage::HandoffGo => writer.write_all(&[TAG_HANDOFF_GO]),
+        ControlMessage::HandoffAbort => writer.write_all(&[TAG_HANDOFF_ABORT]),
+        ControlMessage::HandoffCommitted => writer.write_all(&[TAG_HANDOFF_COMMITTED]),
     }
+}
+
+/// The most `conn_id`s a single [`ControlMessage::HandoffReady`] will
+/// carry -- a sanity bound mirroring [`MAX_PAYLOAD_BYTES`]'s role for
+/// string payloads, not an expected-to-be-reached limit (Phase 2 scale
+/// is nowhere near this many simultaneous live connections).
+const MAX_CONN_IDS: u32 = 65536;
+
+fn write_conn_ids(writer: &mut impl Write, conn_ids: &[u64]) -> io::Result<()> {
+    let count = u32::try_from(conn_ids.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "control message conn_id list too large ({} entries)",
+                conn_ids.len()
+            ),
+        )
+    })?;
+    if count > MAX_CONN_IDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("control message conn_id count {count} exceeds {MAX_CONN_IDS}"),
+        ));
+    }
+    writer.write_all(&count.to_le_bytes())?;
+    for conn_id in conn_ids {
+        writer.write_all(&conn_id.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_conn_ids(reader: &mut impl Read) -> io::Result<Vec<u64>> {
+    let mut count_bytes = [0u8; 4];
+    reader.read_exact(&mut count_bytes)?;
+    let count = u32::from_le_bytes(count_bytes);
+    if count > MAX_CONN_IDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("control: conn_id count {count} exceeds {MAX_CONN_IDS}"),
+        ));
+    }
+    let mut conn_ids = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf)?;
+        conn_ids.push(u64::from_le_bytes(buf));
+    }
+    Ok(conn_ids)
 }
 
 fn write_payload(writer: &mut impl Write, payload: &str) -> io::Result<()> {
@@ -125,6 +225,12 @@ pub fn read_message(reader: &mut impl Read) -> io::Result<ControlMessage> {
         TAG_COPYOVER_NACK => Ok(ControlMessage::CopyoverNack {
             reason: read_payload(reader)?,
         }),
+        TAG_HANDOFF_READY => Ok(ControlMessage::HandoffReady {
+            conn_ids: read_conn_ids(reader)?,
+        }),
+        TAG_HANDOFF_GO => Ok(ControlMessage::HandoffGo),
+        TAG_HANDOFF_ABORT => Ok(ControlMessage::HandoffAbort),
+        TAG_HANDOFF_COMMITTED => Ok(ControlMessage::HandoffCommitted),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("control: unknown message tag {other}"),
@@ -184,6 +290,64 @@ mod tests {
         round_trip(ControlMessage::CopyoverRequested {
             version: String::new(),
         });
+    }
+
+    #[test]
+    fn handoff_ready_round_trips_with_conn_ids() {
+        round_trip(ControlMessage::HandoffReady {
+            conn_ids: vec![1, 2, 3, 42],
+        });
+    }
+
+    #[test]
+    fn handoff_ready_round_trips_with_no_conn_ids() {
+        round_trip(ControlMessage::HandoffReady { conn_ids: vec![] });
+    }
+
+    #[test]
+    fn handoff_go_round_trips() {
+        round_trip(ControlMessage::HandoffGo);
+    }
+
+    #[test]
+    fn handoff_abort_round_trips() {
+        round_trip(ControlMessage::HandoffAbort);
+    }
+
+    #[test]
+    fn handoff_committed_round_trips() {
+        round_trip(ControlMessage::HandoffCommitted);
+    }
+
+    /// Pins the exact ordering contract `HandoffReady`'s own doc comment
+    /// promises: `conn_ids` round-trips in the order given, since the
+    /// receiver pairs it 1:1 by list position against `fdpass::recv_fds`'s
+    /// own order-preserving result, not a reordered/sorted copy.
+    #[test]
+    fn handoff_ready_preserves_conn_id_order() {
+        let (mut a, mut b) = UnixStream::pair().expect("UnixStream::pair");
+        let conn_ids = vec![9, 1, 5, 3];
+        write_message(
+            &mut a,
+            &ControlMessage::HandoffReady {
+                conn_ids: conn_ids.clone(),
+            },
+        )
+        .unwrap();
+        match read_message(&mut b).unwrap() {
+            ControlMessage::HandoffReady { conn_ids: got } => assert_eq!(got, conn_ids),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_conn_id_count_is_refused_on_read_without_allocating_it() {
+        let (mut a, mut b) = UnixStream::pair().expect("UnixStream::pair");
+        a.write_all(&[TAG_HANDOFF_READY]).unwrap();
+        a.write_all(&(MAX_CONN_IDS + 1).to_le_bytes()).unwrap();
+        drop(a);
+        let err = read_message(&mut b).expect_err("an oversized conn_id count must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
