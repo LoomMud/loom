@@ -58,14 +58,14 @@
 //! - Staging a cosign-verified driver artifact + `abi.json` from GHCR.
 //! - Actually wiring [`copyover::CopyoverState`] into `loom-cli`'s real
 //!   supervise loop: spawning a genuine standby for `Preparing`, routing
-//!   the new `HandoffReady`/`HandoffGo`/`HandoffAbort`/`HandoffCommitted`
-//!   control messages ([`control::ControlMessage`]) to/from the right
-//!   process at the right phase, and the full quiesce -> drain -> reclaim
-//!   -> snapshot -> send -> (await Ready) -> (Go | Abort) -> accept
-//!   sequence the design doc's §3/§5 lay out. The snapshot save/load and
-//!   `reconnect()` apply themselves are OBI-221/Gimli's piece, merged;
-//!   this crate's remaining job is driving that interface from a live
-//!   copyover.
+//!   the new `HandoffOffer`/`HandoffReady`/`HandoffGo`/`HandoffCommit`/
+//!   `HandoffAbort`/`HandoffRunning` control messages ([`control::
+//!   ControlMessage`]) to/from the right process at the right phase, and
+//!   the full quiesce -> drain -> reclaim -> snapshot -> send -> (await
+//!   Ready) -> (Go+Commit | Abort) -> accept sequence the design doc's
+//!   §3/§5 lay out. The snapshot save/load and `reconnect()` apply
+//!   themselves are OBI-221/Gimli's piece, merged; this crate's
+//!   remaining job is driving that interface from a live copyover.
 //! - Relaying the snapshot file and reclaimed-connection fds through the
 //!   supervisor process itself (design doc §4: "relay through the
 //!   supervisor... don't open a direct old<->new channel") -- today's
@@ -77,6 +77,20 @@
 //!   process fails after takeover) -- distinct from the already-built
 //!   respawn-on-crash, which only ever starts a fresh standby from
 //!   scratch, never attempts a live hand-off.
+//! - Cross-version compatibility of the control protocol itself (N2, CTO
+//!   re-review OBI-273): the old side of a hand-off runs the *previous*
+//!   binary by definition, so the very first deploy that introduces a
+//!   new control-message tag can't hand off *from* a binary that
+//!   predates it -- that binary's [`control::read_message`] reads the
+//!   new tag as "unknown message tag" (`io::ErrorKind::InvalidData`),
+//!   not as the new variant. The wiring slice above must treat an
+//!   unknown-tag error (or a `CopyoverNack`) from the old process the
+//!   same as any other abort-the-hand-off condition, and fall back to a
+//!   cold restart (the existing respawn-on-crash path) rather than retry
+//!   the same hand-off against a peer that cannot speak it. Tags stay
+//!   append-only (see [`control`]'s `TAG_*` block) specifically so this
+//!   fallback is the only cross-version case to handle -- a tag never
+//!   changes meaning out from under an old binary that already shipped.
 
 pub mod control;
 pub mod copyover;

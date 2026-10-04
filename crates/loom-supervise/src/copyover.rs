@@ -41,8 +41,9 @@ pub enum Phase {
     Preparing,
     /// The old process has reclaimed its connections, taken a snapshot,
     /// and sent both (plus the conn-id list, per [`crate::control::
-    /// ControlMessage::HandoffReady`]'s ordering contract) to the
-    /// standby; waiting for the standby's own `HandoffReady` ack that it
+    /// ControlMessage::HandoffOffer`]'s old-process -> supervisor ->
+    /// standby ordering contract) on to the standby; waiting for the
+    /// standby's own `HandoffReady` ack (standby -> supervisor) that it
     /// has loaded the snapshot and registered (not yet polled) every
     /// adopted connection.
     AwaitingStandbyReady,
@@ -50,36 +51,38 @@ pub enum Phase {
     /// `HandoffReady` arrived within the [`Phase::AwaitingStandbyReady`]
     /// deadline. From here the supervisor commits unconditionally -- an
     /// old-process failure after this point is not an abort (see this
-    /// phase's own doc on [`Phase::next`]).
+    /// phase's own doc on [`Phase::next`]). Per N1 (CTO re-review
+    /// OBI-273): [`CopyoverState::advance`] out of this phase happens
+    /// *before* [`crate::control::ControlMessage::HandoffGo`] is written
+    /// to the standby's socket -- the decision is recorded first, then
+    /// acted on, so any failure after that point (including a short or
+    /// failed write of `Go` itself) lands in a phase that is no longer
+    /// abortable, never in a state where the recorded decision and the
+    /// wire are out of step.
     Deciding,
-    /// `HandoffGo` has been sent to the standby and the matching commit
-    /// message to the old process, in that order; waiting for the
-    /// standby's `HandoffCommitted` ack (bookkeeping only -- the
-    /// supervisor already treats the hand-off as committed the instant
-    /// it entered this phase, per amendment A1's "ack does not gate
-    /// anything further").
+    /// [`crate::control::ControlMessage::HandoffGo`] has been sent to the
+    /// standby and the matching [`crate::control::ControlMessage::
+    /// HandoffCommit`] to the old process, in that order; waiting for the
+    /// standby's `HandoffRunning` ack (bookkeeping only -- the supervisor
+    /// already treats the hand-off as committed the instant it entered
+    /// this phase, per amendment A1's "ack does not gate anything
+    /// further").
     AwaitingStandbyCommitted,
     /// Steady state after a successful hand-off: the former standby is
-    /// now the sole active process, and the old process has been told to
-    /// exit.
+    /// now the sole active process, and the old process has been sent
+    /// [`crate::control::ControlMessage::HandoffCommit`] to drop its
+    /// parked connections and exit.
     Committed,
     /// A failure or timeout occurred before [`Phase::Deciding`] was
     /// reached (or occurred inside it, before the commit messages were
     /// sent). Per amendment A1, entering this phase from the supervisor's
     /// side always SIGKILLs and reaps the standby *before* it sends
     /// [`crate::control::ControlMessage::HandoffAbort`] to the old
-    /// process -- order matters: see this module's doc comment on
-    /// `kill_standby_before_abort_is_load_bearing`-style reasoning in the
-    /// tests below.
+    /// process -- order matters, and is exercised by this module's own
+    /// `abort_after_the_decision_point_panics`-style tests below.
     Aborting,
 }
 
-/// Returns the maximum time this phase may remain active before the
-/// supervisor must treat it as failed and transition to
-/// [`Phase::Aborting`] (or, for phases at/after the decision point, where
-/// an old-process-side timeout no longer means abort -- see
-/// [`Phase::is_abortable`]).
-///
 /// Per the design doc's amendment A4, the sum of every phase's deadline
 /// (through [`Phase::AwaitingStandbyCommitted`]) must stay well under the
 /// acceptance target of a 5s pause, since the pause is measured from
@@ -90,6 +93,11 @@ pub enum Phase {
 /// is still bounded so a wedged standby doesn't leave the supervisor
 /// waiting forever for bookkeeping that will never arrive.
 impl Phase {
+    /// Returns the maximum time this phase may remain active before the
+    /// supervisor must treat it as failed and transition to
+    /// [`Phase::Aborting`] (or, for phases at/after the decision point,
+    /// where an old-process-side timeout no longer means abort -- see
+    /// [`Phase::is_abortable`]).
     #[must_use]
     pub fn deadline(self) -> Option<Duration> {
         match self {
