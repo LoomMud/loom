@@ -26,6 +26,7 @@ impl RecompileHost for RecordingHost {
         RecompileOutcome {
             ok: true,
             recompiled: changed,
+            upgraded_instances: 0,
             failures: Vec::new(),
         }
     }
