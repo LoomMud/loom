@@ -3,12 +3,16 @@
 
 // Master object for the OBI-237 admin-query fixture: like
 // `errors_inbox`'s master (every efun/path allowed) except `valid_read`
-// denies `/std/vault` specifically, so `tests/obi_237_admin_query.rs` can
-// exercise `World::admin_list_objects`/`admin_object_vars`'s real
-// `valid_read` filtering against a caller euid that is not `root` --
-// `root`'s guard set is always empty (D-S1.2), so it is allowed without
-// ever asking this apply at all; every other euid actually goes through
-// this `valid_read` body.
+// denies `/std/vault` to everyone but the `auditor` euid, so
+// `tests/obi_237_admin_query.rs` can exercise `World::admin_list_objects`/
+// `admin_object_vars`'s real `valid_read` filtering against two distinct
+// non-reserved caller euids (CTO review, OBI-237 PR #102, must-fix B1:
+// `root`/`mudlib`/`domain:*` are refused by the admin-query methods
+// themselves before this apply is ever called, so a fixture that relied
+// on `root`'s D-S1.2 guard-bypass to exercise the "allowed" branch would
+// no longer prove anything -- `auditor` is a plain, non-reserved account
+// this `valid_read` happens to trust, same as a real mudlib might grant
+// a dedicated audit role read access to on-call stores).
 pub fn connect() -> object {
     return clone_object("/std/player")
 }
@@ -26,7 +30,7 @@ fn valid_upgrade(path: string, ob: object) -> bool {
 }
 
 fn valid_read(path: string, ob: object, op: string) -> bool {
-    return path != "/std/vault"
+    return path != "/std/vault" or effective_principal() == "auditor"
 }
 
 fn valid_write(path: string, ob: object, op: string) -> bool {

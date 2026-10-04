@@ -44,10 +44,6 @@ fn admin_errors_omits_programs_the_caller_cannot_valid_read() {
         let groups = world.admin_errors("guest", 3, None, &mut host);
         assert_eq!(groups.len(), 1, "{groups:?}");
         assert_eq!(groups[0].program, "/std/player");
-
-        // `root`'s guard set is always empty (D-S1.2): sees both.
-        let as_root = world.admin_errors("root", 5, None, &mut host);
-        assert_eq!(as_root.len(), 2, "{as_root:?}");
     });
 }
 
@@ -63,10 +59,10 @@ fn admin_errors_program_prefix_narrows_the_result() {
         world.input(1, "boom", &mut host);
         host.take(1);
 
-        let narrowed = world.admin_errors("root", 5, Some("/std/player"), &mut host);
+        let narrowed = world.admin_errors("guest", 5, Some("/std/player"), &mut host);
         assert_eq!(narrowed.len(), 1);
 
-        let empty = world.admin_errors("root", 5, Some("/nowhere"), &mut host);
+        let empty = world.admin_errors("guest", 5, Some("/nowhere"), &mut host);
         assert!(empty.is_empty());
     });
 }
@@ -109,5 +105,38 @@ fn admin_errors_redacts_a_secure_origins_message_below_t5_and_shows_it_at_t5() {
         assert_eq!(at_t5.len(), 1);
         assert!(at_t5[0].redacted, "the flag itself is unconditional");
         assert_eq!(at_t5[0].message, "random(): n must be > 0");
+    });
+}
+
+/// CTO review (OBI-237 PR #102, must-fix B1): see
+/// `tests/obi_237_admin_query.rs`'s identical test on `admin_list_objects`/
+/// `admin_object_vars` for the full rationale -- `admin_errors` must
+/// refuse a reserved driver principal (`root`, `mudlib`, `domain:*`) as
+/// `caller_euid` too, not silently grant it root's unconditional
+/// `valid_read` pass via an accidentally-empty guard.
+#[test]
+fn admin_errors_refuses_a_reserved_principal_as_caller_euid() {
+    on_world_thread(|| {
+        let root = fixture("errors_inbox");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host);
+        host.take(1);
+
+        world.input(1, "boom", &mut host);
+        host.take(1);
+        assert_eq!(world.errors_snapshot(None).len(), 1);
+
+        for reserved in ["root", "mudlib", "domain:shire"] {
+            let groups = world.admin_errors(reserved, 5, None, &mut host);
+            assert!(
+                groups.is_empty(),
+                "caller_euid={reserved:?} must not see anything, got {groups:?}"
+            );
+        }
+
+        // Sanity: a non-reserved euid still sees the readable program.
+        let as_guest = world.admin_errors("guest", 5, None, &mut host);
+        assert_eq!(as_guest.len(), 1);
     });
 }

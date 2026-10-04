@@ -83,13 +83,17 @@ fn list_objects_is_filtered_by_the_real_valid_read_not_a_stand_in() {
         world.input(1, "spawnvault", &mut host);
         let vault_path = host.take(1).trim().to_string();
 
-        // `root`'s guard set is always empty (D-S1.2): allowed without
-        // ever asking the master's `valid_read` at all.
-        let as_root = world.admin_list_objects("root", 5, &mut host);
-        assert!(as_root.iter().any(|o| o.path == item_path));
+        // `auditor` is a non-reserved euid this fixture's `valid_read`
+        // happens to trust with `/std/vault` specifically (CTO review,
+        // OBI-237 PR #102, must-fix B1: `root` is refused by
+        // `admin_list_objects` itself before `valid_read` is ever asked,
+        // so it can no longer stand in for "a caller `valid_read`
+        // allows").
+        let as_auditor = world.admin_list_objects("auditor", 5, &mut host);
+        assert!(as_auditor.iter().any(|o| o.path == item_path));
         assert!(
-            as_root.iter().any(|o| o.path == vault_path),
-            "root sees everything, including /std/vault"
+            as_auditor.iter().any(|o| o.path == vault_path),
+            "auditor is specifically allowed /std/vault by this fixture's valid_read"
         );
 
         // Any other euid actually goes through `secure/master.wf`'s
@@ -156,10 +160,13 @@ fn object_vars_a_valid_read_refusal_and_an_unknown_path_are_both_not_found() {
                 .is_none()
         );
 
-        // `root` passes `valid_read` and actually sees the vault's state.
+        // `auditor` is specifically allowed `/std/vault` by this
+        // fixture's `valid_read` (CTO review, OBI-237 PR #102, must-fix
+        // B1: `root` is refused by `admin_object_vars` itself before
+        // `valid_read` is ever asked).
         let vars = world
-            .admin_object_vars("root", 5, &vault_path, &mut host)
-            .expect("root can read /std/vault");
+            .admin_object_vars("auditor", 5, &vault_path, &mut host)
+            .expect("auditor can read /std/vault");
         let secret = vars
             .vars
             .iter()
@@ -220,5 +227,69 @@ fn a_flood_of_admin_queries_never_stalls_world_ticks() {
         // or tick counter, so it cannot have stalled it.
         world.tick(&mut host);
         assert_eq!(world.world_tick(), before + 1);
+    });
+}
+
+/// CTO review (OBI-237 PR #102, must-fix B1): a staff `sub` of a reserved
+/// driver principal (`root`, `mudlib`, any `domain:*`) must be refused by
+/// every admin-query method, not granted the driver's own root privilege
+/// by accident. `syms.intern("root")` reuses `security::ROOT` (sym 0),
+/// which `GuardSet::with` drops as the identity element -- an unchecked
+/// caller_euid of `"root"` would silently build an *empty* guard, which
+/// D-S1.2 allows unconditionally, `/secure` included.
+#[test]
+fn admin_list_objects_refuses_a_reserved_principal_as_caller_euid() {
+    on_world_thread(|| {
+        let root = fixture("admin_query");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+
+        world.connect(1, &mut host);
+        host.take(1);
+        world.input(1, "spawnitem", &mut host);
+        let item_path = host.take(1).trim().to_string();
+
+        for reserved in ["root", "mudlib", "domain:shire"] {
+            let objects = world.admin_list_objects(reserved, 5, &mut host);
+            assert!(
+                objects.is_empty(),
+                "caller_euid={reserved:?} must not see anything, got {objects:?}"
+            );
+        }
+
+        // Sanity: a non-reserved euid still sees the readable object (the
+        // guard above isn't just denying everything unconditionally).
+        let as_guest = world.admin_list_objects("guest", 5, &mut host);
+        assert!(as_guest.iter().any(|o| o.path == item_path));
+    });
+}
+
+#[test]
+fn admin_object_vars_refuses_a_reserved_principal_as_caller_euid() {
+    on_world_thread(|| {
+        let root = fixture("admin_query");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+
+        world.connect(1, &mut host);
+        host.take(1);
+        world.input(1, "spawnitem", &mut host);
+        let item_path = host.take(1).trim().to_string();
+
+        for reserved in ["root", "mudlib", "domain:shire"] {
+            assert!(
+                world
+                    .admin_object_vars(reserved, 5, &item_path, &mut host)
+                    .is_none(),
+                "caller_euid={reserved:?} must not read {item_path}"
+            );
+        }
+
+        // Sanity: a non-reserved euid still reads it.
+        assert!(
+            world
+                .admin_object_vars("guest", 5, &item_path, &mut host)
+                .is_some()
+        );
     });
 }
