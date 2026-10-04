@@ -41,6 +41,30 @@ use tokio::sync::mpsc;
 use tracing::warn;
 use uuid::Uuid;
 
+/// The driver's own trusted principal names (OBI-276, CTO review of
+/// LoomMud/loom#102/OBI-237): `root`, `mudlib`, and anything with a `:`
+/// in it (`domain:<d>`) -- `loom_vm::security::is_reserved_principal`'s
+/// exact predicate, duplicated here rather than pulled in as a
+/// production dependency, since `loom-persist` has no business depending
+/// on the VM/language crate for anything else. No staff row may ever
+/// carry one of these as its `uid`: `root` interns to `ROOT` (sym 0), and
+/// a guard set holding it is the *empty* guard set -- full privilege.
+/// `tests::reserved_principal_matches_loom_vm` pins this copy against
+/// `loom_vm::security::is_reserved_principal` (a dev-dependency only) so
+/// the two definitions can never silently drift apart.
+///
+/// Every place a staff account `uid` is created or renamed
+/// (`roles_set_tier`, `roles_propose_tier`, `roles_approve_proposal`, all
+/// three as a belt-and-braces SQL-side check too -- see
+/// `migrations/0005_reserved_principals.sql`) and every place an existing
+/// row's `uid` is read back for login/token issue (`staff_login`,
+/// `staff_uid_for_username`, `staff_auth_status`) must refuse a reserved
+/// uid outright, so a row created with one before this fix shipped still
+/// can never authenticate.
+pub fn is_reserved_principal(uid: &str) -> bool {
+    uid == "root" || uid == "mudlib" || uid.contains(':')
+}
+
 const ARGON_M_COST_KIB: u32 = 19 * 1024;
 const ARGON_T_COST: u32 = 2;
 const ARGON_P_COST: u32 = 1;
@@ -64,6 +88,14 @@ pub enum PersistError {
     /// that looks like Paperclip's control-plane DB.
     #[error("{0}")]
     ControlPlaneDbRejected(String),
+    /// OBI-276: a caller tried to create, rename, or promote a staff
+    /// account to a `uid` [`is_reserved_principal`] names as a trusted
+    /// driver principal (`root`, `mudlib`, `domain:<d>`). Refused before
+    /// ever reaching Postgres; the `roles_*` security-definer functions
+    /// refuse it again on the SQL side (`migrations/0005_reserved_principals.sql`)
+    /// as a belt-and-braces check for any caller that bypasses this crate.
+    #[error("uid `{0}` is a reserved driver principal and cannot be staff")]
+    ReservedPrincipal(String),
 }
 
 #[derive(Debug, Clone)]
@@ -696,8 +728,17 @@ impl Persist {
             return Ok(None);
         }
 
+        let uid: String = row.try_get("uid")?;
+        if is_reserved_principal(&uid) {
+            // OBI-276 defence in depth: a row created with a reserved uid
+            // before this fix shipped must still never authenticate, even
+            // with the right password. Same generic refusal as a bad
+            // password/username -- never leaks that the row exists.
+            return Ok(None);
+        }
+
         Ok(Some(StaffAuthRecord {
-            uid: row.try_get("uid")?,
+            uid,
             account_id: row.try_get("account_id")?,
             tier: row.try_get("tier")?,
             totp_secret: row.try_get("totp_secret")?,
@@ -713,7 +754,9 @@ impl Persist {
     /// account lockout and `totp_confirm`'s account lockout are always
     /// the same bucket for the same staff member. `None` for a username
     /// that doesn't exist or isn't staff -- callers fall back to a
-    /// username-namespaced key in that case.
+    /// username-namespaced key in that case. Also `None` for a reserved
+    /// uid (OBI-276 defence in depth): a pre-existing reserved-uid row
+    /// must look exactly like "no such staff member" everywhere.
     pub async fn staff_uid_for_username(&self, username: &str) -> Result<Option<String>> {
         let row: Option<String> = sqlx::query_scalar(
             "SELECT s.uid FROM accounts a JOIN staff s ON s.account_id = a.id WHERE a.username = $1",
@@ -721,7 +764,7 @@ impl Persist {
         .bind(username)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row)
+        Ok(row.filter(|uid| !is_reserved_principal(uid)))
     }
 
     /// Enrol (or re-enrol) `uid`'s TOTP secret via the `auth_totp_enroll`
@@ -1098,6 +1141,9 @@ impl Persist {
         new_tier: i16,
         reason: &str,
     ) -> Result<()> {
+        if is_reserved_principal(target_uid) {
+            return Err(PersistError::ReservedPrincipal(target_uid.to_string()));
+        }
         sqlx::query!(
             "SELECT roles_set_tier($1, $2, $3, $4)",
             actor,
@@ -1210,6 +1256,12 @@ impl Persist {
     /// staff uid is refused outright rather than silently minting a
     /// tier-0 token the way a `tier_of`-based check used to.
     pub async fn staff_auth_status(&self, uid: &str) -> Result<Option<StaffTierStatus>> {
+        if is_reserved_principal(uid) {
+            // OBI-276 defence in depth: refuse before even asking
+            // Postgres, so a pre-existing reserved-uid row can never
+            // mint or refresh a token.
+            return Ok(None);
+        }
         use sqlx::Row;
         let row =
             sqlx::query("SELECT tier, totp_secret, totp_confirmed_at FROM staff WHERE uid = $1")
@@ -1338,6 +1390,9 @@ impl Persist {
         new_tier: i16,
         reason: &str,
     ) -> Result<i64> {
+        if is_reserved_principal(target_uid) {
+            return Err(PersistError::ReservedPrincipal(target_uid.to_string()));
+        }
         let id = sqlx::query_scalar!(
             "SELECT roles_propose_tier($1, $2, $3, $4) as \"id!\"",
             actor,
@@ -1938,5 +1993,41 @@ mod tests {
             persist.argon2_concurrency.available_permits(),
             ARGON2_MAX_CONCURRENCY
         );
+    }
+
+    /// OBI-276: `loom-persist`'s copy of the reserved-principal predicate
+    /// must refuse exactly the names `loom_vm::security::is_reserved_principal`
+    /// does, on the same test vectors that crate pins itself against
+    /// (`loom_vm::security::tests::reserved_principals`) -- this is the
+    /// "duplicate it with a test that pins both lists to the same
+    /// values" defence the issue asked for, since `loom-persist` has no
+    /// production dependency on `loom-vm`.
+    #[test]
+    fn reserved_principal_matches_loom_vm() {
+        let reserved = [
+            "root",
+            "mudlib",
+            "domain:shire",
+            "builders:root",
+            "a:b",
+            ":",
+        ];
+        let allowed = ["frodo", "rooted", "mud", "legolas", ""];
+        for r in reserved {
+            assert!(is_reserved_principal(r), "{r}");
+            assert_eq!(
+                is_reserved_principal(r),
+                loom_vm::security::is_reserved_principal(r),
+                "loom-persist and loom-vm disagree on {r}"
+            );
+        }
+        for a in allowed {
+            assert!(!is_reserved_principal(a), "{a}");
+            assert_eq!(
+                is_reserved_principal(a),
+                loom_vm::security::is_reserved_principal(a),
+                "loom-persist and loom-vm disagree on {a}"
+            );
+        }
     }
 }
