@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::bcvm::Value;
 use crate::bcvm::compile_worker::{RecompileJob, RecompileSetJob};
 use crate::bcvm::registry::{Compiler, Registry, RegistryHost};
-use crate::bcvm::vm::{Limits as VmLimits, RtError};
+use crate::bcvm::vm::{Host as VmHost, Limits as VmLimits, RtError};
 use crate::host::{Host, NullHost};
 use crate::object::ObjectId;
 use crate::roles::RolesSnapshot;
@@ -1688,6 +1688,54 @@ impl World {
             h.call_apply(ob, func, args)?
                 .ok_or_else(|| RtError::new(format!("no function `{func}`")))
         })
+        .map_err(|e| e.report())
+    }
+
+    /// Spec M-FS-1 (OBI-180/OBI-179 threat model): run `efun` (`read_file`,
+    /// `write_file`, `compile_object`, and nothing else so far) as a
+    /// world-thread execution whose *entire* guard set is exactly `{uid}`
+    /// -- no inherited call stack, no `this_player`/connection context.
+    /// This is the seam a driver-side caller (`/api/v1/files/*`, OBI-180's
+    /// HTTP handlers; the `/lsp` route's `ReadAuthorizer`) goes through
+    /// instead of running LPC bytecode: `h.call_efun` is the exact same
+    /// dispatch a running program's `CallEfun` instruction would reach, so
+    /// `security::normalize_file_path` -> `authorize()`'s `valid_*` apply
+    /// on the real master -> `fileio` all run unchanged (D-TM5: this is
+    /// deliberately *not* a second, HTTP-side permission check mirroring
+    /// the master -- it *is* the master's own check, just entered by the
+    /// driver). Quotas (`ticks_quota_uid: Some(sym)`) and the audit log
+    /// (`exec`'s own `note_error`, plus `authorize`'s `SecurityState::
+    /// record`) are the same unmodified paths every other caller gets.
+    ///
+    /// Refuses a reserved principal (`root`, `mudlib`, `*:*`) outright
+    /// (D-S3.1) -- there is no HTTP-reachable way to mint one of those
+    /// guards, unlike `seteuid`, which at least requires `/secure` code.
+    pub fn call_file_efun(
+        &mut self,
+        uid: &str,
+        efun: &str,
+        args: Vec<Value>,
+        host: &mut dyn Host,
+    ) -> Result<Value, String> {
+        if crate::security::is_reserved_principal(uid) {
+            return Err(format!("`{uid}` is a reserved principal"));
+        }
+        let sym = self.registry.syms.intern(uid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: sym,
+            euid: sym,
+        });
+        let acting = self.master_or_sentinel();
+        self.exec(
+            host,
+            acting,
+            None,
+            None,
+            Some(guard),
+            None,
+            Some(sym),
+            |h| h.call_efun(efun, args),
+        )
         .map_err(|e| e.report())
     }
 
