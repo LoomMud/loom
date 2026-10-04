@@ -56,7 +56,7 @@ use uuid::Uuid;
 /// Every place a staff account `uid` is created or renamed
 /// (`roles_set_tier`, `roles_propose_tier`, `roles_approve_proposal`, all
 /// three as a belt-and-braces SQL-side check too -- see
-/// `migrations/0005_reserved_principals.sql`) and every place an existing
+/// `migrations/0006_reserved_principal_staff_guard.sql`) and every place an existing
 /// row's `uid` is read back for login/token issue (`staff_login`,
 /// `staff_uid_for_username`, `staff_auth_status`) must refuse a reserved
 /// uid outright, so a row created with one before this fix shipped still
@@ -92,7 +92,7 @@ pub enum PersistError {
     /// account to a `uid` [`is_reserved_principal`] names as a trusted
     /// driver principal (`root`, `mudlib`, `domain:<d>`). Refused before
     /// ever reaching Postgres; the `roles_*` security-definer functions
-    /// refuse it again on the SQL side (`migrations/0005_reserved_principals.sql`)
+    /// refuse it again on the SQL side (`migrations/0006_reserved_principal_staff_guard.sql`)
     /// as a belt-and-braces check for any caller that bypasses this crate.
     #[error("uid `{0}` is a reserved driver principal and cannot be staff")]
     ReservedPrincipal(String),

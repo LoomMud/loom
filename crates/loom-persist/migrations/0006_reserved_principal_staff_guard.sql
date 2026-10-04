@@ -29,6 +29,44 @@ REVOKE ALL ON FUNCTION public.is_reserved_principal(TEXT) FROM PUBLIC;
 -- the security-definer functions below, same pattern as
 -- `roles_resolve_account` in 0002_roles_s2.sql.
 
+-- roles_bootstrap_root (0001_init.sql): the *only* way to create a T5 row
+-- in Phase 1 (owner-only, not reachable via loom_app). Per CTO review of
+-- this PR: an operator bootstrapping the first root is exactly the kind
+-- of caller most likely to pick the uid `root`, and without this check
+-- they would get a T5 staff row that silently can never log in (refused
+-- by the login/token-issue guards in `src/lib.rs`) -- a confusing failure
+-- mode in place of a clear one at bootstrap time.
+CREATE OR REPLACE FUNCTION public.roles_bootstrap_root(
+    p_uid        TEXT,
+    p_account_id UUID
+) RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF p_uid IS NULL OR p_account_id IS NULL THEN
+        RAISE EXCEPTION 'uid and account_id are required';
+    END IF;
+
+    IF public.is_reserved_principal(p_uid) THEN
+        RAISE EXCEPTION 'uid % is a reserved driver principal and cannot be staff', p_uid;
+    END IF;
+
+    INSERT INTO public.staff (uid, account_id, tier, totp_required)
+    VALUES (p_uid, p_account_id, 5, TRUE)
+    ON CONFLICT (uid) DO UPDATE SET tier = 5, totp_required = TRUE;
+
+    INSERT INTO public.role_changes (uid, old_tier, new_tier, domain, actor, reason)
+    VALUES (p_uid, NULL, 5, NULL, 'roles_bootstrap_root',
+            'root bootstrap (owner-invoked; not reachable via loom_app)');
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.roles_bootstrap_root(TEXT, UUID) FROM PUBLIC;
+-- Intentionally no GRANT EXECUTE ... TO loom_app here (unchanged from
+-- 0001_init.sql).
+
 CREATE OR REPLACE FUNCTION public.roles_set_tier(
     p_actor       TEXT,
     p_target_uid  TEXT,

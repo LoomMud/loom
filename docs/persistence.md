@@ -116,6 +116,12 @@ never direct DML from `loom_app`:
 T4/T5 staff row in Phase 1. The two-root approval flow for further T4/T5
 grants is deferred; see "what's next" below.
 
+**Reserved uids** (migration 0006, OBI-276): `roles_set_tier`,
+`roles_propose_tier`, `roles_approve_proposal`, and `roles_bootstrap_root`
+all refuse a uid `loom_vm::security::is_reserved_principal` names as a
+trusted driver principal (`root`, `mudlib`, `domain:<d>`) -- no staff row
+may ever carry one, including via owner-only bootstrap.
+
 **Security invariant:** every `actor` argument above must be the driver's
 effective principal from the privilege stack (OBI-35), never a string taken
 from mudlib/Weft code. The database re-checks promotion rights independently

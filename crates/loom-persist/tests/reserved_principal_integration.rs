@@ -110,6 +110,38 @@ async fn reserved_uids_refused_throughout_the_staff_lifecycle() {
     let tier = support::staff_tier(&fx.owner, "mudlib").await;
     assert_eq!(tier, None, "mudlib must never get a staff row");
 
+    // --- roles_bootstrap_root: owner-only root bootstrap (0001_init.sql) -
+    // The only way to create a T4/T5 staff row in Phase 1. An operator
+    // bootstrapping the first root is exactly the caller most likely to
+    // pick the uid `root` -- this must be refused at the source, not
+    // merely left to the login-time guards below (CTO review fix).
+    for reserved in reserved_names {
+        let account_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM accounts WHERE username = $1")
+                .bind(reserved)
+                .fetch_one(&fx.owner)
+                .await
+                .expect("reserved-name account already seeded above");
+        // Dynamic (unchecked) query: `roles_bootstrap_root` has no GRANT
+        // to `loom_app` at all (0001_init.sql), so the compile-time
+        // `DESCRIBE` under `DATABASE_URL` (`loom_app` in CI) would fail
+        // the same way the `role_proposals` insert above would.
+        let result = sqlx::query("SELECT roles_bootstrap_root($1, $2)")
+            .bind(reserved)
+            .bind(account_id)
+            .execute(&fx.owner)
+            .await;
+        assert!(
+            result.is_err(),
+            "roles_bootstrap_root must refuse uid {reserved}"
+        );
+        let tier = support::staff_tier(&fx.owner, reserved).await;
+        assert_eq!(
+            tier, None,
+            "{reserved} must never get a staff row via roles_bootstrap_root"
+        );
+    }
+
     // --- a pre-existing reserved-uid staff row cannot authenticate -----
     // Simulates a row created before this fix shipped: seeded directly as
     // loom_owner, bypassing every guard above entirely.
