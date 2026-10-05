@@ -602,6 +602,15 @@ fn run_control_responder(
 /// doesn't also wedge waiting on it.
 const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// CTO review non-blocking item (OBI-180): bounds how many `/api/v1/
+/// files/*` file-op requests `spawn_world_thread`'s drain loop runs in
+/// one world-tick pass. `loom_http::files::FILE_OP_QUEUE_DEPTH` (64) is
+/// the most that could ever be queued; draining all of them unconditionally
+/// in one pass is fine today (`read_file`/`write_file` are cheap), but
+/// would stop being true once `compile_object` is wired (a later slice),
+/// so the cap is in place now rather than added under pressure later.
+const FILE_OPS_PER_TICK_BUDGET: usize = 16;
+
 /// A snapshot-request reply: the encoded world bytes plus the `ConnId`s
 /// `World::live_connections()` reported live at that same instant (see
 /// `request_snapshot`'s own doc). Named so the channel types that carry
@@ -627,22 +636,52 @@ fn request_snapshot(snapshot_req_tx: &std::sync::mpsc::Sender<SnapshotRequest>) 
         .map_err(|err| format!("world thread did not answer the snapshot request: {err}"))?
 }
 
-/// Converts a [`Value`] returned by `World::call_file_efun` into the
-/// `Send`-safe [`loom_http::files::FileOpValue`] mirror the file-op
-/// reply channel carries (defined in `loom-http`, not here -- see that
-/// module's doc for why). Anything this doesn't recognise (none of
-/// `read_file`/`write_file`'s documented return shapes) is a driver bug,
-/// not a policy decision, so it is reported as an error rather than
-/// silently coerced.
-fn file_op_value_from_vm(v: Value) -> loom_http::files::FileOpValue {
+/// Converts a [`Value`] returned by `World::call_file_efun`'s
+/// `read_file` into the `Send`-safe [`loom_http::files::FileOpValue`]
+/// mirror the file-op reply channel carries (defined in `loom-http`, not
+/// here -- see that module's doc for why). `read_file` only ever returns
+/// `Null` or a string (see its dispatch in `registry.rs`); anything else
+/// is a driver bug, reported as `Err` (CTO review non-blocking item: an
+/// earlier cut of this silently coerced an unrecognised shape to
+/// `Null`, which the doc comment never actually said it did).
+fn file_op_value_from_read(v: Value) -> Result<loom_http::files::FileOpValue, String> {
     use loom_http::files::FileOpValue;
     match v {
-        Value::Null => FileOpValue::Null,
-        Value::Bool(b) => FileOpValue::Bool(b),
+        Value::Null => Ok(FileOpValue::Null),
         other => other
             .as_str()
             .map(|s| FileOpValue::Str(s.to_string()))
-            .unwrap_or(FileOpValue::Null),
+            .ok_or_else(|| format!("read_file returned an unexpected value: {other:?}")),
+    }
+}
+
+/// Converts a [`loom_vm::world::FileCasOutcome`] (the result of
+/// `World::call_file_write_if_match`) into the matching
+/// [`loom_http::files::FileOpValue`].
+fn file_op_value_from_cas(
+    outcome: loom_vm::world::FileCasOutcome,
+) -> loom_http::files::FileOpValue {
+    use loom_http::files::FileOpValue;
+    use loom_vm::world::FileCasOutcome;
+    match outcome {
+        FileCasOutcome::Written => FileOpValue::Written,
+        FileCasOutcome::QuotaExceeded => FileOpValue::QuotaExceeded,
+        FileCasOutcome::PreconditionFailed => FileOpValue::PreconditionFailed,
+    }
+}
+
+/// Converts a [`loom_http::files::FilePrecondition`] (carried over the
+/// file-op channel, which holds no `loom_vm` type -- see that module's
+/// doc) into the `loom_vm::world::FileMatchPrecondition`
+/// `World::call_file_write_if_match` actually takes.
+fn vm_precondition_from_http(
+    p: &loom_http::files::FilePrecondition,
+) -> loom_vm::world::FileMatchPrecondition {
+    use loom_http::files::FilePrecondition;
+    use loom_vm::world::FileMatchPrecondition;
+    match p {
+        FilePrecondition::IfMatch(etag) => FileMatchPrecondition::IfMatch(etag.clone()),
+        FilePrecondition::IfNoneMatchStar => FileMatchPrecondition::IfNoneMatchStar,
     }
 }
 
@@ -2526,14 +2565,46 @@ fn spawn_world_thread(
                 // OBI-180 M-FS-1: a file-op request from an `/api/v1/files/*`
                 // HTTP handler, drained the same non-blocking way as every
                 // other side-channel input to this loop.
-                // `World::call_file_efun` is the whole mitigation: guard set
-                // exactly `{uid}`, the real `valid_*` master apply, unchanged
-                // quotas/audit.
-                while let Ok(req) = file_op_rx.try_recv() {
-                    let args: Vec<Value> = req.args.iter().map(|s| Value::str(s)).collect();
-                    let result = world
-                        .call_file_efun(&req.uid, req.efun, args, &mut host)
-                        .map(file_op_value_from_vm);
+                // `World::call_file_efun`/`call_file_write_if_match` are the
+                // whole mitigation: guard set exactly `{uid}`, the real
+                // `valid_*` master apply, unchanged quotas/audit.
+                //
+                // CTO review non-blocking item: bounded per world-tick pass
+                // (`FILE_OPS_PER_TICK_BUDGET`) rather than draining the whole
+                // queue unconditionally -- `FILE_OP_QUEUE_DEPTH` (64) file
+                // ops each running a full `exec` could otherwise all land in
+                // one tick once `compile_object` is wired, at real cost to
+                // tick latency; this caps that without needing backpressure
+                // to actually trip.
+                for _ in 0..FILE_OPS_PER_TICK_BUDGET {
+                    let Ok(req) = file_op_rx.try_recv() else {
+                        break;
+                    };
+                    let result: Result<loom_http::files::FileOpValue, loom_http::files::FileOpError> =
+                        match &req.kind {
+                            loom_http::files::FileOpKind::Read => world
+                                .call_file_efun(
+                                    &req.uid,
+                                    "read_file",
+                                    vec![Value::str(&req.path)],
+                                    &mut host,
+                                )
+                                .map_err(loom_http::files::FileOpError::Refused)
+                                .and_then(|v| {
+                                    file_op_value_from_read(v)
+                                        .map_err(loom_http::files::FileOpError::Refused)
+                                }),
+                            loom_http::files::FileOpKind::WriteIfMatch { precondition, text } => world
+                                .call_file_write_if_match(
+                                    &req.uid,
+                                    &req.path,
+                                    vm_precondition_from_http(precondition),
+                                    text,
+                                    &mut host,
+                                )
+                                .map(file_op_value_from_cas)
+                                .map_err(loom_http::files::FileOpError::Refused),
+                        };
                     req.respond(result);
                 }
             }

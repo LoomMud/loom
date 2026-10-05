@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `/api/v1/files/*` (OBI-180): read-through to `World::call_file_efun`
-//! (M-FS-1), without `loom-http` ever depending on `loom-vm` directly.
+//! `/api/v1/files/*` (OBI-180): read-through to `World::call_file_efun`/
+//! `World::call_file_write_if_match` (M-FS-1), without `loom-http` ever
+//! depending on `loom-vm` directly.
 //!
 //! ## Why the channel types live here, not in `loom-cli`
 //!
@@ -13,24 +14,39 @@
 //! loop need to share has to live in a crate both of them see --
 //! `loom-http`, the same way [`crate::webhook::GithubWebhookConfig`] is
 //! defined here and constructed by `loom-cli`. [`FileOpRequest`]/
-//! [`FileOpValue`] intentionally hold no `loom_vm` type (`args`/the
-//! reply are plain `String`s) so this module adds no new dependency
-//! edge; the `loom_vm::Value` <-> [`FileOpValue`] conversion stays in
-//! `loom-cli`, right next to the `World::call_file_efun` call that
-//! produces the `Value` in the first place.
+//! [`FileOpValue`]/[`FilePrecondition`] intentionally hold no `loom_vm`
+//! type (paths/text are plain `String`s) so this module adds no new
+//! dependency edge; the `loom_vm` conversions (`Value` <-> [`FileOpValue`]
+//! for a read, `FileCasOutcome` <-> [`FileOpValue`] for a write,
+//! [`FilePrecondition`] <-> `loom_vm::world::FileMatchPrecondition`) stay
+//! in `loom-cli`, right next to the `World` calls that produce/consume
+//! them.
+//!
+//! ## Why `PUT` is one round trip through the channel, not two
+//!
+//! An earlier cut of this module sent a `read_file` request to compute
+//! the current `ETag`, then -- as a *separate* channel round trip -- a
+//! `write_file` request. The world thread drains the channel one request
+//! at a time, so another `PUT`, or LPC code calling `write_file` directly,
+//! could land between those two round trips and invalidate the
+//! precondition this handler had just checked (a lost update, exactly
+//! what M-FS-6 exists to prevent; CTO review on this PR, must-fix 1).
+//! [`FileOpKind::WriteIfMatch`] sends the precondition down in the *same*
+//! request as the new text, so `loom_vm::World::call_file_write_if_match`
+//! can do the read, the compare, and the write inside one atomic
+//! world-thread `exec` call -- nothing can interleave inside that.
 //!
 //! ## What this module does *not* do yet
 //!
 //! Listings (M-FS-3's "filtered by `valid_read`") and `compile_object`
-//! are a later slice -- `FileOpValue`'s doc already notes
-//! `compile_object`'s diagnostics-list result needs a richer shape than
-//! `Null`/`Bool`/`Str`. `PUT`'s M-FS-5 "one in-flight compile per uid"
-//! clause is also deferred to that slice (there is no compile to
+//! are a later slice -- [`FileOpValue`] would need a richer shape for
+//! `compile_object`'s diagnostics list. M-FS-5's "one in-flight compile
+//! per uid" clause is also deferred to that slice (there is no compile to
 //! serialize yet).
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -56,36 +72,89 @@ pub const FILE_OP_QUEUE_DEPTH: usize = 64;
 /// the world thread to answer, before giving up.
 pub const FILE_OP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A `read_file`/`write_file` result, far enough from `loom_vm::Value`
-/// (which holds `Rc`s and so is not `Send`) to cross the file-op reply
-/// channel into an async HTTP handler's thread.
+/// A `read_file`/CAS-`write_file` result, far enough from `loom_vm`
+/// types (`Value` holds `Rc`s and so is not `Send`) to cross the file-op
+/// reply channel into an async HTTP handler's thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileOpValue {
+    /// `read_file` found nothing at this path.
     Null,
-    Bool(bool),
+    /// `read_file`'s contents.
     Str(String),
+    /// [`FileOpKind::WriteIfMatch`]'s precondition held and the write
+    /// happened.
+    Written,
+    /// [`FileOpKind::WriteIfMatch`]'s precondition held but `write_file`
+    /// itself refused for disk quota (OBI-137 S1), not authorization.
+    QuotaExceeded,
+    /// [`FileOpKind::WriteIfMatch`]'s precondition did not hold (stale
+    /// `If-Match`, or `If-None-Match: *` against an existing file).
+    PreconditionFailed,
+}
+
+/// Which `World` entry point a [`FileOpRequest`] resolves to.
+#[derive(Debug, Clone)]
+pub enum FileOpKind {
+    /// `World::call_file_efun(uid, "read_file", ..)`.
+    Read,
+    /// `World::call_file_write_if_match(uid, path, precondition, text,
+    /// ..)` -- one atomic round trip, see this module's doc for why.
+    WriteIfMatch {
+        precondition: FilePrecondition,
+        text: String,
+    },
+}
+
+/// Mirrors `loom_vm::world::FileMatchPrecondition` without depending on
+/// `loom-vm` (see this module's doc). `loom-cli`'s drain loop converts
+/// one into the other right before calling `World`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilePrecondition {
+    /// `If-Match: "<etag>"`, already unquoted.
+    IfMatch(String),
+    /// `If-None-Match: *`.
+    IfNoneMatchStar,
+}
+
+/// Why a [`FileOpRequest`] didn't get an answer, or got a refusal,
+/// distinguished so handlers can tell M-FS-5's backpressure/timeout
+/// (`503`) apart from M-FS-3's authorization/not-found refusal (`404`)
+/// -- both used to collapse into the same untyped `String` error (CTO
+/// review must-fix 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileOpError {
+    /// [`FileOpSender::try_send`] found the queue full (M-FS-5 "503 on
+    /// backpressure").
+    Busy,
+    /// The world thread didn't answer within [`FILE_OP_REQUEST_TIMEOUT`]
+    /// (M-FS-5 "10 s timeout").
+    Timeout,
+    /// The world thread's receiver is gone (shutting down).
+    Closed,
+    /// The world thread ran the request and refused it: `valid_read`/
+    /// `valid_write` said no, or a `fileio` I/O error. Carries the
+    /// message for logging only -- HTTP handlers never echo it to the
+    /// client (M-FS-3: a refusal looks exactly like "not found").
+    Refused(String),
 }
 
 /// One file operation requested by an `/api/v1/files/*` HTTP handler
-/// (M-FS-1), to be run on the world thread with guard set exactly
-/// `{uid}` via `World::call_file_efun`. `efun` is `"read_file"` or
-/// `"write_file"`; `args` are the efun's string arguments in order
-/// (`[path]` for a read, `[path, text]` for a write). The reply channel
-/// is a fresh one-shot `std::sync::mpsc` per request.
+/// (M-FS-1). The reply channel is a fresh one-shot `std::sync::mpsc` per
+/// request.
 pub struct FileOpRequest {
     pub uid: String,
-    pub efun: &'static str,
-    pub args: Vec<String>,
-    reply: std::sync::mpsc::Sender<Result<FileOpValue, String>>,
+    pub path: String,
+    pub kind: FileOpKind,
+    reply: std::sync::mpsc::Sender<Result<FileOpValue, FileOpError>>,
 }
 
 impl FileOpRequest {
     /// The world-thread side's only way to answer a request -- consumes
     /// `self` so a drain loop can't accidentally reply twice or forget
     /// to. A dropped (never-called) `respond` surfaces to the waiting
-    /// HTTP-side thread as a `recv` error, not a hang (see
-    /// [`request_file_op`]'s doc).
-    pub fn respond(self, result: Result<FileOpValue, String>) {
+    /// HTTP-side thread as a `recv` error, mapped to [`FileOpError::
+    /// Timeout`] (see [`request_file_op`]'s doc) rather than a hang.
+    pub fn respond(self, result: Result<FileOpValue, FileOpError>) {
         let _ = self.reply.send(result);
     }
 }
@@ -101,10 +170,9 @@ pub fn file_op_channel() -> (FileOpSender, Receiver<FileOpRequest>) {
     std::sync::mpsc::sync_channel(FILE_OP_QUEUE_DEPTH)
 }
 
-/// Ask the world thread to run `efun(args)` with guard set exactly
-/// `{uid}` (`World::call_file_efun`, M-FS-1), blocking this call's own
-/// thread until it answers or [`FILE_OP_REQUEST_TIMEOUT`] elapses
-/// (M-FS-5).
+/// Ask the world thread to run `kind` against `path` with guard set
+/// exactly `{uid}` (M-FS-1), blocking this call's own thread until it
+/// answers or [`FILE_OP_REQUEST_TIMEOUT`] elapses (M-FS-5).
 ///
 /// **Never call this from an async task directly** -- it blocks a real
 /// OS thread for up to 10s. Callers in this module always wrap it in
@@ -112,25 +180,35 @@ pub fn file_op_channel() -> (FileOpSender, Receiver<FileOpRequest>) {
 pub fn request_file_op(
     file_op_tx: &FileOpSender,
     uid: &str,
-    efun: &'static str,
-    args: Vec<String>,
-) -> Result<FileOpValue, String> {
+    path: &str,
+    kind: FileOpKind,
+) -> Result<FileOpValue, FileOpError> {
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     match file_op_tx.try_send(FileOpRequest {
         uid: uid.to_string(),
-        efun,
-        args,
+        path: path.to_string(),
+        kind,
         reply: reply_tx,
     }) {
         Ok(()) => {}
-        Err(TrySendError::Full(_)) => return Err("file-op queue is full".to_string()),
-        Err(TrySendError::Disconnected(_)) => {
-            return Err("the world thread is gone".to_string());
-        }
+        Err(TrySendError::Full(_)) => return Err(FileOpError::Busy),
+        Err(TrySendError::Disconnected(_)) => return Err(FileOpError::Closed),
     }
     reply_rx
         .recv_timeout(FILE_OP_REQUEST_TIMEOUT)
-        .map_err(|err| format!("world thread did not answer the file-op request: {err}"))?
+        .unwrap_or(Err(FileOpError::Timeout))
+}
+
+/// Maps backpressure/timeout/shutdown to `503` and a world-thread refusal
+/// to `404` (CTO review must-fix 3) -- the one place both `GET` and `PUT`
+/// make that decision, so they can't drift apart.
+fn status_for_file_op_error(err: &FileOpError) -> StatusCode {
+    match err {
+        FileOpError::Busy | FileOpError::Timeout | FileOpError::Closed => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        FileOpError::Refused(_) => StatusCode::NOT_FOUND,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,12 +237,13 @@ pub fn files_router() -> Router<HttpState> {
 /// - `404` for a path `valid_read` refuses *or* that doesn't exist --
 ///   deliberately the same status for both (M-FS-3): a 403 would tell an
 ///   unauthorised caller a path exists.
-/// - `503` on a full queue or a world thread that didn't answer in time
-///   (M-FS-5), never a hang.
+/// - `503` on a full queue, a world thread that didn't answer in time,
+///   or no file-op channel wired at all (M-FS-5), never a hang.
 /// - `200` with `Content-Type: text/plain; charset=utf-8`,
 ///   `X-Content-Type-Options: nosniff`, a sandboxed `Content-Security-
-///   Policy`, and `Content-Disposition: attachment` (M-FS-4) -- the MIME
-///   type is never derived from the path's extension.
+///   Policy`, `Content-Disposition: attachment`, and an `ETag` (M-FS-4/
+///   M-FS-6 -- a client needs this to build a later `If-Match`) -- the
+///   MIME type is never derived from the path's extension.
 async fn read_file(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -178,22 +257,30 @@ async fn read_file(
     };
     let path = query.path;
     let result = tokio::task::spawn_blocking(move || {
-        request_file_op(&file_op_tx, &uid, "read_file", vec![path])
+        request_file_op(&file_op_tx, &uid, &path, FileOpKind::Read)
     })
     .await;
     match result {
         Ok(Ok(FileOpValue::Str(contents))) => file_response(contents),
         Ok(Ok(FileOpValue::Null)) => StatusCode::NOT_FOUND.into_response(),
-        Ok(Ok(FileOpValue::Bool(_))) => StatusCode::NOT_FOUND.into_response(),
-        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
+        // `read_file` never produces these -- a driver bug, not a
+        // client-facing distinction.
+        Ok(Ok(
+            FileOpValue::Written | FileOpValue::QuotaExceeded | FileOpValue::PreconditionFailed,
+        )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
         Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
 /// M-FS-4's exact response shape for a successful read: `text/plain`,
-/// `nosniff`, a sandboxed CSP, and `attachment` disposition so a
-/// browser navigating here directly never renders the body as HTML.
+/// `nosniff`, a sandboxed CSP with `default-src 'none'` (CTO review
+/// must-fix 5), `attachment` disposition so a browser navigating here
+/// directly never renders the body as HTML, and an `ETag` (CTO review
+/// must-fix 4) so a later `PUT` can build `If-Match` without re-hashing
+/// bytes the client already has another way.
 fn file_response(contents: String) -> axum::response::Response {
+    let etag = etag_for(&contents);
     let mut response = (StatusCode::OK, contents).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -206,21 +293,25 @@ fn file_response(contents: String) -> axum::response::Response {
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("sandbox"),
+        HeaderValue::from_static("sandbox; default-src 'none'"),
     );
     headers.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_static("attachment"),
     );
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        headers.insert(header::ETAG, value);
+    }
     response
 }
 
 /// A strong `ETag` over a file's exact byte contents (M-FS-6):
-/// `sha256(contents)`, hex-encoded, quoted per RFC 9110 S8.8.3. Cheap
-/// enough to recompute on every `PUT` (one hash over at most
-/// [`MAX_WRITE_BODY_BYTES`]) rather than caching -- the world thread is
-/// the only place the real content lives, and this is never on the hot
-/// per-tick path.
+/// `sha256(contents)`, hex-encoded, quoted per RFC 9110 S8.8.3.
+/// Deliberately duplicated in `loom_vm::world::file_etag_hex` rather than
+/// shared across the crate boundary -- see this module's top doc for why
+/// `loom-http` stays `loom-vm`-free. Both sides must still agree
+/// byte-for-byte; a unit test on each side pins the same fixture string
+/// to the same digest.
 fn etag_for(contents: &str) -> String {
     let digest = Sha256::digest(contents.as_bytes());
     format!("\"{}\"", hex_encode(&digest))
@@ -235,7 +326,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Bound on distinct uids tracked by [`write_rate_limiter`] (OBI-204
+/// Bound on distinct uids tracked by a [`WriteRateLimiter`] (OBI-204
 /// hygiene, same shape as `auth::ratelimit`'s caps): past this many
 /// tracked buckets, the oldest-touched ones are evicted rather than
 /// letting an unbounded number of distinct uids grow the map forever.
@@ -243,29 +334,37 @@ fn hex_encode(bytes: &[u8]) -> String {
 const MAX_TRACKED_WRITE_UIDS: usize = 10_000;
 
 /// Per-uid write token bucket (M-FS-5's "per-uid write rate limit"):
-/// `CAPACITY` burst, refilling at one token per `REFILL_INTERVAL`. First
-/// cut for Phase 2 -- numbers are a starting point, not yet tuned
-/// against real builder workflows; revisit with the CTO once there's
-/// usage data, the same caveat `scopes_for_tier` carries.
+/// `WRITE_BUCKET_CAPACITY` burst, refilling at one token per
+/// `WRITE_BUCKET_REFILL_INTERVAL`. First cut for Phase 2 -- numbers are a
+/// starting point, not yet tuned against real builder workflows; revisit
+/// with the CTO once there's usage data, the same caveat
+/// `scopes_for_tier` carries.
 const WRITE_BUCKET_CAPACITY: f64 = 20.0;
 const WRITE_BUCKET_REFILL_INTERVAL: Duration = Duration::from_secs(2);
 
-struct WriteBucket {
+pub(crate) struct WriteBucket {
     tokens: f64,
     last_refill: Instant,
 }
 
-fn write_rate_limiter() -> &'static Mutex<HashMap<String, WriteBucket>> {
-    static LIMITER: OnceLock<Mutex<HashMap<String, WriteBucket>>> = OnceLock::new();
-    LIMITER.get_or_init(|| Mutex::new(HashMap::new()))
+/// Per-[`HttpState`] write-rate-limiter state (CTO review non-blocking
+/// item: this used to be a process-global `static`, which meant every
+/// `HttpState` in the same process -- notably every test -- shared one
+/// set of buckets). `HttpState::new` creates a fresh, empty one via
+/// [`new_write_rate_limiter`]; `Arc` so `HttpState`'s `#[derive(Clone)]`
+/// (one clone per request, axum's usual `State` extraction) shares the
+/// same buckets rather than resetting them per clone.
+pub(crate) type WriteRateLimiter = Arc<Mutex<HashMap<String, WriteBucket>>>;
+
+/// A fresh, empty rate-limiter state for [`HttpState::new`].
+pub(crate) fn new_write_rate_limiter() -> WriteRateLimiter {
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 /// `true` if `uid` may write now (and consumes one token if so); `false`
 /// if its bucket is empty (M-FS-5 -- caller answers `429`).
-fn check_write_rate_limit(uid: &str) -> bool {
-    let mut map = write_rate_limiter()
-        .lock()
-        .expect("write rate limiter mutex poisoned");
+fn check_write_rate_limit(limiter: &WriteRateLimiter, uid: &str) -> bool {
+    let mut map = limiter.lock().expect("write rate limiter mutex poisoned");
     if map.len() >= MAX_TRACKED_WRITE_UIDS && !map.contains_key(uid) {
         // OBI-204-style hard cap: evict the single oldest-touched entry
         // to make room rather than growing without bound. A full sweep
@@ -308,8 +407,10 @@ pub struct WriteFileQuery {
 /// Preconditions are mandatory, not optional (M-FS-6): exactly one of
 /// `If-Match: "<etag>"` (update an existing file whose current contents
 /// hash to that etag) or `If-None-Match: *` (create a file that must not
-/// already exist) is required on every request, so a save can never
-/// silently clobber a concurrent edit.
+/// already exist) is required on every request. The whole read-compare-
+/// write happens as **one** atomic world-thread operation (see this
+/// module's top doc) -- there is no window between checking the
+/// precondition and acting on it.
 ///
 /// - `401` no/invalid bearer token.
 /// - `400` body isn't valid UTF-8, or neither/both precondition headers
@@ -318,18 +419,21 @@ pub struct WriteFileQuery {
 ///   `DefaultBodyLimit` layer on the route, and a belt-and-suspenders
 ///   check here).
 /// - `429` the uid's write rate limit is exhausted (M-FS-5).
-/// - `412` a precondition failed: `If-Match` doesn't match the file's
-///   current `ETag`, or `If-None-Match: *` was sent but the file already
-///   exists.
-/// - `404` the path doesn't authorize for this uid (M-FS-3, same
-///   not-found-shaped refusal as `GET`) -- checked by attempting the
-///   write itself, never a separate ACL.
+/// - `412` the precondition didn't hold: `If-Match` didn't match the
+///   file's current `ETag`, or `If-None-Match: *` was sent but the file
+///   already exists.
+/// - `404` the path doesn't authorize for this uid, or the read half of
+///   the CAS failed for any other reason (M-FS-3, same not-found-shaped
+///   refusal as `GET` -- never a fail-open fall-through to an
+///   unconditional write).
 /// - `503` no file-op channel wired, a full queue, or a world-thread
 ///   timeout (M-FS-5).
-/// - `204` success. The write itself (`World::call_file_efun` ->
-///   `write_file`) is already audited with the real actor uid by the
-///   existing `write_file` efun path (M-FS-7) -- this handler adds no
-///   second audit trail.
+/// - `204` success. The write itself is already audited with the real
+///   actor uid by the existing `write_file` efun path (M-FS-7) -- this
+///   handler adds no second audit trail.
+/// - `507` the precondition held but `write_file` itself refused for
+///   disk quota (OBI-137 S1), not authorization -- distinct from `404`
+///   so a builder can tell "no" from "not allowed".
 async fn write_file(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -358,62 +462,44 @@ async fn write_file(
     if if_match.is_some() && if_none_match_is_star {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let precondition = if if_none_match_is_star {
+        FilePrecondition::IfNoneMatchStar
+    } else {
+        FilePrecondition::IfMatch(
+            if_match
+                .expect("checked above: exactly one of if_match/if_none_match_is_star is set")
+                .trim_matches('"')
+                .to_string(),
+        )
+    };
 
     let Some(file_op_tx) = state.file_op_tx.clone() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    if !check_write_rate_limit(&uid) {
+    if !check_write_rate_limit(&state.write_rate_limiter, &uid) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
     let path = query.path;
-    let current = {
-        let file_op_tx = file_op_tx.clone();
-        let path = path.clone();
-        let uid = uid.clone();
-        tokio::task::spawn_blocking(move || {
-            request_file_op(&file_op_tx, &uid, "read_file", vec![path])
-        })
-        .await
-    };
-    match current {
-        Ok(Ok(FileOpValue::Str(existing))) => {
-            // The file exists: `If-None-Match: *` must refuse (M-FS-6),
-            // `If-Match` must match its current `ETag`.
-            if if_none_match_is_star {
-                return StatusCode::PRECONDITION_FAILED.into_response();
-            }
-            if if_match.as_deref() != Some(etag_for(&existing).as_str()) {
-                return StatusCode::PRECONDITION_FAILED.into_response();
-            }
-        }
-        Ok(Ok(FileOpValue::Null)) => {
-            // The file doesn't exist: `If-Match` can never match (M-FS-6).
-            if if_match.is_some() {
-                return StatusCode::PRECONDITION_FAILED.into_response();
-            }
-        }
-        Ok(Ok(FileOpValue::Bool(_))) => return StatusCode::NOT_FOUND.into_response(),
-        // A refused/failed read for this path -- can't resolve the
-        // precondition either way. Fall through to the real write
-        // attempt below, whose own authorization decision is the one
-        // that actually matters; if that refuses too, it maps to the
-        // same `404` as `GET` (M-FS-3).
-        Ok(Err(_)) | Err(_) => {}
-    }
-
     let result = tokio::task::spawn_blocking(move || {
-        request_file_op(&file_op_tx, &uid, "write_file", vec![path, text])
+        request_file_op(
+            &file_op_tx,
+            &uid,
+            &path,
+            FileOpKind::WriteIfMatch { precondition, text },
+        )
     })
     .await;
     match result {
-        Ok(Ok(FileOpValue::Bool(true))) => StatusCode::NO_CONTENT.into_response(),
-        // `write_file` returns `false` for an over-quota write (OBI-137
-        // S1), not an authorization refusal -- a distinct status from
-        // `404` so a builder can tell "no" from "not allowed".
-        Ok(Ok(FileOpValue::Bool(false))) => StatusCode::INSUFFICIENT_STORAGE.into_response(),
-        Ok(Ok(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Ok(FileOpValue::Written)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(FileOpValue::QuotaExceeded)) => StatusCode::INSUFFICIENT_STORAGE.into_response(),
+        Ok(Ok(FileOpValue::PreconditionFailed)) => StatusCode::PRECONDITION_FAILED.into_response(),
+        // A CAS write never produces these -- a driver bug, not a
+        // client-facing distinction.
+        Ok(Ok(FileOpValue::Null | FileOpValue::Str(_))) => {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
         Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -435,16 +521,16 @@ mod tests {
         let (file_op_tx, file_op_rx) = file_op_channel();
         let worker = std::thread::spawn(move || {
             let req = file_op_rx.recv().expect("a request should arrive");
-            assert_eq!(req.efun, "read_file");
-            assert_eq!(req.args, vec!["/builders/glorfindel/a.wf".to_string()]);
+            assert!(matches!(req.kind, FileOpKind::Read));
+            assert_eq!(req.path, "/builders/glorfindel/a.wf");
             let uid = req.uid.clone();
             req.respond(Ok(FileOpValue::Str(format!("hello, {uid}"))));
         });
         let result = request_file_op(
             &file_op_tx,
             "glorfindel",
-            "read_file",
-            vec!["/builders/glorfindel/a.wf".to_string()],
+            "/builders/glorfindel/a.wf",
+            FileOpKind::Read,
         );
         worker.join().expect("worker thread");
         assert_eq!(
@@ -455,9 +541,9 @@ mod tests {
 
     /// If `respond` is never called (e.g. the world thread panicked),
     /// the reply channel just drops -- `request_file_op` must surface
-    /// that as an error promptly, not hang.
+    /// that promptly as [`FileOpError::Timeout`], not hang.
     #[test]
-    fn a_request_never_answered_is_an_error_not_a_hang() {
+    fn a_request_never_answered_is_a_timeout_not_a_hang() {
         let (file_op_tx, file_op_rx) = file_op_channel();
         let worker = std::thread::spawn(move || {
             let req = file_op_rx.recv().expect("a request should arrive");
@@ -466,16 +552,16 @@ mod tests {
         let result = request_file_op(
             &file_op_tx,
             "glorfindel",
-            "read_file",
-            vec!["/builders/glorfindel/a.wf".to_string()],
+            "/builders/glorfindel/a.wf",
+            FileOpKind::Read,
         );
         worker.join().expect("worker thread");
-        assert!(result.is_err(), "{result:?}");
+        assert_eq!(result, Err(FileOpError::Timeout));
     }
 
     /// Past `FILE_OP_QUEUE_DEPTH` outstanding requests, `try_send` must
-    /// fail immediately (M-FS-5's "503 on backpressure") rather than
-    /// block the caller.
+    /// fail immediately with [`FileOpError::Busy`] (M-FS-5's "503 on
+    /// backpressure") rather than block the caller.
     #[test]
     fn a_full_queue_fails_fast_instead_of_blocking() {
         let (file_op_tx, _file_op_rx) = std::sync::mpsc::sync_channel::<FileOpRequest>(1);
@@ -483,8 +569,8 @@ mod tests {
         file_op_tx
             .try_send(FileOpRequest {
                 uid: "glorfindel".to_string(),
-                efun: "read_file",
-                args: vec![],
+                path: "/builders/glorfindel/a.wf".to_string(),
+                kind: FileOpKind::Read,
                 reply: reply_tx,
             })
             .expect("fill the one slot");
@@ -492,17 +578,49 @@ mod tests {
         let err = file_op_tx
             .try_send(FileOpRequest {
                 uid: "glorfindel".to_string(),
-                efun: "read_file",
-                args: vec![],
+                path: "/builders/glorfindel/a.wf".to_string(),
+                kind: FileOpKind::Read,
                 reply: reply_tx2,
             })
             .unwrap_err();
         assert!(matches!(err, TrySendError::Full(_)));
     }
 
+    /// Pins `etag_for` to the exact same digest
+    /// `loom_vm::world::file_etag_hex`'s own test pins for the same
+    /// fixture string (plus this side's quoting) -- see that test's doc
+    /// for why they must agree byte-for-byte.
+    #[test]
+    fn etag_for_is_pinned_against_the_loom_vm_fixture() {
+        assert_eq!(
+            etag_for("int x;"),
+            "\"e13e332bd08e13cbe2aee094e130ed23878b3b554be5b9a665a83e63caa987ae\""
+        );
+    }
+
+    #[test]
+    fn status_mapping_matches_m_fs_5_and_m_fs_3() {
+        assert_eq!(
+            status_for_file_op_error(&FileOpError::Busy),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status_for_file_op_error(&FileOpError::Timeout),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status_for_file_op_error(&FileOpError::Closed),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status_for_file_op_error(&FileOpError::Refused("no".to_string())),
+            StatusCode::NOT_FOUND
+        );
+    }
+
     // -----------------------------------------------------------------
-    // HTTP wire tests: drive the real `GET /api/v1/files/content` route
-    // (axum router + `HttpState`), not just the channel helpers above.
+    // HTTP wire tests: drive the real routes (axum router + `HttpState`),
+    // not just the channel helpers above.
     // -----------------------------------------------------------------
     mod http_wire {
         use axum::body::Body;
@@ -678,12 +796,12 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_readable_file_is_200_with_m_fs_4_headers() {
+        async fn a_readable_file_is_200_with_m_fs_4_and_m_fs_6_headers() {
             let (file_op_tx, file_op_rx) = file_op_channel();
             std::thread::spawn(move || {
                 let req = file_op_rx.recv().expect("a request should arrive");
                 assert_eq!(req.uid, "frodo");
-                assert_eq!(req.efun, "read_file");
+                assert!(matches!(req.kind, FileOpKind::Read));
                 req.respond(Ok(FileOpValue::Str("int x;".to_string())));
             });
             let (state, keys) = test_state(Some(file_op_tx));
@@ -707,25 +825,31 @@ mod tests {
             assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
             assert_eq!(
                 headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
-                "sandbox"
+                "sandbox; default-src 'none'"
             );
             assert_eq!(
                 headers.get(header::CONTENT_DISPOSITION).unwrap(),
                 "attachment"
             );
+            assert_eq!(
+                headers.get(header::ETAG).unwrap(),
+                etag_for("int x;").as_str()
+            );
             let body = response.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(&body[..], b"int x;");
         }
 
-        /// M-FS-3: a refused path (the fake world thread answers `Err`,
-        /// standing in for `valid_read` refusing it) is `404`, exactly
-        /// like a path that doesn't exist -- never `403`.
+        /// M-FS-3: a refused path (the fake world thread answers
+        /// `Refused`, standing in for `valid_read` refusing it) is
+        /// `404`, exactly like a path that doesn't exist -- never `403`.
         #[tokio::test]
         async fn a_refused_path_is_404_not_403() {
             let (file_op_tx, file_op_rx) = file_op_channel();
             std::thread::spawn(move || {
                 let req = file_op_rx.recv().expect("a request should arrive");
-                req.respond(Err("valid_read refused /secure/master.wf".to_string()));
+                req.respond(Err(FileOpError::Refused(
+                    "valid_read refused /secure/master.wf".to_string(),
+                )));
             });
             let (state, keys) = test_state(Some(file_op_tx));
             let token = bearer_for("frodo", &keys);
@@ -767,6 +891,30 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
 
+        /// CTO review must-fix 3: backpressure must be `503`, never
+        /// `404` -- a wire test for the status mapping unit-tested above.
+        #[tokio::test]
+        async fn a_busy_queue_is_503_not_404() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let req = file_op_rx.recv().expect("a request should arrive");
+                req.respond(Err(FileOpError::Busy));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/files/content?path=/builders/frodo/a.wf")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
         // -------------------------------------------------------------
         // PUT /api/v1/files/content (M-FS-1/M-FS-6/M-FS-7)
         // -------------------------------------------------------------
@@ -784,13 +932,16 @@ mod tests {
         async fn create_with_if_none_match_star_succeeds_when_the_file_is_absent() {
             let (file_op_tx, file_op_rx) = file_op_channel();
             std::thread::spawn(move || {
-                let read = file_op_rx.recv().expect("read request");
-                assert_eq!(read.efun, "read_file");
-                read.respond(Ok(FileOpValue::Null));
-                let write = file_op_rx.recv().expect("write request");
-                assert_eq!(write.efun, "write_file");
-                assert_eq!(write.args[1], "int x;");
-                write.respond(Ok(FileOpValue::Bool(true)));
+                let req = file_op_rx.recv().expect("a request should arrive");
+                assert_eq!(req.path, "/builders/pippin/new.wf");
+                match &req.kind {
+                    FileOpKind::WriteIfMatch { precondition, text } => {
+                        assert_eq!(precondition, &FilePrecondition::IfNoneMatchStar);
+                        assert_eq!(text, "int x;");
+                    }
+                    FileOpKind::Read => panic!("expected a write"),
+                }
+                req.respond(Ok(FileOpValue::Written));
             });
             let (state, keys) = test_state(Some(file_op_tx));
             let token = bearer_for("pippin", &keys);
@@ -806,9 +957,8 @@ mod tests {
         async fn create_with_if_none_match_star_is_412_when_the_file_already_exists() {
             let (file_op_tx, file_op_rx) = file_op_channel();
             std::thread::spawn(move || {
-                let read = file_op_rx.recv().expect("read request");
-                read.respond(Ok(FileOpValue::Str("already here".to_string())));
-                // No write should ever be requested.
+                let req = file_op_rx.recv().expect("a request should arrive");
+                req.respond(Ok(FileOpValue::PreconditionFailed));
             });
             let (state, keys) = test_state(Some(file_op_tx));
             let token = bearer_for("merry", &keys);
@@ -824,10 +974,19 @@ mod tests {
         async fn update_with_a_matching_if_match_succeeds() {
             let (file_op_tx, file_op_rx) = file_op_channel();
             std::thread::spawn(move || {
-                let read = file_op_rx.recv().expect("read request");
-                read.respond(Ok(FileOpValue::Str("old contents".to_string())));
-                let write = file_op_rx.recv().expect("write request");
-                write.respond(Ok(FileOpValue::Bool(true)));
+                let req = file_op_rx.recv().expect("a request should arrive");
+                match &req.kind {
+                    FileOpKind::WriteIfMatch { precondition, .. } => {
+                        assert_eq!(
+                            precondition,
+                            &FilePrecondition::IfMatch(
+                                etag_for("old contents").trim_matches('"').to_string()
+                            )
+                        );
+                    }
+                    FileOpKind::Read => panic!("expected a write"),
+                }
+                req.respond(Ok(FileOpValue::Written));
             });
             let (state, keys) = test_state(Some(file_op_tx));
             let token = bearer_for("sam", &keys);
@@ -844,8 +1003,8 @@ mod tests {
         async fn update_with_a_stale_if_match_is_412() {
             let (file_op_tx, file_op_rx) = file_op_channel();
             std::thread::spawn(move || {
-                let read = file_op_rx.recv().expect("read request");
-                read.respond(Ok(FileOpValue::Str("current contents".to_string())));
+                let req = file_op_rx.recv().expect("a request should arrive");
+                req.respond(Ok(FileOpValue::PreconditionFailed));
             });
             let (state, keys) = test_state(Some(file_op_tx));
             let token = bearer_for("rosie", &keys);
@@ -858,6 +1017,31 @@ mod tests {
             );
             let response = app(state).oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        }
+
+        /// CTO review must-fix 2: a failed CAS read (refused, timed out,
+        /// or any other world-thread error) must never fall through to a
+        /// write -- it's a single atomic request now, so there is no
+        /// separate "write anyway" code path left to fall through to.
+        #[tokio::test]
+        async fn a_refused_cas_is_404_and_never_a_fallthrough_write() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let req = file_op_rx.recv().expect("a request should arrive");
+                // Exactly one request ever arrives -- there is no second
+                // "write anyway" request to drain.
+                req.respond(Err(FileOpError::Refused(
+                    "valid_write refused /secure/x.wf".to_string(),
+                )));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("glorfindel", &keys);
+            let mut request = put_request("/secure/x.wf", &token, "pwned");
+            request
+                .headers_mut()
+                .insert("if-none-match", HeaderValue::from_static("*"));
+            let response = app(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
 
         #[tokio::test]
@@ -902,6 +1086,53 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        /// Each `HttpState` gets its own write-rate-limiter buckets (CTO
+        /// review non-blocking item: this used to be one process-global
+        /// `static` every `HttpState` -- including every test -- shared).
+        /// A bucket exhausted on one `HttpState` must not affect another.
+        #[tokio::test]
+        async fn write_rate_limiter_is_per_http_state_not_global() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                while let Ok(req) = file_op_rx.recv() {
+                    req.respond(Ok(FileOpValue::Written));
+                }
+            });
+            let (state_a, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("exhaust-me", &keys);
+            // Exhaust state_a's bucket for this uid.
+            for _ in 0..(WRITE_BUCKET_CAPACITY as usize) {
+                let mut request = put_request("/builders/exhaust-me/a.wf", &token, "x");
+                request
+                    .headers_mut()
+                    .insert("if-none-match", HeaderValue::from_static("*"));
+                let response = app(state_a.clone()).oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            }
+            let mut request = put_request("/builders/exhaust-me/a.wf", &token, "x");
+            request
+                .headers_mut()
+                .insert("if-none-match", HeaderValue::from_static("*"));
+            let response = app(state_a.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+            // A fresh HttpState (same uid) must not inherit that
+            // exhaustion.
+            let (state_b, _keys_b) = test_state(None);
+            let (file_op_tx_b, file_op_rx_b) = file_op_channel();
+            std::thread::spawn(move || {
+                let req = file_op_rx_b.recv().expect("a request should arrive");
+                req.respond(Ok(FileOpValue::Written));
+            });
+            let state_b = state_b.with_file_ops(file_op_tx_b);
+            let mut request = put_request("/builders/exhaust-me/a.wf", &token, "x");
+            request
+                .headers_mut()
+                .insert("if-none-match", HeaderValue::from_static("*"));
+            let response = app(state_b).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
         }
     }
 }

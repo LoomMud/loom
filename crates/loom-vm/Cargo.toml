@@ -25,6 +25,10 @@ metrics = "0.24.6"
 # M-FS-2 (OBI-180 threat model): NFC-normalise mudlib-absolute paths once,
 # in the one shared VFS resolver, before any confinement check runs.
 unicode-normalization = "0.1"
+# OBI-180 M-FS-6: the `ETag` an `If-Match`/`If-None-Match` PUT precondition
+# compares against is `sha256(contents)` -- already a workspace dependency
+# (loom-http uses it for webhook HMAC), no new licence/deny.toml surface.
+sha2 = "0.11.0"
 
 [target.'cfg(unix)'.dependencies]
 # M-FS-2: `O_NOFOLLOW` on the final path component for both `read_file`

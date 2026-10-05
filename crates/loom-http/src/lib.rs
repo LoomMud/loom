@@ -55,6 +55,7 @@ pub struct HttpState {
     github: Option<std::sync::Arc<dyn auth::GithubIdentityProvider>>,
     github_webhook: Option<webhook::GithubWebhookConfig>,
     file_op_tx: Option<files::FileOpSender>,
+    write_rate_limiter: files::WriteRateLimiter,
 }
 
 impl HttpState {
@@ -72,6 +73,7 @@ impl HttpState {
             github: None,
             github_webhook: None,
             file_op_tx: None,
+            write_rate_limiter: files::new_write_rate_limiter(),
         }
     }
 
