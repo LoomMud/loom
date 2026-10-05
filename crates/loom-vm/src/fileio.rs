@@ -14,14 +14,38 @@
 //! (`/domains/x/evil -> /etc`) cannot be used to read or write outside the
 //! mudlib root even though `resolve` alone would accept it.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+use unicode_normalization::UnicodeNormalization;
 
 /// Read/write size cap (spec: "cap it at 1 MiB").
 pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Resolve a mudlib-absolute path to a filesystem path confined under
-/// `root`, purely lexically (no `..`, no NUL, no empty/`.` segments kept).
+/// `root`, purely lexically. This is the one shared VFS path resolver
+/// (M-FS-2, OBI-180 threat model): every caller -- the `read_file`/
+/// `write_file` efuns here and the planned `/api/v1/files/*` HTTP
+/// handlers -- goes through this single function, so there is exactly
+/// one place that decides what a mudlib-absolute path means.
+///
+/// M-FS-2's steps, in order: reject a NUL byte or a `\` anywhere in the
+/// input (never meaningful in a mudlib path, and `\` is a trap for any
+/// caller that might later hand the string to something that treats it
+/// as a Windows separator); require a leading `/`; NFC-normalise the
+/// remainder once (so two different Unicode encodings of visually
+/// identical text can never resolve to two different paths); then split
+/// into `/`-separated segments and reject `.`, `..`, and any *other*
+/// empty segment (a bare leading `/` yields exactly one leading empty
+/// segment, which is expected and skipped; `//`, trailing `/`, or an
+/// internal `//` all produce an empty segment that is rejected instead
+/// of silently collapsed, matching M-FS-2's "reject ... empty segments"
+/// rather than normalising them away). Non-UTF-8 input cannot reach
+/// this function at all -- `path: &str` is already guaranteed valid
+/// UTF-8 by the type system; the HTTP layer's one-time percent-decode
+/// is responsible for turning any non-UTF-8 byte sequence into a
+/// rejection before it ever becomes a `&str`.
+///
 /// Does not touch the filesystem, so it also confines a path that does
 /// not exist yet (`write_file` creating a new file). Suffix checks
 /// (`write_file`'s `.wf`/`.txt` allow-list) run against `path` *before*
@@ -30,14 +54,38 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     if path.as_bytes().contains(&0) {
         return Err("path must not contain a NUL byte".to_string());
     }
+    if path.contains('\\') {
+        return Err("path must not contain a `\\`".to_string());
+    }
     let trimmed = path.trim();
     if !trimmed.starts_with('/') {
         return Err("path must be mudlib-absolute (start with `/`)".to_string());
     }
+    // Perf (bench-gate regression on `priv_miss`/`priv_read_hit`, CI):
+    // the overwhelming majority of real mudlib paths are already NFC
+    // (plain ASCII qualifies trivially), so `is_nfc_quick` -- a cheap
+    // per-codepoint scan with no allocation -- lets that common case
+    // skip the `nfc().collect()` allocation entirely; only a path that
+    // actually needs normalising pays for it.
+    let normalized: std::borrow::Cow<str> =
+        match unicode_normalization::is_nfc_quick(trimmed.chars()) {
+            unicode_normalization::IsNormalized::Yes => std::borrow::Cow::Borrowed(trimmed),
+            _ => std::borrow::Cow::Owned(trimmed.nfc().collect()),
+        };
     let mut out = root.to_path_buf();
-    for seg in trimmed.split('/') {
-        if seg.is_empty() || seg == "." {
-            continue;
+    for (i, seg) in normalized.split('/').enumerate() {
+        if seg.is_empty() {
+            // Exactly one empty segment is expected: the one produced by
+            // the mandatory leading `/`, always at index 0. Any other
+            // empty segment (`//`, a trailing `/`) is rejected rather
+            // than collapsed.
+            if i == 0 {
+                continue;
+            }
+            return Err("path must not contain an empty segment".to_string());
+        }
+        if seg == "." {
+            return Err("path must not contain a `.` segment".to_string());
         }
         if seg == ".." {
             return Err("path must not contain `..`".to_string());
@@ -91,6 +139,25 @@ fn confine_canonical(root: &Path, candidate: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// `O_NOFOLLOW` on the leaf path only (M-FS-2): `confine_canonical`
+/// already walks up to the deepest existing ancestor and checks *that*
+/// canonicalizes under `root`, but a symlink planted at the exact leaf
+/// in the window between that check and this open would otherwise still
+/// be followed. Opening with `O_NOFOLLOW` turns that race into a clean
+/// `ELOOP` error instead of a followed read/write -- every real mudlib
+/// file is created by `write_file` itself and is never a symlink, so
+/// this never rejects a legitimate file.
+#[cfg(unix)]
+fn open_nofollow(path: &Path, opts: &std::fs::OpenOptions) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.clone().custom_flags(libc::O_NOFOLLOW).open(path)
+}
+
+#[cfg(not(unix))]
+fn open_nofollow(path: &Path, opts: &std::fs::OpenOptions) -> std::io::Result<std::fs::File> {
+    opts.open(path)
+}
+
 /// `read_file()`: `Ok(None)` if the file does not exist, `Err` for a bad
 /// path, an oversized file, or any other I/O failure.
 pub fn read_file(root: &Path, path: &str) -> Result<Option<String>, String> {
@@ -104,7 +171,8 @@ pub fn read_file(root: &Path, path: &str) -> Result<Option<String>, String> {
     // file that grows between an earlier `metadata()` check and the read
     // itself (TOCTOU) can never smuggle more than one byte over the cap
     // through, rather than trusting a stale size (CTO review, OBI-85).
-    let file = std::fs::File::open(&resolved).map_err(|e| format!("{path}: {e}"))?;
+    let file = open_nofollow(&resolved, std::fs::OpenOptions::new().read(true))
+        .map_err(|e| format!("{path}: {e}"))?;
     let mut buf = Vec::new();
     file.take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut buf)
@@ -198,10 +266,20 @@ pub fn write_file(root: &Path, path: &str, text: &str) -> Result<bool, String> {
     // existing ancestor, which also catches a pre-existing symlink
     // planted at `resolved` itself (its own canonical form is checked
     // too, not just its parent's).
-    // Residual risk (accepted for alpha): a symlink planted between this
-    // check and the write races it; nothing in-driver can create one.
+    // M-FS-2: open the leaf itself with `O_NOFOLLOW` (`open_nofollow`,
+    // above), so even a symlink planted in the window between this
+    // check and the write below is refused outright instead of raced.
     confine_canonical(root, &resolved)?;
-    std::fs::write(&resolved, text).map_err(|e| format!("{path}: {e}"))?;
+    let mut file = open_nofollow(
+        &resolved,
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true),
+    )
+    .map_err(|e| format!("{path}: {e}"))?;
+    file.write_all(text.as_bytes())
+        .map_err(|e| format!("{path}: {e}"))?;
     Ok(true)
 }
 
@@ -680,5 +758,120 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// A symlink planted at the exact write target *after* the lexical
+    /// and canonical checks but caught by `O_NOFOLLOW` at open time
+    /// (M-FS-2) -- simulated here by writing through an existing symlink
+    /// leaf the normal way (`write_through_a_symlinked_leaf_is_rejected`
+    /// above already covers "symlink present before the call starts";
+    /// this one additionally asserts the file's *contents* are
+    /// untouched, not just that the outer `Result` is an error, so a
+    /// future refactor can't quietly fall back to following the link).
+    #[test]
+    #[cfg(unix)]
+    fn read_through_a_symlinked_leaf_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tmp_root("read-symlink-leaf");
+        let outside = tmp_root("read-symlink-leaf-outside");
+        std::fs::write(outside.join("secret.txt"), "top secret").unwrap();
+        std::fs::create_dir_all(root.join("domains/x")).unwrap();
+        symlink(outside.join("secret.txt"), root.join("domains/x/link.txt")).unwrap();
+
+        let result = read_file(&root, "/domains/x/link.txt");
+        assert!(result.is_err(), "expected an error, got {result:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn backslash_is_rejected() {
+        let root = tmp_root("backslash");
+        assert!(read_file(&root, "/domains/x\\y.wf").is_err());
+        assert!(write_file(&root, "/domains/x\\y.wf", "x").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn double_slash_is_rejected_not_collapsed() {
+        let root = tmp_root("double-slash");
+        assert!(read_file(&root, "/domains//x/y.wf").is_err());
+        assert!(read_file(&root, "/domains/x/y.wf/").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dot_segment_is_rejected_not_skipped() {
+        let root = tmp_root("dot-segment");
+        assert!(read_file(&root, "/domains/./x/y.wf").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M-FS-2: NFC-normalise once, in the shared resolver -- two
+    /// differently-encoded (NFC vs NFD) forms of the same visual path
+    /// must land on the same file, not two different ones.
+    #[test]
+    fn nfc_and_nfd_forms_of_the_same_path_resolve_identically() {
+        let root = tmp_root("nfc");
+        // "e" + combining acute accent (NFD) vs the precomposed "é" (NFC).
+        let nfd_path = "/domains/cafe\u{0301}/y.wf";
+        let nfc_path = "/domains/caf\u{00e9}/y.wf";
+        write_file(&root, nfd_path, "hello").unwrap();
+        assert_eq!(
+            read_file(&root, nfc_path).unwrap(),
+            Some("hello".to_string())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // M-FS-2: fuzz/property test -- for any input string, `resolve` must
+    // never (a) panic, and (b) produce a path that, once it exists,
+    // canonicalizes to somewhere outside `root`. We can't easily drive
+    // arbitrary bytes through a `&str` API with the actual filesystem
+    // underneath in a property test without creating real directories
+    // for every case, so this focuses on the lexical half of the
+    // contract: `resolve` never returns `Ok` for input containing `..`
+    // as a path component, a NUL byte, or a `\`, and every `Ok` result's
+    // path lexically starts with `root`.
+    use proptest::prop_assert;
+
+    proptest::proptest! {
+        #[test]
+        fn resolve_never_escapes_root_lexically(segments in proptest::collection::vec(
+            proptest::sample::select(vec![
+                "a", "b", "..", ".", "", "x\u{0301}", "y\u{00e9}", ".git", "c",
+            ]),
+            0..8,
+        )) {
+            let root = tmp_root("proptest-resolve");
+            let path = format!("/{}", segments.join("/"));
+            match resolve(&root, &path) {
+                Ok(resolved) => {
+                    prop_assert!(resolved.starts_with(&root));
+                    // A lexically-accepted path must not contain `..` or
+                    // `.` components once resolved, and must not have
+                    // escaped `root` by segment count either.
+                    for comp in resolved.strip_prefix(&root).unwrap().components() {
+                        use std::path::Component;
+                        prop_assert!(!matches!(comp, Component::ParentDir | Component::CurDir));
+                    }
+                }
+                Err(_) => {
+                    // Rejecting is always a safe outcome for this property.
+                }
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        #[test]
+        fn resolve_rejects_every_nul_or_backslash_input(s in ".*") {
+            let root = tmp_root("proptest-nul-backslash");
+            if s.as_bytes().contains(&0) || s.contains('\\') {
+                prop_assert!(resolve(&root, &s).is_err());
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 }

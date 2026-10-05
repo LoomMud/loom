@@ -22,6 +22,15 @@ serde_json = "1.0.145"
 # same `metrics` facade `loom-net`/`loom-obs` already depend on (already a
 # workspace dependency, no new licence/deny.toml surface).
 metrics = "0.24.6"
+# M-FS-2 (OBI-180 threat model): NFC-normalise mudlib-absolute paths once,
+# in the one shared VFS resolver, before any confinement check runs.
+unicode-normalization = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+# M-FS-2: `O_NOFOLLOW` on the final path component for both `read_file`
+# and `write_file`, closing the symlink-planted-between-check-and-open
+# TOCTOU window that `confine_canonical` alone cannot (see `fileio.rs`).
+libc = "0.2.177"
 
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }
