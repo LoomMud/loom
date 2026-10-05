@@ -740,6 +740,23 @@ mod tests {
             async fn record_audit(&self, _event: AuditEvent) -> Result<(), DirectoryError> {
                 unimplemented!("not exercised by these tests")
             }
+            async fn admin_set_tier(
+                &self,
+                _actor: &str,
+                _target_uid: &str,
+                _new_tier: i16,
+                _reason: &str,
+            ) -> Result<(), crate::auth::AdminDirectoryError> {
+                unimplemented!("not exercised by these tests")
+            }
+            async fn admin_audit_recent(
+                &self,
+                _limit: i64,
+                _before_id: Option<i64>,
+            ) -> Result<Vec<crate::auth::AdminAuditEntry>, crate::auth::AdminDirectoryError>
+            {
+                unimplemented!("not exercised by these tests")
+            }
         }
 
         fn keys() -> JwtKeys {
