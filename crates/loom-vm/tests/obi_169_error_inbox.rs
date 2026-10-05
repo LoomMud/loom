@@ -260,3 +260,52 @@ fn a_secure_origins_message_is_redacted_below_t5_and_shown_at_t5() {
         assert_eq!(host.take(1), "random(): n must be > 0\n");
     });
 }
+
+/// OBI-287 (M-ERR-1 follow-up): `errors_efun`'s redaction floor used to
+/// come from `self_object()`'s own euid, not the caller's -- so a call
+/// routed through a command object (`self_object()` is that object
+/// while the efun runs) was redaction-floored on *its* tier, never the
+/// invoking player's. This fixture's `/secure/cmds_errors` stands in for
+/// that command object (root-owned, same as a real driver-shipped
+/// command would be, so it never contributes an euid of its own to the
+/// guard set): a T5 player routed through it still sees the real
+/// message, and a T4 player routed through the exact same path still
+/// gets `<redacted>` -- the tier comes from the guard set's minimum,
+/// never from the command object sitting in between.
+#[test]
+fn a_command_objects_own_euid_does_not_override_the_callers_redaction_tier() {
+    on_world_thread(|| {
+        let root = fixture("errors_inbox");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host);
+        host.take(1);
+
+        world.input(1, "triggervault2", &mut host);
+        host.take(1);
+
+        world.set_roles_snapshot(std::sync::Arc::new(
+            loom_vm::RolesSnapshot::from_seed_json(
+                r#"{"staff": {"root-tester": 5, "junior-tester": 4}}"#,
+            )
+            .expect("seed parses"),
+        ));
+
+        // T5, calling through the command-object stand-in: sees the real
+        // message, same as calling `errors()` directly would (the prior
+        // test above).
+        world.input(1, "become root-tester", &mut host);
+        assert_eq!(host.take(1), "ok\n");
+        world.input(1, "cmderrormessage /secure/vault2", &mut host);
+        assert_eq!(host.take(1), "random(): n must be > 0\n");
+
+        // T4, same path: still `<redacted>` -- one tier short of T5 is
+        // enough to keep the redaction, whether the low tier is the
+        // caller's own or (the bug this guards against) a command
+        // object's.
+        world.input(1, "become junior-tester", &mut host);
+        assert_eq!(host.take(1), "ok\n");
+        world.input(1, "cmderrormessage /secure/vault2", &mut host);
+        assert_eq!(host.take(1), "<redacted>\n");
+    });
+}

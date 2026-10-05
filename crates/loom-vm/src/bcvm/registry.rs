@@ -4992,11 +4992,34 @@ impl<'a> RegistryHost<'a> {
             .expect("checked above")
             .errors
             .snapshot(prefix.as_deref());
-        let caller_euid = self
-            .registry
-            .syms
-            .name(principal_of(self.registry, self.self_object()).euid)
-            .to_string();
+        // M-ERR-1 fix: the redaction tier is the caller's, decided the
+        // same way `authorize` decides access -- off the guard set
+        // (`top_guard().euids()`), not off `self_object()`'s own euid.
+        // A command object such as `/cmds/builder/errors` runs this efun
+        // with its *own* principal as `self_object()`, which is not the
+        // player who invoked it; keying off that principal's euid floors
+        // everyone at that command object's tier (fails closed today
+        // because the command object isn't staff, but would leak if it
+        // ever were). The guard set carries every non-root euid still on
+        // the call stack (`top_guard().euids()` never yields the literal
+        // `root` sentinel: `GuardSet::with` drops it entirely, so a
+        // root-owned command object -- the only way a path's uid can
+        // actually be `root`, since `creator_file`'s own answer is
+        // filtered to reject it -- never floors this check by itself),
+        // so take the minimum tier across it: one low-tier frame
+        // anywhere in the chain (the actual player if never staff, or a
+        // non-root-owned command object if its own uid ever held a
+        // staff tier) is enough to keep the redaction. An all-root stack
+        // (`euids()` empty) un-redacts.
+        let min_caller_tier = self
+            .top_guard()
+            .euids()
+            .map(|euid| {
+                let name = self.registry.syms.name(euid).to_string();
+                self.euid_tier(&name)
+            })
+            .min()
+            .unwrap_or(5);
         let mut decided: HashMap<String, bool> = HashMap::new();
         let mut out = Vec::new();
         for row in rows {
@@ -5027,7 +5050,7 @@ impl<'a> RegistryHost<'a> {
             // principle, grant `/secure/foo` read access to someone
             // below T5 -- this redaction is a driver-enforced floor, not
             // conditioned on the master's own policy).
-            let message = if row.redacted && self.euid_tier(&caller_euid) < 5 {
+            let message = if row.redacted && min_caller_tier < 5 {
                 "<redacted>".to_string()
             } else {
                 row.message.clone()
