@@ -262,18 +262,16 @@ fn a_secure_origins_message_is_redacted_below_t5_and_shown_at_t5() {
 }
 
 /// OBI-287 (M-ERR-1 follow-up): `errors_efun`'s redaction floor used to
-/// come from `self_object()`'s own euid, not the caller's -- so a call
-/// routed through a command object (`self_object()` is that object
-/// while the efun runs) was redaction-floored on *its* tier, never the
-/// invoking player's. This fixture's `/secure/cmds_errors` stands in for
-/// that command object (root-owned, same as a real driver-shipped
-/// command would be, so it never contributes an euid of its own to the
-/// guard set): a T5 player routed through it still sees the real
-/// message, and a T4 player routed through the exact same path still
-/// gets `<redacted>` -- the tier comes from the guard set's minimum,
-/// never from the command object sitting in between.
+/// come from `self_object()`'s own euid -- so a call routed through a
+/// lib command object (`/cmds/errors` here, `mudlib`-owned like Warp's
+/// `/cmds/builder/errors`) was floored at the command object's tier 0,
+/// redacting even a T5 caller. The tier now comes from the guard set:
+/// a T5 player through the command sees the message, a T4 player through
+/// the same path gets `<redacted>`, and a T5 player whose call passes
+/// through a non-staff builder's code (`/builders/bob`) also gets
+/// `<redacted>`, because the minimum tier on the stack decides.
 #[test]
-fn a_command_objects_own_euid_does_not_override_the_callers_redaction_tier() {
+fn errors_redaction_tier_comes_from_the_callers_guard_set_not_the_command_object() {
     on_world_thread(|| {
         let root = fixture("errors_inbox");
         let mut world = World::boot(&root).expect("boot");
@@ -291,21 +289,24 @@ fn a_command_objects_own_euid_does_not_override_the_callers_redaction_tier() {
             .expect("seed parses"),
         ));
 
-        // T5, calling through the command-object stand-in: sees the real
-        // message, same as calling `errors()` directly would (the prior
-        // test above).
+        // T5 through the mudlib-owned command object: real message.
         world.input(1, "become root-tester", &mut host);
         assert_eq!(host.take(1), "ok\n");
-        world.input(1, "cmderrormessage /secure/vault2", &mut host);
+        world.input(1, "viaerrormessage /cmds/errors /secure/vault2", &mut host);
         assert_eq!(host.take(1), "random(): n must be > 0\n");
 
-        // T4, same path: still `<redacted>` -- one tier short of T5 is
-        // enough to keep the redaction, whether the low tier is the
-        // caller's own or (the bug this guards against) a command
-        // object's.
+        // T5, but through a tier-0 builder's code first: redacted.
+        world.input(
+            1,
+            "viaerrormessage /builders/bob/proxy /secure/vault2",
+            &mut host,
+        );
+        assert_eq!(host.take(1), "<redacted>\n");
+
+        // T4 through the same command object: redacted.
         world.input(1, "become junior-tester", &mut host);
         assert_eq!(host.take(1), "ok\n");
-        world.input(1, "cmderrormessage /secure/vault2", &mut host);
+        world.input(1, "viaerrormessage /cmds/errors /secure/vault2", &mut host);
         assert_eq!(host.take(1), "<redacted>\n");
     });
 }

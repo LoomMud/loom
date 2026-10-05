@@ -1,0 +1,16 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// M-ERR-1 (OBI-287) fixture: stands in for a lib command object such as
+// Warp's `/cmds/builder/errors`. This fixture's master has no
+// `creator_file`, so (like Warp's) the path falls back to
+// `default_creator` and is owned by `mudlib`, a non-staff lib principal.
+// It calls `errors()` itself, so `self_object()` is *this* object, not
+// the player who invoked it.
+pub fn run(filter: string) -> string {
+    let rows = errors(filter)
+    if len(rows) == 0 {
+        return "none"
+    }
+    return rows[0]["message"] ?? "?"
+}

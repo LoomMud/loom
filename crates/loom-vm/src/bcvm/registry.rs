@@ -4992,34 +4992,39 @@ impl<'a> RegistryHost<'a> {
             .expect("checked above")
             .errors
             .snapshot(prefix.as_deref());
-        // M-ERR-1 fix: the redaction tier is the caller's, decided the
-        // same way `authorize` decides access -- off the guard set
-        // (`top_guard().euids()`), not off `self_object()`'s own euid.
-        // A command object such as `/cmds/builder/errors` runs this efun
-        // with its *own* principal as `self_object()`, which is not the
-        // player who invoked it; keying off that principal's euid floors
-        // everyone at that command object's tier (fails closed today
-        // because the command object isn't staff, but would leak if it
-        // ever were). The guard set carries every non-root euid still on
-        // the call stack (`top_guard().euids()` never yields the literal
-        // `root` sentinel: `GuardSet::with` drops it entirely, so a
-        // root-owned command object -- the only way a path's uid can
-        // actually be `root`, since `creator_file`'s own answer is
-        // filtered to reject it -- never floors this check by itself),
-        // so take the minimum tier across it: one low-tier frame
-        // anywhere in the chain (the actual player if never staff, or a
-        // non-root-owned command object if its own uid ever held a
-        // staff tier) is enough to keep the redaction. An all-root stack
-        // (`euids()` empty) un-redacts.
-        let min_caller_tier = self
-            .top_guard()
-            .euids()
-            .map(|euid| {
-                let name = self.registry.syms.name(euid).to_string();
-                self.euid_tier(&name)
-            })
-            .min()
-            .unwrap_or(5);
+        // M-ERR-1 fix (OBI-287): the redaction tier is the caller's,
+        // decided off the guard set (`top_guard().euids()`) the same way
+        // `authorize` decides access -- not off `self_object()`'s own
+        // euid, which for a command object such as Warp's
+        // `/cmds/builder/errors` is the command object's, not the
+        // player's. Every euid on the stack must be T5 or higher (the
+        // minimum, so one low-tier frame anywhere -- e.g. builder code
+        // the player called into -- keeps the redaction), except the
+        // driver's lib principals: `root` (never stored in a `GuardSet`
+        // at all) and `mudlib` (the default owner of `/cmds/**`, `/std/**`
+        // and other lib code, D-S1.1; a reserved principal no account or
+        // workroom can take, D-S3.1). Mudlib code is not a caller with a
+        // tier of its own -- counting it as tier 0 would redact every
+        // T5 player who used a lib command, which is the bug -- and
+        // counting it as staff would be wrong too (a player body still
+        // running as `mudlib` before its post-login `seteuid` is no
+        // one's T5). So `mudlib` is skipped and the tier comes from the
+        // other euids on the stack. Only an empty guard set (an
+        // all-root stack) un-redacts. A stack whose only euids are
+        // `mudlib` has no caller with a tier, so it stays redacted
+        // (fail closed).
+        let guard = self.top_guard();
+        let min_caller_tier = if guard.is_empty() {
+            5
+        } else {
+            guard
+                .euids()
+                .map(|euid| self.registry.syms.name(euid).to_string())
+                .filter(|name| name != "mudlib")
+                .map(|name| self.euid_tier(&name))
+                .min()
+                .unwrap_or(0)
+        };
         let mut decided: HashMap<String, bool> = HashMap::new();
         let mut out = Vec::new();
         for row in rows {

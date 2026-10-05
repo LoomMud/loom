@@ -38,13 +38,13 @@ pub fn process_input(line: string) {
             let m = rows[0]["message"] ?? "?"
             send(self, $"{m}\n")
         }
-    } else if verb == "cmderrormessage" and len(words) == 2 {
+    } else if verb == "viaerrormessage" and len(words) == 3 {
         // OBI-287 (M-ERR-1): same query as `errormessage`, but routed
-        // through `/secure/cmds_errors`'s `run` -- a stand-in for a
-        // command object (`self_object()` is that object while this
-        // runs, not the player) -- so the redaction tier has to come
-        // from the caller's guard set, not `self_object()`'s own euid.
-        let m = load_object("/secure/cmds_errors").run(words[1])
+        // through `words[1]`'s `run` -- a command object stand-in
+        // (`self_object()` is that object while the efun runs, not the
+        // player) -- so the redaction tier has to come from the guard
+        // set, not `self_object()`'s own euid.
+        let m = load_object(words[1]).run(words[2])
         send(self, $"{m}\n")
     } else {
         send(self, "What?\n")
