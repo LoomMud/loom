@@ -501,6 +501,74 @@ fn list_dir_reserved_principals_are_refused_outright() {
         let err = world
             .list_dir(reserved, "/builders/arch", &mut host)
             .unwrap_err();
-        assert!(err.contains("reserved principal"), "{reserved}: {err}");
+        match err {
+            loom_vm::world::ListDirError::Refused(msg) => {
+                assert!(msg.contains("reserved principal"), "{reserved}: {msg}");
+            }
+            other => panic!("{reserved}: expected Refused, got {other:?}"),
+        }
     }
+}
+
+/// CTO review on PR #117, must-fix 2: a `valid_read` that throws on one
+/// entry must fail the *whole* listing, never silently drop just that
+/// entry and return a shorter-but-successful-looking list.
+#[test]
+fn list_dir_errors_instead_of_silently_dropping_an_entry_whose_valid_read_throws() {
+    const THROWING_MASTER: &str = r#"
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    if path == "/builders/glorfindel/bad.wf" {
+        random(0)
+    }
+    return true
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}
+"#;
+    let root = scratch("list-dir-throwing-entry");
+    let p = root.join("secure/master.wf");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, THROWING_MASTER).unwrap();
+    let mut world = World::boot(&root).expect("boot");
+    let mut host = FakeHost::default();
+
+    world
+        .call_file_efun(
+            "glorfindel",
+            "write_file",
+            vec![
+                Value::str("/builders/glorfindel/good.wf"),
+                Value::str("fine"),
+            ],
+            &mut host,
+        )
+        .unwrap();
+    world
+        .call_file_efun(
+            "glorfindel",
+            "write_file",
+            vec![
+                Value::str("/builders/glorfindel/bad.wf"),
+                Value::str("boom"),
+            ],
+            &mut host,
+        )
+        .unwrap();
+
+    let err = world
+        .list_dir("glorfindel", "/builders/glorfindel", &mut host)
+        .expect_err(
+            "a valid_read that throws on one entry must fail the whole listing, \
+             never silently return the other entries alone",
+        );
+    assert!(
+        matches!(err, loom_vm::world::ListDirError::Internal(_)),
+        "{err:?}"
+    );
 }

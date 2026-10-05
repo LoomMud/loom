@@ -164,10 +164,22 @@ pub enum FileOpError {
     /// The world thread's receiver is gone (shutting down).
     Closed,
     /// The world thread ran the request and refused it: `valid_read`/
-    /// `valid_write` said no, or a `fileio` I/O error. Carries the
-    /// message for logging only -- HTTP handlers never echo it to the
-    /// client (M-FS-3: a refusal looks exactly like "not found").
+    /// `valid_write` said no, a reserved principal, or (for `GET`/`PUT`
+    /// on `/api/v1/files/content`, which fail closed through `authorize`)
+    /// an I/O error. Carries the message for logging only -- HTTP
+    /// handlers never echo it to the client (M-FS-3: a refusal looks
+    /// exactly like "not found").
     Refused(String),
+    /// A `valid_read`/`valid_write` apply itself threw or exhausted its
+    /// tick budget, or an unexpected `fileio` I/O error distinct from
+    /// the normal "missing" case -- currently only `World::list_dir`
+    /// produces this (`loom_vm::world::ListDirError::Internal`). Mapped
+    /// to `503`, the same split `loom_http::admin_query::
+    /// WorldQueryError::Internal` already draws for the admin endpoints
+    /// (OBI-279): a `valid_read` that can't produce a real decision must
+    /// never look like a (possibly truncated) successful listing or a
+    /// plain `Refused`.
+    Internal(String),
 }
 
 /// One file operation requested by an `/api/v1/files/*` HTTP handler
@@ -236,9 +248,10 @@ pub fn request_file_op(
 /// make that decision, so they can't drift apart.
 fn status_for_file_op_error(err: &FileOpError) -> StatusCode {
     match err {
-        FileOpError::Busy | FileOpError::Timeout | FileOpError::Closed => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        FileOpError::Busy
+        | FileOpError::Timeout
+        | FileOpError::Closed
+        | FileOpError::Internal(_) => StatusCode::SERVICE_UNAVAILABLE,
         FileOpError::Refused(_) => StatusCode::NOT_FOUND,
     }
 }
@@ -730,6 +743,10 @@ mod tests {
         assert_eq!(
             status_for_file_op_error(&FileOpError::Refused("no".to_string())),
             StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status_for_file_op_error(&FileOpError::Internal("apply threw".to_string())),
+            StatusCode::SERVICE_UNAVAILABLE
         );
     }
 
