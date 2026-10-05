@@ -201,6 +201,32 @@ pub fn file_size_bytes(root: &Path, path: &str) -> Result<u64, String> {
         .map_err(|e| format!("{}: {e}", resolved.display()))
 }
 
+/// Immediate entries of a mudlib-absolute directory (OBI-180 M-FS-3):
+/// each entry's bare name (not a full path), files and subdirectories
+/// both included, sorted for determinism. `Ok(None)` for a path that
+/// doesn't exist or isn't a directory -- the driver-side caller
+/// (`World::list_dir`) maps that to the same "not found" shape
+/// `read_file` already gives a missing file, so a listing you can't read
+/// looks exactly like one that doesn't exist (M-FS-3). Confined the same
+/// way `read_file`/`write_file` are (lexical `resolve` + `confine_
+/// canonical`, `O_NOFOLLOW` has no meaning for a directory open itself,
+/// but `confine_canonical` still refuses an escape via a symlinked
+/// ancestor).
+pub fn list_dir(root: &Path, path: &str) -> Result<Option<Vec<String>>, String> {
+    let resolved = resolve(root, path)?;
+    if !resolved.is_dir() {
+        return Ok(None);
+    }
+    confine_canonical(root, &resolved)?;
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))? {
+        let entry = entry.map_err(|e| format!("{}: {e}", resolved.display()))?;
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    Ok(Some(names))
+}
+
 /// Recursive byte total of every regular file under a mudlib-absolute
 /// directory (OBI-121 S2c `disk_quota_mb`, `/builders/<u>/**`). `Ok(0)`
 /// for a directory that does not exist yet (a builder who has never
@@ -426,6 +452,38 @@ mod tests {
             read_file(&root, "/domains/x/y.wf").unwrap(),
             Some("hello".to_string())
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_dir_returns_sorted_entry_names() {
+        let root = tmp_root("list-dir");
+        write_file(&root, "/domains/x/b.wf", "b").unwrap();
+        write_file(&root, "/domains/x/a.wf", "a").unwrap();
+        std::fs::create_dir_all(root.join("domains/x/sub")).unwrap();
+        assert_eq!(
+            list_dir(&root, "/domains/x").unwrap(),
+            Some(vec![
+                "a.wf".to_string(),
+                "b.wf".to_string(),
+                "sub".to_string()
+            ])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_dir_on_a_missing_path_is_none() {
+        let root = tmp_root("list-dir-missing");
+        assert_eq!(list_dir(&root, "/domains/nope").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_dir_on_a_file_not_a_directory_is_none() {
+        let root = tmp_root("list-dir-on-file");
+        write_file(&root, "/domains/x/a.wf", "a").unwrap();
+        assert_eq!(list_dir(&root, "/domains/x/a.wf").unwrap(), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

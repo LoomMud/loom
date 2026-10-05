@@ -385,3 +385,122 @@ fn call_file_efun_refuses_an_efun_outside_the_allowlist() {
         .unwrap_err();
     assert!(err.contains("not a file-op efun"), "{err}");
 }
+
+// ---------------------------------------------------------------------
+// World::list_dir (OBI-180 M-FS-3): a directory listing filtered by
+// valid_read, the same master policy as every other file op above.
+// ---------------------------------------------------------------------
+
+#[test]
+fn list_dir_returns_entries_in_own_workroom() {
+    let (mut world, mut host, _root) = boot("list-dir-own");
+    world
+        .call_file_efun(
+            "glorfindel",
+            "write_file",
+            vec![Value::str("/builders/glorfindel/a.wf"), Value::str("a")],
+            &mut host,
+        )
+        .unwrap();
+    world
+        .call_file_efun(
+            "glorfindel",
+            "write_file",
+            vec![Value::str("/builders/glorfindel/b.wf"), Value::str("b")],
+            &mut host,
+        )
+        .unwrap();
+    let entries = world
+        .list_dir("glorfindel", "/builders/glorfindel", &mut host)
+        .expect("own workroom listing should be allowed")
+        .expect("the directory exists");
+    assert_eq!(entries, vec!["a.wf".to_string(), "b.wf".to_string()]);
+}
+
+#[test]
+fn list_dir_in_another_builders_workroom_is_none() {
+    let (mut world, mut host, _root) = boot("list-dir-elsewhere");
+    world
+        .call_file_efun(
+            "arch",
+            "write_file",
+            vec![Value::str("/builders/frodo/secret.wf"), Value::str("ring")],
+            &mut host,
+        )
+        .unwrap();
+    let entries = world
+        .list_dir("glorfindel", "/builders/frodo", &mut host)
+        .expect("the call itself is authorized, just refused by valid_read");
+    assert_eq!(
+        entries, None,
+        "a refused listing looks exactly like a missing directory (M-FS-3)"
+    );
+}
+
+#[test]
+fn list_dir_on_a_missing_directory_is_none() {
+    let (mut world, mut host, _root) = boot("list-dir-missing");
+    let entries = world
+        .list_dir(
+            "glorfindel",
+            "/builders/glorfindel/never-created",
+            &mut host,
+        )
+        .expect("the call itself is authorized");
+    assert_eq!(entries, None);
+}
+
+#[test]
+fn list_dir_secure_is_none_for_a_non_root_uid() {
+    let (mut world, mut host, _root) = boot("list-dir-secure");
+    let entries = world
+        .list_dir("glorfindel", "/secure", &mut host)
+        .expect("the call itself is authorized, just refused by valid_read");
+    assert_eq!(entries, None);
+}
+
+/// Per-entry filtering (M-FS-3): a listing can authorize for its own
+/// directory yet still hide individual entries the master's `valid_read`
+/// refuses for that specific child path. The test master policy doesn't
+/// have a case that applies here (own-workroom entries are always
+/// readable by their owner, elsewhere is refused wholesale by the
+/// directory-level check above), so this proves the *shape* with `arch`
+/// (who can read everywhere per the test policy) listing a directory
+/// that mixes `arch`'s own files with another builder's, confirming
+/// both show up when the master says yes to both.
+#[test]
+fn list_dir_shows_every_entry_the_master_allows() {
+    let (mut world, mut host, _root) = boot("list-dir-arch");
+    world
+        .call_file_efun(
+            "arch",
+            "write_file",
+            vec![Value::str("/builders/frodo/a.wf"), Value::str("a")],
+            &mut host,
+        )
+        .unwrap();
+    world
+        .call_file_efun(
+            "arch",
+            "write_file",
+            vec![Value::str("/builders/frodo/b.wf"), Value::str("b")],
+            &mut host,
+        )
+        .unwrap();
+    let entries = world
+        .list_dir("arch", "/builders/frodo", &mut host)
+        .unwrap()
+        .expect("arch may read anywhere per the test master policy");
+    assert_eq!(entries, vec!["a.wf".to_string(), "b.wf".to_string()]);
+}
+
+#[test]
+fn list_dir_reserved_principals_are_refused_outright() {
+    let (mut world, mut host, _root) = boot("list-dir-reserved");
+    for reserved in ["root", "mudlib", "staff:ops"] {
+        let err = world
+            .list_dir(reserved, "/builders/arch", &mut host)
+            .unwrap_err();
+        assert!(err.contains("reserved principal"), "{reserved}: {err}");
+    }
+}

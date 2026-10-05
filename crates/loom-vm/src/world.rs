@@ -2322,6 +2322,72 @@ impl World {
         .map_err(|e| e.report())
     }
 
+    /// `GET /api/v1/files/list?path=...` (OBI-180 M-FS-3): immediate
+    /// entries of a mudlib-absolute directory, filtered by `valid_read`.
+    /// `None` if the directory itself doesn't authorize for `uid` or
+    /// doesn't exist (M-FS-3: a listing you can't read looks exactly
+    /// like one that doesn't exist, same as `read_file`'s `Null`) --
+    /// otherwise each entry's bare name is *additionally* checked
+    /// against `valid_read` on its own full path and dropped if refused,
+    /// the same per-entry filtering `World::admin_list_objects` already
+    /// does for live objects (`RegistryHost::admin_valid_read`'s doc
+    /// comment).
+    ///
+    /// Deliberately goes through `admin_valid_read` rather than a new
+    /// LPC-visible `get_dir` efun: no new efun means no new
+    /// language-surface addition (`EFUNS` table, `driver_efun` dispatch,
+    /// `valid_efun` privilege class) for a feature that is really just a
+    /// driver-side read, exactly the same reasoning `admin_list_objects`/
+    /// `admin_object_vars` already apply.
+    pub fn list_dir(
+        &mut self,
+        uid: &str,
+        path: &str,
+        host: &mut dyn Host,
+    ) -> Result<Option<Vec<String>>, String> {
+        if crate::security::is_reserved_principal(uid) {
+            return Err(format!("`{uid}` is a reserved principal"));
+        }
+        let path = crate::security::normalize_file_path(path)?;
+        let sym = self.registry.syms.intern(uid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: sym,
+            euid: sym,
+        });
+        let acting = self.master_or_sentinel();
+        let root = self.root().to_path_buf();
+        self.exec(
+            host,
+            acting,
+            None,
+            None,
+            Some(guard),
+            None,
+            Some(sym),
+            move |h| {
+                if !h.admin_valid_read("get_dir", &path) {
+                    return Ok(None);
+                }
+                match crate::fileio::list_dir(&root, &path) {
+                    Ok(Some(entries)) => {
+                        let trimmed = path.trim_end_matches('/');
+                        let filtered: Vec<String> = entries
+                            .into_iter()
+                            .filter(|name| {
+                                let child = format!("{trimmed}/{name}");
+                                h.admin_valid_read("get_dir", &child)
+                            })
+                            .collect();
+                        Ok(Some(filtered))
+                    }
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(RtError::new(e)),
+                }
+            },
+        )
+        .map_err(|e| e.report())
+    }
+
     pub fn find_object(&self, name: &str) -> Option<ObjectId> {
         self.registry
             .names
