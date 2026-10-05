@@ -38,6 +38,14 @@ pub fn process_input(line: string) {
             let m = rows[0]["message"] ?? "?"
             send(self, $"{m}\n")
         }
+    } else if verb == "viaerrormessage" and len(words) == 3 {
+        // OBI-287 (M-ERR-1): same query as `errormessage`, but routed
+        // through `words[1]`'s `run` -- a command object stand-in
+        // (`self_object()` is that object while the efun runs, not the
+        // player) -- so the redaction tier has to come from the guard
+        // set, not `self_object()`'s own euid.
+        let m = load_object(words[1]).run(words[2])
+        send(self, $"{m}\n")
     } else {
         send(self, "What?\n")
     }

@@ -4992,11 +4992,39 @@ impl<'a> RegistryHost<'a> {
             .expect("checked above")
             .errors
             .snapshot(prefix.as_deref());
-        let caller_euid = self
-            .registry
-            .syms
-            .name(principal_of(self.registry, self.self_object()).euid)
-            .to_string();
+        // M-ERR-1 fix (OBI-287): the redaction tier is the caller's,
+        // decided off the guard set (`top_guard().euids()`) the same way
+        // `authorize` decides access -- not off `self_object()`'s own
+        // euid, which for a command object such as Warp's
+        // `/cmds/builder/errors` is the command object's, not the
+        // player's. Every euid on the stack must be T5 or higher (the
+        // minimum, so one low-tier frame anywhere -- e.g. builder code
+        // the player called into -- keeps the redaction), except the
+        // driver's lib principals: `root` (never stored in a `GuardSet`
+        // at all) and `mudlib` (the default owner of `/cmds/**`, `/std/**`
+        // and other lib code, D-S1.1; a reserved principal no account or
+        // workroom can take, D-S3.1). Mudlib code is not a caller with a
+        // tier of its own -- counting it as tier 0 would redact every
+        // T5 player who used a lib command, which is the bug -- and
+        // counting it as staff would be wrong too (a player body still
+        // running as `mudlib` before its post-login `seteuid` is no
+        // one's T5). So `mudlib` is skipped and the tier comes from the
+        // other euids on the stack. Only an empty guard set (an
+        // all-root stack) un-redacts. A stack whose only euids are
+        // `mudlib` has no caller with a tier, so it stays redacted
+        // (fail closed).
+        let guard = self.top_guard();
+        let min_caller_tier = if guard.is_empty() {
+            5
+        } else {
+            guard
+                .euids()
+                .map(|euid| self.registry.syms.name(euid).to_string())
+                .filter(|name| name != "mudlib")
+                .map(|name| self.euid_tier(&name))
+                .min()
+                .unwrap_or(0)
+        };
         let mut decided: HashMap<String, bool> = HashMap::new();
         let mut out = Vec::new();
         for row in rows {
@@ -5027,7 +5055,7 @@ impl<'a> RegistryHost<'a> {
             // principle, grant `/secure/foo` read access to someone
             // below T5 -- this redaction is a driver-enforced floor, not
             // conditioned on the master's own policy).
-            let message = if row.redacted && self.euid_tier(&caller_euid) < 5 {
+            let message = if row.redacted && min_caller_tier < 5 {
                 "<redacted>".to_string()
             } else {
                 row.message.clone()

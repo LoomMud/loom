@@ -260,3 +260,53 @@ fn a_secure_origins_message_is_redacted_below_t5_and_shown_at_t5() {
         assert_eq!(host.take(1), "random(): n must be > 0\n");
     });
 }
+
+/// OBI-287 (M-ERR-1 follow-up): `errors_efun`'s redaction floor used to
+/// come from `self_object()`'s own euid -- so a call routed through a
+/// lib command object (`/cmds/errors` here, `mudlib`-owned like Warp's
+/// `/cmds/builder/errors`) was floored at the command object's tier 0,
+/// redacting even a T5 caller. The tier now comes from the guard set:
+/// a T5 player through the command sees the message, a T4 player through
+/// the same path gets `<redacted>`, and a T5 player whose call passes
+/// through a non-staff builder's code (`/builders/bob`) also gets
+/// `<redacted>`, because the minimum tier on the stack decides.
+#[test]
+fn errors_redaction_tier_comes_from_the_callers_guard_set_not_the_command_object() {
+    on_world_thread(|| {
+        let root = fixture("errors_inbox");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = FakeHost::default();
+        world.connect(1, &mut host);
+        host.take(1);
+
+        world.input(1, "triggervault2", &mut host);
+        host.take(1);
+
+        world.set_roles_snapshot(std::sync::Arc::new(
+            loom_vm::RolesSnapshot::from_seed_json(
+                r#"{"staff": {"root-tester": 5, "junior-tester": 4}}"#,
+            )
+            .expect("seed parses"),
+        ));
+
+        // T5 through the mudlib-owned command object: real message.
+        world.input(1, "become root-tester", &mut host);
+        assert_eq!(host.take(1), "ok\n");
+        world.input(1, "viaerrormessage /cmds/errors /secure/vault2", &mut host);
+        assert_eq!(host.take(1), "random(): n must be > 0\n");
+
+        // T5, but through a tier-0 builder's code first: redacted.
+        world.input(
+            1,
+            "viaerrormessage /builders/bob/proxy /secure/vault2",
+            &mut host,
+        );
+        assert_eq!(host.take(1), "<redacted>\n");
+
+        // T4 through the same command object: redacted.
+        world.input(1, "become junior-tester", &mut host);
+        assert_eq!(host.take(1), "ok\n");
+        world.input(1, "viaerrormessage /cmds/errors /secure/vault2", &mut host);
+        assert_eq!(host.take(1), "<redacted>\n");
+    });
+}
