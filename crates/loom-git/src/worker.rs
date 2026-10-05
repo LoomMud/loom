@@ -1088,7 +1088,9 @@ fn report_post_merge(
     let env_name = config.env_name.clone();
     let new_live = new_live.to_string();
     let outcome = outcome.clone();
-    let deadline = Instant::now() + crate::report::REPORT_TOTAL_DEADLINE;
+    // Cutoff for *starting* calls; the whole pass ends by
+    // start + REPORT_TOTAL_DEADLINE (30s) even with one call in flight.
+    let deadline = crate::report::report_call_cutoff(Instant::now());
     let spawned = std::thread::Builder::new()
         .name("loom-git-report".to_string())
         .spawn(move || {
