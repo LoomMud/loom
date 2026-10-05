@@ -109,7 +109,26 @@ pub const MAX_UNIQUE_PRS: usize = 20;
 /// checks this before every network call and stops the rest of the pass
 /// (logged, not an error) once it's past -- a partial report is strictly
 /// better than an unbounded one, and the pass is best-effort already.
+///
+/// This is a *hard* wall-clock bound on the detached report thread, not
+/// just the cutoff for starting new calls: the deadline handed to
+/// [`resolve_pull_requests`]/[`report_recompile`] is
+/// `start + REPORT_TOTAL_DEADLINE - REPORT_MAX_IN_FLIGHT`, so the last
+/// call started before the cutoff still finishes (or times out) by
+/// `start + REPORT_TOTAL_DEADLINE`. See [`report_call_cutoff`].
 pub const REPORT_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Worst-case wall-clock for one [`ReportGitHub`] call against the real
+/// API: an installation-token mint plus the call itself, each capped by
+/// `UreqClient`'s 10s per-request timeout (`github::transport`).
+pub const REPORT_MAX_IN_FLIGHT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The instant after which a report pass started at `start` must not
+/// begin any further network call, so that the whole pass -- including
+/// a call already in flight -- ends by `start + REPORT_TOTAL_DEADLINE`.
+pub fn report_call_cutoff(start: std::time::Instant) -> std::time::Instant {
+    start + REPORT_TOTAL_DEADLINE.saturating_sub(REPORT_MAX_IN_FLIGHT)
+}
 
 /// Cap on list items (`recompiled`/`failures`) rendered into one comment
 /// body before truncating with a "... and N more" line -- GitHub rejects
@@ -439,6 +458,61 @@ mod tests {
     /// itself (see `worker.rs`'s `post_merge_report` tests for that).
     fn far_future_deadline() -> std::time::Instant {
         std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    // --- OBI-278: total-deadline enforcement --------------------------
+
+    #[test]
+    fn report_call_cutoff_leaves_room_for_one_in_flight_call() {
+        let start = std::time::Instant::now();
+        let cutoff = report_call_cutoff(start);
+        assert!(cutoff > start, "some budget must remain for real calls");
+        assert!(cutoff + REPORT_MAX_IN_FLIGHT <= start + REPORT_TOTAL_DEADLINE);
+    }
+
+    #[test]
+    fn past_deadline_makes_no_network_calls() {
+        let server = spawn_fake_github(|_, path, _| {
+            if path.contains("access_tokens") {
+                token_resp()
+            } else if path.ends_with("/pulls") {
+                (200, r#"[{"number":99}]"#.to_string())
+            } else {
+                (201, "{}".to_string())
+            }
+        });
+        let app = client(&server);
+        let past = std::time::Instant::now();
+        let commits = vec![
+            // Needs the commits-to-pulls fallback -> must be skipped.
+            MergedCommit {
+                sha: "deadbeef".to_string(),
+                subject: "Rebased commit, no PR marker".to_string(),
+            },
+            // Free subject parse still resolves; its comment must be skipped.
+            MergedCommit {
+                sha: "abc123".to_string(),
+                subject: "loom-git: thing (#42)".to_string(),
+            },
+        ];
+        let resolved = resolve_pull_requests(&app, "LoomMud", "loom", &commits, past);
+        assert_eq!(resolved[0].pr_number, None);
+        assert_eq!(resolved[1].pr_number, Some(42));
+        let results = report_recompile(
+            &app,
+            "LoomMud",
+            "loom",
+            "staging",
+            "cafef00d",
+            &commits,
+            &RecompileOutcome::default(),
+            past,
+        );
+        assert!(results.is_empty());
+        assert!(
+            server.requests.lock().unwrap().is_empty(),
+            "no HTTP request may be made once the deadline has passed"
+        );
     }
 
     // --- squash-subject extraction -----------------------------------
