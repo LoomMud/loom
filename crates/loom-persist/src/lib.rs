@@ -1470,7 +1470,7 @@ impl Persist {
     /// to 200 so a caller can never force an unbounded read of the whole
     /// table through this path.
     ///
-    /// Read-only: `loom_app` has `SELECT` on `audit_log` (0006 migration)
+    /// Read-only: `loom_app` has `SELECT` on `audit_log` (0007 migration)
     /// and nothing else, so this is the only operation this function (or
     /// any other `loom_app` code path) can perform against the table --
     /// there is no corresponding update/delete method because there is no
