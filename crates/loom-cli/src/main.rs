@@ -3005,6 +3005,33 @@ fn spawn_world_thread(
                                 });
                             let _ = reply.send(result);
                         }
+                        // OBI-233 (CTO review: "route it through the
+                        // world thread to interactive objects only"):
+                        // `text` is already sanitized/prefixed by
+                        // `loom_http::auth::AuthService::admin_broadcast`
+                        // -- this only fans it out, one `Host::send` per
+                        // session, to every connection `who_sessions`
+                        // reports an `account` for (i.e. past the login
+                        // prompt; see that method's doc comment for why
+                        // that's the driver's only available "logged in"
+                        // proxy). A connection still at the login/
+                        // creation prompt never sees it. `Host::send`'s
+                        // own backpressure (a slow client's full output
+                        // queue) already drops *that* client, never this
+                        // loop or the world thread.
+                        WorldQueryRequest::Broadcast { text, reply } => {
+                            let recipients: Vec<u64> = world
+                                .who_sessions()
+                                .into_iter()
+                                .filter(|s| s.account.is_some())
+                                .map(|s| s.conn_id)
+                                .collect();
+                            let count = recipients.len();
+                            for conn_id in recipients {
+                                host.send(conn_id, &text);
+                            }
+                            let _ = reply.send(Ok(count));
+                        }
                     }
                 }
             };

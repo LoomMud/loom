@@ -47,6 +47,7 @@ pub fn admin_router() -> Router<HttpState> {
         .route("/api/v1/admin/objects", get(list_objects))
         .route("/api/v1/admin/objects/{*rest}", get(object_vars))
         .route("/api/v1/admin/errors", get(errors))
+        .route("/api/v1/admin/broadcast", post(broadcast))
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +94,7 @@ fn admin_error_response(error: AdminError) -> (StatusCode, Json<ErrorResponse>) 
             error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable")
         }
         AdminError::NotFound => error_response(StatusCode::NOT_FOUND, "not_found"),
+        AdminError::BodyTooLarge => error_response(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large"),
     }
 }
 
@@ -450,6 +452,60 @@ async fn errors(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminBroadcastRequest {
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BroadcastResponse {
+    recipients: usize,
+}
+
+/// `POST /api/v1/admin/broadcast` (OBI-233, M-ADM-2/4/5): a server-wide
+/// staff message, delivered through the normal mudlib output path --
+/// `crate::admin_query::WorldAdminQuery::broadcast`, routed through the
+/// world thread to interactive sessions only (CTO review, OBI-233),
+/// never a direct write to `loom-net`'s connection table. Tier/step-up
+/// checks, the size cap, sanitization, and the driver-fixed
+/// `[Broadcast] ` prefix all live in `AuthService::admin_broadcast` --
+/// this handler only extracts the body and forwards it. `state.auth` or
+/// `state.world_query()` unset both answer `503`, same "optional, not
+/// wired" shape as every other admin/auth route. On success, the
+/// response body reports how many interactive sessions received it --
+/// `0` is a normal (not an error) answer when nobody is logged in.
+async fn broadcast(
+    State(state): State<HttpState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let Some(auth) = state.auth_service() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
+    };
+    let Some(claims) = bearer_claims(&headers, &state) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(query) = state.world_query() else {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response();
+    };
+
+    let request: AdminBroadcastRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "bad_request").into_response(),
+    };
+
+    let ctx = auth_context(&headers, Some(peer));
+    match auth
+        .admin_broadcast(&claims, &ctx, query, &request.text)
+        .await
+    {
+        Ok(recipients) => (StatusCode::OK, Json(BroadcastResponse { recipients })).into_response(),
+        Err(error) => admin_error_response(error).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::Request;
@@ -614,7 +670,17 @@ mod tests {
     /// also sees `/secure/master`), so the routing/gating tests below
     /// can tell "reached the world query and got a real filtered answer"
     /// apart from "never got that far".
-    struct FakeWorldQuery;
+    struct FakeWorldQuery {
+        broadcasts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Default for FakeWorldQuery {
+        fn default() -> Self {
+            FakeWorldQuery {
+                broadcasts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
 
     #[async_trait::async_trait]
     impl crate::admin_query::WorldAdminQuery for FakeWorldQuery {
@@ -708,6 +774,19 @@ mod tests {
                 .filter(|e| program_prefix.is_none_or(|p| e.program.starts_with(p)))
                 .collect())
         }
+
+        /// Captures the exact text [`crate::auth::AuthService::
+        /// admin_broadcast`] handed it (already sanitized and prefixed)
+        /// so tests can assert on it, and returns a fixed fake recipient
+        /// count (`2`) -- standing in for "the world thread fanned it
+        /// out to every interactive session".
+        async fn broadcast(
+            &self,
+            text: &str,
+        ) -> Result<usize, crate::admin_query::WorldQueryError> {
+            self.broadcasts.lock().unwrap().push(text.to_string());
+            Ok(2)
+        }
     }
 
     fn test_app() -> (axum::Router, AuthService, Dir) {
@@ -726,8 +805,60 @@ mod tests {
             loom_obs::PrometheusMetrics::new_unregistered(),
         )
         .with_auth(auth.clone())
-        .with_world_query(std::sync::Arc::new(FakeWorldQuery));
+        .with_world_query(std::sync::Arc::new(FakeWorldQuery::default()));
         (app(state), auth, dir)
+    }
+
+    /// Same as [`test_app`], but also returns a handle onto the exact
+    /// strings [`FakeWorldQuery::broadcast`] was called with -- the
+    /// broadcast route's delivery side, which `test_app`'s shared
+    /// `FakeWorldQuery` already answers (so the `200`/`recipients` wire
+    /// shape is identical), but these tests also need to inspect what
+    /// was actually "delivered".
+    fn test_app_with_broadcast_capture() -> (
+        axum::Router,
+        AuthService,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let keys = JwtKeys::single(
+            [7u8; 32],
+            "test-kid",
+            "https://build.loommud.com/",
+            jwt::AUDIENCE,
+        );
+        let auth = AuthService::new(std::sync::Arc::new(Dir::default()), keys);
+        let (ws_accept_tx, _ws_accept_rx) = tokio::sync::mpsc::channel(1);
+        let query = FakeWorldQuery::default();
+        let broadcasts = query.broadcasts.clone();
+        let state = HttpState::new(
+            ws_accept_tx,
+            loom_obs::Readiness::new(),
+            loom_obs::PrometheusMetrics::new_unregistered(),
+        )
+        .with_auth(auth.clone())
+        .with_world_query(std::sync::Arc::new(query));
+        (app(state), auth, broadcasts)
+    }
+
+    /// Same as [`test_app`], but with [`HttpState::with_world_query`]
+    /// deliberately left unset -- proves the broadcast route's (and
+    /// every world-query route's) `503` "not wired" path.
+    fn test_app_without_world_query() -> (axum::Router, AuthService) {
+        let keys = JwtKeys::single(
+            [7u8; 32],
+            "test-kid",
+            "https://build.loommud.com/",
+            jwt::AUDIENCE,
+        );
+        let auth = AuthService::new(std::sync::Arc::new(Dir::default()), keys);
+        let (ws_accept_tx, _ws_accept_rx) = tokio::sync::mpsc::channel(1);
+        let state = HttpState::new(
+            ws_accept_tx,
+            loom_obs::Readiness::new(),
+            loom_obs::PrometheusMetrics::new_unregistered(),
+        )
+        .with_auth(auth.clone());
+        (app(state), auth)
     }
 
     async fn access_token(auth: &AuthService, sub: &str, tier: i16, mfa_at: Option<i64>) -> String {
@@ -1263,5 +1394,172 @@ mod tests {
         let request = with_peer(request);
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn broadcast_request(token: &str, text: &str) -> Request<axum::body::Body> {
+        with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/broadcast")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"text": text}).to_string(),
+                ))
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn broadcast_is_503_when_world_query_is_not_wired() {
+        let (app, auth) = test_app_without_world_query();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "root", 5, Some(now)).await;
+        let response = app
+            .oneshot(broadcast_request(&token, "server restart in 5m"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn broadcast_without_bearer_is_401() {
+        let (app, _auth, _broadcasts) = test_app_with_broadcast_capture();
+        let request = with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/broadcast")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"text": "hi"}).to_string(),
+                ))
+                .unwrap(),
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn broadcast_below_tier_4_is_forbidden() {
+        let (app, auth, _broadcasts) = test_app_with_broadcast_capture();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        // Tier 3 is enough for a role change (`admin_set_tier`'s floor),
+        // but not for broadcast.
+        let token = access_token(&auth, "lead", 3, Some(now)).await;
+        let response = app
+            .oneshot(broadcast_request(&token, "server restart"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn broadcast_at_tier_4_without_step_up_is_forbidden() {
+        let (app, auth, _broadcasts) = test_app_with_broadcast_capture();
+        // `mfa_at: None` -- never stepped up.
+        let token = access_token(&auth, "root", 4, None).await;
+        let response = app
+            .oneshot(broadcast_request(&token, "server restart"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn broadcast_with_a_body_over_1kib_is_rejected() {
+        let (app, auth, _broadcasts) = test_app_with_broadcast_capture();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "root", 5, Some(now)).await;
+        let oversized = "a".repeat(1025);
+        let response = app
+            .oneshot(broadcast_request(&token, &oversized))
+            .await
+            .unwrap();
+        assert!(
+            response.status() == StatusCode::PAYLOAD_TOO_LARGE
+                || response.status() == StatusCode::BAD_REQUEST,
+            "expected 413 or 400, got {}",
+            response.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_that_sanitizes_to_nothing_is_400() {
+        let (app, auth, _broadcasts) = test_app_with_broadcast_capture();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "root", 5, Some(now)).await;
+        // Entirely C0 control characters: sanitizes down to the empty
+        // string.
+        let response = app
+            .oneshot(broadcast_request(&token, "\x07\x1b\x01"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Integration/smoke: a successful broadcast reaches the normal
+    /// mudlib output path -- `crate::admin_query::WorldAdminQuery::
+    /// broadcast` -- with the sanitized text, a driver-fixed
+    /// `[Broadcast] ` prefix on every line (CTO review, OBI-233), and
+    /// exactly one trailing `\n` (CTO review, first pass, must-fix 1) --
+    /// and the response reports the fake recipient count
+    /// [`FakeWorldQuery::broadcast`] returns, not a bare `204` a caller
+    /// could mistake for "delivered" even if nothing were wired
+    /// (must-fix 2).
+    #[tokio::test]
+    async fn broadcast_succeeds_for_t4_with_step_up_and_reaches_world_query() {
+        let (app, auth, broadcasts) = test_app_with_broadcast_capture();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "root", 4, Some(now)).await;
+        let response = app
+            .oneshot(broadcast_request(&token, "server restart in 5m\x07"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["recipients"], 2);
+
+        let delivered = broadcasts.lock().unwrap().clone();
+        assert_eq!(delivered, vec!["[Broadcast] server restart in 5m\n"]);
+    }
+
+    /// A multi-line body gets the prefix on *every* line, and the
+    /// sanitizer strips bidi/zero-width characters (CTO review, second
+    /// pass) in addition to C0/C1 controls.
+    #[tokio::test]
+    async fn broadcast_prefixes_every_line_and_strips_bidi_and_zero_width() {
+        let (app, auth, broadcasts) = test_app_with_broadcast_capture();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "root", 4, Some(now)).await;
+        let text = "line one\u{202E}\nline\u{200B} two\u{FEFF}";
+        let response = app.oneshot(broadcast_request(&token, text)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let delivered = broadcasts.lock().unwrap().clone();
+        assert_eq!(
+            delivered,
+            vec!["[Broadcast] line one\n[Broadcast] line two\n"]
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_with_an_unknown_field_is_400() {
+        let (app, auth, _broadcasts) = test_app_with_broadcast_capture();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "root", 5, Some(now)).await;
+        let request = with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/admin/broadcast")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"text": "hi", "actor": "root"}).to_string(),
+                ))
+                .unwrap(),
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
