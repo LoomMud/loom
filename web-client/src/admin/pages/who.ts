@@ -5,10 +5,12 @@ import type { AdminApi } from "../api.js";
 import { describeError } from "../api.js";
 import { clear, el, errorBanner, table } from "../dom.js";
 
-/** `GET /api/v1/admin/who` (OBI-234): a live-connection list, no tier
- * floor beyond "a staff bearer token at all" (M-ADM-3: the response
- * shape itself never carries an email or an IP -- nothing to render
- * here even if a page wanted to). */
+/** `GET /api/v1/admin/who` (OBI-234): tier >= 2 (CTO review on PR #98:
+ * a plain T1/builder token can no longer enumerate every connected
+ * account). M-ADM-3: the response shape itself never carries an email
+ * or an IP -- nothing to render here even if a page wanted to. A 403
+ * for a sub-T2 caller renders through the same generic error banner as
+ * every other admin page. */
 export async function renderWhoPage(root: HTMLElement, api: AdminApi): Promise<void> {
   clear(root);
   root.append(el("h1", {}, ["Who's online"]));

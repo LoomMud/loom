@@ -185,6 +185,12 @@ pub const ADMIN_ROLE_CHANGE_MIN_TIER: i16 = 3;
 /// as [`ADMIN_ROLE_CHANGE_MIN_TIER`] for role changes (UX, not the
 /// security boundary).
 pub const OBJECT_LIST_MIN_TIER: i16 = 3;
+/// Tier floor for `GET /api/v1/admin/who` (OBI-234, CTO review on PR
+/// #98): the scope note doesn't set a floor for `who`, only M-ADM-3's
+/// response-shape rule. T2+ (not T1/builder) is the explicit, more
+/// conservative default the review asked for -- a plain builder token
+/// can no longer enumerate every connected account.
+pub const WHO_MIN_TIER: i16 = 2;
 /// Tier floor for `GET /api/v1/admin/objects/:path/vars` (OBI-234 scope:
 /// "T4, audited per access").
 pub const OBJECT_VARS_MIN_TIER: i16 = 4;
@@ -938,11 +944,29 @@ impl AuthService {
             .await;
             return Err(AdminError::Forbidden);
         }
-        let rows = self
-            .directory
-            .admin_audit_recent(limit, before_id)
-            .await
-            .map_err(AdminError::from)?;
+        let rows = match self.directory.admin_audit_recent(limit, before_id).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                let admin_err = AdminError::from(err);
+                let reason_detail = match &admin_err {
+                    AdminError::Rejected(message) => {
+                        format!("limit={limit} before_id={before_id:?} reason={message}")
+                    }
+                    _ => format!(
+                        "limit={limit} before_id={before_id:?} reason=directory_unavailable"
+                    ),
+                };
+                self.audit(
+                    "admin.audit.view",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(reason_detail),
+                )
+                .await;
+                return Err(admin_err);
+            }
+        };
         self.audit(
             "admin.audit.view",
             Some(claims.sub.clone()),
@@ -954,17 +978,31 @@ impl AuthService {
         Ok(rows)
     }
 
-    /// `GET /api/v1/admin/who` (OBI-234): no tier floor beyond "is a
-    /// staff bearer token at all" -- the scope note doesn't gate `who`
-    /// behind a tier, only behind M-ADM-3's response-shape rule (no
-    /// email/IP, enforced by [`crate::admin_query::WhoEntry`] simply not
-    /// having those fields). Still audited either way (M-ADM-4).
+    /// `GET /api/v1/admin/who` (OBI-234, CTO review on PR #98): tier >= 2
+    /// ([`WHO_MIN_TIER`]) -- a T1 (builder) token alone no longer lists
+    /// every connected account. The scope note didn't set a floor;
+    /// picking one explicitly (over leaving `who` open to any staff
+    /// token) is the more conservative default the review asked for.
+    /// Still audited either way (M-ADM-4), and M-ADM-3 (no email/IP) is
+    /// enforced by [`crate::admin_query::WhoEntry`] simply not having
+    /// those fields, independent of this floor.
     pub async fn admin_who(
         &self,
         claims: &AccessClaims,
         ctx: &AuthContext,
         query: &dyn crate::admin_query::WorldAdminQuery,
     ) -> Result<Vec<crate::admin_query::WhoEntry>, AdminError> {
+        if claims.tier < WHO_MIN_TIER {
+            self.audit(
+                "admin.who",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some("reason=forbidden".to_string()),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
         match query.who().await {
             Ok(rows) => {
                 self.audit(
@@ -1066,7 +1104,7 @@ impl AuthService {
             .await;
             return Err(AdminError::Forbidden);
         }
-        if path.starts_with("/secure/") && claims.tier < SECURE_VARS_MIN_TIER {
+        if is_or_might_be_secure(path) && claims.tier < SECURE_VARS_MIN_TIER {
             self.audit(
                 "admin.objects.vars",
                 Some(claims.sub.clone()),
@@ -1208,6 +1246,33 @@ fn totp_gate_detail(error: &AuthError) -> &'static str {
         AuthError::InvalidCredentials => "staff_row_missing",
         _ => "totp_gate_failed",
     }
+}
+
+/// Does `path` name, or might it after normalization name, something
+/// under `/secure/` (OBI-234, CTO review on PR #98)? This is only the
+/// HTTP edge's T5 floor for [`AuthService::admin_object_vars`] -- the
+/// real gate is `valid_read` on the world side, which resolves the path
+/// for real. This helper exists so the edge floor isn't trivially
+/// bypassed by an unnormalized path (`//secure/x`, `/./secure/x`) while
+/// `valid_read` still (correctly) treats it as `/secure/x`; it fails
+/// *closed*: anything it can't confidently normalize (a `..` segment) is
+/// treated as "might be secure", never waved through as "definitely
+/// not".
+///
+/// Splits on `/`, drops empty segments (collapsing repeated slashes) and
+/// `.` segments; returns `true` if a `..` segment is seen (can't resolve
+/// without knowing the real filesystem, so don't try -- refuse to rule
+/// out `/secure/`) or if the first remaining segment is `"secure"`.
+fn is_or_might_be_secure(path: &str) -> bool {
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => return true,
+            "secure" => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The rate limiter's account key for a resolved staff uid (OBI-204): the

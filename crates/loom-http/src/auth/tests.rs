@@ -39,6 +39,10 @@ struct FakeDirectoryInner {
     /// reached the directory (OBI-185): used to prove a forbidden/
     /// step-up-refused call never gets this far.
     admin_set_tier_calls: u32,
+    /// When `true`, [`StaffDirectory::admin_audit_recent`] fails outright
+    /// (CTO review on PR #98: proving the deny path is audited too, not
+    /// just the tier-floor refusal).
+    fail_admin_audit: bool,
 }
 
 #[derive(Default, Clone)]
@@ -74,6 +78,13 @@ impl FakeDirectory {
 
     fn set_tier(&self, uid: &str, tier: i16) {
         self.inner.lock().unwrap().staff.get_mut(uid).unwrap().tier = tier;
+    }
+
+    /// Make the next (and every subsequent) [`StaffDirectory::
+    /// admin_audit_recent`] call fail with
+    /// [`AdminDirectoryError::Unavailable`] (CTO review on PR #98).
+    fn fail_admin_audit(&self) {
+        self.inner.lock().unwrap().fail_admin_audit = true;
     }
 
     fn link_github(&self, github_id: i64, uid: &str) {
@@ -371,6 +382,9 @@ impl StaffDirectory for FakeDirectory {
         before_id: Option<i64>,
     ) -> Result<Vec<AdminAuditEntry>, AdminDirectoryError> {
         let inner = self.inner.lock().unwrap();
+        if inner.fail_admin_audit {
+            return Err(AdminDirectoryError::Unavailable);
+        }
         let mut rows: Vec<AdminAuditEntry> = inner
             .audit_events
             .iter()
@@ -1474,5 +1488,52 @@ async fn admin_audit_recent_requires_tier_3_and_is_itself_audited() {
     assert!(
         events.iter().any(|e| e.kind == "admin.audit.view"),
         "the audit view itself must be audited: {events:?}"
+    );
+}
+
+/// M-ADM-4 (CTO review on PR #98): a directory failure on the audit view
+/// itself is audited too, not just the tier-floor refusal -- every other
+/// admin route's deny path (e.g. `admin_set_tier`'s `Rejected`/
+/// `DirectoryUnavailable`) already does this; `admin_audit_recent` had
+/// been the one exception.
+#[tokio::test]
+async fn admin_audit_recent_directory_failure_is_audited() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("lead", "pw", 3);
+    directory.fail_admin_audit();
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("lead", 3, Some(now().unix_timestamp()));
+    let result = service.admin_audit_recent(&claims, &ctx(), 10, None).await;
+    assert_eq!(result.unwrap_err(), AdminError::DirectoryUnavailable);
+
+    let events = directory.audit_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "admin.audit.view" && e.verdict == "deny"),
+        "a directory failure on the audit view must still be audited: {events:?}"
+    );
+}
+
+/// (CTO review on PR #98): the `/secure/` T5 floor for `admin_object_vars`
+/// is a raw string check against an un-normalized path -- `valid_read`
+/// on the world side is the real gate (it resolves the path for real),
+/// so this is defense in depth only, but it should still fail *closed*
+/// against the obvious bypass attempts rather than waving them through
+/// as "definitely not /secure".
+#[test]
+fn is_or_might_be_secure_normalizes_and_fails_closed() {
+    assert!(is_or_might_be_secure("/secure/master"));
+    assert!(is_or_might_be_secure("//secure/master"), "repeated slashes");
+    assert!(is_or_might_be_secure("/./secure/master"), "a . segment");
+    assert!(
+        is_or_might_be_secure("/../secure/master"),
+        "a .. segment must fail closed, never be waved through"
+    );
+    assert!(!is_or_might_be_secure("/std/room"));
+    assert!(
+        !is_or_might_be_secure("/securex/room"),
+        "prefix, not a segment"
     );
 }

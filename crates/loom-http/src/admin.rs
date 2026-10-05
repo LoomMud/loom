@@ -868,7 +868,7 @@ mod tests {
     async fn who_response_never_includes_email_or_ip() {
         let (app, auth, dir) = test_app();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let token = access_token(&auth, "apprentice", 1, Some(now)).await;
+        let token = access_token(&auth, "builder", 2, Some(now)).await;
         let request = Request::builder()
             .method("GET")
             .uri("/api/v1/admin/who")
@@ -913,6 +913,28 @@ mod tests {
         let request = with_peer(request);
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn who_below_tier_2_is_forbidden() {
+        let (app, auth, dir) = test_app();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, "apprentice", 1, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/v1/admin/who")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let request = with_peer(request);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let audits = dir.audits.lock().unwrap();
+        assert!(
+            audits
+                .iter()
+                .any(|e| e.kind == "admin.who" && e.verdict == "deny")
+        );
     }
 
     #[tokio::test]
