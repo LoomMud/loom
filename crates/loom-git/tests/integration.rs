@@ -982,6 +982,12 @@ mod post_merge_report {
     struct FakeGitHub {
         addr: String,
         comments: Arc<Mutex<Vec<(u64, String)>>>,
+        /// Set once the fake server has actually served the forced 503
+        /// (OBI-278 review item 2) -- exposed so
+        /// `github_5xx_during_report_does_not_fail_sync_main` can assert
+        /// the 503 really happened, not just that the test ran without
+        /// hanging.
+        failed_once: Arc<std::sync::atomic::AtomicBool>,
     }
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1025,6 +1031,7 @@ mod post_merge_report {
         let comments = Arc::new(Mutex::new(Vec::new()));
         let comments_clone = comments.clone();
         let failed_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed_once_handle = failed_once.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = match stream {
@@ -1081,7 +1088,11 @@ mod post_merge_report {
                 let _ = stream.write_all(resp_body.as_bytes());
             }
         });
-        FakeGitHub { addr, comments }
+        FakeGitHub {
+            addr,
+            comments,
+            failed_once: failed_once_handle,
+        }
     }
 
     // Shared throwaway test fixture (see `loom_git`'s own jwt test module
@@ -1195,7 +1206,54 @@ mod post_merge_report {
                     pr_opener: Box::new(UnusedPrOpener),
                     owner: "LoomMud".to_string(),
                     repo: "warp".to_string(),
-                    report_client: Some(Box::new(ReportAdapter(client))),
+                    report_client: Some(Arc::new(ReportAdapter(client))),
+                }),
+            },
+        )
+        .expect("spawn with an https:// remote_url and a TokenProvider must succeed");
+        (handle, calls)
+    }
+
+    /// Same as [`spawn_reporting_worker`], but with the push/fetch
+    /// `TokenProvider` and the post-merge `ReportGitHub` pointed at two
+    /// *different* fake servers -- needed when a test wants one of them
+    /// (typically the report side) to be slow without that also
+    /// stalling every ordinary tick's token refresh, which is unrelated
+    /// to what the test is exercising (OBI-278).
+    fn spawn_reporting_worker_split_servers(
+        fx: &Fixture,
+        token_server: &FakeGitHub,
+        report_server: &FakeGitHub,
+        env: &str,
+        upgraded_instances: usize,
+    ) -> (GitWorkerHandle, Arc<Mutex<Vec<RecompileCall>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let host = FixedInstancesHost {
+            calls: calls.clone(),
+            upgraded_instances,
+        };
+        let mut config = GitConfig::new(fx.git_dir(), fx.work_tree(), "origin", env);
+        config.commit_coalesce = Duration::from_millis(10);
+        config.push_debounce = Duration::from_millis(10);
+        config.sync_poll = Duration::from_secs(3600); // only via kick() in tests
+        config.tick = Duration::from_millis(10);
+        config.remote_url = "https://github.com/example/warp-mudlib.git".to_string();
+        let token_client = github_client(token_server);
+        let report_client = github_client(report_server);
+        let handle = GitWorker::spawn_with_propose(
+            config,
+            Some(Box::new(TokenAdapter(token_client))),
+            Box::new(host),
+            Box::new(RecordingAudit::default()),
+            ProposeConfig {
+                authorizer: Box::new(loom_git::AllowAllAuthorizer),
+                quota: Box::new(loom_git::InMemoryQuota::new()),
+                limits: loom_git::ProposeLimits::default(),
+                github: Some(ProposeGitHubConfig {
+                    pr_opener: Box::new(UnusedPrOpener),
+                    owner: "LoomMud".to_string(),
+                    repo: "warp".to_string(),
+                    report_client: Some(Arc::new(ReportAdapter(report_client))),
                 }),
             },
         )
@@ -1328,6 +1386,123 @@ mod post_merge_report {
         wait_for(
             || fx.work_tree().join("hall.wf").exists(),
             "the fast-forwarded work tree to contain the new file regardless of the report outcome",
+        );
+
+        // OBI-278 review item 2: assert the forced 503 was actually
+        // served, not just that the test happened to pass without
+        // hitting it (the report runs on a detached thread -- see
+        // `report_post_merge` -- so it can lag behind the fast-forward
+        // asserted above).
+        wait_for(
+            || server.failed_once.load(std::sync::atomic::Ordering::SeqCst),
+            "the fake GitHub server to have actually served the forced 503 for the comment attempt",
+        );
+        assert!(
+            server.comments.lock().unwrap().is_empty(),
+            "a single-attempt comment that got a 503 must not also show up as posted"
+        );
+
+        handle.shutdown();
+    }
+
+    /// Acceptance (OBI-278): a GitHub that *doesn't* error, just sleeps
+    /// past `UreqClient`'s own per-call timeout, must not stall
+    /// `SyncMain` -- the report runs on a detached thread, so the sync
+    /// pass (fast-forward + recompile) finishes on its own schedule
+    /// regardless of how long the stalled report thread eventually takes
+    /// to give up.
+    ///
+    /// Bound asserted here: the whole test -- `handle.kick()` through the
+    /// fast-forwarded work tree showing up -- finishes in well under
+    /// `crate::report::REPORT_TOTAL_DEADLINE` (30s), let alone the
+    /// several minutes a synchronous report blocked on a hung GitHub
+    /// could have taken (`UreqClient`'s 10s timeout doesn't even apply
+    /// here, since nothing ever responds at all).
+    #[test]
+    fn slow_github_during_report_does_not_stall_sync_main() {
+        let fx = setup();
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connected_clone = connected.clone();
+        // A listener that accepts a connection, then sleeps *past*
+        // `UreqClient`'s own 10s per-call timeout before ever responding
+        // -- a fake GitHub that is merely very slow, not one that hangs
+        // forever, so this directly exercises the per-call timeout path
+        // the issue describes rather than relying on a connection reset.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                connected_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_secs(12));
+                // The client (UreqClient, 10s timeout) has almost
+                // certainly already given up and closed its side by
+                // now -- this write is best-effort and its result
+                // doesn't matter either way.
+                drop(stream);
+            }
+        });
+        let server = FakeGitHub {
+            addr,
+            comments: Arc::new(Mutex::new(Vec::new())),
+            failed_once: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        // A separate, fast, fake GitHub for the push/fetch
+        // `TokenProvider` side -- every tick's token refresh
+        // (`resolve_token`) must keep working at its ordinary pace; it
+        // is unrelated to the slow report path this test exercises.
+        let token_server = spawn_fake_github(false);
+        let (handle, calls) =
+            spawn_reporting_worker_split_servers(&fx, &token_server, &server, "test", 1);
+
+        handle.barrier();
+        std::thread::sleep(Duration::from_millis(100));
+
+        merge_a_pr_into_main(&fx, "reviewer-clone-report-hang", 9);
+
+        let started = std::time::Instant::now();
+        handle.kick();
+        wait_for(
+            || !calls.lock().unwrap().is_empty(),
+            "recompile_set to be called even though GitHub is about to stall answering the report",
+        );
+        wait_for(
+            || fx.work_tree().join("hall.wf").exists(),
+            "the fast-forwarded work tree to contain the new file regardless of the stalled report",
+        );
+        let sync_elapsed = started.elapsed();
+        // Bound #1: `SyncMain` itself (fast-forward + recompile) is
+        // never blocked on the report at all -- it is observed complete
+        // in well under a second in practice; 5s gives ample CI margin
+        // while still being nowhere near the "minutes" a synchronous
+        // report over a slow GitHub could have taken.
+        assert!(
+            sync_elapsed < Duration::from_secs(5),
+            "SyncMain (fast-forward + recompile) must not be stalled by a slow GitHub report \
+             call, took {sync_elapsed:?}"
+        );
+
+        // Bound #2: the detached report thread (`report_post_merge`)
+        // really was dispatched, not silently skipped -- its outbound
+        // HTTP call reaching the (slow) fake GitHub shows up almost
+        // immediately too, independent of the git-worker thread's own
+        // pace. From there, `UreqClient`'s existing 10s per-call timeout
+        // bounds how long that one in-flight call can run, comfortably
+        // inside `report::REPORT_TOTAL_DEADLINE`'s 30s total ceiling for
+        // the whole pass -- not the open-ended "stall for minutes" this
+        // ticket started from.
+        wait_for(
+            || connected.load(std::sync::atomic::Ordering::SeqCst),
+            "the detached report thread to have reached out to the (slow) fake GitHub",
+        );
+        let total_elapsed = started.elapsed();
+        assert!(
+            total_elapsed < Duration::from_secs(5),
+            "dispatching the report's HTTP call must also happen promptly, not after the \
+             git-worker thread's own work; took {total_elapsed:?}"
         );
 
         handle.shutdown();
