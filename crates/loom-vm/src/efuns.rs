@@ -207,6 +207,32 @@ pub fn static_name(name: &str) -> Option<&'static str> {
     EFUNS.iter().find(|(n, ..)| *n == name).map(|(n, ..)| *n)
 }
 
+/// Driver-internal `authorize` call sites that are not a player-callable
+/// efun at all, but still want a real (non-`"?"`) name in the audit
+/// trail's `kind` field -- `admin_query` (OBI-279, the CTO review
+/// follow-up to OBI-237 PR #102, non-blocking note 2) is the only one so
+/// far: `bcvm::registry::RegistryHost::admin_valid_read` calls
+/// `authorize("admin_query", ...)` for the HTTP admin-query world-thread
+/// side (`World::admin_list_objects`/`admin_object_vars`/`admin_errors`),
+/// which has no registered efun of that name to resolve (deliberately:
+/// it must never become player-callable). Kept separate from [`EFUNS`]
+/// itself so `admin_query` never gains arity/privilege/tick-cost
+/// metadata, never shows up in `docs/efuns.md`, and never needs a
+/// matching `loom_compiler::efuns` entry for `efun_table_matches_vm` to
+/// agree with.
+const NON_EFUN_AUDIT_KINDS: &[&str] = &["admin_query"];
+
+/// The audit-trail `kind` name for `authorize`'s `efun` argument: the
+/// real efun name if `name` is one ([`static_name`]), else the matching
+/// [`NON_EFUN_AUDIT_KINDS`] entry, else `"?"` (an unrecognized name,
+/// which should not happen from any call site in this crate -- both
+/// sources are exhaustive over every `authorize` caller).
+pub fn audit_kind_name(name: &str) -> &'static str {
+    static_name(name)
+        .or_else(|| NON_EFUN_AUDIT_KINDS.iter().find(|n| **n == name).copied())
+        .unwrap_or("?")
+}
+
 /// The privilege class of efun `name`, if it exists.
 pub fn privilege(name: &str) -> Option<Privilege> {
     EFUNS
@@ -295,6 +321,18 @@ mod tests {
         for p in [Privilege::P1, Privilege::P2, Privilege::P3, Privilege::P4] {
             assert!(p.gated());
         }
+    }
+
+    /// OBI-279: `admin_query` resolves to its own name, not `"?"`, even
+    /// though it is not (and must never become) a registered efun.
+    #[test]
+    fn admin_query_is_a_known_non_efun_audit_kind() {
+        assert!(static_name("admin_query").is_none());
+        assert_eq!(audit_kind_name("admin_query"), "admin_query");
+        assert_eq!(audit_kind_name("not_a_real_name_at_all"), "?");
+        // A real efun still resolves through `static_name`, not the
+        // non-efun list.
+        assert_eq!(audit_kind_name("read_file"), "read_file");
     }
 
     /// Keeps `docs/efuns.md` honest: run with `UPDATE_EFUNS_DOC=1` after

@@ -89,7 +89,9 @@ fn list_objects_is_filtered_by_the_real_valid_read_not_a_stand_in() {
         // `admin_list_objects` itself before `valid_read` is ever asked,
         // so it can no longer stand in for "a caller `valid_read`
         // allows").
-        let as_auditor = world.admin_list_objects("auditor", 5, &mut host);
+        let as_auditor = world
+            .admin_list_objects("auditor", 5, &mut host)
+            .expect("no budget exhaustion in this fixture");
         assert!(as_auditor.iter().any(|o| o.path == item_path));
         assert!(
             as_auditor.iter().any(|o| o.path == vault_path),
@@ -98,7 +100,9 @@ fn list_objects_is_filtered_by_the_real_valid_read_not_a_stand_in() {
 
         // Any other euid actually goes through `secure/master.wf`'s
         // `valid_read`, which denies `/std/vault` specifically.
-        let as_guest = world.admin_list_objects("guest", 0, &mut host);
+        let as_guest = world
+            .admin_list_objects("guest", 0, &mut host)
+            .expect("no budget exhaustion in this fixture");
         assert!(
             as_guest.iter().any(|o| o.path == item_path),
             "a readable program's objects are still listed"
@@ -124,6 +128,7 @@ fn object_vars_renders_real_state_once_valid_read_passes() {
 
         let vars = world
             .admin_object_vars("guest", 0, &item_path, &mut host)
+            .expect("no budget exhaustion in this fixture")
             .expect("readable program");
         assert_eq!(vars.path, item_path);
         let count = vars.vars.iter().find(|v| v.name == "count").expect("count");
@@ -152,11 +157,13 @@ fn object_vars_a_valid_read_refusal_and_an_unknown_path_are_both_not_found() {
         assert!(
             world
                 .admin_object_vars("guest", 0, &vault_path, &mut host)
+                .expect("no budget exhaustion in this fixture")
                 .is_none()
         );
         assert!(
             world
                 .admin_object_vars("guest", 0, "/std/does_not_exist#1", &mut host)
+                .expect("no budget exhaustion in this fixture")
                 .is_none()
         );
 
@@ -166,6 +173,7 @@ fn object_vars_a_valid_read_refusal_and_an_unknown_path_are_both_not_found() {
         // `valid_read` is ever asked).
         let vars = world
             .admin_object_vars("auditor", 5, &vault_path, &mut host)
+            .expect("no budget exhaustion in this fixture")
             .expect("auditor can read /std/vault");
         let secret = vars
             .vars
@@ -208,10 +216,13 @@ fn a_flood_of_admin_queries_never_stalls_world_ticks() {
         // worth of draining -- the exact shape a flooding HTTP client
         // produces once its own requests start queueing.
         for _ in 0..5_000 {
-            let objects = world.admin_list_objects("guest", 0, &mut host);
+            let objects = world
+                .admin_list_objects("guest", 0, &mut host)
+                .expect("no budget exhaustion in this fixture");
             assert!(objects.iter().any(|o| o.path == item_path));
             let vars = world
                 .admin_object_vars("guest", 0, &item_path, &mut host)
+                .expect("no budget exhaustion in this fixture")
                 .expect("readable");
             assert!(!vars.vars.is_empty());
         }
@@ -250,7 +261,9 @@ fn admin_list_objects_refuses_a_reserved_principal_as_caller_euid() {
         let item_path = host.take(1).trim().to_string();
 
         for reserved in ["root", "mudlib", "domain:shire"] {
-            let objects = world.admin_list_objects(reserved, 5, &mut host);
+            let objects = world
+                .admin_list_objects(reserved, 5, &mut host)
+                .expect("a reserved principal is refused, never a budget error");
             assert!(
                 objects.is_empty(),
                 "caller_euid={reserved:?} must not see anything, got {objects:?}"
@@ -259,7 +272,9 @@ fn admin_list_objects_refuses_a_reserved_principal_as_caller_euid() {
 
         // Sanity: a non-reserved euid still sees the readable object (the
         // guard above isn't just denying everything unconditionally).
-        let as_guest = world.admin_list_objects("guest", 5, &mut host);
+        let as_guest = world
+            .admin_list_objects("guest", 5, &mut host)
+            .expect("no budget exhaustion in this fixture");
         assert!(as_guest.iter().any(|o| o.path == item_path));
     });
 }
@@ -280,6 +295,7 @@ fn admin_object_vars_refuses_a_reserved_principal_as_caller_euid() {
             assert!(
                 world
                     .admin_object_vars(reserved, 5, &item_path, &mut host)
+                    .expect("a reserved principal is refused, never a budget error")
                     .is_none(),
                 "caller_euid={reserved:?} must not read {item_path}"
             );
@@ -289,6 +305,7 @@ fn admin_object_vars_refuses_a_reserved_principal_as_caller_euid() {
         assert!(
             world
                 .admin_object_vars("guest", 5, &item_path, &mut host)
+                .expect("no budget exhaustion in this fixture")
                 .is_some()
         );
     });

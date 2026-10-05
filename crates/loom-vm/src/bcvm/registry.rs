@@ -3433,7 +3433,12 @@ impl<'a> RegistryHost<'a> {
     /// `true` for **every** euid in it. Fails closed: no master, no apply,
     /// an error or a non-bool result all deny. Audited either way.
     fn authorize(&mut self, efun: &str, class: Privilege, op: Operation<'_>) -> R<()> {
-        let efun = crate::efuns::static_name(efun).unwrap_or("?");
+        // OBI-279 (CTO review, PR #102, non-blocking note 2):
+        // `audit_kind_name` resolves both a registered efun name and the
+        // small set of driver-internal, never-player-callable call sites
+        // (`"admin_query"`) that still want a real audit `kind`, not the
+        // `"?"` fallback `static_name` alone would give the latter.
+        let efun = crate::efuns::audit_kind_name(efun);
         let guard = self.top_guard().clone();
         let caller = self.self_object();
         let mut denied_by = None;
@@ -3506,13 +3511,104 @@ impl<'a> RegistryHost<'a> {
     /// carrying the HTTP-authenticated staff account's own euid, see
     /// their doc comments). The `"admin_query"` name passed to
     /// `authorize` does not match any registered efun (never
-    /// player-callable), so it is recorded in the audit trail's `kind`
-    /// field as `"?"` -- a cosmetic gap (flagged for CTO review), not a
-    /// security one: the actual allow/deny decision and the audit
-    /// record's other fields (euid, operation, verdict) are all real.
-    pub(crate) fn admin_valid_read(&mut self, op: &'static str, path: &str) -> bool {
-        self.authorize("admin_query", Privilege::P1, Operation::Read { path, op })
-            .is_ok()
+    /// player-callable), but is a recognized [`crate::efuns::
+    /// NON_EFUN_AUDIT_KINDS`] entry (OBI-279, CTO review of PR #102,
+    /// non-blocking note 2), so it is still recorded in the audit
+    /// trail's `kind` field as `"admin_query"`, not `"?"` -- the actual
+    /// allow/deny decision and the audit record's other fields (euid,
+    /// operation, verdict) were always real; only the `kind` label was
+    /// the gap, and it's now fixed.
+    ///
+    /// CTO review (OBI-279, follow-up to PR #102, non-blocking note 1):
+    /// this is **not** a thin call to [`Self::authorize`] -- `authorize`
+    /// fails closed by design (spec: an in-game efun's `valid_*` apply
+    /// that errors, including tick/call-depth exhaustion, must still
+    /// just *deny* the call, never let the error itself escape into the
+    /// calling program's own unwind). That is the right contract for
+    /// every player-facing `valid_*` gate, but wrong for this one: an
+    /// HTTP admin query has no running program to fail safely back into
+    /// -- a `valid_read` that could not produce a real answer (its own
+    /// tick budget ([`APPLY_TICKS`]) ran out, or it raised/threw) must
+    /// surface as `Err` here, so `World::admin_list_objects`/
+    /// `admin_object_vars`/`admin_errors` can propagate it out to the
+    /// HTTP edge's `503`, not silently fold it into "nothing readable"
+    /// (`exec(...).unwrap_or_default()`'s bug, fixed alongside this).
+    /// This duplicates `authorize`'s per-euid loop rather than adding an
+    /// error-surfacing mode to `authorize` itself, to keep every other
+    /// `valid_*` call site's fail-closed contract untouched.
+    pub(crate) fn admin_valid_read(&mut self, op: &'static str, path: &str) -> R<bool> {
+        let kind = crate::efuns::audit_kind_name("admin_query");
+        let operation = Operation::Read { path, op };
+        let guard = self.top_guard().clone();
+        let caller = self.self_object();
+        let mut denied_by = None;
+        let mut apply_err: Option<RtError> = None;
+        if !guard.is_empty() {
+            let master = self.master();
+            for euid in guard.euids() {
+                let looked = self
+                    .driver
+                    .as_mut()
+                    .expect("admin_valid_read needs a driver")
+                    .security
+                    .lookup(&operation, euid);
+                let allowed = match looked {
+                    Ok(b) => b,
+                    Err(miss) => {
+                        self.extra_ticks += MISS_CHARGE;
+                        let outcome = match master {
+                            None => Ok(false),
+                            Some(m) => {
+                                let args = self.apply_args(&operation, caller);
+                                match self.run_cut(m, operation.apply(), args, Some(euid)) {
+                                    Ok(Some(Value::Bool(b))) => Ok(b),
+                                    Ok(_) => Ok(false),
+                                    Err(e) => Err(e),
+                                }
+                            }
+                        };
+                        let sec = &mut self.driver.as_mut().expect("driver").security;
+                        sec.misses += 1;
+                        match outcome {
+                            Ok(b) => {
+                                if let Some(miss) = miss {
+                                    sec.store(miss, b);
+                                }
+                                b
+                            }
+                            Err(e) => {
+                                // Not cached (`sec.store`): an answer that
+                                // never actually arrived must not poison
+                                // the decision cache for the next distinct
+                                // program this call batches over.
+                                apply_err = Some(e);
+                                false
+                            }
+                        }
+                    }
+                };
+                if !allowed {
+                    denied_by = Some(euid);
+                }
+                if apply_err.is_some() {
+                    break;
+                }
+            }
+        }
+        let sec = &mut self.driver.as_mut().expect("driver").security;
+        sec.record(
+            caller,
+            kind,
+            Privilege::P1,
+            &operation,
+            &guard,
+            denied_by.is_none() && apply_err.is_none(),
+            denied_by,
+        );
+        match apply_err {
+            Some(e) => Err(e),
+            None => Ok(denied_by.is_none()),
+        }
     }
 
     fn apply_args(&self, op: &Operation<'_>, caller: ObjectId) -> Vec<Value> {

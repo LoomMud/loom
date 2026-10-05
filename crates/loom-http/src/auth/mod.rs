@@ -261,6 +261,12 @@ impl From<crate::admin_query::WorldQueryError> for AdminError {
             WorldQueryError::Busy | WorldQueryError::Timeout | WorldQueryError::Closed => {
                 AdminError::WorldUnavailable
             }
+            // OBI-279: a `valid_read` that failed to produce a real
+            // decision is a different failure than a `Busy`/`Timeout`/
+            // `Closed` channel, but the HTTP-visible outcome (`503`) is
+            // the same -- both mean "the world side could not safely
+            // answer this query right now".
+            WorldQueryError::Internal(_) => AdminError::WorldUnavailable,
         }
     }
 }
