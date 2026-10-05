@@ -79,7 +79,7 @@ use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::HttpState;
@@ -114,6 +114,12 @@ pub enum FileOpValue {
     /// [`FileOpKind::WriteIfMatch`]'s precondition did not hold (stale
     /// `If-Match`, or `If-None-Match: *` against an existing file).
     PreconditionFailed,
+    /// [`FileOpKind::List`]'s directory listing, filtered by
+    /// `valid_read` (M-FS-3). Distinct from `Null` (a readable directory
+    /// can legitimately be empty) -- an unreadable or missing directory
+    /// is a [`FileOpError::Refused`] from `World::list_dir`'s `None`,
+    /// mapped the same place `read_file`'s own `Null` is.
+    Entries(Vec<String>),
 }
 
 /// Which `World` entry point a [`FileOpRequest`] resolves to.
@@ -127,6 +133,8 @@ pub enum FileOpKind {
         precondition: FilePrecondition,
         text: String,
     },
+    /// `World::list_dir(uid, path, ..)` (M-FS-3).
+    List,
 }
 
 /// Mirrors `loom_vm::world::FileMatchPrecondition` without depending on
@@ -247,12 +255,14 @@ pub struct ReadFileQuery {
 const MAX_WRITE_BODY_BYTES: usize = 1024 * 1024;
 
 pub fn files_router() -> Router<HttpState> {
-    Router::new().route(
-        "/api/v1/files/content",
-        get(read_file)
-            .put(write_file)
-            .route_layer(DefaultBodyLimit::max(MAX_WRITE_BODY_BYTES)),
-    )
+    Router::new()
+        .route(
+            "/api/v1/files/content",
+            get(read_file)
+                .put(write_file)
+                .route_layer(DefaultBodyLimit::max(MAX_WRITE_BODY_BYTES)),
+        )
+        .route("/api/v1/files/list", get(list_dir))
 }
 
 /// `GET /api/v1/files/content?path=/builders/<u>/...` (M-FS-1).
@@ -290,7 +300,10 @@ async fn read_file(
         // `read_file` never produces these -- a driver bug, not a
         // client-facing distinction.
         Ok(Ok(
-            FileOpValue::Written | FileOpValue::QuotaExceeded | FileOpValue::PreconditionFailed,
+            FileOpValue::Written
+            | FileOpValue::QuotaExceeded
+            | FileOpValue::PreconditionFailed
+            | FileOpValue::Entries(_),
         )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
         Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -520,7 +533,7 @@ async fn write_file(
         Ok(Ok(FileOpValue::PreconditionFailed)) => StatusCode::PRECONDITION_FAILED.into_response(),
         // A CAS write never produces these -- a driver bug, not a
         // client-facing distinction.
-        Ok(Ok(FileOpValue::Null | FileOpValue::Str(_))) => {
+        Ok(Ok(FileOpValue::Null | FileOpValue::Str(_) | FileOpValue::Entries(_))) => {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
         Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
@@ -530,6 +543,84 @@ async fn write_file(
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
     headers.get(name)?.to_str().ok().map(|s| s.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListDirQuery {
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ListDirResponse {
+    entries: Vec<String>,
+}
+
+/// `GET /api/v1/files/list?path=/builders/<u>/...` (M-FS-3).
+///
+/// - `401` with no/invalid bearer token.
+/// - `404` for a directory `valid_read` refuses on the directory itself
+///   *or* that doesn't exist -- same status for both, same reasoning as
+///   `GET /api/v1/files/content`'s `404` (M-FS-3: a 403 would tell an
+///   unauthorised caller the directory exists).
+/// - `503` on a full queue, a world thread that didn't answer in time,
+///   or no file-op channel wired at all (M-FS-5).
+/// - `200` with a JSON `{"entries": [...]}` body -- `World::list_dir`
+///   has already dropped any individual entry `valid_read` refuses, so
+///   every name in the response is one this uid may also `GET`.
+///   `Content-Type: application/json`, `nosniff`, and the same sandboxed
+///   CSP as a file read (M-FS-4).
+async fn list_dir(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(query): Query<ListDirQuery>,
+) -> impl IntoResponse {
+    let Some(uid) = bearer_uid(&headers, &state) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(file_op_tx) = state.file_op_tx.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let path = query.path;
+    let result = tokio::task::spawn_blocking(move || {
+        request_file_op(&file_op_tx, &uid, &path, FileOpKind::List)
+    })
+    .await;
+    match result {
+        Ok(Ok(FileOpValue::Entries(entries))) => list_dir_response(entries),
+        // `World::list_dir` reports a refused/missing directory as a
+        // `FileOpError::Refused` (loom-cli's drain loop maps its `None`
+        // there), not an `Ok` -- these never happen, but are not a
+        // client-facing distinction if the driver side ever changes.
+        Ok(Ok(
+            FileOpValue::Null
+            | FileOpValue::Str(_)
+            | FileOpValue::Written
+            | FileOpValue::QuotaExceeded
+            | FileOpValue::PreconditionFailed,
+        )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
+        Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+/// M-FS-4's response shape for a listing: JSON, `nosniff`, the same
+/// sandboxed CSP as a file read. No `Content-Disposition: attachment` --
+/// that header is specifically for `GET /api/v1/files/content`'s raw
+/// file bodies (M-FS-4 names it for "raw bodies"), not a JSON API
+/// response, which axum's `Json` already sends as `application/json`,
+/// never sniffable as HTML regardless.
+fn list_dir_response(entries: Vec<String>) -> axum::response::Response {
+    let mut response = (StatusCode::OK, axum::Json(ListDirResponse { entries })).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; default-src 'none'"),
+    );
+    response
 }
 
 #[cfg(test)]
@@ -980,7 +1071,7 @@ mod tests {
                         assert_eq!(precondition, &FilePrecondition::IfNoneMatchStar);
                         assert_eq!(text, "int x;");
                     }
-                    FileOpKind::Read => panic!("expected a write"),
+                    FileOpKind::Read | FileOpKind::List => panic!("expected a write"),
                 }
                 req.respond(Ok(FileOpValue::Written));
             });
@@ -1025,7 +1116,7 @@ mod tests {
                             )
                         );
                     }
-                    FileOpKind::Read => panic!("expected a write"),
+                    FileOpKind::Read | FileOpKind::List => panic!("expected a write"),
                 }
                 req.respond(Ok(FileOpValue::Written));
             });
@@ -1174,6 +1265,104 @@ mod tests {
                 .insert("if-none-match", HeaderValue::from_static("*"));
             let response = app(state_b).oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        // -------------------------------------------------------------
+        // GET /api/v1/files/list (M-FS-3)
+        // -------------------------------------------------------------
+
+        #[tokio::test]
+        async fn listing_a_readable_directory_is_200_with_json_entries() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let req = file_op_rx.recv().expect("a request should arrive");
+                assert_eq!(req.path, "/builders/frodo");
+                assert!(matches!(req.kind, FileOpKind::List));
+                req.respond(Ok(FileOpValue::Entries(vec![
+                    "a.wf".to_string(),
+                    "b.wf".to_string(),
+                ])));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/files/list?path=/builders/frodo")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let headers = response.headers().clone();
+            assert_eq!(
+                headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+                "sandbox; default-src 'none'"
+            );
+            assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["entries"], serde_json::json!(["a.wf", "b.wf"]));
+        }
+
+        /// M-FS-3: a refused or missing directory is `404`, same status
+        /// as `GET /api/v1/files/content`'s refusal case -- never `403`.
+        #[tokio::test]
+        async fn listing_a_refused_directory_is_404_not_403() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let req = file_op_rx.recv().expect("a request should arrive");
+                req.respond(Err(FileOpError::Refused(
+                    "get_dir refused or the directory does not exist".to_string(),
+                )));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/files/list?path=/secure")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn listing_with_no_bearer_token_is_401() {
+            let (state, _keys) = test_state(None);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/files/list?path=/builders/frodo")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn listing_with_no_file_op_channel_wired_is_503() {
+            let (state, keys) = test_state(None);
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/files/list?path=/builders/frodo")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 }
