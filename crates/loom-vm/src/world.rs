@@ -2727,3 +2727,70 @@ mod tick_share_window_tests {
         );
     }
 }
+
+/// OBI-279 (CTO review of PR #102, must-fix 1): `RegistryHost::
+/// admin_valid_read`'s per-euid decision loop must behave exactly like
+/// `authorize`'s own (both now share `RegistryHost::decide`) -- a
+/// src-level unit test, not a `tests/obi_279_admin_query_errors.rs`
+/// integration test, because exercising a genuinely multi-principal cut
+/// guard means calling `World::exec`/`RegistryHost::admin_valid_read`
+/// directly (both `pub(crate)`/private, not reachable from outside this
+/// crate) -- `World`'s own public admin-query methods only ever build a
+/// single-principal guard (one HTTP-authenticated staff euid), so this
+/// is the only way to prove the shared loop's multi-euid behavior at
+/// all.
+#[cfg(test)]
+mod admin_query_tests {
+    use super::*;
+    use crate::security::{GuardSet, Principal};
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).join(name)
+    }
+
+    /// A cut guard carrying two distinct euids, `"first"` pushed before
+    /// `"second"` (push order, `GuardSet::euids`): `secure/master.wf`'s
+    /// `valid_read` denies outright for `"first"` and raises a runtime
+    /// error for `"second"`. If the per-euid loop incorrectly kept
+    /// asking after `"first"` already denied (the bug this guards
+    /// against: an earlier, hand-duplicated copy of this loop in
+    /// `admin_valid_read` only stopped early on an apply *error*, not on
+    /// an ordinary denial), this would see `"second"`'s error and answer
+    /// `Err`, not the plain `Ok(false)` a single, shared decision loop
+    /// gives.
+    #[test]
+    fn admin_valid_read_stops_at_the_first_denying_euid_in_a_multi_principal_guard() {
+        let root = fixture("admin_query_two_euid");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = NullHost;
+
+        let master = world.master.expect("fixture has a master");
+        let first = world.registry.syms.intern("first");
+        let second = world.registry.syms.intern("second");
+        let guard = GuardSet::empty()
+            .with(Principal {
+                uid: first,
+                euid: first,
+            })
+            .with(Principal {
+                uid: second,
+                euid: second,
+            });
+
+        let result = world.exec(
+            &mut host,
+            master,
+            None,
+            None,
+            Some(guard),
+            None,
+            None,
+            |h| h.admin_valid_read("x", "/std/item"),
+        );
+        assert!(
+            matches!(result, Ok(false)),
+            "must deny at the first (\"first\") euid and never reach the \
+             second (\"second\") euid's error-raising valid_read, got {result:?}"
+        );
+    }
+}

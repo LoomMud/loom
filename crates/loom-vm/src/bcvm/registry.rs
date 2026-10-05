@@ -3428,6 +3428,85 @@ impl<'a> RegistryHost<'a> {
         r
     }
 
+    /// Decide `op` for every euid in `guard` (D-S1.2/D-S1.3): the
+    /// shared core of [`Self::authorize`] and [`Self::admin_valid_read`].
+    /// Stops at the **first** euid (push order, [`GuardSet::euids`]) that
+    /// does not get a real `true`: either a plain denial (the cached
+    /// decision, or the master's apply, answered `false`/non-`bool`) or
+    /// an apply failure (the master has no apply, or the apply itself
+    /// errored -- tick/call-depth exhaustion, a thrown value, any
+    /// runtime error). A later euid is never asked once an earlier one
+    /// has already decided the outcome, same as a single-euid guard --
+    /// callers must not see a second, deeper apply's error (or its tick
+    /// cost) for a decision that was already made.
+    ///
+    /// Returns `(denied_by, apply_err)`: `denied_by` is the first euid
+    /// that didn't get a real `true` (`None` iff the guard is empty or
+    /// every euid did); `apply_err` is `Some` iff that denial was an
+    /// apply failure rather than an actual `false` answer (CTO review,
+    /// OBI-279, must-fix 1: this is what lets [`Self::admin_valid_read`]
+    /// surface a tick-budget/runtime failure as `Err` while
+    /// [`Self::authorize`] still fails closed -- same decision, two
+    /// different things to do with it, instead of two separately
+    /// maintained copies of this loop that can drift apart from each
+    /// other, which is exactly what happened here).
+    ///
+    /// A policy-cache hit/miss-then-answer is stored in the cache either
+    /// way (an apply that completed, allow or deny); an apply failure is
+    /// never cached (an answer that never actually arrived must not
+    /// poison the decision cache for the next lookup of the same euid).
+    fn decide(
+        &mut self,
+        guard: &GuardSet,
+        caller: ObjectId,
+        op: &Operation<'_>,
+    ) -> (Option<Sym>, Option<RtError>) {
+        if guard.is_empty() {
+            return (None, None);
+        }
+        let master = self.master();
+        for euid in guard.euids() {
+            let looked = self
+                .driver
+                .as_mut()
+                .expect("decide needs a driver")
+                .security
+                .lookup(op, euid);
+            let (allowed, err) = match looked {
+                Ok(b) => (b, None),
+                Err(miss) => {
+                    self.extra_ticks += MISS_CHARGE;
+                    let outcome = match master {
+                        None => Ok(false),
+                        Some(m) => {
+                            let args = self.apply_args(op, caller);
+                            match self.run_cut(m, op.apply(), args, Some(euid)) {
+                                Ok(Some(Value::Bool(b))) => Ok(b),
+                                Ok(_) => Ok(false),
+                                Err(e) => Err(e),
+                            }
+                        }
+                    };
+                    let sec = &mut self.driver.as_mut().expect("driver").security;
+                    sec.misses += 1;
+                    match outcome {
+                        Ok(b) => {
+                            if let Some(miss) = miss {
+                                sec.store(miss, b);
+                            }
+                            (b, None)
+                        }
+                        Err(e) => (false, Some(e)),
+                    }
+                }
+            };
+            if !allowed {
+                return (Some(euid), err);
+            }
+        }
+        (None, None)
+    }
+
     /// Decide `op` for the current guard set (D-S1.2/D-S1.3): allowed iff
     /// the guard set is empty (all root) or the master's apply returns
     /// `true` for **every** euid in it. Fails closed: no master, no apply,
@@ -3441,44 +3520,12 @@ impl<'a> RegistryHost<'a> {
         let efun = crate::efuns::audit_kind_name(efun);
         let guard = self.top_guard().clone();
         let caller = self.self_object();
-        let mut denied_by = None;
-        if !guard.is_empty() {
-            let master = self.master();
-            for euid in guard.euids() {
-                let looked = self
-                    .driver
-                    .as_mut()
-                    .expect("authorize needs a driver")
-                    .security
-                    .lookup(&op, euid);
-                let allowed = match looked {
-                    Ok(b) => b,
-                    Err(miss) => {
-                        self.extra_ticks += MISS_CHARGE;
-                        let b = match master {
-                            None => false,
-                            Some(m) => {
-                                let args = self.apply_args(&op, caller);
-                                matches!(
-                                    self.run_cut(m, op.apply(), args, Some(euid)),
-                                    Ok(Some(Value::Bool(true)))
-                                )
-                            }
-                        };
-                        let sec = &mut self.driver.as_mut().expect("driver").security;
-                        sec.misses += 1;
-                        if let Some(miss) = miss {
-                            sec.store(miss, b);
-                        }
-                        b
-                    }
-                };
-                if !allowed {
-                    denied_by = Some(euid);
-                    break;
-                }
-            }
-        }
+        // Fails closed: `decide`'s `apply_err` (an apply that couldn't
+        // answer at all) is deliberately not distinguished from a plain
+        // `false` here -- both just deny the call, same as before this
+        // was extracted into a function shared with `admin_valid_read`
+        // (CTO review, OBI-279, must-fix 1).
+        let (denied_by, _apply_err) = self.decide(&guard, caller, &op);
         let sec = &mut self.driver.as_mut().expect("driver").security;
         sec.record(
             caller,
@@ -3533,68 +3580,23 @@ impl<'a> RegistryHost<'a> {
     /// `admin_object_vars`/`admin_errors` can propagate it out to the
     /// HTTP edge's `503`, not silently fold it into "nothing readable"
     /// (`exec(...).unwrap_or_default()`'s bug, fixed alongside this).
-    /// This duplicates `authorize`'s per-euid loop rather than adding an
-    /// error-surfacing mode to `authorize` itself, to keep every other
-    /// `valid_*` call site's fail-closed contract untouched.
+    ///
+    /// CTO review (OBI-279, must-fix 1): shares [`Self::decide`]'s
+    /// per-euid loop with `authorize` instead of a second, hand-copied
+    /// one -- an earlier version of this method forked that loop and
+    /// drifted from it (it only stopped early on an apply failure, not
+    /// on an ordinary denial), which a two-euid guard where the first
+    /// euid denies and the second euid's `valid_read` itself errors
+    /// would have wrongly surfaced as `Err` instead of a plain `Ok(false)`
+    /// (`decide`'s own doc comment, and `World`'s unit test
+    /// `admin_valid_read_stops_at_the_first_denying_euid_in_a_multi_
+    /// principal_guard`, cover this).
     pub(crate) fn admin_valid_read(&mut self, op: &'static str, path: &str) -> R<bool> {
         let kind = crate::efuns::audit_kind_name("admin_query");
         let operation = Operation::Read { path, op };
         let guard = self.top_guard().clone();
         let caller = self.self_object();
-        let mut denied_by = None;
-        let mut apply_err: Option<RtError> = None;
-        if !guard.is_empty() {
-            let master = self.master();
-            for euid in guard.euids() {
-                let looked = self
-                    .driver
-                    .as_mut()
-                    .expect("admin_valid_read needs a driver")
-                    .security
-                    .lookup(&operation, euid);
-                let allowed = match looked {
-                    Ok(b) => b,
-                    Err(miss) => {
-                        self.extra_ticks += MISS_CHARGE;
-                        let outcome = match master {
-                            None => Ok(false),
-                            Some(m) => {
-                                let args = self.apply_args(&operation, caller);
-                                match self.run_cut(m, operation.apply(), args, Some(euid)) {
-                                    Ok(Some(Value::Bool(b))) => Ok(b),
-                                    Ok(_) => Ok(false),
-                                    Err(e) => Err(e),
-                                }
-                            }
-                        };
-                        let sec = &mut self.driver.as_mut().expect("driver").security;
-                        sec.misses += 1;
-                        match outcome {
-                            Ok(b) => {
-                                if let Some(miss) = miss {
-                                    sec.store(miss, b);
-                                }
-                                b
-                            }
-                            Err(e) => {
-                                // Not cached (`sec.store`): an answer that
-                                // never actually arrived must not poison
-                                // the decision cache for the next distinct
-                                // program this call batches over.
-                                apply_err = Some(e);
-                                false
-                            }
-                        }
-                    }
-                };
-                if !allowed {
-                    denied_by = Some(euid);
-                }
-                if apply_err.is_some() {
-                    break;
-                }
-            }
-        }
+        let (denied_by, apply_err) = self.decide(&guard, caller, &operation);
         let sec = &mut self.driver.as_mut().expect("driver").security;
         sec.record(
             caller,
@@ -3602,7 +3604,7 @@ impl<'a> RegistryHost<'a> {
             Privilege::P1,
             &operation,
             &guard,
-            denied_by.is_none() && apply_err.is_none(),
+            denied_by.is_none(),
             denied_by,
         );
         match apply_err {
