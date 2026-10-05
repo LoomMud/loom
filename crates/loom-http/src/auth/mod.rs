@@ -1264,10 +1264,16 @@ fn totp_gate_detail(error: &AuthError) -> &'static str {
 /// without knowing the real filesystem, so don't try -- refuse to rule
 /// out `/secure/`) or if the first remaining segment is `"secure"`.
 fn is_or_might_be_secure(path: &str) -> bool {
+    // A `..` anywhere in the path can walk back out past a non-`secure`
+    // prefix (e.g. `/std/../secure/master`), so treat any `..` segment as
+    // "might be secure" rather than only checking the first segment
+    // (CTO re-review must-fix, PR #98 / OBI-185 / OBI-234).
+    if path.split('/').any(|segment| segment == "..") {
+        return true;
+    }
     for segment in path.split('/') {
         match segment {
             "" | "." => continue,
-            ".." => return true,
             "secure" => return true,
             _ => return false,
         }

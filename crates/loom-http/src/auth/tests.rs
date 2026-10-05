@@ -1536,4 +1536,13 @@ fn is_or_might_be_secure_normalizes_and_fails_closed() {
         !is_or_might_be_secure("/securex/room"),
         "prefix, not a segment"
     );
+    assert!(
+        is_or_might_be_secure("/std/../secure/master"),
+        "a .. segment anywhere, not just first, must fail closed (CTO re-review \
+         must-fix, PR #98 / T5 edge floor)"
+    );
+    assert!(
+        is_or_might_be_secure("/std/x/../../secure/y"),
+        "multiple .. segments must still fail closed"
+    );
 }
