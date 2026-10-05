@@ -621,6 +621,24 @@ pub enum FileCasOutcome {
     PreconditionFailed,
 }
 
+/// Why [`World::list_dir`] didn't return a listing (OBI-180 M-FS-3, CTO
+/// review on PR #117 must-fix 2): distinguishes an outright refusal
+/// (reserved principal, or a malformed path that never reaches a
+/// `valid_read` apply at all) from a genuine failure partway through
+/// evaluating the listing (a `valid_read` apply that threw or exhausted
+/// its tick budget, or an unexpected `fileio` I/O error). The HTTP layer
+/// maps `Refused` the same "looks like not found" way as a plain
+/// `valid_read` no (M-FS-3); `Internal` is a `503`, the same split
+/// `loom_http::admin_query::WorldQueryError::Internal` already draws for
+/// the admin endpoints (OBI-279) -- a `valid_read` that can't produce a
+/// real decision must never look like a (possibly truncated) successful
+/// listing or a plain refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListDirError {
+    Refused(String),
+    Internal(String),
+}
+
 /// `sha256(contents)`, hex-encoded (OBI-180 M-FS-6). Deliberately
 /// duplicated in `loom_http::files::etag_for` rather than shared: sharing
 /// it would mean `loom-http` depending on `loom-vm` (or vice versa) just
@@ -2324,7 +2342,7 @@ impl World {
 
     /// `GET /api/v1/files/list?path=...` (OBI-180 M-FS-3): immediate
     /// entries of a mudlib-absolute directory, filtered by `valid_read`.
-    /// `None` if the directory itself doesn't authorize for `uid` or
+    /// `Ok(None)` if the directory itself doesn't authorize for `uid` or
     /// doesn't exist (M-FS-3: a listing you can't read looks exactly
     /// like one that doesn't exist, same as `read_file`'s `Null`) --
     /// otherwise each entry's bare name is *additionally* checked
@@ -2339,16 +2357,28 @@ impl World {
     /// `valid_efun` privilege class) for a feature that is really just a
     /// driver-side read, exactly the same reasoning `admin_list_objects`/
     /// `admin_object_vars` already apply.
+    ///
+    /// `Err(ListDirError::Internal)` (CTO review on PR #117, must-fix 2;
+    /// same bug class OBI-279 fixed for the admin endpoints) if a
+    /// `valid_read` apply itself throws or exhausts its tick budget, or
+    /// `fileio` hits a real I/O error -- for *either* the directory-level
+    /// check or any individual entry. Never a silently shorter listing:
+    /// every per-entry `admin_valid_read` call uses `?`, so one entry's
+    /// apply failure fails the whole call instead of just being dropped
+    /// (which would look like a complete, successful listing that
+    /// happens to be missing an entry).
     pub fn list_dir(
         &mut self,
         uid: &str,
         path: &str,
         host: &mut dyn Host,
-    ) -> Result<Option<Vec<String>>, String> {
+    ) -> Result<Option<Vec<String>>, ListDirError> {
         if crate::security::is_reserved_principal(uid) {
-            return Err(format!("`{uid}` is a reserved principal"));
+            return Err(ListDirError::Refused(format!(
+                "`{uid}` is a reserved principal"
+            )));
         }
-        let path = crate::security::normalize_file_path(path)?;
+        let path = crate::security::normalize_file_path(path).map_err(ListDirError::Refused)?;
         let sym = self.registry.syms.intern(uid);
         let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
             uid: sym,
@@ -2365,19 +2395,19 @@ impl World {
             None,
             Some(sym),
             move |h| {
-                if !h.admin_valid_read("get_dir", &path) {
+                if !h.admin_valid_read("get_dir", &path)? {
                     return Ok(None);
                 }
                 match crate::fileio::list_dir(&root, &path) {
                     Ok(Some(entries)) => {
                         let trimmed = path.trim_end_matches('/');
-                        let filtered: Vec<String> = entries
-                            .into_iter()
-                            .filter(|name| {
-                                let child = format!("{trimmed}/{name}");
-                                h.admin_valid_read("get_dir", &child)
-                            })
-                            .collect();
+                        let mut filtered = Vec::with_capacity(entries.len());
+                        for name in entries {
+                            let child = format!("{trimmed}/{name}");
+                            if h.admin_valid_read("get_dir", &child)? {
+                                filtered.push(name);
+                            }
+                        }
                         Ok(Some(filtered))
                     }
                     Ok(None) => Ok(None),
@@ -2385,7 +2415,7 @@ impl World {
                 }
             },
         )
-        .map_err(|e| e.report())
+        .map_err(|e| ListDirError::Internal(e.report()))
     }
 
     pub fn find_object(&self, name: &str) -> Option<ObjectId> {

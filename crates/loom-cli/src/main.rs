@@ -2731,19 +2731,22 @@ fn spawn_world_thread(
                                 )
                                 .map(file_op_value_from_cas)
                                 .map_err(loom_http::files::FileOpError::Refused),
-                            loom_http::files::FileOpKind::List => world
+                            loom_http::files::FileOpKind::List => match world
                                 .list_dir(&req.uid, &req.path, &mut host)
-                                .map_err(loom_http::files::FileOpError::Refused)
-                                .and_then(|entries| {
-                                    entries.map(loom_http::files::FileOpValue::Entries).ok_or_else(
-                                        || {
-                                            loom_http::files::FileOpError::Refused(
-                                                "get_dir refused or the directory does not exist"
-                                                    .to_string(),
-                                            )
-                                        },
-                                    )
-                                }),
+                            {
+                                Ok(Some(entries)) => {
+                                    Ok(loom_http::files::FileOpValue::Entries(entries))
+                                }
+                                Ok(None) => Err(loom_http::files::FileOpError::Refused(
+                                    "get_dir refused or the directory does not exist".to_string(),
+                                )),
+                                Err(loom_vm::world::ListDirError::Refused(msg)) => {
+                                    Err(loom_http::files::FileOpError::Refused(msg))
+                                }
+                                Err(loom_vm::world::ListDirError::Internal(msg)) => {
+                                    Err(loom_http::files::FileOpError::Internal(msg))
+                                }
+                            },
                         };
                     req.respond(result);
                 }
