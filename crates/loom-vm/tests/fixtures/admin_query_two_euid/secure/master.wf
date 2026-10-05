@@ -1,0 +1,46 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Master object for a src-level unit test (`World`'s own `tests` module,
+// `admin_valid_read_stops_at_the_first_denying_euid_in_a_multi_principal_
+// guard`, OBI-279 CTO review must-fix): `valid_read` denies outright for
+// `effective_principal() == "first"`, and raises a runtime error for
+// `effective_principal() == "second"` -- a cut guard carrying both
+// euids, "first" pushed before "second" (push order, `GuardSet::euids`),
+// must see only a plain `false` (denied), never the error "second"'s
+// `valid_read` would raise, which is only reachable if the per-euid
+// decision loop incorrectly keeps asking after the first euid already
+// denied.
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    let who = effective_principal()
+    if who == "first" {
+        return false
+    } else if who == "second" {
+        random(0)
+    }
+    return true
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_seteuid(ob: object, e: string) -> bool {
+    return true
+}
