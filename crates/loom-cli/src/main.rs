@@ -627,37 +627,15 @@ fn request_snapshot(snapshot_req_tx: &std::sync::mpsc::Sender<SnapshotRequest>) 
         .map_err(|err| format!("world thread did not answer the snapshot request: {err}"))?
 }
 
-/// Bound on in-flight `/api/v1/files/*` file-op requests queued for the
-/// world thread (OBI-180 M-FS-5): past this many outstanding requests,
-/// [`FileOpSender::try_send`] fails immediately instead of queueing --
-/// loom-http's job (a later slice) is to turn that into a `503`, never
-/// to block the calling task waiting for room.
-const FILE_OP_QUEUE_DEPTH: usize = 64;
-
-/// M-FS-5's "10 s timeout": how long [`request_file_op`] blocks its own
-/// (dedicated, non-async -- see that function's doc) thread waiting for
-/// the world thread to answer, before giving up. Same bounded-wait
-/// principle as [`SNAPSHOT_REQUEST_TIMEOUT`].
-const FILE_OP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// A `read_file`/`write_file` result, far enough from `loom_vm::Value`
-/// (which holds `Rc`s and so is not `Send`) to cross the file-op reply
-/// channel into an async HTTP handler's thread. `compile_object` is a
-/// later slice (its result shape -- a diagnostics list -- needs more
-/// than this).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FileOpValue {
-    Null,
-    Bool(bool),
-    Str(String),
-}
-
 /// Converts a [`Value`] returned by `World::call_file_efun` into the
-/// `Send`-safe mirror the file-op reply channel carries. Anything this
-/// doesn't recognise (none of `read_file`/`write_file`'s documented
-/// return shapes) is a driver bug, not a policy decision, so it is
-/// reported as an error rather than silently coerced.
-fn file_op_value_from_vm(v: Value) -> FileOpValue {
+/// `Send`-safe [`loom_http::files::FileOpValue`] mirror the file-op
+/// reply channel carries (defined in `loom-http`, not here -- see that
+/// module's doc for why). Anything this doesn't recognise (none of
+/// `read_file`/`write_file`'s documented return shapes) is a driver bug,
+/// not a policy decision, so it is reported as an error rather than
+/// silently coerced.
+fn file_op_value_from_vm(v: Value) -> loom_http::files::FileOpValue {
+    use loom_http::files::FileOpValue;
     match v {
         Value::Null => FileOpValue::Null,
         Value::Bool(b) => FileOpValue::Bool(b),
@@ -666,55 +644,6 @@ fn file_op_value_from_vm(v: Value) -> FileOpValue {
             .map(|s| FileOpValue::Str(s.to_string()))
             .unwrap_or(FileOpValue::Null),
     }
-}
-
-/// One file operation requested by an `/api/v1/files/*` HTTP handler
-/// (OBI-180 M-FS-1), to be run on the world thread with guard set
-/// exactly `{uid}` via `World::call_file_efun`. `efun` is `"read_file"`
-/// or `"write_file"` (the only two `call_file_efun` is exercised against
-/// so far); `args` are the efun's string arguments in order (`[path]`
-/// for a read, `[path, text]` for a write). The reply channel is a
-/// fresh one-shot `std::sync::mpsc` per request, same shape as
-/// [`SnapshotRequest`].
-pub struct FileOpRequest {
-    pub uid: String,
-    pub efun: &'static str,
-    pub args: Vec<String>,
-    reply: std::sync::mpsc::Sender<Result<FileOpValue, String>>,
-}
-
-/// The world thread's half of the file-op channel (`spawn_world_thread`'s
-/// `file_op_rx`); `loom-http`'s `HttpState` holds the sending half
-/// returned alongside it once that wiring lands.
-pub type FileOpSender = std::sync::mpsc::SyncSender<FileOpRequest>;
-
-/// Ask the world thread (via `spawn_world_thread`'s inline `file_op_rx`
-/// drain) to run `efun(args)` with guard set exactly `{uid}`
-/// (`World::call_file_efun`, M-FS-1), blocking this call's own thread
-/// until it answers or [`FILE_OP_REQUEST_TIMEOUT`] elapses (M-FS-5).
-///
-/// **Never call this from an async task directly** -- it blocks a real
-/// OS thread for up to 10s. Wrap it in `tokio::task::spawn_blocking`
-/// (loom-http's job, the next slice), the same way `request_snapshot`'s
-/// caller is its own dedicated thread, never the async runtime.
-pub fn request_file_op(
-    file_op_tx: &FileOpSender,
-    uid: &str,
-    efun: &'static str,
-    args: Vec<String>,
-) -> Result<FileOpValue, String> {
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    file_op_tx
-        .try_send(FileOpRequest {
-            uid: uid.to_string(),
-            efun,
-            args,
-            reply: reply_tx,
-        })
-        .map_err(|_| "file-op queue is full or the world thread is gone".to_string())?;
-    reply_rx
-        .recv_timeout(FILE_OP_REQUEST_TIMEOUT)
-        .map_err(|err| format!("world thread did not answer the file-op request: {err}"))?
 }
 
 /// How long [`reclaim_and_readopt_all`] waits for `loom-net`'s
@@ -1562,19 +1491,18 @@ async fn serve(
     let (snapshot_req_tx, snapshot_req_rx) = std::sync::mpsc::channel::<SnapshotRequest>();
 
     // OBI-180 M-FS-1/M-FS-5: the file-op channel `/api/v1/files/*`
-    // handlers will send `read_file`/`write_file` requests on (loom-http
-    // wiring is a later slice -- created here, alongside every other
-    // world-thread side channel, so `spawn_world_thread` never needs an
-    // `Option` for it). Bounded (`sync_channel`): past `FILE_OP_QUEUE_
-    // DEPTH` outstanding requests, `request_file_op`'s `try_send` fails
+    // handlers send `read_file`/`write_file` requests on (created here,
+    // alongside every other world-thread side channel, so
+    // `spawn_world_thread` never needs an `Option` for it). Bounded
+    // (`sync_channel`, depth defined in `loom_http::files` so the HTTP
+    // and world-thread sides agree on one number): past that many
+    // outstanding requests, `request_file_op`'s `try_send` fails
     // immediately instead of queueing (M-FS-5's "503 on backpressure").
-    // `file_op_tx` stays bound for the rest of this function's scope
-    // (which runs for the server's whole lifetime) so `file_op_rx`'s
-    // sender-closed check in `spawn_world_thread` never trips; nothing
-    // sends on it yet until loom-http's wiring lands.
-    let (file_op_tx, file_op_rx) =
-        std::sync::mpsc::sync_channel::<FileOpRequest>(FILE_OP_QUEUE_DEPTH);
-    let _file_op_tx = file_op_tx;
+    // The sender half goes to `HttpState::with_file_ops` below; this
+    // binding stays alive for the rest of this function's scope (which
+    // runs for the server's whole lifetime) so `file_op_rx`'s
+    // sender-closed check in `spawn_world_thread` never trips.
+    let (file_op_tx, file_op_rx) = loom_http::files::file_op_channel();
 
     // OBI-184 (copyover-trigger slice): real handles to `loom-net`'s
     // reclaim/adopt primitives (OBI-94/OBI-221, merged but previously
@@ -1634,7 +1562,8 @@ async fn serve(
         .expect("metrics recorder installed exactly once per process");
 
     let (ws_accept_tx, ws_accept_rx) = mpsc::channel(WS_ACCEPT_QUEUE_DEPTH);
-    let mut http_state = loom_http::HttpState::new(ws_accept_tx, readiness, metrics);
+    let mut http_state =
+        loom_http::HttpState::new(ws_accept_tx, readiness, metrics).with_file_ops(file_op_tx);
     if let Some(web_root) = web_root_from_env() {
         http_state = http_state.with_web_root(web_root);
     }
@@ -2410,7 +2339,7 @@ fn spawn_world_thread(
     has_audit_sink: bool,
     load_roles_seed: bool,
     snapshot_req_rx: std::sync::mpsc::Receiver<SnapshotRequest>,
-    file_op_rx: std::sync::mpsc::Receiver<FileOpRequest>,
+    file_op_rx: std::sync::mpsc::Receiver<loom_http::files::FileOpRequest>,
 ) -> Result<thread::JoinHandle<()>, String> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let handle = thread::Builder::new()
@@ -2595,17 +2524,17 @@ fn spawn_world_thread(
                     let _ = reply_tx.send(result);
                 }
                 // OBI-180 M-FS-1: a file-op request from an `/api/v1/files/*`
-                // HTTP handler (loom-http's job, a later slice), drained the
-                // same non-blocking way as every other side-channel input to
-                // this loop. `World::call_file_efun` is the whole mitigation:
-                // guard set exactly `{uid}`, the real `valid_*` master apply,
-                // unchanged quotas/audit.
+                // HTTP handler, drained the same non-blocking way as every
+                // other side-channel input to this loop.
+                // `World::call_file_efun` is the whole mitigation: guard set
+                // exactly `{uid}`, the real `valid_*` master apply, unchanged
+                // quotas/audit.
                 while let Ok(req) = file_op_rx.try_recv() {
                     let args: Vec<Value> = req.args.iter().map(|s| Value::str(s)).collect();
                     let result = world
                         .call_file_efun(&req.uid, req.efun, args, &mut host)
                         .map(file_op_value_from_vm);
-                    let _ = req.reply.send(result);
+                    req.respond(result);
                 }
             }
         })
@@ -2945,107 +2874,5 @@ mod roles_manager_tests {
             _ = tokio::time::sleep(Duration::from_secs(3600)) => "timer won",
         };
         assert_eq!(raced, "timer won");
-    }
-}
-
-#[cfg(test)]
-mod file_op_channel_tests {
-    use super::*;
-
-    /// `request_file_op` round-trips through a fake "world thread" that
-    /// just echoes the request back as a `FileOpValue::Str` -- proves the
-    /// channel plumbing itself (queueing, the per-request reply channel,
-    /// `file_op_value_from_vm`'s `Value` conversion is exercised
-    /// separately by `loom-vm`'s own `call_file_efun` tests) without
-    /// needing a real `World`/mudlib boot.
-    #[test]
-    fn round_trips_through_a_fake_world_thread() {
-        let (file_op_tx, file_op_rx) =
-            std::sync::mpsc::sync_channel::<FileOpRequest>(FILE_OP_QUEUE_DEPTH);
-        let worker = std::thread::spawn(move || {
-            let req = file_op_rx.recv().expect("a request should arrive");
-            assert_eq!(req.efun, "read_file");
-            assert_eq!(req.args, vec!["/builders/glorfindel/a.wf".to_string()]);
-            let _ = req
-                .reply
-                .send(Ok(FileOpValue::Str(format!("hello, {}", req.uid))));
-        });
-        let result = request_file_op(
-            &file_op_tx,
-            "glorfindel",
-            "read_file",
-            vec!["/builders/glorfindel/a.wf".to_string()],
-        );
-        worker.join().expect("worker thread");
-        assert_eq!(
-            result,
-            Ok(FileOpValue::Str("hello, glorfindel".to_string()))
-        );
-    }
-
-    /// M-FS-5's "10 s timeout": if nothing ever answers, `request_file_op`
-    /// must give up and return an error, not block forever. Uses a tiny
-    /// timeout override by racing the real call against a watchdog --
-    /// the function's own `FILE_OP_REQUEST_TIMEOUT` is 10s, too slow to
-    /// wait out in a unit test, so this proves the *shape* (a dropped
-    /// reply sender surfaces as an error promptly) rather than the exact
-    /// duration.
-    #[test]
-    fn a_reply_sender_dropped_without_an_answer_is_an_error_not_a_hang() {
-        let (file_op_tx, file_op_rx) =
-            std::sync::mpsc::sync_channel::<FileOpRequest>(FILE_OP_QUEUE_DEPTH);
-        let worker = std::thread::spawn(move || {
-            let req = file_op_rx.recv().expect("a request should arrive");
-            drop(req.reply); // answer never comes
-        });
-        let result = request_file_op(
-            &file_op_tx,
-            "glorfindel",
-            "read_file",
-            vec!["/builders/glorfindel/a.wf".to_string()],
-        );
-        worker.join().expect("worker thread");
-        assert!(result.is_err(), "{result:?}");
-    }
-
-    /// Past `FILE_OP_QUEUE_DEPTH` outstanding requests, `try_send` must
-    /// fail immediately (M-FS-5's "503 on backpressure") rather than
-    /// block the caller.
-    #[test]
-    fn a_full_queue_fails_fast_instead_of_blocking() {
-        let (file_op_tx, _file_op_rx) = std::sync::mpsc::sync_channel::<FileOpRequest>(1);
-        let (reply_tx, _reply_rx) = std::sync::mpsc::channel();
-        // Fill the one slot; nothing ever drains it in this test.
-        file_op_tx
-            .try_send(FileOpRequest {
-                uid: "glorfindel".to_string(),
-                efun: "read_file",
-                args: vec![],
-                reply: reply_tx,
-            })
-            .expect("fill the one slot");
-        let (reply_tx2, _reply_rx2) = std::sync::mpsc::channel();
-        let err = file_op_tx
-            .try_send(FileOpRequest {
-                uid: "glorfindel".to_string(),
-                efun: "read_file",
-                args: vec![],
-                reply: reply_tx2,
-            })
-            .unwrap_err();
-        assert!(matches!(err, std::sync::mpsc::TrySendError::Full(_)));
-    }
-
-    #[test]
-    fn value_conversion_covers_read_file_and_write_file_shapes() {
-        assert_eq!(file_op_value_from_vm(Value::Null), FileOpValue::Null);
-        assert_eq!(
-            file_op_value_from_vm(Value::Bool(true)),
-            FileOpValue::Bool(true)
-        );
-        assert_eq!(
-            file_op_value_from_vm(Value::str("hello")),
-            FileOpValue::Str("hello".to_string())
-        );
     }
 }
