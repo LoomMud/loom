@@ -41,7 +41,9 @@ fn admin_errors_omits_programs_the_caller_cannot_valid_read() {
 
         // `admin_errors` for a non-root caller sees only the readable one
         // -- same filter the `errors` efun applies, not a stand-in.
-        let groups = world.admin_errors("guest", 3, None, &mut host);
+        let groups = world
+            .admin_errors("guest", 3, None, &mut host)
+            .expect("no budget exhaustion in this fixture");
         assert_eq!(groups.len(), 1, "{groups:?}");
         assert_eq!(groups[0].program, "/std/player");
     });
@@ -59,10 +61,14 @@ fn admin_errors_program_prefix_narrows_the_result() {
         world.input(1, "boom", &mut host);
         host.take(1);
 
-        let narrowed = world.admin_errors("guest", 5, Some("/std/player"), &mut host);
+        let narrowed = world
+            .admin_errors("guest", 5, Some("/std/player"), &mut host)
+            .expect("no budget exhaustion in this fixture");
         assert_eq!(narrowed.len(), 1);
 
-        let empty = world.admin_errors("guest", 5, Some("/nowhere"), &mut host);
+        let empty = world
+            .admin_errors("guest", 5, Some("/nowhere"), &mut host)
+            .expect("no budget exhaustion in this fixture");
         assert!(empty.is_empty());
     });
 }
@@ -95,13 +101,17 @@ fn admin_errors_redacts_a_secure_origins_message_below_t5_and_shows_it_at_t5() {
             "the Rust-side inbox (no permission/redaction filter) always has the real text"
         );
 
-        let below_t5 = world.admin_errors("guest", 4, None, &mut host);
+        let below_t5 = world
+            .admin_errors("guest", 4, None, &mut host)
+            .expect("no budget exhaustion in this fixture");
         assert_eq!(below_t5.len(), 1);
         assert_eq!(below_t5[0].program, "/secure/vault2");
         assert!(below_t5[0].redacted);
         assert_eq!(below_t5[0].message, "<redacted>");
 
-        let at_t5 = world.admin_errors("guest", 5, None, &mut host);
+        let at_t5 = world
+            .admin_errors("guest", 5, None, &mut host)
+            .expect("no budget exhaustion in this fixture");
         assert_eq!(at_t5.len(), 1);
         assert!(at_t5[0].redacted, "the flag itself is unconditional");
         assert_eq!(at_t5[0].message, "random(): n must be > 0");
@@ -128,7 +138,9 @@ fn admin_errors_refuses_a_reserved_principal_as_caller_euid() {
         assert_eq!(world.errors_snapshot(None).len(), 1);
 
         for reserved in ["root", "mudlib", "domain:shire"] {
-            let groups = world.admin_errors(reserved, 5, None, &mut host);
+            let groups = world
+                .admin_errors(reserved, 5, None, &mut host)
+                .expect("a reserved principal is refused, never a budget error");
             assert!(
                 groups.is_empty(),
                 "caller_euid={reserved:?} must not see anything, got {groups:?}"
@@ -136,7 +148,9 @@ fn admin_errors_refuses_a_reserved_principal_as_caller_euid() {
         }
 
         // Sanity: a non-reserved euid still sees the readable program.
-        let as_guest = world.admin_errors("guest", 5, None, &mut host);
+        let as_guest = world
+            .admin_errors("guest", 5, None, &mut host)
+            .expect("no budget exhaustion in this fixture");
         assert_eq!(as_guest.len(), 1);
     });
 }

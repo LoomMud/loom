@@ -2521,15 +2521,18 @@ fn spawn_world_thread(
                             let _ = reply.send(Ok(who));
                         }
                         WorldQueryRequest::ListObjects { euid, tier, reply } => {
-                            let objects = world
-                                .admin_list_objects(&euid, tier, host)
-                                .into_iter()
-                                .map(|o| loom_http::admin_query::ObjectSummary {
-                                    path: o.path,
-                                    euid: o.euid,
-                                })
-                                .collect();
-                            let _ = reply.send(Ok(objects));
+                            let result = world.admin_list_objects(&euid, tier, host).map(|objs| {
+                                objs.into_iter()
+                                    .map(|o| loom_http::admin_query::ObjectSummary {
+                                        path: o.path,
+                                        euid: o.euid,
+                                    })
+                                    .collect()
+                            });
+                            let result = result.map_err(|e| {
+                                loom_http::admin_query::WorldQueryError::Internal(e.message)
+                            });
+                            let _ = reply.send(result);
                         }
                         WorldQueryRequest::ObjectVars {
                             euid,
@@ -2538,7 +2541,7 @@ fn spawn_world_thread(
                             reply,
                         } => {
                             let result = match world.admin_object_vars(&euid, tier, &path, host) {
-                                Some(vars) => Ok(ObjectVars {
+                                Ok(Some(vars)) => Ok(ObjectVars {
                                     path: vars.path,
                                     vars: vars
                                         .vars
@@ -2549,9 +2552,12 @@ fn spawn_world_thread(
                                         })
                                         .collect(),
                                 }),
-                                None => {
+                                Ok(None) => {
                                     Err(loom_http::admin_query::WorldQueryError::NotFound)
                                 }
+                                Err(e) => Err(loom_http::admin_query::WorldQueryError::Internal(
+                                    e.message,
+                                )),
                             };
                             let _ = reply.send(result);
                         }
@@ -2561,22 +2567,28 @@ fn spawn_world_thread(
                             program_prefix,
                             reply,
                         } => {
-                            let groups = world
+                            let result = world
                                 .admin_errors(&euid, tier, program_prefix.as_deref(), host)
-                                .into_iter()
-                                .map(|g| ErrorGroup {
-                                    program: g.program,
-                                    function: g.function,
-                                    line: g.line,
-                                    message: g.message,
-                                    redacted: g.redacted,
-                                    count: g.count,
-                                    first_seen_unix_ms: g.first_seen_unix_ms,
-                                    last_seen_unix_ms: g.last_seen_unix_ms,
-                                    sample_trace: g.sample_trace,
+                                .map(|groups| {
+                                    groups
+                                        .into_iter()
+                                        .map(|g| ErrorGroup {
+                                            program: g.program,
+                                            function: g.function,
+                                            line: g.line,
+                                            message: g.message,
+                                            redacted: g.redacted,
+                                            count: g.count,
+                                            first_seen_unix_ms: g.first_seen_unix_ms,
+                                            last_seen_unix_ms: g.last_seen_unix_ms,
+                                            sample_trace: g.sample_trace,
+                                        })
+                                        .collect()
                                 })
-                                .collect();
-                            let _ = reply.send(Ok(groups));
+                                .map_err(|e| {
+                                    loom_http::admin_query::WorldQueryError::Internal(e.message)
+                                });
+                            let _ = reply.send(result);
                         }
                     }
                 }

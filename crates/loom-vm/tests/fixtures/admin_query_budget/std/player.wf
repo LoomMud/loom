@@ -1,0 +1,26 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// A minimal player for the OBI-279 admin-query-budget fixture (see
+// `secure/master.wf`'s doc comment): `spawnitem` clones `/std/item` so
+// `tests/obi_279_admin_query_errors.rs` has a live object whose program
+// a budget-exhausted `valid_read` can be asked about.
+pub fn logon() {
+    send(self, "ready\n")
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "spawnitem" {
+        let it = clone_object("/std/item")
+        send(self, $"{object_name(it)}\n")
+    } else if verb == "boom" {
+        random(0)
+    } else {
+        send(self, "What?\n")
+    }
+}
+
+pub fn net_dead() {
+}

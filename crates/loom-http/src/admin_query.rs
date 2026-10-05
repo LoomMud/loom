@@ -156,6 +156,17 @@ pub enum WorldQueryError {
     Closed,
     /// `object_vars` for a path that doesn't name a live object.
     NotFound,
+    /// OBI-279 (CTO review, PR #102, non-blocking note 1): the request
+    /// was answered, but the world side's own `valid_read` gate failed
+    /// to produce a real decision (a tick-budget or other runtime
+    /// failure inside the master's `valid_read`, see `loom_vm::World::
+    /// admin_list_objects`/`admin_object_vars`/`admin_errors`'s doc
+    /// comments) -- distinct from an empty/`NotFound` result, which
+    /// means the gate *ran* and said no. Carries the world-side error
+    /// message for operator-facing logs; never rendered to the HTTP
+    /// response body (same "never a different error shape" rule
+    /// `NotFound` already follows for `object_vars`).
+    Internal(String),
 }
 
 /// What `loom-http`'s admin routes need from the world thread. Defined

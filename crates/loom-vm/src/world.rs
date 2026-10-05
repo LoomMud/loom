@@ -1170,12 +1170,23 @@ impl World {
     /// tier-based rule (HTTP's own T3 floor has already run by the time
     /// this is called -- this is the *real* gate behind it, same spec
     /// reasoning as `errors_efun`'s T5 redaction note).
+    ///
+    /// CTO review (OBI-279, follow-up to OBI-237 PR #102, non-blocking
+    /// note 1): `Err` (a tick-budget or other runtime failure inside
+    /// `valid_read` itself, surfaced by [`RegistryHost::admin_valid_read`]
+    /// rather than silently treated as a denial the way it would be for
+    /// an in-game efun's `valid_*` gate) propagates out of this method,
+    /// not swallowed into an empty, successful-looking `Vec` -- the HTTP
+    /// edge turns this into a `503` (`WorldQueryError`), not "nothing
+    /// readable". A `valid_read` that runs and returns a plain `bool`,
+    /// allow or deny, is unaffected: this only changes what happens when
+    /// `valid_read` *itself* fails to produce an answer at all.
     pub fn admin_list_objects(
         &mut self,
         caller_euid: &str,
         _caller_tier: i16,
         host: &mut dyn Host,
-    ) -> Vec<AdminObjectSummary> {
+    ) -> Result<Vec<AdminObjectSummary>, RtError> {
         // CTO review (OBI-237 PR #102, must-fix B1): `caller_euid` is an
         // HTTP-authenticated staff `sub`, never validated against the
         // driver's reserved-principal rule the way an in-game `seteuid`
@@ -1190,7 +1201,7 @@ impl World {
         // `is_reserved_principal` denies exactly those names, the same
         // check `check_reserved_euid` applies to an in-game `seteuid`.
         if crate::security::is_reserved_principal(caller_euid) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let master = self.master_or_sentinel();
         let euid_sym = self.registry.syms.intern(caller_euid);
@@ -1209,9 +1220,14 @@ impl World {
                 let program_path = o.program.path.to_string();
                 let name = o.name.clone();
                 let euid_sym = o.euid;
-                let allowed = *decided
-                    .entry(program_path.clone())
-                    .or_insert_with(|| h.admin_valid_read("list_objects", &program_path));
+                let allowed = match decided.get(&program_path) {
+                    Some(&a) => a,
+                    None => {
+                        let a = h.admin_valid_read("list_objects", &program_path)?;
+                        decided.insert(program_path, a);
+                        a
+                    }
+                };
                 if !allowed {
                     continue;
                 }
@@ -1220,7 +1236,6 @@ impl World {
             }
             Ok(out)
         })
-        .unwrap_or_default()
     }
 
     /// `GET /api/v1/admin/objects/:path/vars`'s real data (OBI-237):
@@ -1254,18 +1269,27 @@ impl World {
     /// real secret in a plain (non-`persistent`, non-`/secure`-gated)
     /// var is a mudlib-side `valid_read` policy bug, not something this
     /// method can detect from here.
+    ///
+    /// CTO review (OBI-279, follow-up to OBI-237 PR #102, non-blocking
+    /// note 1): `Err` (a tick-budget or other runtime failure inside
+    /// `valid_read` itself) propagates out of this method, same as
+    /// [`World::admin_list_objects`]'s doc comment -- distinct from the
+    /// `Ok(None)` this method already uses for "doesn't exist" and "a
+    /// real, completed `valid_read` denied it", which stay deliberately
+    /// indistinguishable from each other, just not from "the permission
+    /// check itself never completed".
     pub fn admin_object_vars(
         &mut self,
         caller_euid: &str,
         _caller_tier: i16,
         path: &str,
         host: &mut dyn Host,
-    ) -> Option<AdminObjectVars> {
+    ) -> Result<Option<AdminObjectVars>, RtError> {
         // CTO review (OBI-237 PR #102, must-fix B1): see
         // `admin_list_objects`'s doc comment for why this check must run
         // before `syms.intern(caller_euid)`, not after.
         if crate::security::is_reserved_principal(caller_euid) {
-            return None;
+            return Ok(None);
         }
         let master = self.master_or_sentinel();
         let euid_sym = self.registry.syms.intern(caller_euid);
@@ -1283,7 +1307,7 @@ impl World {
                 return Ok(None);
             };
             let program_path = o.program.path.to_string();
-            if !h.admin_valid_read("object_vars", &program_path) {
+            if !h.admin_valid_read("object_vars", &program_path)? {
                 return Ok(None);
             }
             let Some(o) = h.registry.get(id) else {
@@ -1311,7 +1335,6 @@ impl World {
                 vars,
             }))
         })
-        .unwrap_or(None)
     }
 
     /// `GET /api/v1/admin/errors`'s real data (OBI-235, OBI-237): every
@@ -1335,18 +1358,23 @@ impl World {
     /// the same tier space the master's roles snapshot uses (T5 is
     /// `/secure`'s own floor throughout the admin-query surface, e.g.
     /// `loom-http`'s `SECURE_VARS_MIN_TIER`).
+    ///
+    /// CTO review (OBI-279, follow-up to OBI-237 PR #102, non-blocking
+    /// note 1): `Err` (a tick-budget or other runtime failure inside
+    /// `valid_read` itself) propagates out of this method, same as
+    /// [`World::admin_list_objects`]'s doc comment.
     pub fn admin_errors(
         &mut self,
         caller_euid: &str,
         caller_tier: i16,
         program_prefix: Option<&str>,
         host: &mut dyn Host,
-    ) -> Vec<AdminErrorGroup> {
+    ) -> Result<Vec<AdminErrorGroup>, RtError> {
         // CTO review (OBI-237 PR #102, must-fix B1): see
         // `admin_list_objects`'s doc comment for why this check must run
         // before `syms.intern(caller_euid)`, not after.
         if crate::security::is_reserved_principal(caller_euid) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let master = self.master_or_sentinel();
         let euid_sym = self.registry.syms.intern(caller_euid);
@@ -1359,9 +1387,14 @@ impl World {
             let mut decided: HashMap<String, bool> = HashMap::new();
             let mut out = Vec::new();
             for row in rows {
-                let allowed = *decided
-                    .entry(row.program.clone())
-                    .or_insert_with(|| h.admin_valid_read("errors", &row.program));
+                let allowed = match decided.get(&row.program) {
+                    Some(&a) => a,
+                    None => {
+                        let a = h.admin_valid_read("errors", &row.program)?;
+                        decided.insert(row.program.clone(), a);
+                        a
+                    }
+                };
                 if !allowed {
                     continue;
                 }
@@ -1384,7 +1417,6 @@ impl World {
             }
             Ok(out)
         })
-        .unwrap_or_default()
     }
 
     /// `tick_share_per_min` (OBI-121 S2c §3, OBI-137 S2): does `uid`'s
