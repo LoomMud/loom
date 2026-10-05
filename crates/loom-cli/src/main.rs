@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use loom_http::admin_query::{
+    ADMIN_QUERY_QUEUE_DEPTH, ChannelWorldQuery, ErrorGroup, ObjectVars, VarEntry, WhoEntry,
+    WorldQueryRequest,
+};
 use loom_net::{AdoptedConn, GmcpMessage, NetCommand, NetConfig, NetEvent, ReclaimRequest};
 use loom_persist::{DbEvent, DbRequest, Password, Persist};
 use loom_vm::{AccountAuth, Host, RolesMutations, RolesSnapshot, Value, World};
@@ -16,7 +20,6 @@ use time::OffsetDateTime;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
-
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const COMMAND_CHANNEL_CAPACITY: usize = 1024;
 /// Bound on in-flight `account_create`/`account_login`/`roles_*` mutation
@@ -1557,6 +1560,16 @@ async fn serve(
     let (reclaim_tx, reclaim_rx) = mpsc::channel::<ReclaimRequest>(RECLAIM_QUEUE_DEPTH);
     let (adopt_tx, adopt_rx) = mpsc::channel::<AdoptedConn>(RECLAIM_QUEUE_DEPTH);
 
+    // OBI-237 (OBI-234 follow-up): the admin `who`/object-browser query
+    // channel -- bounded, `try_send`-only from the HTTP side
+    // (`ChannelWorldQuery`), drained by the world thread's own event loop
+    // every iteration, same bridging shape as `db_req_tx`/`db_event_rx`
+    // above (request/reply direction reversed: HTTP calls into the world,
+    // not the world calling out). See `loom_http::admin_query`'s module
+    // doc for the full bound/backpressure/timeout contract this pairs
+    // with.
+    let (admin_query_tx, admin_query_rx) = mpsc::channel(ADMIN_QUERY_QUEUE_DEPTH);
+
     let world_handle = spawn_world_thread(
         mudlib_root.clone(),
         save_dir,
@@ -1568,6 +1581,7 @@ async fn serve(
         roles_snapshot_rx,
         roles_reload_tx,
         audit_tx,
+        admin_query_rx,
         persist.is_some(),
         persist.is_none(),
         snapshot_req_rx,
@@ -1601,8 +1615,9 @@ async fn serve(
         .expect("metrics recorder installed exactly once per process");
 
     let (ws_accept_tx, ws_accept_rx) = mpsc::channel(WS_ACCEPT_QUEUE_DEPTH);
-    let mut http_state =
-        loom_http::HttpState::new(ws_accept_tx, readiness, metrics).with_file_ops(file_op_tx);
+    let mut http_state = loom_http::HttpState::new(ws_accept_tx, readiness, metrics)
+        .with_file_ops(file_op_tx)
+        .with_world_query(std::sync::Arc::new(ChannelWorldQuery::new(admin_query_tx)));
     if let Some(web_root) = web_root_from_env() {
         http_state = http_state.with_web_root(web_root);
     }
@@ -2375,6 +2390,7 @@ fn spawn_world_thread(
     mut roles_snapshot_rx: watch::Receiver<Option<std::sync::Arc<RolesSnapshot>>>,
     roles_reload_tx: mpsc::Sender<()>,
     audit_tx: mpsc::Sender<Vec<loom_vm::AuditRow>>,
+    mut admin_query_rx: mpsc::Receiver<WorldQueryRequest>,
     has_audit_sink: bool,
     load_roles_seed: bool,
     snapshot_req_rx: std::sync::mpsc::Receiver<SnapshotRequest>,
@@ -2468,6 +2484,104 @@ fn spawn_world_thread(
                 world.drain_roles_results(host);
             };
 
+            // OBI-237 (OBI-234 follow-up): drain every pending admin
+            // `who`/`objects`/`objects/:path/vars`/`errors` request, same
+            // `try_recv` shape as `drain_db_events` above -- never
+            // `blocking_recv`, drained once per event-loop iteration, so a
+            // flood of admin queries degrades to the HTTP side's own
+            // `Busy`/503 once `admin_query_rx`'s bounded channel fills,
+            // never world-thread latency. Each reply is answered with its
+            // own tick-budgeted `valid_read` apply (`World::
+            // admin_list_objects`/`admin_object_vars`/`admin_errors`'s own
+            // doc comments) and sent on a `oneshot`, which cannot block
+            // either.
+            //
+            // CTO review (OBI-237 PR #102, non-blocking note): drained
+            // once per event-loop iteration, same as `drain_db_events` --
+            // on an otherwise-idle server that means once per
+            // `NetEvent::Tick` (`WORLD_TICK_INTERVAL`, 100 ms), not
+            // instantly on send; a query answered between two ticks still
+            // meets the HTTP side's 2s `ADMIN_QUERY_TIMEOUT` with ample
+            // margin, but this is the latency floor an admin request
+            // actually has, not "as soon as it's sent".
+            let mut drain_admin_queries = |world: &mut World, host: &mut NetHost| {
+                while let Ok(request) = admin_query_rx.try_recv() {
+                    match request {
+                        WorldQueryRequest::Who { reply } => {
+                            let who = world
+                                .who_sessions()
+                                .into_iter()
+                                .map(|s| WhoEntry {
+                                    conn_id: s.conn_id,
+                                    account: s.account,
+                                    connected_at: OffsetDateTime::from(s.connected_at),
+                                    idle_secs: s.idle_secs,
+                                })
+                                .collect();
+                            let _ = reply.send(Ok(who));
+                        }
+                        WorldQueryRequest::ListObjects { euid, tier, reply } => {
+                            let objects = world
+                                .admin_list_objects(&euid, tier, host)
+                                .into_iter()
+                                .map(|o| loom_http::admin_query::ObjectSummary {
+                                    path: o.path,
+                                    euid: o.euid,
+                                })
+                                .collect();
+                            let _ = reply.send(Ok(objects));
+                        }
+                        WorldQueryRequest::ObjectVars {
+                            euid,
+                            tier,
+                            path,
+                            reply,
+                        } => {
+                            let result = match world.admin_object_vars(&euid, tier, &path, host) {
+                                Some(vars) => Ok(ObjectVars {
+                                    path: vars.path,
+                                    vars: vars
+                                        .vars
+                                        .into_iter()
+                                        .map(|v| VarEntry {
+                                            name: v.name,
+                                            value: v.value,
+                                        })
+                                        .collect(),
+                                }),
+                                None => {
+                                    Err(loom_http::admin_query::WorldQueryError::NotFound)
+                                }
+                            };
+                            let _ = reply.send(result);
+                        }
+                        WorldQueryRequest::Errors {
+                            euid,
+                            tier,
+                            program_prefix,
+                            reply,
+                        } => {
+                            let groups = world
+                                .admin_errors(&euid, tier, program_prefix.as_deref(), host)
+                                .into_iter()
+                                .map(|g| ErrorGroup {
+                                    program: g.program,
+                                    function: g.function,
+                                    line: g.line,
+                                    message: g.message,
+                                    redacted: g.redacted,
+                                    count: g.count,
+                                    first_seen_unix_ms: g.first_seen_unix_ms,
+                                    last_seen_unix_ms: g.last_seen_unix_ms,
+                                    sample_trace: g.sample_trace,
+                                })
+                                .collect();
+                            let _ = reply.send(Ok(groups));
+                        }
+                    }
+                }
+            };
+
             while let Some(event) = event_rx.blocking_recv() {
                 match event {
                     NetEvent::Connected(conn) => world.connect(conn, &mut host),
@@ -2548,6 +2662,7 @@ fn spawn_world_thread(
                     world.set_roles_snapshot(snap);
                 }
                 drain_db_events(&mut world, &mut host);
+                drain_admin_queries(&mut world, &mut host);
                 // OBI-184 (copyover-trigger slice): a snapshot request
                 // from `run_control_responder`'s control socket, drained
                 // the same way as every other side-channel input to this

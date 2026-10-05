@@ -236,6 +236,38 @@ async fn direct_insert_into_staff_is_denied_for_loom_app() {
     );
 }
 
+/// OBI-185 (M-ADM-1 acceptance test): a direct `UPDATE` on `staff` must
+/// also fail for `loom_app` -- not just `INSERT` -- so there is no way
+/// to move a uid's tier except through `roles_set_tier`/
+/// `roles_propose_tier`/`roles_approve_proposal`.
+#[tokio::test]
+async fn direct_update_of_staff_is_denied_for_loom_app() {
+    let Some(fx) = support::setup().await else {
+        return;
+    };
+
+    let lead_uid = unique_uid("lead-update-attempt");
+    let lead_account = seed_account(&fx.owner, &lead_uid).await;
+    seed_staff(&fx.owner, &lead_uid, lead_account, 3).await;
+
+    let result = sqlx::query("UPDATE staff SET tier = 5 WHERE uid = $1")
+        .bind(&lead_uid)
+        .execute(fx.app.pool())
+        .await;
+
+    let err = result.expect_err("direct UPDATE of staff.tier must fail for loom_app");
+    let message = err.to_string().to_lowercase();
+    assert!(
+        message.contains("permission denied"),
+        "expected a permission-denied error, got: {message}"
+    );
+    assert_eq!(
+        staff_tier(&fx.owner, &lead_uid).await,
+        Some(3),
+        "tier must be unchanged after the denied direct UPDATE"
+    );
+}
+
 /// D-27.7: a T3 domain lead promotes a T1 member of its own domain to T2;
 /// the call succeeds and a `role_changes` row is written.
 #[tokio::test]

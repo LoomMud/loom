@@ -1,0 +1,29 @@
+<!-- SPDX-FileCopyrightText: 2026 Oberfield -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      M-IDE-1/M-IDE-2 (OBI-179 threat model): a strict CSP for the admin
+      pages -- no inline scripts/styles, no remote script origins beyond
+      `'self'`, no `object`/embed, no framing. Every page module under
+      `src/admin/` only ever builds DOM via `createElement`/`textContent`
+      (`src/admin/dom.ts`), so there is no inline-script/style need this
+      CSP would have to carve an exception for.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    />
+    <title>Loom admin</title>
+    <link rel="stylesheet" href="./admin.css" />
+  </head>
+  <body>
+    <nav id="admin-nav"></nav>
+    <main id="admin-main"></main>
+    <div id="admin-modal" class="step-up-overlay"></div>
+    <!-- External module only: `script-src 'self'` blocks inline scripts. -->
+    <script type="module" src="./dist/admin/main.js"></script>
+  </body>
+</html>

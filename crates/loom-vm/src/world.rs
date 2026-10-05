@@ -69,6 +69,84 @@ pub struct AuditRow {
     pub at_unix_ms: i64,
 }
 
+/// One live connection, as reported by the OBI-237 admin-query
+/// world-thread side (`World::who_sessions`). Mirrors
+/// `loom_http::admin_query::WhoEntry` field-for-field; defined here
+/// (rather than depending on `loom-http` from `loom-vm`) so `loom-cli`'s
+/// bridging code is the only place that needs to know both shapes --
+/// see that module's doc comment (M-ADM-3: never an email or an IP,
+/// neither of which exists anywhere in `World`'s own state for a
+/// connection, so there is no field here to leak one from).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub conn_id: u64,
+    /// The bound account uid, if logged in -- see
+    /// [`World::who_sessions`]'s doc comment for exactly what "logged in"
+    /// means here.
+    pub account: Option<String>,
+    pub connected_at: std::time::SystemTime,
+    pub idle_secs: i64,
+}
+
+/// One object in the OBI-237 admin-query `list_objects` answer, already
+/// filtered by `valid_read` (see [`World::admin_list_objects`]). Mirrors
+/// `loom_http::admin_query::ObjectSummary`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminObjectSummary {
+    pub path: String,
+    pub euid: String,
+}
+
+/// One rendered variable in the OBI-237 admin-query `object_vars` answer.
+/// Mirrors `loom_http::admin_query::VarEntry`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminVarEntry {
+    pub name: String,
+    pub value: String,
+}
+
+/// The OBI-237 admin-query `object_vars` answer for one live object, once
+/// `valid_read` has already passed (see [`World::admin_object_vars`]).
+/// Mirrors `loom_http::admin_query::ObjectVars`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminObjectVars {
+    pub path: String,
+    pub vars: Vec<AdminVarEntry>,
+}
+
+/// One group in the OBI-235/OBI-237 admin-query `errors` answer, already
+/// `valid_read`-filtered per program and M-ERR-1-redacted (see
+/// [`World::admin_errors`]). Mirrors `loom_http::admin_query::ErrorGroup`
+/// field-for-field (which itself mirrors `crate::errors::ErrorRecord`,
+/// except `line` is `Option<u32>` here/there vs. `ErrorRecord`'s `0`-for-
+/// unknown convention).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminErrorGroup {
+    pub program: String,
+    pub function: String,
+    pub line: Option<u32>,
+    pub message: String,
+    pub redacted: bool,
+    pub count: u64,
+    pub first_seen_unix_ms: u64,
+    pub last_seen_unix_ms: u64,
+    pub sample_trace: Vec<String>,
+}
+
+/// A connection's session timing (OBI-237): `connected_at` is wall-clock
+/// (what `who` reports), `last_activity` is monotonic (`Instant`, so
+/// `idle_secs` can never go backwards under a clock adjustment). Kept
+/// separate from `BcObject` (which already tracks `conn`) because a
+/// connection outlives any single bound object across a `seteuid`/login
+/// flow, and because `Registry::capture`'s snapshot (OBI-173) has no
+/// reason to carry wall-clock session metadata across a copyover --
+/// `World::reconnect` re-seeds it fresh instead (see that method's doc
+/// comment).
+struct ConnSession {
+    connected_at: std::time::SystemTime,
+    last_activity: std::time::Instant,
+}
+
 /// The `account_create`/`account_login` async backend (spec, OBI-85):
 /// `World` calls this to *issue* a request (never blocking); the answer
 /// comes back out-of-band, through whatever channel the implementation
@@ -408,6 +486,9 @@ pub struct World {
     /// Grouped runtime-error inbox (OBI-169, spec §8.3): see
     /// `crate::errors::ErrorInbox`. Fed uniformly by `World::exec`.
     errors: crate::errors::ErrorInbox,
+    /// Per-connection session timing (OBI-237 admin query `who`): see
+    /// [`ConnSession`].
+    sessions: HashMap<u64, ConnSession>,
 }
 
 /// Identifies one [`World::begin_recompile`] call, so its eventual result
@@ -623,6 +704,7 @@ impl World {
             tick_share: HashMap::new(),
             disk_usage: crate::disk_usage::DiskUsage::default(),
             errors: crate::errors::ErrorInbox::new(),
+            sessions: HashMap::new(),
         };
         let mut null = NullHost;
         let sentinel = ObjectId {
@@ -720,6 +802,7 @@ impl World {
             tick_share: HashMap::new(),
             disk_usage: crate::disk_usage::DiskUsage::default(),
             errors: crate::errors::ErrorInbox::new(),
+            sessions: HashMap::new(),
         })
     }
 
@@ -1016,6 +1099,294 @@ impl World {
         self.errors.snapshot(program_prefix)
     }
 
+    /// `GET /api/v1/admin/who`'s real data (OBI-237, the world-thread side
+    /// of the admin query channel, OBI-234 follow-up): one row per live
+    /// connection, in ascending `conn` id order.
+    ///
+    /// `account` is the bound object's current *euid*, but only once it
+    /// differs from the object's immutable `uid` -- i.e. only once
+    /// something has `seteuid`'d it, which in a real mudlib is exactly
+    /// what `/secure/login` does once a connection authenticates (see
+    /// `bcvm::registry::RegistryHost::check_confinement`'s doc comment
+    /// for the same euid-is-the-account convention this driver already
+    /// relies on for `move_to` confinement). A connection still at a
+    /// login/creation prompt -- never `seteuid`'d -- reports `None`. This
+    /// is a convention, not a dedicated "logged in" flag: the driver has
+    /// no concept of its own of what "logged in" means (spec: entirely
+    /// mudlib policy), so this is the best available proxy, not an
+    /// invented parallel one.
+    ///
+    /// Never an email or an IP address: neither exists anywhere in
+    /// `World`'s own state for a connection (M-ADM-3), so there is no
+    /// field here to leak one from even by accident.
+    pub fn who_sessions(&self) -> Vec<SessionSummary> {
+        let mut out: Vec<SessionSummary> = self
+            .registry
+            .conns
+            .iter()
+            .filter_map(|(&conn_id, &ob)| {
+                let o = self.registry.get(ob)?;
+                let session = self.sessions.get(&conn_id)?;
+                let account = (o.euid != o.uid).then(|| self.principal_name(o.euid).to_string());
+                let idle_secs = std::time::Instant::now()
+                    .saturating_duration_since(session.last_activity)
+                    .as_secs() as i64;
+                Some(SessionSummary {
+                    conn_id,
+                    account,
+                    connected_at: session.connected_at,
+                    idle_secs,
+                })
+            })
+            .collect();
+        out.sort_unstable_by_key(|s| s.conn_id);
+        out
+    }
+
+    /// `GET /api/v1/admin/objects`'s real data (OBI-237): every live
+    /// object whose *declaring program* `caller_euid` can `valid_read` --
+    /// the exact `Operation::Read`/`authorize` call path every other
+    /// `valid_read` call-site uses (`bcvm::registry::RegistryHost::
+    /// admin_valid_read`'s doc comment; the `errors` efun's own
+    /// per-program filter is the closest existing precedent, down to "a
+    /// denied program's objects are silently omitted, not an error" --
+    /// see `errors_efun`'s doc comment). The decision is cached per
+    /// distinct program for the duration of this one call (same reason
+    /// `errors_efun` does it: many objects commonly share one program,
+    /// and the security decision cache would dedupe the `valid_read`
+    /// apply calls anyway, but this skips even the cache lookups).
+    ///
+    /// Run inside a `cut_guard` carrying exactly `caller_euid` as both
+    /// `uid` and `euid` (D-S1.2 rule 5's cut semantics): the admin caller
+    /// has no live in-game object at all (an HTTP request, not a
+    /// connection), so there is no `self_object` principal to derive a
+    /// guard from the normal way -- this is the explicit substitute,
+    /// exactly as a scheduled `call_out`'s captured guard substitutes for
+    /// its own missing "current" principal.
+    ///
+    /// `caller_tier` is accepted for parity with `loom_http::admin_query::
+    /// WorldAdminQuery`'s signature but intentionally unused: the world
+    /// side's permission boundary is `valid_read` alone, never a parallel
+    /// tier-based rule (HTTP's own T3 floor has already run by the time
+    /// this is called -- this is the *real* gate behind it, same spec
+    /// reasoning as `errors_efun`'s T5 redaction note).
+    pub fn admin_list_objects(
+        &mut self,
+        caller_euid: &str,
+        _caller_tier: i16,
+        host: &mut dyn Host,
+    ) -> Vec<AdminObjectSummary> {
+        // CTO review (OBI-237 PR #102, must-fix B1): `caller_euid` is an
+        // HTTP-authenticated staff `sub`, never validated against the
+        // driver's reserved-principal rule the way an in-game `seteuid`
+        // is (`bcvm::registry::RegistryHost::check_reserved_euid`,
+        // D-S3.1/M-FS-1). Refused *before* interning: `syms.intern("root")`
+        // reuses `security::ROOT` (sym 0), which `GuardSet::with` drops
+        // as the identity element, leaving an **empty** guard -- D-S1.2's
+        // "an all-root stack is allowed without asking the master" rule,
+        // meaning a staff account literally named `root` (or `mudlib`, or
+        // any `domain:*`) would silently get root's own unconditional
+        // `valid_read` pass, `/secure` included, instead of being denied.
+        // `is_reserved_principal` denies exactly those names, the same
+        // check `check_reserved_euid` applies to an in-game `seteuid`.
+        if crate::security::is_reserved_principal(caller_euid) {
+            return Vec::new();
+        }
+        let master = self.master_or_sentinel();
+        let euid_sym = self.registry.syms.intern(caller_euid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: euid_sym,
+            euid: euid_sym,
+        });
+        let ids = self.registry.ids();
+        self.exec(host, master, None, None, Some(guard), None, None, |h| {
+            let mut decided: HashMap<String, bool> = HashMap::new();
+            let mut out = Vec::new();
+            for id in ids {
+                let Some(o) = h.registry.get(id) else {
+                    continue;
+                };
+                let program_path = o.program.path.to_string();
+                let name = o.name.clone();
+                let euid_sym = o.euid;
+                let allowed = *decided
+                    .entry(program_path.clone())
+                    .or_insert_with(|| h.admin_valid_read("list_objects", &program_path));
+                if !allowed {
+                    continue;
+                }
+                let euid = h.registry.syms.name(euid_sym).to_string();
+                out.push(AdminObjectSummary { path: name, euid });
+            }
+            Ok(out)
+        })
+        .unwrap_or_default()
+    }
+
+    /// `GET /api/v1/admin/objects/:path/vars`'s real data (OBI-237):
+    /// `path`'s variables, once `caller_euid` passes the exact same
+    /// `valid_read` gate as [`World::admin_list_objects`] -- on `path`'s
+    /// *declaring program*, not the instance path, same as every other
+    /// `valid_read` call-site.
+    ///
+    /// `None` both for a `path` that does not resolve to a live object
+    /// ([`World::find_object`]) and for one `valid_read` refuses --
+    /// deliberately indistinguishable (the trait doc comment this
+    /// mirrors, `loom_http::admin_query::WorldAdminQuery::object_vars`,
+    /// requires exactly this: "never a different error shape", so the
+    /// HTTP layer can't be used to probe which `/secure` paths exist).
+    /// This is also where `/secure` confidentiality is actually
+    /// enforced -- the HTTP edge's T5 tier floor is a convenience, not
+    /// the real boundary; a master whose `valid_read` denies a
+    /// `/secure/**` program to a tier-5 caller is still obeyed here.
+    ///
+    /// CTO review (OBI-237 PR #102, non-blocking note): this renders
+    /// *every* variable `valid_read` lets the caller see, with no
+    /// credential-shaped-name scrubbing of its own (e.g. `/secure/login`'s
+    /// transient `pending_pw` would render like any other var). That is
+    /// deliberate, not an oversight: `valid_read` is the one real
+    /// confidentiality boundary this method enforces (the line above),
+    /// and a master whose policy lets a caller read a program at all is
+    /// trusted to have already decided that caller may see its state --
+    /// adding a second, driver-guessed "looks like a credential" filter
+    /// on top would be exactly the kind of parallel permission rule this
+    /// issue's design note says not to invent. A mudlib that stores a
+    /// real secret in a plain (non-`persistent`, non-`/secure`-gated)
+    /// var is a mudlib-side `valid_read` policy bug, not something this
+    /// method can detect from here.
+    pub fn admin_object_vars(
+        &mut self,
+        caller_euid: &str,
+        _caller_tier: i16,
+        path: &str,
+        host: &mut dyn Host,
+    ) -> Option<AdminObjectVars> {
+        // CTO review (OBI-237 PR #102, must-fix B1): see
+        // `admin_list_objects`'s doc comment for why this check must run
+        // before `syms.intern(caller_euid)`, not after.
+        if crate::security::is_reserved_principal(caller_euid) {
+            return None;
+        }
+        let master = self.master_or_sentinel();
+        let euid_sym = self.registry.syms.intern(caller_euid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: euid_sym,
+            euid: euid_sym,
+        });
+        let target = self.find_object(path);
+        let path = path.to_string();
+        self.exec(host, master, None, None, Some(guard), None, None, |h| {
+            let Some(id) = target else {
+                return Ok(None);
+            };
+            let Some(o) = h.registry.get(id) else {
+                return Ok(None);
+            };
+            let program_path = o.program.path.to_string();
+            if !h.admin_valid_read("object_vars", &program_path) {
+                return Ok(None);
+            }
+            let Some(o) = h.registry.get(id) else {
+                return Ok(None);
+            };
+            let raw: Vec<(String, Value)> = o
+                .vars
+                .iter()
+                .map(|((_, name), v)| (name.to_string(), v.clone()))
+                .collect();
+            let mut vars: Vec<AdminVarEntry> = raw
+                .into_iter()
+                .map(|(name, value)| {
+                    let value = crate::bcvm::heap::display(&value, &|oid| {
+                        h.registry
+                            .get(oid)
+                            .map_or_else(|| "<destructed>".to_string(), |o| o.name.clone())
+                    });
+                    AdminVarEntry { name, value }
+                })
+                .collect();
+            vars.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+            Ok(Some(AdminObjectVars {
+                path: path.clone(),
+                vars,
+            }))
+        })
+        .unwrap_or(None)
+    }
+
+    /// `GET /api/v1/admin/errors`'s real data (OBI-235, OBI-237): every
+    /// error-inbox group (`World::errors_snapshot`, OBI-169) whose
+    /// *program* `caller_euid` can `valid_read`, optionally narrowed to
+    /// `program_prefix` first (`errors_snapshot`'s own filter -- same
+    /// semantics as the `errors` efun's own `filter` argument). Exactly
+    /// `errors_efun`'s own per-program permission filter and M-ERR-1
+    /// redaction rule, just invoked for an HTTP admin caller instead of
+    /// an in-game one: a denied program's groups are silently omitted,
+    /// not an error, and a `/secure/**` origin's message is redacted to
+    /// any caller below `caller_tier` 5, independent of whether
+    /// `valid_read` itself already let a lower tier through (see
+    /// `errors_efun`'s own doc comment for why that floor is
+    /// driver-enforced, not conditioned on the master's policy).
+    ///
+    /// `caller_tier` here *is* used (unlike `admin_list_objects`/
+    /// `admin_object_vars`'s `_caller_tier`): M-ERR-1's redaction rule is
+    /// specifically tier-keyed, not `valid_read`-keyed, both in the
+    /// `errors` efun and here -- the HTTP-authenticated staff tier is
+    /// the same tier space the master's roles snapshot uses (T5 is
+    /// `/secure`'s own floor throughout the admin-query surface, e.g.
+    /// `loom-http`'s `SECURE_VARS_MIN_TIER`).
+    pub fn admin_errors(
+        &mut self,
+        caller_euid: &str,
+        caller_tier: i16,
+        program_prefix: Option<&str>,
+        host: &mut dyn Host,
+    ) -> Vec<AdminErrorGroup> {
+        // CTO review (OBI-237 PR #102, must-fix B1): see
+        // `admin_list_objects`'s doc comment for why this check must run
+        // before `syms.intern(caller_euid)`, not after.
+        if crate::security::is_reserved_principal(caller_euid) {
+            return Vec::new();
+        }
+        let master = self.master_or_sentinel();
+        let euid_sym = self.registry.syms.intern(caller_euid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: euid_sym,
+            euid: euid_sym,
+        });
+        let rows = self.errors_snapshot(program_prefix);
+        self.exec(host, master, None, None, Some(guard), None, None, |h| {
+            let mut decided: HashMap<String, bool> = HashMap::new();
+            let mut out = Vec::new();
+            for row in rows {
+                let allowed = *decided
+                    .entry(row.program.clone())
+                    .or_insert_with(|| h.admin_valid_read("errors", &row.program));
+                if !allowed {
+                    continue;
+                }
+                let message = if row.redacted && caller_tier < 5 {
+                    "<redacted>".to_string()
+                } else {
+                    row.message
+                };
+                out.push(AdminErrorGroup {
+                    program: row.program,
+                    function: row.function,
+                    line: if row.line == 0 { None } else { Some(row.line) },
+                    message,
+                    redacted: row.redacted,
+                    count: row.count,
+                    first_seen_unix_ms: row.first_seen_unix_ms,
+                    last_seen_unix_ms: row.last_seen_unix_ms,
+                    sample_trace: row.sample_trace,
+                });
+            }
+            Ok(out)
+        })
+        .unwrap_or_default()
+    }
+
     /// `tick_share_per_min` (OBI-121 S2c §3, OBI-137 S2): does `uid`'s
     /// sliding-window usage already meet or exceed its tier's
     /// `tick_share_per_min`? A uid with no such row (unlimited, or the
@@ -1113,6 +1484,17 @@ impl World {
             }
         };
         self.registry.bind(conn, player);
+        // OBI-237: session timing for the admin `who` query -- recorded
+        // only once the connection is actually bound to a live object
+        // (never for a connection master's own `connect()` refused and
+        // closed above).
+        self.sessions.insert(
+            conn,
+            ConnSession {
+                connected_at: std::time::SystemTime::now(),
+                last_activity: std::time::Instant::now(),
+            },
+        );
         if let Err(e) = self.exec(
             host,
             player,
@@ -1142,6 +1524,11 @@ impl World {
         let Some(&ob) = self.registry.conns.get(&conn) else {
             return;
         };
+        // OBI-237: any input at all resets the idle clock `who` reports,
+        // independent of whether `process_input` itself succeeds below.
+        if let Some(session) = self.sessions.get_mut(&conn) {
+            session.last_activity = std::time::Instant::now();
+        }
         let actor = self.registry.get(ob).map(|o| o.euid);
         let r = self.exec(
             host,
@@ -1187,6 +1574,15 @@ impl World {
         let Some(&ob) = self.registry.conns.get(&conn) else {
             return;
         };
+        // OBI-237: a copyover's new process has no memory of the old
+        // process's session timing (it is wall-clock metadata, not part
+        // of `Registry::capture`'s snapshot -- see `ConnSession`'s doc
+        // comment), so `who` treats every reconnected session as freshly
+        // connected at copyover time rather than silently omitting it.
+        self.sessions.entry(conn).or_insert_with(|| ConnSession {
+            connected_at: std::time::SystemTime::now(),
+            last_activity: std::time::Instant::now(),
+        });
         let r = self.exec(host, ob, Some(ob), Some(conn), None, None, None, |h| {
             h.call_apply(ob, "reconnect", Vec::new())
         });
@@ -1264,6 +1660,7 @@ impl World {
         let Some(ob) = self.registry.conns.remove(&conn) else {
             return;
         };
+        self.sessions.remove(&conn);
         // Errors have nowhere to go (the connection is gone).
         let _ = self.exec(host, ob, Some(ob), None, None, None, None, |h| {
             h.call_apply(ob, "autosave", Vec::new())
