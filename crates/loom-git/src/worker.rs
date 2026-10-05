@@ -300,7 +300,13 @@ pub struct ProposeGitHubConfig {
     /// entirely -- distinct from `pr_opener`, since a `propose`-only test
     /// double doesn't necessarily also implement
     /// [`crate::report::ReportGitHub`].
-    pub report_client: Option<Box<dyn crate::report::ReportGitHub>>,
+    ///
+    /// `Arc`, not `Box` (OBI-278): the actual network calls run on a
+    /// detached thread (see [`report_post_merge`]), never the
+    /// git-worker thread itself, so this has to be cheaply cloneable
+    /// into that thread rather than borrowed for the duration of the
+    /// call.
+    pub report_client: Option<Arc<dyn crate::report::ReportGitHub>>,
 }
 
 /// Everything `propose` (B3.3) needs beyond the commit/push/sync config
@@ -885,6 +891,16 @@ fn run_sync_main(
         // move that actually touches `live`, and every pass in between
         // wrongly looks like "first sync" to `report_post_merge`
         // (OBI-272).
+        //
+        // This branch intentionally posts no post-merge PR report for
+        // this range (OBI-278): `report_post_merge` is only called below
+        // once `live` has actually moved, and that is deliberate here --
+        // `main` moved but produced no change worth telling any PR about
+        // (its rebuild already landed in an earlier pass, or it touched
+        // nothing that survives onto `live`), so there is nothing to
+        // report yet. The *next* pass that does move `live` reports
+        // against `refs/loom/last-main` as just updated below, so the
+        // range is never silently dropped, only deferred.
         let _ = repo.git(&["update-ref", "refs/loom/last-main", &new_main]);
         crate::metrics::record_sync(if rebase_ok {
             "no_change"
@@ -1021,9 +1037,21 @@ fn run_sync_main(
 /// with what happened. Skipped entirely (not an error) when there's no
 /// `GitHubAppClient` configured for this ([`ProposeGitHubConfig`]'s
 /// `report_client`), or when `old_main` is `None` (first sync: nothing
-/// to diff against). Every failure here (a bad `merged_commits` range,
-/// a GitHub 5xx) is logged and otherwise swallowed -- this must never
-/// fail the `SyncMain` pass it's reporting on.
+/// to diff against).
+///
+/// OBI-278: the actual GitHub calls (`resolve_pull_requests`'s
+/// commits-to-pulls fallback, then up to [`crate::report::MAX_UNIQUE_PRS`]
+/// `create_issue_comment` calls) run on a **detached thread**, bounded
+/// by [`crate::report::REPORT_TOTAL_DEADLINE`] total -- never the
+/// git-worker thread this function is called from. `UreqClient`'s own
+/// per-call timeout (10s) times up to 100 commits plus 20 comments could
+/// otherwise stall commit/push/sync for minutes on a slow GitHub.
+/// `merged_commits` itself stays synchronous here: it is a local `git
+/// log`, not a network call, and the caller needs its `is_empty()` to
+/// decide whether there's anything to report at all. Every failure past
+/// that point (a GitHub 5xx, a transport timeout) is logged on the
+/// detached thread and otherwise swallowed -- this must never fail, or
+/// even delay, the `SyncMain` pass it's reporting on.
 fn report_post_merge(
     repo: &Repo,
     config: &GitConfig,
@@ -1036,7 +1064,7 @@ fn report_post_merge(
     let Some(gh_cfg) = propose_config.github.as_ref() else {
         return;
     };
-    let Some(report_client) = gh_cfg.report_client.as_deref() else {
+    let Some(report_client) = gh_cfg.report_client.clone() else {
         return;
     };
     let Some(old_main) = old_main else {
@@ -1055,15 +1083,29 @@ fn report_post_merge(
     if commits.is_empty() {
         return;
     }
-    let _ = crate::report::report_recompile(
-        report_client,
-        &gh_cfg.owner,
-        &gh_cfg.repo,
-        &config.env_name,
-        new_live,
-        &commits,
-        outcome,
-    );
+    let owner = gh_cfg.owner.clone();
+    let repo_name = gh_cfg.repo.clone();
+    let env_name = config.env_name.clone();
+    let new_live = new_live.to_string();
+    let outcome = outcome.clone();
+    let deadline = Instant::now() + crate::report::REPORT_TOTAL_DEADLINE;
+    let spawned = std::thread::Builder::new()
+        .name("loom-git-report".to_string())
+        .spawn(move || {
+            let _ = crate::report::report_recompile(
+                report_client.as_ref(),
+                &owner,
+                &repo_name,
+                &env_name,
+                &new_live,
+                &commits,
+                &outcome,
+                deadline,
+            );
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "loom-git: failed to spawn post-merge PR report thread");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

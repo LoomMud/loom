@@ -99,6 +99,18 @@ pub const MAX_MERGED_COMMITS: usize = 100;
 /// (with a warning) rather than spam every one of them.
 pub const MAX_UNIQUE_PRS: usize = 20;
 
+/// Total wall-clock budget (OBI-278) for one post-merge report pass --
+/// every `commit_pulls`/`create_issue_comment` call against the real
+/// GitHub API, combined. `UreqClient`'s own per-call timeout is 10s
+/// (`github::transport`), and up to [`MAX_MERGED_COMMITS`] lookups plus
+/// [`MAX_UNIQUE_PRS`] comments in one pass means an unbounded total could
+/// run for minutes against a slow GitHub. [`report_post_merge_bounded`]
+/// (called from a detached thread, never the git-worker thread itself)
+/// checks this before every network call and stops the rest of the pass
+/// (logged, not an error) once it's past -- a partial report is strictly
+/// better than an unbounded one, and the pass is best-effort already.
+pub const REPORT_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Cap on list items (`recompiled`/`failures`) rendered into one comment
 /// body before truncating with a "... and N more" line -- GitHub rejects
 /// comment bodies over 65,536 characters, and a batch large enough to
@@ -192,26 +204,47 @@ pub struct ResolvedCommit {
 /// lookup failure (transport error, non-2xx) is logged and treated the
 /// same as "no PR found" -- this must never panic the sync loop over a
 /// GitHub API hiccup.
+///
+/// `deadline` (OBI-278) bounds the *network* fallback only -- the first
+/// two, free, subject-parsing attempts always run regardless of how much
+/// budget is left. Once `Instant::now()` is past `deadline`, every
+/// remaining commit that would otherwise need a `commit_pulls` call is
+/// left unresolved (`pr_number: None`, logged once) rather than making
+/// the call anyway.
 pub fn resolve_pull_requests(
     client: &dyn ReportGitHub,
     owner: &str,
     repo: &str,
     commits: &[MergedCommit],
+    deadline: std::time::Instant,
 ) -> Vec<ResolvedCommit> {
+    let mut deadline_logged = false;
     commits
         .iter()
         .map(|commit| {
             let pr_number = extract_pr_number(&commit.subject)
                 .or_else(|| extract_merge_commit_pr_number(&commit.subject))
-                .or_else(|| match client.commit_pulls(owner, repo, &commit.sha) {
-                    Ok(pulls) => first_pull_number(&pulls),
-                    Err(e) => {
-                        tracing::warn!(
-                            sha = %commit.sha,
-                            error = %e,
-                            "loom-git: commits-to-pulls lookup failed"
-                        );
-                        None
+                .or_else(|| {
+                    if std::time::Instant::now() >= deadline {
+                        if !deadline_logged {
+                            deadline_logged = true;
+                            tracing::warn!(
+                                "loom-git: post-merge report deadline reached, \
+                                 skipping remaining commits-to-pulls lookups"
+                            );
+                        }
+                        return None;
+                    }
+                    match client.commit_pulls(owner, repo, &commit.sha) {
+                        Ok(pulls) => first_pull_number(&pulls),
+                        Err(e) => {
+                            tracing::warn!(
+                                sha = %commit.sha,
+                                error = %e,
+                                "loom-git: commits-to-pulls lookup failed"
+                            );
+                            None
+                        }
                     }
                 });
             ResolvedCommit {
@@ -319,6 +352,12 @@ pub fn comment_body(env_name: &str, live_sha: &str, outcome: &RecompileOutcome) 
 /// that case. Returns one entry per PR actually commented on (success or
 /// [`crate::github::GitHubAppError`]), so the caller can decide
 /// whether/how to surface a comment failure.
+///
+/// `deadline` (OBI-278) is the same total budget threaded through
+/// [`resolve_pull_requests`]: once past it, no further
+/// `create_issue_comment` calls are made either (logged once) -- a
+/// partial set of comments, not an unbounded one.
+#[allow(clippy::too_many_arguments)]
 pub fn report_recompile(
     client: &dyn ReportGitHub,
     owner: &str,
@@ -327,6 +366,7 @@ pub fn report_recompile(
     live_sha: &str,
     commits: &[MergedCommit],
     outcome: &RecompileOutcome,
+    deadline: std::time::Instant,
 ) -> Vec<(u64, Result<(), crate::github::GitHubAppError>)> {
     if commits.len() > MAX_MERGED_COMMITS {
         tracing::warn!(
@@ -337,7 +377,7 @@ pub fn report_recompile(
         );
         return Vec::new();
     }
-    let resolved = resolve_pull_requests(client, owner, repo, commits);
+    let resolved = resolve_pull_requests(client, owner, repo, commits, deadline);
     let body = comment_body(env_name, live_sha, outcome);
     let mut seen = std::collections::BTreeSet::new();
     let mut results = Vec::new();
@@ -352,6 +392,13 @@ pub fn report_recompile(
                     tracing::warn!(
                         cap = MAX_UNIQUE_PRS,
                         "loom-git: unique-PR cap reached, skipping remaining PR comments"
+                    );
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(
+                        "loom-git: post-merge report deadline reached, \
+                         skipping remaining PR comments"
                     );
                     break;
                 }
@@ -384,6 +431,14 @@ mod tests {
 
     fn test_pem() -> String {
         include_str!("github/testdata/test_key.pkcs8.pem").to_string()
+    }
+
+    /// A deadline far enough out that none of these tests' (fast,
+    /// loopback) fake-GitHub calls can plausibly hit it -- these tests
+    /// are exercising resolution/comment behavior, not the deadline
+    /// itself (see `worker.rs`'s `post_merge_report` tests for that).
+    fn far_future_deadline() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
     }
 
     // --- squash-subject extraction -----------------------------------
@@ -631,7 +686,8 @@ mod tests {
             sha: "deadbeef".to_string(),
             subject: "Rebased commit, no PR marker".to_string(),
         }];
-        let resolved = resolve_pull_requests(&app, "LoomMud", "loom", &commits);
+        let resolved =
+            resolve_pull_requests(&app, "LoomMud", "loom", &commits, far_future_deadline());
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].pr_number, Some(99));
         let paths: Vec<String> = server
@@ -658,7 +714,8 @@ mod tests {
             sha: "abc123".to_string(),
             subject: "loom-git: thing (#42)".to_string(),
         }];
-        let resolved = resolve_pull_requests(&app, "LoomMud", "loom", &commits);
+        let resolved =
+            resolve_pull_requests(&app, "LoomMud", "loom", &commits, far_future_deadline());
         assert_eq!(resolved[0].pr_number, Some(42));
         let hit_pulls_api = server
             .requests
@@ -686,7 +743,8 @@ mod tests {
             sha: "abc123".to_string(),
             subject: "Merge pull request #81 from LoomMud/legolas/obi-190-loom-git".to_string(),
         }];
-        let resolved = resolve_pull_requests(&app, "LoomMud", "loom", &commits);
+        let resolved =
+            resolve_pull_requests(&app, "LoomMud", "loom", &commits, far_future_deadline());
         assert_eq!(resolved[0].pr_number, Some(81));
         let hit_pulls_api = server
             .requests
@@ -723,7 +781,14 @@ mod tests {
             failures: vec![],
         };
         let results = report_recompile(
-            &app, "LoomMud", "loom", "staging", "cafef00d", &commits, &outcome,
+            &app,
+            "LoomMud",
+            "loom",
+            "staging",
+            "cafef00d",
+            &commits,
+            &outcome,
+            far_future_deadline(),
         );
         assert!(results.is_empty());
     }
@@ -829,7 +894,14 @@ mod tests {
             failures: vec![],
         };
         let results = report_recompile(
-            &app, "LoomMud", "loom", "staging", "cafef00d", &commits, &outcome,
+            &app,
+            "LoomMud",
+            "loom",
+            "staging",
+            "cafef00d",
+            &commits,
+            &outcome,
+            far_future_deadline(),
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 10);
@@ -860,7 +932,14 @@ mod tests {
         }];
         let outcome = RecompileOutcome::default();
         let results = report_recompile(
-            &app, "LoomMud", "loom", "staging", "cafef00d", &commits, &outcome,
+            &app,
+            "LoomMud",
+            "loom",
+            "staging",
+            "cafef00d",
+            &commits,
+            &outcome,
+            far_future_deadline(),
         );
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 55);
@@ -897,7 +976,14 @@ mod tests {
             .collect();
         let outcome = RecompileOutcome::default();
         let results = report_recompile(
-            &app, "LoomMud", "loom", "staging", "cafef00d", &commits, &outcome,
+            &app,
+            "LoomMud",
+            "loom",
+            "staging",
+            "cafef00d",
+            &commits,
+            &outcome,
+            far_future_deadline(),
         );
         assert!(results.is_empty());
     }
@@ -923,7 +1009,14 @@ mod tests {
             .collect();
         let outcome = RecompileOutcome::default();
         let results = report_recompile(
-            &app, "LoomMud", "loom", "staging", "cafef00d", &commits, &outcome,
+            &app,
+            "LoomMud",
+            "loom",
+            "staging",
+            "cafef00d",
+            &commits,
+            &outcome,
+            far_future_deadline(),
         );
         assert_eq!(results.len(), MAX_UNIQUE_PRS);
     }
