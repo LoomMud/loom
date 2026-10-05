@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::bcvm::Value;
 use crate::bcvm::compile_worker::{RecompileJob, RecompileSetJob};
 use crate::bcvm::registry::{Compiler, Registry, RegistryHost};
-use crate::bcvm::vm::{Limits as VmLimits, RtError};
+use crate::bcvm::vm::{Host as VmHost, Limits as VmLimits, RtError};
 use crate::host::{Host, NullHost};
 use crate::object::ObjectId;
 use crate::roles::RolesSnapshot;
@@ -507,6 +507,80 @@ impl TickShareWindow {
             }
         }
         total
+    }
+}
+
+/// `PUT /api/v1/files/content`'s precondition (OBI-180 M-FS-6): either
+/// the caller's `ETag` must match the file's current contents (update),
+/// or the file must not exist yet (create).
+#[derive(Debug, Clone)]
+pub enum FileMatchPrecondition {
+    /// `If-Match: "<etag>"` -- the file must currently exist and hash to
+    /// exactly this `sha256` hex digest (quoted or not; compared after
+    /// stripping surrounding `"`).
+    IfMatch(String),
+    /// `If-None-Match: *` -- the file must not currently exist.
+    IfNoneMatchStar,
+}
+
+/// Outcome of [`World::call_file_write_if_match`], distinct from its
+/// `Err(String)` (an authorization refusal or I/O failure, same shape as
+/// [`World::call_file_efun`]'s): all three of these are a successful,
+/// authorized attempt that ran to completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCasOutcome {
+    /// The write happened.
+    Written,
+    /// `write_file` refused for disk quota, not authorization (OBI-137
+    /// S1) -- the precondition was satisfied, the write itself just
+    /// didn't happen.
+    QuotaExceeded,
+    /// The precondition didn't hold (stale `If-Match`, or
+    /// `If-None-Match: *` against a file that already exists).
+    PreconditionFailed,
+}
+
+/// `sha256(contents)`, hex-encoded (OBI-180 M-FS-6). Deliberately
+/// duplicated in `loom_http::files::etag_for` rather than shared: sharing
+/// it would mean `loom-http` depending on `loom-vm` (or vice versa) just
+/// for a ten-line hash function, a dependency edge neither crate
+/// otherwise needs (see that module's doc for why `loom-http` stays
+/// `loom-vm`-free). Both sides must still agree byte-for-byte, so any
+/// change here needs the matching change there, and vice versa -- a unit
+/// test on each side pins the same fixture string to the same digest.
+fn file_etag_hex(contents: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(contents.as_bytes());
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// `true` if `contents` hashes to `expected` (already unquoted). Used
+/// only by [`World::call_file_write_if_match`]'s `If-Match` branch.
+fn file_etag_matches(contents: &str, expected: &str) -> bool {
+    file_etag_hex(contents) == expected
+}
+
+#[cfg(test)]
+mod file_etag_tests {
+    use super::*;
+
+    /// Pins `file_etag_hex` to the exact same digest
+    /// `loom_http::files::etag_for`'s own test pins for the same fixture
+    /// string (minus quoting) -- both sides must agree byte-for-byte on
+    /// what `sha256("int x;")` hex-encodes to, since one computes the
+    /// `ETag` a client sees and the other independently verifies the
+    /// `If-Match` built from it.
+    #[test]
+    fn pinned_against_the_loom_http_fixture() {
+        assert_eq!(
+            file_etag_hex("int x;"),
+            "e13e332bd08e13cbe2aee094e130ed23878b3b554be5b9a665a83e63caa987ae"
+        );
     }
 }
 
@@ -1688,6 +1762,134 @@ impl World {
             h.call_apply(ob, func, args)?
                 .ok_or_else(|| RtError::new(format!("no function `{func}`")))
         })
+        .map_err(|e| e.report())
+    }
+
+    /// Spec M-FS-1 (OBI-180/OBI-179 threat model): run `efun` (`read_file`,
+    /// `write_file`, `compile_object`, and nothing else so far) as a
+    /// world-thread execution whose *entire* guard set is exactly `{uid}`
+    /// -- no inherited call stack, no `this_player`/connection context.
+    /// This is the seam a driver-side caller (`/api/v1/files/*`, OBI-180's
+    /// HTTP handlers; the `/lsp` route's `ReadAuthorizer`) goes through
+    /// instead of running LPC bytecode: `h.call_efun` is the exact same
+    /// dispatch a running program's `CallEfun` instruction would reach, so
+    /// `security::normalize_file_path` -> `authorize()`'s `valid_*` apply
+    /// on the real master -> `fileio` all run unchanged (D-TM5: this is
+    /// deliberately *not* a second, HTTP-side permission check mirroring
+    /// the master -- it *is* the master's own check, just entered by the
+    /// driver). Quotas (`ticks_quota_uid: Some(sym)`) and the audit log
+    /// (`exec`'s own `note_error`, plus `authorize`'s `SecurityState::
+    /// record`) are the same unmodified paths every other caller gets.
+    ///
+    /// Refuses a reserved principal (`root`, `mudlib`, `*:*`) outright
+    /// (D-S3.1) -- there is no HTTP-reachable way to mint one of those
+    /// guards, unlike `seteuid`, which at least requires `/secure` code.
+    ///
+    /// `efun` is restricted to the small allowlist this driver entry
+    /// point is meant for (OBI-180 review, non-blocking item 1): a public
+    /// `World` method that ran *any* named efun on the master's behalf
+    /// would be a general driver-side efun runner, not the narrow
+    /// file-op seam this is documented as.
+    pub fn call_file_efun(
+        &mut self,
+        uid: &str,
+        efun: &str,
+        args: Vec<Value>,
+        host: &mut dyn Host,
+    ) -> Result<Value, String> {
+        if crate::security::is_reserved_principal(uid) {
+            return Err(format!("`{uid}` is a reserved principal"));
+        }
+        if !matches!(efun, "read_file" | "write_file" | "compile_object") {
+            return Err(format!("`{efun}` is not a file-op efun"));
+        }
+        let sym = self.registry.syms.intern(uid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: sym,
+            euid: sym,
+        });
+        let acting = self.master_or_sentinel();
+        self.exec(
+            host,
+            acting,
+            None,
+            None,
+            Some(guard),
+            None,
+            Some(sym),
+            |h| h.call_efun(efun, args),
+        )
+        .map_err(|e| e.report())
+    }
+
+    /// Atomic compare-and-swap `write_file` (OBI-180 M-FS-6, CTO review
+    /// must-fix 1): reads the file, checks `precondition` against its
+    /// current contents, and -- only if it holds -- writes `new_text`,
+    /// all inside **one** [`Self::exec`] call. The world thread processes
+    /// one `exec` to completion before looking at anything else (another
+    /// HTTP request, a scheduled `call_out`, LPC code calling `write_file`
+    /// directly), so nothing can land between the read and the write the
+    /// way it could across two separate [`Self::call_file_efun`] calls
+    /// (the lost-update window the CTO review flagged) -- this replaces
+    /// that two-request shape for `PUT`, not just adds to it.
+    ///
+    /// A failed read (refused by `valid_read`, or an I/O error) is
+    /// propagated as `Err` without ever reaching `write_file` -- never a
+    /// fail-open fall-through to an unconditional write (review must-fix
+    /// 2).
+    pub fn call_file_write_if_match(
+        &mut self,
+        uid: &str,
+        path: &str,
+        precondition: FileMatchPrecondition,
+        new_text: &str,
+        host: &mut dyn Host,
+    ) -> Result<FileCasOutcome, String> {
+        if crate::security::is_reserved_principal(uid) {
+            return Err(format!("`{uid}` is a reserved principal"));
+        }
+        let sym = self.registry.syms.intern(uid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: sym,
+            euid: sym,
+        });
+        let acting = self.master_or_sentinel();
+        let path_for_read = Value::str(path);
+        let path_for_write = Value::str(path);
+        let new_text = new_text.to_string();
+        self.exec(
+            host,
+            acting,
+            None,
+            None,
+            Some(guard),
+            None,
+            Some(sym),
+            move |h| {
+                let current = h.call_efun("read_file", vec![path_for_read])?;
+                let existing: Option<String> = match current {
+                    Value::Null => None,
+                    other => other.as_str().map(|s| s.to_string()),
+                };
+                let satisfied = match &precondition {
+                    FileMatchPrecondition::IfNoneMatchStar => existing.is_none(),
+                    FileMatchPrecondition::IfMatch(expected) => existing
+                        .as_deref()
+                        .map(|contents| file_etag_matches(contents, expected.trim_matches('"')))
+                        .unwrap_or(false),
+                };
+                if !satisfied {
+                    return Ok(FileCasOutcome::PreconditionFailed);
+                }
+                match h.call_efun("write_file", vec![path_for_write, Value::str(&new_text)])? {
+                    Value::Bool(true) => Ok(FileCasOutcome::Written),
+                    Value::Bool(false) => Ok(FileCasOutcome::QuotaExceeded),
+                    other => Err(RtError::new(format!(
+                        "write_file returned an unexpected value: {other:?}"
+                    ))),
+                }
+            },
+        )
         .map_err(|e| e.report())
     }
 

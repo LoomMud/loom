@@ -38,6 +38,7 @@ use tracing::debug;
 
 pub mod auth;
 mod client_ip;
+pub mod files;
 mod handlers;
 pub mod webhook;
 
@@ -53,6 +54,8 @@ pub struct HttpState {
     auth: Option<auth::AuthService>,
     github: Option<std::sync::Arc<dyn auth::GithubIdentityProvider>>,
     github_webhook: Option<webhook::GithubWebhookConfig>,
+    file_op_tx: Option<files::FileOpSender>,
+    write_rate_limiter: files::WriteRateLimiter,
 }
 
 impl HttpState {
@@ -69,6 +72,8 @@ impl HttpState {
             auth: None,
             github: None,
             github_webhook: None,
+            file_op_tx: None,
+            write_rate_limiter: files::new_write_rate_limiter(),
         }
     }
 
@@ -103,6 +108,14 @@ impl HttpState {
         self.github_webhook = Some(config);
         self
     }
+
+    /// Mount `GET /api/v1/files/content` (OBI-180 M-FS-1). Unset by
+    /// default -- answers `503` until `loom-cli` wires the world-thread
+    /// file-op channel (see `files::file_op_channel`).
+    pub fn with_file_ops(mut self, file_op_tx: files::FileOpSender) -> Self {
+        self.file_op_tx = Some(file_op_tx);
+        self
+    }
 }
 
 pub fn app(state: HttpState) -> Router {
@@ -114,6 +127,7 @@ pub fn app(state: HttpState) -> Router {
         .route("/metrics", get(metrics))
         .merge(handlers::auth_router())
         .merge(webhook::webhook_router())
+        .merge(files::files_router())
         .with_state(state);
     match web_root {
         Some(root) => router.fallback_service(ServeDir::new(root)),
