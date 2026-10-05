@@ -21,21 +21,26 @@
 //!
 //! ## What this module does *not* do yet
 //!
-//! Only `GET` (`read_file`) is wired below. `PUT` (`write_file` +
-//! `If-Match`/`If-None-Match`, M-FS-6/M-FS-7), listings (M-FS-3), and
-//! `compile_object` are a later slice -- `FileOpValue`'s doc already
-//! notes `compile_object`'s diagnostics-list result needs a richer
-//! shape than `Null`/`Bool`/`Str`.
+//! Listings (M-FS-3's "filtered by `valid_read`") and `compile_object`
+//! are a later slice -- `FileOpValue`'s doc already notes
+//! `compile_object`'s diagnostics-list result needs a richer shape than
+//! `Null`/`Bool`/`Str`. `PUT`'s M-FS-5 "one in-flight compile per uid"
+//! clause is also deferred to that slice (there is no compile to
+//! serialize yet).
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::{Query, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::HttpState;
 use crate::handlers::bearer_uid;
@@ -133,8 +138,19 @@ pub struct ReadFileQuery {
     path: String,
 }
 
+/// 1 MiB request body cap (M-FS-5). Enforced by axum's
+/// [`DefaultBodyLimit`] layer (rejects an oversized body before fully
+/// buffering it, not just after) on the `PUT` route only -- the `GET`
+/// route has no request body to limit.
+const MAX_WRITE_BODY_BYTES: usize = 1024 * 1024;
+
 pub fn files_router() -> Router<HttpState> {
-    Router::new().route("/api/v1/files/content", get(read_file))
+    Router::new().route(
+        "/api/v1/files/content",
+        get(read_file)
+            .put(write_file)
+            .route_layer(DefaultBodyLimit::max(MAX_WRITE_BODY_BYTES)),
+    )
 }
 
 /// `GET /api/v1/files/content?path=/builders/<u>/...` (M-FS-1).
@@ -197,6 +213,213 @@ fn file_response(contents: String) -> axum::response::Response {
         HeaderValue::from_static("attachment"),
     );
     response
+}
+
+/// A strong `ETag` over a file's exact byte contents (M-FS-6):
+/// `sha256(contents)`, hex-encoded, quoted per RFC 9110 S8.8.3. Cheap
+/// enough to recompute on every `PUT` (one hash over at most
+/// [`MAX_WRITE_BODY_BYTES`]) rather than caching -- the world thread is
+/// the only place the real content lives, and this is never on the hot
+/// per-tick path.
+fn etag_for(contents: &str) -> String {
+    let digest = Sha256::digest(contents.as_bytes());
+    format!("\"{}\"", hex_encode(&digest))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Bound on distinct uids tracked by [`write_rate_limiter`] (OBI-204
+/// hygiene, same shape as `auth::ratelimit`'s caps): past this many
+/// tracked buckets, the oldest-touched ones are evicted rather than
+/// letting an unbounded number of distinct uids grow the map forever.
+/// Staff uid counts are nowhere near this in practice.
+const MAX_TRACKED_WRITE_UIDS: usize = 10_000;
+
+/// Per-uid write token bucket (M-FS-5's "per-uid write rate limit"):
+/// `CAPACITY` burst, refilling at one token per `REFILL_INTERVAL`. First
+/// cut for Phase 2 -- numbers are a starting point, not yet tuned
+/// against real builder workflows; revisit with the CTO once there's
+/// usage data, the same caveat `scopes_for_tier` carries.
+const WRITE_BUCKET_CAPACITY: f64 = 20.0;
+const WRITE_BUCKET_REFILL_INTERVAL: Duration = Duration::from_secs(2);
+
+struct WriteBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+fn write_rate_limiter() -> &'static Mutex<HashMap<String, WriteBucket>> {
+    static LIMITER: OnceLock<Mutex<HashMap<String, WriteBucket>>> = OnceLock::new();
+    LIMITER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `true` if `uid` may write now (and consumes one token if so); `false`
+/// if its bucket is empty (M-FS-5 -- caller answers `429`).
+fn check_write_rate_limit(uid: &str) -> bool {
+    let mut map = write_rate_limiter()
+        .lock()
+        .expect("write rate limiter mutex poisoned");
+    if map.len() >= MAX_TRACKED_WRITE_UIDS && !map.contains_key(uid) {
+        // OBI-204-style hard cap: evict the single oldest-touched entry
+        // to make room rather than growing without bound. A full sweep
+        // (like `auth::ratelimit`'s) is overkill here -- write buckets
+        // have no lockout state to expire, just tokens that passively
+        // refill, so one eviction per over-cap insert keeps the map
+        // bounded without a separate sweep pass.
+        if let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, b)| b.last_refill)
+            .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
+        }
+    }
+    let now = Instant::now();
+    let bucket = map.entry(uid.to_string()).or_insert_with(|| WriteBucket {
+        tokens: WRITE_BUCKET_CAPACITY,
+        last_refill: now,
+    });
+    let elapsed = now.saturating_duration_since(bucket.last_refill);
+    let refilled = elapsed.as_secs_f64() / WRITE_BUCKET_REFILL_INTERVAL.as_secs_f64();
+    bucket.tokens = (bucket.tokens + refilled).min(WRITE_BUCKET_CAPACITY);
+    bucket.last_refill = now;
+    if bucket.tokens >= 1.0 {
+        bucket.tokens -= 1.0;
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WriteFileQuery {
+    path: String,
+}
+
+/// `PUT /api/v1/files/content?path=...` (M-FS-1/M-FS-6/M-FS-7).
+///
+/// Preconditions are mandatory, not optional (M-FS-6): exactly one of
+/// `If-Match: "<etag>"` (update an existing file whose current contents
+/// hash to that etag) or `If-None-Match: *` (create a file that must not
+/// already exist) is required on every request, so a save can never
+/// silently clobber a concurrent edit.
+///
+/// - `401` no/invalid bearer token.
+/// - `400` body isn't valid UTF-8, or neither/both precondition headers
+///   given, or `If-None-Match` is present but isn't exactly `*`.
+/// - `413` body over [`MAX_WRITE_BODY_BYTES`] (enforced twice: axum's
+///   `DefaultBodyLimit` layer on the route, and a belt-and-suspenders
+///   check here).
+/// - `429` the uid's write rate limit is exhausted (M-FS-5).
+/// - `412` a precondition failed: `If-Match` doesn't match the file's
+///   current `ETag`, or `If-None-Match: *` was sent but the file already
+///   exists.
+/// - `404` the path doesn't authorize for this uid (M-FS-3, same
+///   not-found-shaped refusal as `GET`) -- checked by attempting the
+///   write itself, never a separate ACL.
+/// - `503` no file-op channel wired, a full queue, or a world-thread
+///   timeout (M-FS-5).
+/// - `204` success. The write itself (`World::call_file_efun` ->
+///   `write_file`) is already audited with the real actor uid by the
+///   existing `write_file` efun path (M-FS-7) -- this handler adds no
+///   second audit trail.
+async fn write_file(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(query): Query<WriteFileQuery>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(uid) = bearer_uid(&headers, &state) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if body.len() > MAX_WRITE_BODY_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let Ok(text) = String::from_utf8(body.to_vec()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    let if_match = header_str(&headers, header::IF_MATCH);
+    let if_none_match_is_star = header_str(&headers, header::IF_NONE_MATCH).as_deref() == Some("*");
+    let if_none_match_present = headers.contains_key(header::IF_NONE_MATCH);
+    if if_none_match_present && !if_none_match_is_star {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if if_match.is_none() && !if_none_match_is_star {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if if_match.is_some() && if_none_match_is_star {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let Some(file_op_tx) = state.file_op_tx.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if !check_write_rate_limit(&uid) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+
+    let path = query.path;
+    let current = {
+        let file_op_tx = file_op_tx.clone();
+        let path = path.clone();
+        let uid = uid.clone();
+        tokio::task::spawn_blocking(move || {
+            request_file_op(&file_op_tx, &uid, "read_file", vec![path])
+        })
+        .await
+    };
+    match current {
+        Ok(Ok(FileOpValue::Str(existing))) => {
+            // The file exists: `If-None-Match: *` must refuse (M-FS-6),
+            // `If-Match` must match its current `ETag`.
+            if if_none_match_is_star {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            }
+            if if_match.as_deref() != Some(etag_for(&existing).as_str()) {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            }
+        }
+        Ok(Ok(FileOpValue::Null)) => {
+            // The file doesn't exist: `If-Match` can never match (M-FS-6).
+            if if_match.is_some() {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            }
+        }
+        Ok(Ok(FileOpValue::Bool(_))) => return StatusCode::NOT_FOUND.into_response(),
+        // A refused/failed read for this path -- can't resolve the
+        // precondition either way. Fall through to the real write
+        // attempt below, whose own authorization decision is the one
+        // that actually matters; if that refuses too, it maps to the
+        // same `404` as `GET` (M-FS-3).
+        Ok(Err(_)) | Err(_) => {}
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        request_file_op(&file_op_tx, &uid, "write_file", vec![path, text])
+    })
+    .await;
+    match result {
+        Ok(Ok(FileOpValue::Bool(true))) => StatusCode::NO_CONTENT.into_response(),
+        // `write_file` returns `false` for an over-quota write (OBI-137
+        // S1), not an authorization refusal -- a distinct status from
+        // `404` so a builder can tell "no" from "not allowed".
+        Ok(Ok(FileOpValue::Bool(false))) => StatusCode::INSUFFICIENT_STORAGE.into_response(),
+        Ok(Ok(_)) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    headers.get(name)?.to_str().ok().map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -542,6 +765,143 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        // -------------------------------------------------------------
+        // PUT /api/v1/files/content (M-FS-1/M-FS-6/M-FS-7)
+        // -------------------------------------------------------------
+
+        fn put_request(uid_path: &str, token: &str, body: &'static str) -> Request<Body> {
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/files/content?path={uid_path}"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(body))
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn create_with_if_none_match_star_succeeds_when_the_file_is_absent() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let read = file_op_rx.recv().expect("read request");
+                assert_eq!(read.efun, "read_file");
+                read.respond(Ok(FileOpValue::Null));
+                let write = file_op_rx.recv().expect("write request");
+                assert_eq!(write.efun, "write_file");
+                assert_eq!(write.args[1], "int x;");
+                write.respond(Ok(FileOpValue::Bool(true)));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("pippin", &keys);
+            let mut request = put_request("/builders/pippin/new.wf", &token, "int x;");
+            request
+                .headers_mut()
+                .insert("if-none-match", HeaderValue::from_static("*"));
+            let response = app(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        #[tokio::test]
+        async fn create_with_if_none_match_star_is_412_when_the_file_already_exists() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let read = file_op_rx.recv().expect("read request");
+                read.respond(Ok(FileOpValue::Str("already here".to_string())));
+                // No write should ever be requested.
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("merry", &keys);
+            let mut request = put_request("/builders/merry/exists.wf", &token, "int x;");
+            request
+                .headers_mut()
+                .insert("if-none-match", HeaderValue::from_static("*"));
+            let response = app(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        }
+
+        #[tokio::test]
+        async fn update_with_a_matching_if_match_succeeds() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let read = file_op_rx.recv().expect("read request");
+                read.respond(Ok(FileOpValue::Str("old contents".to_string())));
+                let write = file_op_rx.recv().expect("write request");
+                write.respond(Ok(FileOpValue::Bool(true)));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("sam", &keys);
+            let etag = etag_for("old contents");
+            let mut request = put_request("/builders/sam/a.wf", &token, "new contents");
+            request
+                .headers_mut()
+                .insert("if-match", HeaderValue::from_str(&etag).unwrap());
+            let response = app(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        #[tokio::test]
+        async fn update_with_a_stale_if_match_is_412() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let read = file_op_rx.recv().expect("read request");
+                read.respond(Ok(FileOpValue::Str("current contents".to_string())));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("rosie", &keys);
+            let mut request = put_request("/builders/rosie/a.wf", &token, "new contents");
+            request.headers_mut().insert(
+                "if-match",
+                HeaderValue::from_static(
+                    "\"0000000000000000000000000000000000000000000000000000000000000000\"",
+                ),
+            );
+            let response = app(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        }
+
+        #[tokio::test]
+        async fn missing_precondition_headers_is_400() {
+            let (state, keys) = test_state(None);
+            let token = bearer_for("bilbo", &keys);
+            let request = put_request("/builders/bilbo/a.wf", &token, "text");
+            let response = app(state).oneshot(request).await.unwrap();
+            // No file-op channel wired either, but the precondition check
+            // runs before any channel use, so this is 400, not 503.
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn a_body_over_the_cap_is_413() {
+            let (file_op_tx, _file_op_rx) = file_op_channel();
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("farmer-maggot", &keys);
+            let oversized = vec![b'x'; MAX_WRITE_BODY_BYTES + 1];
+            let mut request = Request::builder()
+                .method("PUT")
+                .uri("/api/v1/files/content?path=/builders/farmer-maggot/a.wf")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(oversized))
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("if-none-match", HeaderValue::from_static("*"));
+            let response = app(state).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        #[tokio::test]
+        async fn no_bearer_token_is_401_for_put_too() {
+            let (state, _keys) = test_state(None);
+            let response = app(state)
+                .oneshot(put_request(
+                    "/builders/frodo/a.wf",
+                    "not-a-real-token",
+                    "text",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
     }
 }
