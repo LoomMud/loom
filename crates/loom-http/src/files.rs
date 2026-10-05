@@ -43,6 +43,30 @@
 //! `compile_object`'s diagnostics list. M-FS-5's "one in-flight compile
 //! per uid" clause is also deferred to that slice (there is no compile to
 //! serialize yet).
+//!
+//! ## API notes (CTO re-review on OBI-180, `4e65f1a`; record in client docs)
+//!
+//! - **`PUT` needs read permission too.** CAS reads the current `ETag`
+//!   before it writes, so a uid with `valid_write` but no `valid_read`
+//!   on a path gets `404` on `PUT`, same as a plain `GET` would. That is
+//!   the correct fail-closed behaviour (M-FS-3), not a bug -- clients
+//!   should not assume write access alone is enough to `PUT`.
+//! - **A `503` doesn't mean the write didn't land.** A timeout after the
+//!   request was already enqueued can still commit on the world-thread
+//!   side; the client just never saw the `200`. CAS makes a retry safe:
+//!   replaying the same `If-Match` after a `503` gets `412` (not a lost
+//!   update) if the first attempt actually committed. Clients should
+//!   re-`GET` for the current `ETag` on a `412` that follows a `503`,
+//!   rather than assuming the retry itself failed.
+//! - **`Refused` also covers I/O errors, not just permission denials.**
+//!   A `fileio` error (and tick exhaustion) maps to the same
+//!   [`FileOpError::Refused`] as a `valid_read`/`valid_write` denial, and
+//!   both come back as the same `404` (M-FS-3: a refusal must look
+//!   exactly like "not found", so it can't be used to probe which files
+//!   exist). If callers ever need to tell an I/O failure apart from a
+//!   permission denial, that needs a new `Internal` variant mapped to
+//!   `500` and logged server-side only -- today they are indistinguishable
+//!   on the wire by design.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
