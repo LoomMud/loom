@@ -155,11 +155,15 @@ impl HttpState {
 /// but `frame-ancestors` (and `sandbox`/`report-uri`) are no-ops when
 /// delivered that way per the CSP spec -- they only take effect as an
 /// actual response header. A header and a `<meta>` tag can coexist
-/// (browsers enforce the intersection), so this duplicates the same
-/// policy as a header for defense in depth and to make `frame-ancestors
-/// 'none'` actually enforced. `X-Frame-Options: DENY` rides along as a
-/// header-only fallback for UAs that predate `frame-ancestors`.
-const STATIC_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+/// (browsers enforce the intersection), so the header carries *only*
+/// the header-only directive: it wraps every file under the web root,
+/// including the player client (`index.html`), which uses an inline
+/// `<style>` and inline module `<script>` that admin.html's
+/// `script-src 'self'; style-src 'self'` would block. Page-specific
+/// policy stays in each page's `<meta>` tag. `X-Frame-Options: DENY`
+/// rides along as a header-only fallback for UAs that predate
+/// `frame-ancestors`.
+const STATIC_CSP: &str = "frame-ancestors 'none'";
 
 pub fn app(state: HttpState) -> Router {
     let web_root = state.web_root.clone();
@@ -729,10 +733,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing CSP header on {path}"))
                 .to_str()
                 .unwrap();
-            assert!(
-                csp.contains("frame-ancestors 'none'"),
-                "path: {path}, csp: {csp}"
-            );
+            assert_eq!(csp, "frame-ancestors 'none'", "path: {path}");
+            // Must not constrain script/style: index.html relies on an
+            // inline <style> and inline module <script>.
+            assert!(!csp.contains("script-src") && !csp.contains("default-src"));
             let xfo = response
                 .headers()
                 .get(header::HeaderName::from_static("x-frame-options"))
