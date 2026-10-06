@@ -857,24 +857,40 @@ impl Compiler {
     /// [`CompiledProgram`]s exactly like [`Compiler::recompile`], **not yet
     /// installed** — the caller still passes this to
     /// [`RegistryHost::install`].
+    ///
+    /// **Redaction (OBI-296 T-FS-3):** every `Err` branch below returns
+    /// `(path, message)` rather than one joined `String` -- `path` is
+    /// always the specific program the diagnostic is about, named only
+    /// in that first slot, never folded into `message`'s text. That is
+    /// deliberate: the caller with per-uid `valid_read` context
+    /// (`World::poll_recompiles`) decides whether `path` is safe to echo
+    /// to whichever uid asked for this compile, and redacts the whole
+    /// thing (`"<redacted>: compile failed"`) rather than just hiding
+    /// `path` if not -- `message` alone could still name an identifier or
+    /// quote a source fragment from a program that uid has no business
+    /// reading (e.g. an inherited `/secure` dependent pulled in by `root_path`'s
+    /// own widely-inherited recompile).
     pub fn finish_recompile(
         &mut self,
         registry: &Registry,
         root_path: &str,
         begin_snapshot: &compile_worker::ProgramSnapshot,
         outcome: compile_worker::CompileOutcome,
-    ) -> Result<HashMap<String, Rc<CompiledProgram>>, String> {
+    ) -> Result<HashMap<String, Rc<CompiledProgram>>, (String, String)> {
         let result = match outcome {
             compile_worker::CompileOutcome::Ready(r) => r,
-            compile_worker::CompileOutcome::Failed(e) => return Err(e),
+            compile_worker::CompileOutcome::Failed { path, message } => {
+                return Err((path, message));
+            }
         };
 
         let now = compile_worker::ProgramSnapshot::capture(registry);
         for wp in &result.programs {
             if now.entry(&wp.path) != begin_snapshot.entry(&wp.path) {
-                return Err(format!(
-                    "stale: registry changed during background compile of {}; re-issue update",
-                    wp.path
+                return Err((
+                    wp.path.clone(),
+                    "stale: registry changed during background compile; re-issue update"
+                        .to_string(),
                 ));
             }
         }
@@ -883,14 +899,17 @@ impl Compiler {
         begin_deps.sort_unstable();
         now_deps.sort_unstable();
         if begin_deps != now_deps {
-            return Err(format!(
-                "stale: dependent set of {root_path} changed during background compile; re-issue update"
+            return Err((
+                root_path.to_string(),
+                "stale: dependent set changed during background compile; re-issue update"
+                    .to_string(),
             ));
         }
         for (path, hash) in &result.ancestor_hashes {
             if now.source_hash_of(path) != Some(*hash) {
-                return Err(format!(
-                    "ancestor {path} changed on disk since it was installed; update it first"
+                return Err((
+                    path.clone(),
+                    "changed on disk since it was installed; update it first".to_string(),
                 ));
             }
         }
@@ -900,10 +919,14 @@ impl Compiler {
         }
         let mut new_set: HashMap<String, Rc<CompiledProgram>> = HashMap::new();
         for wp in result.programs {
-            let module = loom_compiler::bytecode::decode(&wp.module_bytes)
-                .map_err(|e| format!("{}: corrupt background compile result: {e}", wp.path))?;
+            let module = loom_compiler::bytecode::decode(&wp.module_bytes).map_err(|e| {
+                (
+                    wp.path.clone(),
+                    format!("corrupt background compile result: {e}"),
+                )
+            })?;
             loom_compiler::verify::verify(&module)
-                .map_err(|e| format!("{}: failed re-verification: {e}", wp.path))?;
+                .map_err(|e| (wp.path.clone(), format!("failed re-verification: {e}")))?;
             let var_specs: Vec<VarSpec> = wp
                 .var_specs
                 .iter()
@@ -911,12 +934,12 @@ impl Compiler {
                     Ok(VarSpec {
                         name: Rc::from(v.name.as_str()),
                         ty: loom_compiler::bytecode::decode_ty(&v.ty_bytes)
-                            .map_err(|e| format!("{}: corrupt var type: {e}", wp.path))?,
+                            .map_err(|e| (wp.path.clone(), format!("corrupt var type: {e}")))?,
                         has_init: v.has_init,
                         persistent: v.persistent,
                     })
                 })
-                .collect::<Result<_, String>>()?;
+                .collect::<Result<_, (String, String)>>()?;
             let parent = wp
                 .parent_path
                 .as_ref()
@@ -2911,7 +2934,7 @@ impl<'a> RegistryHost<'a> {
         root_path: &str,
         begin_snapshot: &compile_worker::ProgramSnapshot,
         outcome: compile_worker::CompileOutcome,
-    ) -> Result<(), String> {
+    ) -> Result<(), (String, String)> {
         let new_set = {
             let driver = self
                 .driver
@@ -2922,8 +2945,14 @@ impl<'a> RegistryHost<'a> {
                 .finish_recompile(self.registry, root_path, begin_snapshot, outcome)?
         };
         // Lazy install (OBI-89): migration warnings surface later through
-        // `Registry::lazy_upgrade_warnings`, not here.
-        self.install(new_set).map(|_| ())
+        // `Registry::lazy_upgrade_warnings`, not here. `install` never
+        // actually returns `Err` today, but its signature still carries a
+        // `String` error -- pair it with `root_path` rather than widen
+        // this method's own `Err` type to a three-case enum for a branch
+        // that can't be hit.
+        self.install(new_set)
+            .map(|_| ())
+            .map_err(|e| (root_path.to_string(), e))
     }
 
     /// Call `name` on `on` (the object executing this call) as an

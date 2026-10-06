@@ -432,7 +432,7 @@ pub struct World {
     /// thread but not yet applied (OBI-90/D-P1.5): `World::tick` installs
     /// each one as soon as it finishes, so ticks in between are never
     /// blocked on a slow compile.
-    pending_recompiles: Vec<(RecompileToken, RecompileJob)>,
+    pending_recompiles: Vec<(RecompileToken, RecompileJob, Option<String>)>,
     /// Every background compile `World::tick`/`poll_recompiles` has
     /// installed (or failed to) since the last `take_finished_recompiles`.
     finished_recompiles: Vec<(RecompileToken, Result<(), String>)>,
@@ -2155,12 +2155,28 @@ impl World {
         path: &str,
         delay: std::time::Duration,
     ) -> RecompileToken {
+        self.begin_recompile_after_for(path, delay, None)
+    }
+
+    /// [`Self::begin_recompile_after`], but remembers `redact_for_uid` so
+    /// [`Self::poll_recompiles`] can later redact that job's diagnostics
+    /// to whatever `redact_for_uid` can `valid_read` (OBI-296 T-FS-3).
+    /// `None` (every call above except [`Self::begin_file_compile_after`])
+    /// means "driver-internal caller, not an HTTP-authenticated uid" --
+    /// skip the check and report the compiler's diagnostics verbatim,
+    /// same as before this redaction existed.
+    fn begin_recompile_after_for(
+        &mut self,
+        path: &str,
+        delay: std::time::Duration,
+        redact_for_uid: Option<String>,
+    ) -> RecompileToken {
         let token = RecompileToken(self.next_recompile_token);
         self.next_recompile_token += 1;
         let job = self
             .compiler
             .begin_recompile_after(&self.root, &self.registry, path, delay);
-        self.pending_recompiles.push((token, job));
+        self.pending_recompiles.push((token, job, redact_for_uid));
         token
     }
 
@@ -2175,16 +2191,48 @@ impl World {
         }
         let jobs = std::mem::take(&mut self.pending_recompiles);
         let mut still_pending = Vec::new();
-        for (token, job) in jobs {
+        for (token, job, redact_for_uid) in jobs {
             match job.poll() {
-                None => still_pending.push((token, job)),
+                None => still_pending.push((token, job, redact_for_uid)),
                 Some(outcome) => {
                     let root_path = job.path().to_string();
                     let begin_snapshot = job.begin_snapshot().clone();
                     let master = self.master_or_sentinel();
+                    // OBI-296 T-FS-3: a per-uid redaction check needs that
+                    // uid's own `{uid}` guard set as `top_guard` (exactly
+                    // like `call_file_efun`/`begin_file_compile`'s own
+                    // `authorize` call) -- not the driver-acting `master`
+                    // this `exec` otherwise runs as -- so `admin_valid_read`
+                    // below asks the real question ("can `uid` read this
+                    // path", M-FS-3), not "can the master" (always yes).
+                    let guard = redact_for_uid.as_deref().map(|uid| {
+                        let sym = self.registry.syms.intern(uid);
+                        crate::security::GuardSet::empty().with(crate::security::Principal {
+                            uid: sym,
+                            euid: sym,
+                        })
+                    });
+                    let redact = redact_for_uid.is_some();
                     let result = self
-                        .exec(host, master, None, None, None, None, None, |h| {
-                            Ok(h.finish_recompile(&root_path, &begin_snapshot, outcome))
+                        .exec(host, master, None, None, guard, None, None, |h| {
+                            match h.finish_recompile(&root_path, &begin_snapshot, outcome) {
+                                Ok(()) => Ok(Ok(())),
+                                Err((path, message)) => {
+                                    if !redact {
+                                        return Ok(Err(format!("{path}: {message}")));
+                                    }
+                                    // Fail closed (M-FS-3): an
+                                    // `admin_valid_read` that itself
+                                    // errors or denies must redact, same
+                                    // as a definite "no".
+                                    match h.admin_valid_read("compile_diagnostics", &path) {
+                                        Ok(true) => Ok(Err(format!("{path}: {message}"))),
+                                        Ok(false) | Err(_) => {
+                                            Ok(Err("<redacted>: compile failed".to_string()))
+                                        }
+                                    }
+                                }
+                            }
                         })
                         .unwrap_or_else(|e| Err(e.report()));
                     self.finished_recompiles.push((token, result));
@@ -2204,7 +2252,7 @@ impl World {
     /// True while `token`'s background compile is still running (not yet
     /// picked up by `poll_recompiles`/`tick`).
     pub fn recompile_pending(&self, token: RecompileToken) -> bool {
-        self.pending_recompiles.iter().any(|(t, _)| *t == token)
+        self.pending_recompiles.iter().any(|(t, _, _)| *t == token)
     }
 
     /// Load (compile + create) `path` as the driver would for a preload.
@@ -2362,7 +2410,7 @@ impl World {
                 move |h| h.authorize_compile(&path),
             )
             .map_err(|e| e.report())?;
-        Ok(self.begin_recompile_after(&norm, delay))
+        Ok(self.begin_recompile_after_for(&norm, delay, Some(uid.to_string())))
     }
 
     /// Atomic compare-and-swap `write_file` (OBI-180 M-FS-6, CTO review
