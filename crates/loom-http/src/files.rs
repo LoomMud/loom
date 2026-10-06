@@ -122,6 +122,18 @@ pub enum FileOpValue {
     /// `World::MAX_LIST_ENTRIES`-truncation (CTO review on PR #117,
     /// should-fix 1), carried through to the JSON response body.
     Entries { names: Vec<String>, truncated: bool },
+    /// [`FileOpKind::Compile`] ran `compile_object` and it succeeded
+    /// (spec §7.2 step 6.4: per-object migration warnings, if any, are
+    /// not fatal and are not surfaced here -- OBI-34 tracks a real
+    /// builder-facing channel for those; this is only the top-level
+    /// compile-failed/compile-succeeded distinction).
+    CompileOk,
+    /// [`FileOpKind::Compile`] ran `compile_object` and the compiler
+    /// produced diagnostics (parse/semantic errors) -- not a driver
+    /// refusal, so unlike [`FileOpError::Refused`] this is reported to
+    /// the client verbatim (M-IDE's "see a diagnostic, fix it" flow
+    /// needs the real compiler message).
+    CompileFailed(String),
 }
 
 /// Which `World` entry point a [`FileOpRequest`] resolves to.
@@ -137,6 +149,10 @@ pub enum FileOpKind {
     },
     /// `World::list_dir(uid, path, ..)` (M-FS-3).
     List,
+    /// `World::call_file_efun(uid, "compile_object", ..)` (M-FS-5's "one
+    /// in-flight compile per uid, newest save wins" -- enforced by
+    /// [`CompileInFlight`] at the HTTP layer, not here).
+    Compile,
 }
 
 /// Mirrors `loom_vm::world::FileMatchPrecondition` without depending on
@@ -278,6 +294,7 @@ pub fn files_router() -> Router<HttpState> {
                 .route_layer(DefaultBodyLimit::max(MAX_WRITE_BODY_BYTES)),
         )
         .route("/api/v1/files/list", get(list_dir))
+        .route("/api/v1/files/compile", axum::routing::post(compile_object))
 }
 
 /// `GET /api/v1/files/content?path=/builders/<u>/...` (M-FS-1).
@@ -318,7 +335,9 @@ async fn read_file(
             FileOpValue::Written
             | FileOpValue::QuotaExceeded
             | FileOpValue::PreconditionFailed
-            | FileOpValue::Entries { .. },
+            | FileOpValue::Entries { .. }
+            | FileOpValue::CompileOk
+            | FileOpValue::CompileFailed(_),
         )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
         Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -548,9 +567,13 @@ async fn write_file(
         Ok(Ok(FileOpValue::PreconditionFailed)) => StatusCode::PRECONDITION_FAILED.into_response(),
         // A CAS write never produces these -- a driver bug, not a
         // client-facing distinction.
-        Ok(Ok(FileOpValue::Null | FileOpValue::Str(_) | FileOpValue::Entries { .. })) => {
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Ok(Ok(
+            FileOpValue::Null
+            | FileOpValue::Str(_)
+            | FileOpValue::Entries { .. }
+            | FileOpValue::CompileOk
+            | FileOpValue::CompileFailed(_),
+        )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
         Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -618,7 +641,9 @@ async fn list_dir(
             | FileOpValue::Str(_)
             | FileOpValue::Written
             | FileOpValue::QuotaExceeded
-            | FileOpValue::PreconditionFailed,
+            | FileOpValue::PreconditionFailed
+            | FileOpValue::CompileOk
+            | FileOpValue::CompileFailed(_),
         )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
         Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -647,6 +672,157 @@ fn list_dir_response(entries: Vec<String>, truncated: bool) -> axum::response::R
         HeaderValue::from_static("sandbox; default-src 'none'"),
     );
     response
+}
+
+/// Per-[`HttpState`] generation counter for M-FS-5's "one in-flight
+/// compile per uid (newest save wins)": each uid has one counter, bumped
+/// every time a compile request for that uid starts. A request only
+/// gets to answer the client if its own token is still the latest one
+/// recorded for that uid by the time the compile finishes -- a request
+/// superseded by a newer one for the same uid (the common case: a
+/// builder saves again before the first compile returns) answers `409`
+/// instead of a possibly-stale result, so the client never has to guess
+/// which of two overlapping responses is the current one. This does not
+/// cancel the superseded compile's world-thread work (there is no
+/// cancellation hook into a `World::exec` already running) -- it only
+/// suppresses that response, same bounded scope as the rest of this
+/// slice.
+pub(crate) type CompileInFlight = Arc<Mutex<HashMap<String, u64>>>;
+
+/// Bound on distinct uids tracked by a [`CompileInFlight`] map, same
+/// reasoning and cap as [`MAX_TRACKED_WRITE_UIDS`].
+const MAX_TRACKED_COMPILE_UIDS: usize = 10_000;
+
+/// A fresh, empty compile-in-flight tracker for [`HttpState::new`].
+pub(crate) fn new_compile_in_flight() -> CompileInFlight {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Claim the next generation token for `uid`, evicting an arbitrary
+/// tracked uid first if the map is at [`MAX_TRACKED_COMPILE_UIDS`] and
+/// `uid` isn't already tracked (same bounded-map shape as
+/// [`check_write_rate_limit`]).
+fn claim_compile_token(tracker: &CompileInFlight, uid: &str) -> u64 {
+    let mut map = tracker.lock().expect("compile-in-flight mutex poisoned");
+    if map.len() >= MAX_TRACKED_COMPILE_UIDS
+        && !map.contains_key(uid)
+        && let Some(oldest) = map.keys().next().cloned()
+    {
+        map.remove(&oldest);
+    }
+    let entry = map.entry(uid.to_string()).or_insert(0);
+    *entry += 1;
+    *entry
+}
+
+/// `true` if `token` is still the latest one claimed for `uid` -- i.e.
+/// this request was not superseded by a newer compile for the same uid
+/// while it was running.
+fn compile_token_is_current(tracker: &CompileInFlight, uid: &str, token: u64) -> bool {
+    let map = tracker.lock().expect("compile-in-flight mutex poisoned");
+    map.get(uid) == Some(&token)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompileQuery {
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CompileResponse {
+    ok: bool,
+    /// Present (non-empty) only when `ok` is `false`: the compiler's own
+    /// diagnostics text, verbatim (M-IDE "see a diagnostic, fix it").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<String>,
+}
+
+fn compile_response(ok: bool, diagnostics: Option<String>) -> axum::response::Response {
+    let mut response = (
+        StatusCode::OK,
+        axum::Json(CompileResponse { ok, diagnostics }),
+    )
+        .into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; default-src 'none'"),
+    );
+    response
+}
+
+/// `POST /api/v1/files/compile?path=...` (M-FS-1/M-FS-5/M-FS-7):
+/// `World::call_file_efun(uid, "compile_object", [path], ..)`, going
+/// through the exact same `authorize()` (`Privilege::P1`,
+/// `Operation::Compile`) and audit path a `compile_object()` LPC call
+/// gets -- this handler adds no second permission check.
+///
+/// - `401` no/invalid bearer token.
+/// - `429` the uid's write rate limit is exhausted -- compiling is
+///   shared with [`check_write_rate_limit`]'s bucket (M-FS-5): a compile
+///   is at least as expensive as a write, and in practice always follows
+///   one.
+/// - `409` this request was superseded by a newer `/compile` call for
+///   the same uid before it got to answer (M-FS-5 "one in-flight compile
+///   per uid, newest save wins") -- the client should trust the newer
+///   request's response instead.
+/// - `404` `path` doesn't authorize (`Privilege::P1`'s `valid_write`-
+///   style confinement) for this uid, same not-found-shaped refusal as
+///   `GET`/`PUT` (M-FS-3).
+/// - `503` no file-op channel wired, a full queue, or a world-thread
+///   timeout (M-FS-5).
+/// - `200` `{"ok": true}` on a clean compile, or `{"ok": false,
+///   "diagnostics": "..."}` when the compiler produced diagnostics --
+///   deliberately still `200`, not a `4xx`/`5xx`: the HTTP request
+///   itself succeeded, the *compile* just found errors, the same
+///   distinction a `200` `GET` makes for a file that happens to contain
+///   broken LPC.
+async fn compile_object(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(query): Query<CompileQuery>,
+) -> impl IntoResponse {
+    let Some(uid) = bearer_uid(&headers, &state) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(file_op_tx) = state.file_op_tx.clone() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if !check_write_rate_limit(&state.write_rate_limiter, &uid) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let token = claim_compile_token(&state.compile_in_flight, &uid);
+    let path = query.path;
+    let compile_uid = uid.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        request_file_op(&file_op_tx, &compile_uid, &path, FileOpKind::Compile)
+    })
+    .await;
+    if !compile_token_is_current(&state.compile_in_flight, &uid, token) {
+        return StatusCode::CONFLICT.into_response();
+    }
+    match result {
+        Ok(Ok(FileOpValue::CompileOk)) => compile_response(true, None),
+        Ok(Ok(FileOpValue::CompileFailed(diagnostics))) => {
+            compile_response(false, Some(diagnostics))
+        }
+        // `compile_object` never produces these -- a driver bug, not a
+        // client-facing distinction.
+        Ok(Ok(
+            FileOpValue::Null
+            | FileOpValue::Str(_)
+            | FileOpValue::Written
+            | FileOpValue::QuotaExceeded
+            | FileOpValue::PreconditionFailed
+            | FileOpValue::Entries { .. },
+        )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
+        Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -1109,7 +1285,9 @@ mod tests {
                         assert_eq!(precondition, &FilePrecondition::IfNoneMatchStar);
                         assert_eq!(text, "int x;");
                     }
-                    FileOpKind::Read | FileOpKind::List => panic!("expected a write"),
+                    FileOpKind::Read | FileOpKind::List | FileOpKind::Compile => {
+                        panic!("expected a write")
+                    }
                 }
                 req.respond(Ok(FileOpValue::Written));
             });
@@ -1154,7 +1332,9 @@ mod tests {
                             )
                         );
                     }
-                    FileOpKind::Read | FileOpKind::List => panic!("expected a write"),
+                    FileOpKind::Read | FileOpKind::List | FileOpKind::Compile => {
+                        panic!("expected a write")
+                    }
                 }
                 req.respond(Ok(FileOpValue::Written));
             });
@@ -1430,6 +1610,185 @@ mod tests {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["truncated"], serde_json::json!(true));
+        }
+
+        // -------------------------------------------------------------
+        // POST /api/v1/files/compile (M-FS-5 "one in-flight compile per
+        // uid, newest save wins")
+        // -------------------------------------------------------------
+
+        #[tokio::test]
+        async fn a_clean_compile_is_200_ok_true() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let req = file_op_rx.recv().expect("a request should arrive");
+                assert_eq!(req.path, "/builders/frodo/a.wf");
+                assert!(matches!(req.kind, FileOpKind::Compile));
+                req.respond(Ok(FileOpValue::CompileOk));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/files/compile?path=/builders/frodo/a.wf")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["ok"], serde_json::json!(true));
+            assert!(json.get("diagnostics").is_none());
+        }
+
+        #[tokio::test]
+        async fn a_failed_compile_is_200_ok_false_with_diagnostics() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let req = file_op_rx.recv().expect("a request should arrive");
+                req.respond(Ok(FileOpValue::CompileFailed(
+                    "a.wf:3: expected ';'".to_string(),
+                )));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/files/compile?path=/builders/frodo/a.wf")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["ok"], serde_json::json!(false));
+            assert_eq!(
+                json["diagnostics"],
+                serde_json::json!("a.wf:3: expected ';'")
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refused_compile_path_is_404_not_403() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let req = file_op_rx.recv().expect("a request should arrive");
+                req.respond(Err(FileOpError::Refused("valid_write refused".to_string())));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/files/compile?path=/secure/evil.wf")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn no_bearer_token_is_401_for_compile_too() {
+            let (state, _keys) = test_state(None);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/files/compile?path=/builders/frodo/a.wf")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn no_file_op_channel_wired_is_503_for_compile() {
+            let (state, keys) = test_state(None);
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/files/compile?path=/builders/frodo/a.wf")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        #[tokio::test]
+        async fn a_full_queue_is_503_for_compile() {
+            let (file_op_tx, _file_op_rx) = std::sync::mpsc::sync_channel::<FileOpRequest>(0);
+            // A zero-capacity channel with nothing ever receiving: the
+            // very first `try_send` finds it full (no rendezvous
+            // partner), same shape as `a_busy_queue_is_503_not_404`.
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/files/compile?path=/builders/frodo/a.wf")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        /// M-FS-5 "one in-flight compile per uid, newest save wins": if
+        /// another compile for the same uid claims a newer token while
+        /// this request is still waiting on the world thread, this
+        /// request must answer `409` instead of its (now-stale) result,
+        /// even though the world thread itself answered successfully.
+        #[tokio::test]
+        async fn a_superseded_compile_is_409_even_on_a_successful_world_thread_answer() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("frodo", &keys);
+            let tracker = state.compile_in_flight.clone();
+            std::thread::spawn(move || {
+                let req = file_op_rx.recv().expect("a request should arrive");
+                // Simulate a second, newer `/compile` request for the same
+                // uid claiming its token while this one is still in
+                // flight -- this request's own token (claimed before this
+                // closure ran) is now stale.
+                claim_compile_token(&tracker, "frodo");
+                req.respond(Ok(FileOpValue::CompileOk));
+            });
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/files/compile?path=/builders/frodo/a.wf")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
         }
     }
 }

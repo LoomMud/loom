@@ -673,6 +673,23 @@ fn file_op_value_from_cas(
     }
 }
 
+/// Converts a [`Value`] returned by `World::call_file_efun`'s
+/// `compile_object` into the matching [`loom_http::files::FileOpValue`].
+/// `compile_object`'s dispatch in `registry.rs` only ever returns `Null`
+/// (clean compile) or a string (the compiler's diagnostics) -- anything
+/// else is a driver bug, reported as `Err`, same reasoning as
+/// `file_op_value_from_read`.
+fn file_op_value_from_compile(v: Value) -> Result<loom_http::files::FileOpValue, String> {
+    use loom_http::files::FileOpValue;
+    match v {
+        Value::Null => Ok(FileOpValue::CompileOk),
+        other => other
+            .as_str()
+            .map(|s| FileOpValue::CompileFailed(s.to_string()))
+            .ok_or_else(|| format!("compile_object returned an unexpected value: {other:?}")),
+    }
+}
+
 /// Converts a [`loom_http::files::FilePrecondition`] (carried over the
 /// file-op channel, which holds no `loom_vm` type -- see that module's
 /// doc) into the `loom_vm::world::FileMatchPrecondition`
@@ -2821,6 +2838,18 @@ fn spawn_world_thread(
                                     Err(loom_http::files::FileOpError::Internal(msg))
                                 }
                             },
+                            loom_http::files::FileOpKind::Compile => world
+                                .call_file_efun(
+                                    &req.uid,
+                                    "compile_object",
+                                    vec![Value::str(&req.path)],
+                                    &mut host,
+                                )
+                                .map_err(loom_http::files::FileOpError::Refused)
+                                .and_then(|v| {
+                                    file_op_value_from_compile(v)
+                                        .map_err(loom_http::files::FileOpError::Refused)
+                                }),
                         };
                     req.respond(result);
                 }
