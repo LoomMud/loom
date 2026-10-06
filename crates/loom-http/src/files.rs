@@ -118,8 +118,10 @@ pub enum FileOpValue {
     /// `valid_read` (M-FS-3). Distinct from `Null` (a readable directory
     /// can legitimately be empty) -- an unreadable or missing directory
     /// is a [`FileOpError::Refused`] from `World::list_dir`'s `None`,
-    /// mapped the same place `read_file`'s own `Null` is.
-    Entries(Vec<String>),
+    /// mapped the same place `read_file`'s own `Null` is. `truncated` is
+    /// `World::MAX_LIST_ENTRIES`-truncation (CTO review on PR #117,
+    /// should-fix 1), carried through to the JSON response body.
+    Entries { names: Vec<String>, truncated: bool },
 }
 
 /// Which `World` entry point a [`FileOpRequest`] resolves to.
@@ -316,7 +318,7 @@ async fn read_file(
             FileOpValue::Written
             | FileOpValue::QuotaExceeded
             | FileOpValue::PreconditionFailed
-            | FileOpValue::Entries(_),
+            | FileOpValue::Entries { .. },
         )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
         Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -546,7 +548,7 @@ async fn write_file(
         Ok(Ok(FileOpValue::PreconditionFailed)) => StatusCode::PRECONDITION_FAILED.into_response(),
         // A CAS write never produces these -- a driver bug, not a
         // client-facing distinction.
-        Ok(Ok(FileOpValue::Null | FileOpValue::Str(_) | FileOpValue::Entries(_))) => {
+        Ok(Ok(FileOpValue::Null | FileOpValue::Str(_) | FileOpValue::Entries { .. })) => {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
         Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
@@ -566,6 +568,11 @@ pub struct ListDirQuery {
 #[derive(Debug, Serialize)]
 struct ListDirResponse {
     entries: Vec<String>,
+    /// `true` if the real directory had more than `World::
+    /// MAX_LIST_ENTRIES` entries (CTO review on PR #117, should-fix 1):
+    /// `entries` is the sorted-by-name prefix, never silently a
+    /// different (e.g. random) subset.
+    truncated: bool,
 }
 
 /// `GET /api/v1/files/list?path=/builders/<u>/...` (M-FS-3).
@@ -577,11 +584,13 @@ struct ListDirResponse {
 ///   unauthorised caller the directory exists).
 /// - `503` on a full queue, a world thread that didn't answer in time,
 ///   or no file-op channel wired at all (M-FS-5).
-/// - `200` with a JSON `{"entries": [...]}` body -- `World::list_dir`
-///   has already dropped any individual entry `valid_read` refuses, so
-///   every name in the response is one this uid may also `GET`.
-///   `Content-Type: application/json`, `nosniff`, and the same sandboxed
-///   CSP as a file read (M-FS-4).
+/// - `200` with a JSON `{"entries": [...], "truncated": bool}` body --
+///   `World::list_dir` has already dropped any individual entry
+///   `valid_read` refuses, so every name in the response is one this
+///   uid may also `GET`; `truncated` is `true` if the real directory had
+///   more than `World::MAX_LIST_ENTRIES` entries. `Content-Type:
+///   application/json`, `nosniff`, and the same sandboxed CSP as a file
+///   read (M-FS-4).
 async fn list_dir(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -599,7 +608,7 @@ async fn list_dir(
     })
     .await;
     match result {
-        Ok(Ok(FileOpValue::Entries(entries))) => list_dir_response(entries),
+        Ok(Ok(FileOpValue::Entries { names, truncated })) => list_dir_response(names, truncated),
         // `World::list_dir` reports a refused/missing directory as a
         // `FileOpError::Refused` (loom-cli's drain loop maps its `None`
         // there), not an `Ok` -- these never happen, but are not a
@@ -622,8 +631,12 @@ async fn list_dir(
 /// file bodies (M-FS-4 names it for "raw bodies"), not a JSON API
 /// response, which axum's `Json` already sends as `application/json`,
 /// never sniffable as HTML regardless.
-fn list_dir_response(entries: Vec<String>) -> axum::response::Response {
-    let mut response = (StatusCode::OK, axum::Json(ListDirResponse { entries })).into_response();
+fn list_dir_response(entries: Vec<String>, truncated: bool) -> axum::response::Response {
+    let mut response = (
+        StatusCode::OK,
+        axum::Json(ListDirResponse { entries, truncated }),
+    )
+        .into_response();
     let headers = response.headers_mut();
     headers.insert(
         header::HeaderName::from_static("x-content-type-options"),
@@ -1295,10 +1308,10 @@ mod tests {
                 let req = file_op_rx.recv().expect("a request should arrive");
                 assert_eq!(req.path, "/builders/frodo");
                 assert!(matches!(req.kind, FileOpKind::List));
-                req.respond(Ok(FileOpValue::Entries(vec![
-                    "a.wf".to_string(),
-                    "b.wf".to_string(),
-                ])));
+                req.respond(Ok(FileOpValue::Entries {
+                    names: vec!["a.wf".to_string(), "b.wf".to_string()],
+                    truncated: false,
+                }));
             });
             let (state, keys) = test_state(Some(file_op_tx));
             let token = bearer_for("frodo", &keys);
@@ -1322,6 +1335,7 @@ mod tests {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["entries"], serde_json::json!(["a.wf", "b.wf"]));
+            assert_eq!(json["truncated"], serde_json::json!(false));
         }
 
         /// M-FS-3: a refused or missing directory is `404`, same status
@@ -1380,6 +1394,34 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        #[tokio::test]
+        async fn listing_a_truncated_directory_carries_truncated_true() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let req = file_op_rx.recv().expect("a request should arrive");
+                req.respond(Ok(FileOpValue::Entries {
+                    names: vec!["a.wf".to_string()],
+                    truncated: true,
+                }));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/files/list?path=/builders/frodo")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["truncated"], serde_json::json!(true));
         }
     }
 }
