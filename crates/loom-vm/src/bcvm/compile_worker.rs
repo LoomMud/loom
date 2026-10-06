@@ -202,9 +202,19 @@ pub enum CompileSetOutcome {
 pub enum CompileOutcome {
     Ready(RecompileResult),
     /// Rendered diagnostics / "file not found", exactly like
-    /// `Compiler::recompile`'s `Err(String)`. Also used when the OS
-    /// refused to spawn the background thread at all.
-    Failed(String),
+    /// `Compiler::recompile`'s `Err(String)` used to be before OBI-296
+    /// (T-FS-3): `path` is the specific program the diagnostic is about
+    /// -- never folded into `message` -- so a caller with per-uid
+    /// `valid_read` context (`World::poll_recompiles`) can redact it
+    /// without having to re-parse a joined string. Also used when the
+    /// OS refused to spawn the background thread at all, or the worker
+    /// thread vanished without sending a result (`path` is then the
+    /// root path this job was compiling, since that's the only path in
+    /// scope).
+    Failed {
+        path: String,
+        message: String,
+    },
 }
 
 /// Send-safe snapshot of a [`Registry`]'s current program topology
@@ -322,9 +332,10 @@ impl RecompileJob {
         match self.rx.try_recv() {
             Ok(outcome) => Some(outcome),
             Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => Some(CompileOutcome::Failed(
-                "internal: compile worker thread exited without a result".to_string(),
-            )),
+            Err(mpsc::TryRecvError::Disconnected) => Some(CompileOutcome::Failed {
+                path: self.root_path.clone(),
+                message: "internal: compile worker thread exited without a result".to_string(),
+            }),
         }
     }
 }
@@ -372,9 +383,10 @@ pub fn spawn_recompile_after(
         // the OS is out of resources) — report it the same way a compile
         // error would be reported, through the very channel the caller is
         // about to poll.
-        let _ = tx.send(CompileOutcome::Failed(format!(
-            "failed to spawn background compile thread: {e}"
-        )));
+        let _ = tx.send(CompileOutcome::Failed {
+            path: job_path.clone(),
+            message: format!("failed to spawn background compile thread: {e}"),
+        });
     }
     RecompileJob {
         rx,
@@ -392,7 +404,12 @@ pub fn spawn_recompile_after(
 fn run_recompile(root: &Path, path: &str, snapshot: &ProgramSnapshot) -> CompileOutcome {
     let path = match mudlib::normalize_path(path) {
         Ok(p) => p,
-        Err(e) => return CompileOutcome::Failed(e),
+        Err(e) => {
+            return CompileOutcome::Failed {
+                path: path.to_string(),
+                message: e,
+            };
+        }
     };
     let mut session = Session::new(mudlib::FsLoader {
         root: root.to_path_buf(),
@@ -415,8 +432,18 @@ fn run_recompile(root: &Path, path: &str, snapshot: &ProgramSnapshot) -> Compile
     // before `path` itself is built.
     let linearization: Vec<std::rc::Rc<str>> = match session.compile(&path) {
         Outcome::Ok(checked) => checked.info.linearization.clone(),
-        Outcome::Failed(msg) => return CompileOutcome::Failed(msg.clone()),
-        Outcome::Missing(msg) => return CompileOutcome::Failed(msg.clone()),
+        Outcome::Failed(msg) => {
+            return CompileOutcome::Failed {
+                path: path.clone(),
+                message: msg.clone(),
+            };
+        }
+        Outcome::Missing(msg) => {
+            return CompileOutcome::Failed {
+                path: path.clone(),
+                message: msg.clone(),
+            };
+        }
     };
     let mut to_compile: Vec<String> = Vec::new();
     for anc in &linearization {
@@ -439,29 +466,46 @@ fn run_recompile(root: &Path, path: &str, snapshot: &ProgramSnapshot) -> Compile
         }
         match session.compile(p) {
             Outcome::Ok(_) => {}
-            Outcome::Failed(msg) => return CompileOutcome::Failed(msg.clone()),
-            Outcome::Missing(msg) => return CompileOutcome::Failed(msg.clone()),
+            Outcome::Failed(msg) => {
+                return CompileOutcome::Failed {
+                    path: p.clone(),
+                    message: msg.clone(),
+                };
+            }
+            Outcome::Missing(msg) => {
+                return CompileOutcome::Failed {
+                    path: p.clone(),
+                    message: msg.clone(),
+                };
+            }
         }
         let anc_hir = match session.outcomes().get(p) {
             Some(Outcome::Ok(c)) => c.hir.clone(),
             _ => {
-                return CompileOutcome::Failed(format!(
-                    "internal: {p} missing from the compile session"
-                ));
+                return CompileOutcome::Failed {
+                    path: p.clone(),
+                    message: "internal: missing from the compile session".to_string(),
+                };
             }
         };
         let anc_src = match session.outcomes().get(p) {
             Some(Outcome::Ok(c)) => c.src.clone(),
             _ => {
-                return CompileOutcome::Failed(format!(
-                    "internal: {p} missing from the compile session"
-                ));
+                return CompileOutcome::Failed {
+                    path: p.clone(),
+                    message: "internal: missing from the compile session".to_string(),
+                };
             }
         };
         let parent_path = anc_hir.inherits.first().map(|inh| inh.path.to_string());
         let unit = match compile_hir_unit(&anc_hir, &anc_src) {
             Ok(u) => u,
-            Err(e) => return CompileOutcome::Failed(format!("{p}: {e}")),
+            Err(e) => {
+                return CompileOutcome::Failed {
+                    path: p.clone(),
+                    message: e.to_string(),
+                };
+            }
         };
         let var_specs = unit
             .var_specs
