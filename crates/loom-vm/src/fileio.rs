@@ -203,8 +203,13 @@ pub fn file_size_bytes(root: &Path, path: &str) -> Result<u64, String> {
 
 /// Immediate entries of a mudlib-absolute directory (OBI-180 M-FS-3):
 /// each entry's bare name (not a full path), files and subdirectories
-/// both included, sorted for determinism. `Ok(None)` for a path that
-/// doesn't exist or isn't a directory -- the driver-side caller
+/// both included, sorted for determinism. Dotfiles (a name starting with
+/// `.`, e.g. a live mudlib checkout's own `.git`, OBI-190) are hidden
+/// (CTO review on PR #117, should-fix 2) -- there is no caller yet that
+/// needs them, and a bare `valid_read` pass on `/` would otherwise
+/// expose repository internals nothing in the mudlib ever intended to
+/// publish as a file. `Ok(None)` for a path that doesn't exist or isn't
+/// a directory -- the driver-side caller
 /// (`World::list_dir`) maps that to the same "not found" shape
 /// `read_file` already gives a missing file, so a listing you can't read
 /// looks exactly like one that doesn't exist (M-FS-3). Confined the same
@@ -221,7 +226,11 @@ pub fn list_dir(root: &Path, path: &str) -> Result<Option<Vec<String>>, String> 
     let mut names = Vec::new();
     for entry in std::fs::read_dir(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))? {
         let entry = entry.map_err(|e| format!("{}: {e}", resolved.display()))?;
-        names.push(entry.file_name().to_string_lossy().into_owned());
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        names.push(name);
     }
     names.sort();
     Ok(Some(names))
@@ -468,6 +477,20 @@ mod tests {
                 "b.wf".to_string(),
                 "sub".to_string()
             ])
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_dir_hides_dotfiles() {
+        let root = tmp_root("list-dir-dotfiles");
+        write_file(&root, "/domains/x/visible.wf", "v").unwrap();
+        std::fs::create_dir_all(root.join("domains/x/.git")).unwrap();
+        std::fs::write(root.join("domains/x/.gitignore"), "x").unwrap();
+        assert_eq!(
+            list_dir(&root, "/domains/x").unwrap(),
+            Some(vec!["visible.wf".to_string()]),
+            "dotfiles (.git, .gitignore) must never show up in a listing"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

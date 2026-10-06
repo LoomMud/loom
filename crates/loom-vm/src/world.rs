@@ -639,6 +639,26 @@ pub enum ListDirError {
     Internal(String),
 }
 
+/// Cap on how many directory entries [`World::list_dir`] evaluates and
+/// returns in one call (CTO review on PR #117, should-fix 1): each entry
+/// costs one `valid_read` apply (a cache miss plus `MISS_CHARGE` the
+/// first time) inside a single `exec`, so an unbounded directory could
+/// otherwise exhaust the exec's tick budget (becoming an `Internal`
+/// error for the *whole* listing) or hold the world thread for a long
+/// time. Entries are evaluated in the sorted order `fileio::list_dir`
+/// already returns, so the cap always keeps the same prefix regardless
+/// of how many of them end up `valid_read`-filtered out.
+pub const MAX_LIST_ENTRIES: usize = 1000;
+
+/// [`World::list_dir`]'s successful result: the (`valid_read`-filtered,
+/// possibly [`MAX_LIST_ENTRIES`]-truncated) entry names, plus whether
+/// the real directory had more entries than made it into `names`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListDirResult {
+    pub names: Vec<String>,
+    pub truncated: bool,
+}
+
 /// `sha256(contents)`, hex-encoded (OBI-180 M-FS-6). Deliberately
 /// duplicated in `loom_http::files::etag_for` rather than shared: sharing
 /// it would mean `loom-http` depending on `loom-vm` (or vice versa) just
@@ -2367,12 +2387,17 @@ impl World {
     /// apply failure fails the whole call instead of just being dropped
     /// (which would look like a complete, successful listing that
     /// happens to be missing an entry).
+    ///
+    /// Dotfiles are hidden (`fileio::list_dir`'s own doc comment) and the
+    /// result is capped at [`MAX_LIST_ENTRIES`] entries, sorted by name,
+    /// with [`ListDirResult::truncated`] set when the real directory had
+    /// more (CTO review on PR #117, should-fix 1/2).
     pub fn list_dir(
         &mut self,
         uid: &str,
         path: &str,
         host: &mut dyn Host,
-    ) -> Result<Option<Vec<String>>, ListDirError> {
+    ) -> Result<Option<ListDirResult>, ListDirError> {
         if crate::security::is_reserved_principal(uid) {
             return Err(ListDirError::Refused(format!(
                 "`{uid}` is a reserved principal"
@@ -2401,14 +2426,18 @@ impl World {
                 match crate::fileio::list_dir(&root, &path) {
                     Ok(Some(entries)) => {
                         let trimmed = path.trim_end_matches('/');
-                        let mut filtered = Vec::with_capacity(entries.len());
-                        for name in entries {
+                        let truncated = entries.len() > MAX_LIST_ENTRIES;
+                        let mut filtered = Vec::with_capacity(entries.len().min(MAX_LIST_ENTRIES));
+                        for name in entries.into_iter().take(MAX_LIST_ENTRIES) {
                             let child = format!("{trimmed}/{name}");
                             if h.admin_valid_read("get_dir", &child)? {
                                 filtered.push(name);
                             }
                         }
-                        Ok(Some(filtered))
+                        Ok(Some(ListDirResult {
+                            names: filtered,
+                            truncated,
+                        }))
                     }
                     Ok(None) => Ok(None),
                     Err(e) => Err(RtError::new(e)),

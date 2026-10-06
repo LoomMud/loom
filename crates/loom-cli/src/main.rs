@@ -2734,9 +2734,10 @@ fn spawn_world_thread(
                             loom_http::files::FileOpKind::List => match world
                                 .list_dir(&req.uid, &req.path, &mut host)
                             {
-                                Ok(Some(entries)) => {
-                                    Ok(loom_http::files::FileOpValue::Entries(entries))
-                                }
+                                Ok(Some(result)) => Ok(loom_http::files::FileOpValue::Entries {
+                                    names: result.names,
+                                    truncated: result.truncated,
+                                }),
                                 Ok(None) => Err(loom_http::files::FileOpError::Refused(
                                     "get_dir refused or the directory does not exist".to_string(),
                                 )),

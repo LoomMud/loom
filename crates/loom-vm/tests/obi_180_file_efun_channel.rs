@@ -414,7 +414,8 @@ fn list_dir_returns_entries_in_own_workroom() {
         .list_dir("glorfindel", "/builders/glorfindel", &mut host)
         .expect("own workroom listing should be allowed")
         .expect("the directory exists");
-    assert_eq!(entries, vec!["a.wf".to_string(), "b.wf".to_string()]);
+    assert_eq!(entries.names, vec!["a.wf".to_string(), "b.wf".to_string()]);
+    assert!(!entries.truncated);
 }
 
 #[test]
@@ -491,7 +492,7 @@ fn list_dir_shows_every_entry_the_master_allows() {
         .list_dir("arch", "/builders/frodo", &mut host)
         .unwrap()
         .expect("arch may read anywhere per the test master policy");
-    assert_eq!(entries, vec!["a.wf".to_string(), "b.wf".to_string()]);
+    assert_eq!(entries.names, vec!["a.wf".to_string(), "b.wf".to_string()]);
 }
 
 #[test]
@@ -571,4 +572,57 @@ fn valid_write(path: string, ob: object, op: string) -> bool {
         matches!(err, loom_vm::world::ListDirError::Internal(_)),
         "{err:?}"
     );
+}
+
+/// CTO review on PR #117, should-fix 1: a directory with more than
+/// `MAX_LIST_ENTRIES` entries is truncated, not left to exhaust the
+/// exec's tick budget evaluating every one of them.
+#[test]
+fn list_dir_truncates_past_the_cap() {
+    let (mut world, mut host, _root) = boot("list-dir-truncate");
+    let over_the_cap = loom_vm::world::MAX_LIST_ENTRIES + 10;
+    for i in 0..over_the_cap {
+        world
+            .call_file_efun(
+                "glorfindel",
+                "write_file",
+                vec![
+                    Value::str(&format!("/builders/glorfindel/f{i:05}.wf")),
+                    Value::str("x"),
+                ],
+                &mut host,
+            )
+            .unwrap();
+    }
+    let result = world
+        .list_dir("glorfindel", "/builders/glorfindel", &mut host)
+        .unwrap()
+        .expect("own workroom listing should be allowed");
+    assert_eq!(result.names.len(), loom_vm::world::MAX_LIST_ENTRIES);
+    assert!(result.truncated);
+}
+
+/// CTO review on PR #117, should-fix 2: dotfiles (e.g. a live mudlib
+/// checkout's own `.git`, OBI-190) never show up in a listing, even for
+/// a uid whose `valid_read` would allow everything.
+#[test]
+fn list_dir_hides_dotfiles() {
+    let (mut world, mut host, root) = boot("list-dir-dotfiles");
+    world
+        .call_file_efun(
+            "glorfindel",
+            "write_file",
+            vec![
+                Value::str("/builders/glorfindel/visible.wf"),
+                Value::str("v"),
+            ],
+            &mut host,
+        )
+        .unwrap();
+    std::fs::create_dir_all(root.join("builders/glorfindel/.git")).unwrap();
+    let result = world
+        .list_dir("glorfindel", "/builders/glorfindel", &mut host)
+        .unwrap()
+        .expect("own workroom listing should be allowed");
+    assert_eq!(result.names, vec!["visible.wf".to_string()]);
 }
