@@ -28,12 +28,14 @@ use std::path::PathBuf;
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use loom_obs::{PrometheusMetrics, Readiness};
 use tokio::sync::mpsc;
+use tower::ServiceBuilder;
 use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::debug;
 
 mod admin;
@@ -147,6 +149,22 @@ impl HttpState {
     }
 }
 
+/// M-IDE-1/M-IDE-2 (OBI-179 threat model) for the static web client
+/// (`web-client/admin.html` and friends, OBI-294): `admin.html` already
+/// carries this via a `<meta http-equiv="Content-Security-Policy">` tag,
+/// but `frame-ancestors` (and `sandbox`/`report-uri`) are no-ops when
+/// delivered that way per the CSP spec -- they only take effect as an
+/// actual response header. A header and a `<meta>` tag can coexist
+/// (browsers enforce the intersection), so the header carries *only*
+/// the header-only directive: it wraps every file under the web root,
+/// including the player client (`index.html`), which uses an inline
+/// `<style>` and inline module `<script>` that admin.html's
+/// `script-src 'self'; style-src 'self'` would block. Page-specific
+/// policy stays in each page's `<meta>` tag. `X-Frame-Options: DENY`
+/// rides along as a header-only fallback for UAs that predate
+/// `frame-ancestors`.
+const STATIC_CSP: &str = "frame-ancestors 'none'";
+
 pub fn app(state: HttpState) -> Router {
     let web_root = state.web_root.clone();
     let router = Router::new()
@@ -160,7 +178,19 @@ pub fn app(state: HttpState) -> Router {
         .merge(files::files_router())
         .with_state(state);
     match web_root {
-        Some(root) => router.fallback_service(ServeDir::new(root)),
+        Some(root) => {
+            let static_files = ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    header::CONTENT_SECURITY_POLICY,
+                    HeaderValue::from_static(STATIC_CSP),
+                ))
+                .layer(SetResponseHeaderLayer::overriding(
+                    header::HeaderName::from_static("x-frame-options"),
+                    HeaderValue::from_static("DENY"),
+                ))
+                .service(ServeDir::new(root));
+            router.fallback_service(static_files)
+        }
         None => router,
     }
 }
@@ -662,5 +692,73 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn static_fallback_carries_frame_ancestors_as_a_header_not_only_meta() {
+        // OBI-294: `admin.html`'s `frame-ancestors 'none'` is a no-op
+        // when delivered only via `<meta http-equiv="Content-Security-
+        // Policy">` (ignored by the CSP spec for that directive). The
+        // static fallback must also carry it as a real response header
+        // for every path under the served tree -- not just `admin.html`
+        // -- plus `X-Frame-Options: DENY` as a header-only fallback for
+        // older UAs.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>loom</html>").unwrap();
+        std::fs::write(
+            dir.path().join("admin.html"),
+            "<html><!-- meta CSP lives here too --></html>",
+        )
+        .unwrap();
+
+        let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
+        let state = HttpState::new(
+            ws_accept_tx,
+            Readiness::new(),
+            PrometheusMetrics::new_unregistered(),
+        )
+        .with_web_root(dir.path().to_path_buf());
+        let app = app(state);
+
+        for path in ["/", "/admin.html"] {
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "path: {path}");
+            let csp = response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .unwrap_or_else(|| panic!("missing CSP header on {path}"))
+                .to_str()
+                .unwrap();
+            assert_eq!(csp, "frame-ancestors 'none'", "path: {path}");
+            // Must not constrain script/style: index.html relies on an
+            // inline <style> and inline module <script>.
+            assert!(!csp.contains("script-src") && !csp.contains("default-src"));
+            let xfo = response
+                .headers()
+                .get(header::HeaderName::from_static("x-frame-options"))
+                .unwrap_or_else(|| panic!("missing X-Frame-Options header on {path}"))
+                .to_str()
+                .unwrap();
+            assert_eq!(xfo, "DENY");
+        }
+
+        // Explicit (non-fallback) routes are untouched by the static-file
+        // CSP layer -- it only wraps the `ServeDir` fallback service.
+        let request = axum::http::Request::builder()
+            .uri("/healthz")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .is_none()
+        );
     }
 }
