@@ -20,7 +20,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{on_world_thread, scratch, FakeHost};
+use common::{FakeHost, on_world_thread, scratch};
 use loom_vm::World;
 
 /// `valid_read` denies everything under `/secure` to anyone but `root`
