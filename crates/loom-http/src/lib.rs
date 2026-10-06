@@ -60,7 +60,6 @@ pub struct HttpState {
     github_webhook: Option<webhook::GithubWebhookConfig>,
     file_op_tx: Option<files::FileOpSender>,
     write_rate_limiter: files::WriteRateLimiter,
-    compile_in_flight: files::CompileInFlight,
     world_query: Option<std::sync::Arc<dyn admin_query::WorldAdminQuery>>,
 }
 
@@ -80,7 +79,6 @@ impl HttpState {
             github_webhook: None,
             file_op_tx: None,
             write_rate_limiter: files::new_write_rate_limiter(),
-            compile_in_flight: files::new_compile_in_flight(),
             world_query: None,
         }
     }
