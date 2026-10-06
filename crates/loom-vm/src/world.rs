@@ -2289,6 +2289,82 @@ impl World {
         .map_err(|e| e.report())
     }
 
+    /// `POST /api/v1/files/compile` (OBI-180 M-FS-5, CTO review of PR
+    /// #119 on `c29c7a3`, must-fix 1): a `compile_object` entry point
+    /// that never blocks the world thread on the compile itself.
+    ///
+    /// Authorizes `path` for `uid` under exactly the `{uid}` guard set
+    /// -- the same `authorize(P1, Operation::Compile)` call and audit
+    /// record the synchronous `compile_object` efun arm makes --
+    /// inside one [`Self::exec`], via [`crate::bcvm::registry::
+    /// RegistryHost::authorize_compile`]. Only once that succeeds does
+    /// this call [`Self::begin_recompile`], which hands the actual
+    /// parse/check/codegen/verify work (of `path` and, for a widely
+    /// inherited path, every dependent) to `loom-vm`'s background
+    /// compile-worker thread (OBI-90, D-P1.5) -- nothing about that call
+    /// touches `self.registry`, so this never runs inside the `exec`
+    /// that just authorized it, and never blocks `tick`/`input`/
+    /// `connect` for any other connection while it runs. Poll
+    /// [`Self::take_finished_recompiles`] for the eventual result
+    /// (`Ok(())` a clean compile, `Err(diagnostics)` the compiler's own
+    /// diagnostics text -- not a driver error, see that method's doc),
+    /// keyed by the returned [`RecompileToken`], or
+    /// [`Self::recompile_pending`] to check without draining it.
+    ///
+    /// Refuses a reserved principal (`root`, `mudlib`, `*:*`) outright,
+    /// same as [`Self::call_file_efun`] -- there is no HTTP-reachable
+    /// way to mint one of those guards. `Err` here is always an
+    /// authorization refusal (M-FS-3: the caller maps this to the same
+    /// not-found-shaped `404` every other refused file op gets) --
+    /// never a compile diagnostic, which can only arrive later, via
+    /// [`Self::take_finished_recompiles`].
+    pub fn begin_file_compile(
+        &mut self,
+        uid: &str,
+        path: &str,
+        host: &mut dyn Host,
+    ) -> Result<RecompileToken, String> {
+        self.begin_file_compile_after(uid, path, std::time::Duration::ZERO, host)
+    }
+
+    /// [`Self::begin_file_compile`], but the background thread sleeps for
+    /// `delay` before it starts compiling -- test/tooling support for
+    /// deterministically exercising M-FS-5's per-uid in-flight/queued
+    /// behaviour (`loom-cli`'s drain loop) without a real multi-second
+    /// `.wf` file, same reasoning as [`Self::begin_recompile_after`].
+    #[doc(hidden)]
+    pub fn begin_file_compile_after(
+        &mut self,
+        uid: &str,
+        path: &str,
+        delay: std::time::Duration,
+        host: &mut dyn Host,
+    ) -> Result<RecompileToken, String> {
+        if crate::security::is_reserved_principal(uid) {
+            return Err(format!("`{uid}` is a reserved principal"));
+        }
+        let sym = self.registry.syms.intern(uid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: sym,
+            euid: sym,
+        });
+        let acting = self.master_or_sentinel();
+        let path = path.to_string();
+        let norm = self
+            .exec(
+                host,
+                acting,
+                None,
+                None,
+                Some(guard),
+                None,
+                Some(sym),
+                move |h| h.authorize_compile(&path),
+            )
+            .map_err(|e| e.report())?;
+        Ok(self.begin_recompile_after(&norm, delay))
+    }
+
     /// Atomic compare-and-swap `write_file` (OBI-180 M-FS-6, CTO review
     /// must-fix 1): reads the file, checks `precondition` against its
     /// current contents, and -- only if it holds -- writes `new_text`,

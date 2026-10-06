@@ -609,10 +609,285 @@ const SNAPSHOT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// files/*` file-op requests `spawn_world_thread`'s drain loop runs in
 /// one world-tick pass. `loom_http::files::FILE_OP_QUEUE_DEPTH` (64) is
 /// the most that could ever be queued; draining all of them unconditionally
-/// in one pass is fine today (`read_file`/`write_file` are cheap), but
-/// would stop being true once `compile_object` is wired (a later slice),
-/// so the cap is in place now rather than added under pressure later.
+/// in one pass is fine today (`read_file`/`write_file` are cheap, and a
+/// `Compile` request only ever starts or queues a background compile
+/// here -- see [`CompileSlot`] -- it never runs one inline), but the cap
+/// is in place so a flood of cheap requests still can't monopolise a
+/// tick indefinitely.
 const FILE_OPS_PER_TICK_BUDGET: usize = 16;
+
+/// Per-uid compile-queue state for `/api/v1/files/compile` (OBI-180
+/// M-FS-5, CTO review of PR #119 on `c29c7a3`, must-fix 2): at most one
+/// compile in flight and one queued per uid, tracked on the world
+/// thread -- not the HTTP layer, which has no way to see (let alone
+/// cancel) work already handed to `loom-vm`'s background compile-worker
+/// thread. A newer `/compile` request for a uid that already has one in
+/// flight replaces whatever was queued; the displaced request is
+/// answered `409` (`FileOpError::Superseded`) immediately, without ever
+/// running. When the in-flight compile finishes (`World::
+/// take_finished_recompiles`), the queued request (if any) starts next.
+#[derive(Default)]
+struct CompileSlot {
+    /// The compile currently running in the background, and the
+    /// `/compile` request whose HTTP caller is waiting on its result.
+    in_flight: Option<(
+        loom_vm::world::RecompileToken,
+        loom_http::files::FileOpRequest,
+    )>,
+    /// At most one newer request, displacing (with a `409`) whatever
+    /// was queued before it.
+    queued: Option<(String, loom_http::files::FileOpRequest)>,
+}
+
+/// Starts a queued compile for `uid`, if any, once its slot's previous
+/// in-flight compile has finished (`drain_finished_recompiles` empties
+/// `in_flight` before calling this). A `begin_file_compile` refusal here
+/// (an authorization failure -- the same thing a direct `/compile` call
+/// for this uid/path would also get) answers the queued request
+/// immediately rather than leaving it stuck.
+/// Routes one `FileOpKind::Compile` request into `compile_slots` (CTO
+/// review of PR #119, must-fix 2): starts it immediately via
+/// `World::begin_file_compile` if nothing is in flight yet for this uid,
+/// otherwise queues it -- displacing (with `409`,
+/// `FileOpError::Superseded`) whatever request was queued before it, so
+/// at most one compile is ever in flight and one queued per uid, no
+/// matter how many `/compile` calls for the same uid land before the
+/// first one finishes.
+fn enqueue_compile(
+    world: &mut World,
+    host: &mut NetHost,
+    compile_slots: &mut std::collections::HashMap<String, CompileSlot>,
+    req: loom_http::files::FileOpRequest,
+) {
+    let uid = req.uid.clone();
+    let path = req.path.clone();
+    let slot = compile_slots.entry(uid.clone()).or_default();
+    if slot.in_flight.is_some() {
+        if let Some((_, displaced)) = slot.queued.take() {
+            displaced.respond(Err(loom_http::files::FileOpError::Superseded));
+        }
+        slot.queued = Some((path, req));
+    } else {
+        match world.begin_file_compile(&uid, &path, host) {
+            Ok(token) => slot.in_flight = Some((token, req)),
+            Err(msg) => {
+                req.respond(Err(loom_http::files::FileOpError::Refused(msg)));
+                if slot.queued.is_none() {
+                    compile_slots.remove(&uid);
+                }
+            }
+        }
+    }
+}
+
+fn start_queued_compile(world: &mut World, host: &mut NetHost, uid: &str, slot: &mut CompileSlot) {
+    let Some((path, req)) = slot.queued.take() else {
+        return;
+    };
+    match world.begin_file_compile(uid, &path, host) {
+        Ok(token) => slot.in_flight = Some((token, req)),
+        Err(msg) => req.respond(Err(loom_http::files::FileOpError::Refused(msg))),
+    }
+}
+
+/// Drains every compile `World::take_finished_recompiles` has installed
+/// since the last call, answers the waiting `/compile` request for each
+/// one, and starts that uid's queued compile (if any) next -- called
+/// once per event-loop iteration, same cadence as `drain_db_events`/
+/// `drain_admin_queries` (results only actually appear after a `World::
+/// tick`, since that is what drives `World::poll_recompiles`, but
+/// draining here rather than only on `NetEvent::Tick` costs nothing and
+/// keeps this symmetric with the other drains).
+fn drain_finished_recompiles(
+    world: &mut World,
+    host: &mut NetHost,
+    compile_slots: &mut std::collections::HashMap<String, CompileSlot>,
+) {
+    for (token, result) in world.take_finished_recompiles() {
+        let Some((uid, mut slot)) = compile_slots
+            .iter()
+            .find(|(_, slot)| slot.in_flight.as_ref().is_some_and(|(t, _)| *t == token))
+            .map(|(uid, _)| uid.clone())
+            .and_then(|uid| compile_slots.remove(&uid).map(|slot| (uid, slot)))
+        else {
+            // No request is waiting on this token (shouldn't happen --
+            // every `begin_file_compile` call records its token in
+            // exactly one slot's `in_flight` -- but answering nothing is
+            // safer than panicking the world thread over a bookkeeping
+            // bug).
+            continue;
+        };
+        if let Some((_, req)) = slot.in_flight.take() {
+            req.respond(Ok(file_op_value_from_recompile_result(result)));
+        }
+        start_queued_compile(world, host, &uid, &mut slot);
+        if slot.in_flight.is_some() || slot.queued.is_some() {
+            compile_slots.insert(uid, slot);
+        }
+    }
+}
+
+#[cfg(test)]
+mod compile_queue_tests {
+    //! M-FS-5 "one in-flight compile per uid, newest save wins" (CTO
+    //! review of PR #119, must-fix 2), exercised against a real
+    //! `World`/`enqueue_compile`/`drain_finished_recompiles` -- not a
+    //! fake channel -- so these catch a regression in the actual queue
+    //! bookkeeping, not just its wire-level status mapping (that part is
+    //! covered in `loom-http`'s own tests).
+    use super::*;
+    use loom_http::files::{
+        FileOpError, FileOpKind, FileOpValue, file_op_channel, request_file_op,
+    };
+
+    const MASTER: &str = r#"
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+"#;
+
+    fn scratch(tag: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("loom-cli-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn boot(tag: &str) -> (World, NetHost) {
+        let root = scratch(tag);
+        let master = root.join("secure/master.wf");
+        std::fs::create_dir_all(master.parent().unwrap()).unwrap();
+        std::fs::write(&master, MASTER).unwrap();
+        let prog = root.join("builders/frodo/a.wf");
+        std::fs::create_dir_all(prog.parent().unwrap()).unwrap();
+        std::fs::write(&prog, "var x: int = 1\n").unwrap();
+        let world = World::boot(&root).expect("boot");
+        let (command_tx, _command_rx) = mpsc::channel(8);
+        (world, NetHost { command_tx })
+    }
+
+    /// Sends a `Compile` request on its own thread (mirroring how an
+    /// `/api/v1/files/compile` handler really calls `request_file_op`,
+    /// via `spawn_blocking`) and hands back the world-thread-side
+    /// [`loom_http::files::FileOpRequest`] plus a handle to join for the
+    /// eventual HTTP-side result.
+    fn fake_compile_request(
+        uid: &str,
+        path: &str,
+    ) -> (
+        loom_http::files::FileOpRequest,
+        std::thread::JoinHandle<Result<FileOpValue, FileOpError>>,
+    ) {
+        let (tx, rx) = file_op_channel();
+        let uid = uid.to_string();
+        let path = path.to_string();
+        let handle =
+            std::thread::spawn(move || request_file_op(&tx, &uid, &path, FileOpKind::Compile));
+        let req = rx.recv().expect("the request we just sent");
+        (req, handle)
+    }
+
+    /// A second `/compile` for a uid that already has one in flight
+    /// queues instead of starting a second background compile; a third
+    /// one displaces the second (`409`) rather than stacking up, and
+    /// never touches the first (still in-flight) compile.
+    #[test]
+    fn a_third_request_displaces_the_second_with_409_not_the_first() {
+        let (mut world, mut host) = boot("queue-displace");
+        let mut compile_slots: std::collections::HashMap<String, CompileSlot> =
+            std::collections::HashMap::new();
+
+        let (first, _first_handle) = fake_compile_request("frodo", "/builders/frodo/a");
+        enqueue_compile(&mut world, &mut host, &mut compile_slots, first);
+        let slot = compile_slots.get("frodo").expect("frodo has a slot");
+        let in_flight_token = slot.in_flight.as_ref().map(|(t, _)| *t);
+        assert!(
+            in_flight_token.is_some(),
+            "first request should start a compile"
+        );
+        assert!(slot.queued.is_none());
+
+        let (second, second_handle) = fake_compile_request("frodo", "/builders/frodo/a");
+        enqueue_compile(&mut world, &mut host, &mut compile_slots, second);
+        assert!(
+            compile_slots.get("frodo").unwrap().queued.is_some(),
+            "second request should queue behind the first"
+        );
+
+        let (third, _third_handle) = fake_compile_request("frodo", "/builders/frodo/a");
+        enqueue_compile(&mut world, &mut host, &mut compile_slots, third);
+
+        assert_eq!(
+            second_handle.join().expect("second's thread"),
+            Err(FileOpError::Superseded),
+            "the displaced second request must answer 409, not run or hang"
+        );
+        let slot = compile_slots.get("frodo").expect("frodo still has a slot");
+        assert_eq!(
+            slot.in_flight.as_ref().map(|(t, _)| *t),
+            in_flight_token,
+            "the original in-flight compile is untouched"
+        );
+        assert!(slot.queued.is_some(), "the third request is now queued");
+    }
+
+    /// Once the in-flight compile finishes, the queued request starts
+    /// next -- the uid never runs more than one compile at a time, but
+    /// also never silently drops the one request that survived being
+    /// queued.
+    #[test]
+    fn the_queued_request_starts_once_the_in_flight_one_finishes() {
+        let (mut world, mut host) = boot("queue-advance");
+        let mut compile_slots: std::collections::HashMap<String, CompileSlot> =
+            std::collections::HashMap::new();
+
+        let (first, first_handle) = fake_compile_request("frodo", "/builders/frodo/a");
+        enqueue_compile(&mut world, &mut host, &mut compile_slots, first);
+        let (second, _second_handle) = fake_compile_request("frodo", "/builders/frodo/a");
+        enqueue_compile(&mut world, &mut host, &mut compile_slots, second);
+
+        // Wait for the first (real, background) compile to finish.
+        let mut drained = false;
+        for _ in 0..200 {
+            world.tick(&mut host);
+            drain_finished_recompiles(&mut world, &mut host, &mut compile_slots);
+            if compile_slots
+                .get("frodo")
+                .is_some_and(|slot| slot.queued.is_none())
+            {
+                drained = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(drained, "the first compile never finished");
+        assert_eq!(
+            first_handle.join().expect("first's thread"),
+            Ok(FileOpValue::CompileOk)
+        );
+        let slot = compile_slots
+            .get("frodo")
+            .expect("the queued request started");
+        assert!(
+            slot.in_flight.is_some(),
+            "the queued request should now be the in-flight one"
+        );
+    }
+}
 
 /// A snapshot-request reply: the encoded world bytes plus the `ConnId`s
 /// `World::live_connections()` reported live at that same instant (see
@@ -673,20 +948,44 @@ fn file_op_value_from_cas(
     }
 }
 
-/// Converts a [`Value`] returned by `World::call_file_efun`'s
-/// `compile_object` into the matching [`loom_http::files::FileOpValue`].
-/// `compile_object`'s dispatch in `registry.rs` only ever returns `Null`
-/// (clean compile) or a string (the compiler's diagnostics) -- anything
-/// else is a driver bug, reported as `Err`, same reasoning as
-/// `file_op_value_from_read`.
-fn file_op_value_from_compile(v: Value) -> Result<loom_http::files::FileOpValue, String> {
-    use loom_http::files::FileOpValue;
-    match v {
-        Value::Null => Ok(FileOpValue::CompileOk),
-        other => other
-            .as_str()
-            .map(|s| FileOpValue::CompileFailed(s.to_string()))
-            .ok_or_else(|| format!("compile_object returned an unexpected value: {other:?}")),
+/// Converts a [`World::take_finished_recompiles`] outcome into the
+/// matching [`loom_http::files::FileOpValue`] (CTO review of PR #119,
+/// must-fix 1: the earlier `file_op_value_from_compile` converted a
+/// dynamic `Value` `World::call_file_efun(uid, "compile_object", ..)`
+/// returned, which ran the compile synchronously on the world thread --
+/// `begin_file_compile`/`take_finished_recompiles` replace that whole
+/// path, so there is no longer an "unexpected `Value` shape" case to
+/// report as a driver bug (must-fix 3): `Result<(), String>` is
+/// total -- `Ok(())` is always a clean compile, `Err` is always the
+/// compiler's own diagnostics text (`RegistryHost::finish_recompile`'s
+/// doc), never a transport-level surprise.
+///
+/// Caps `diagnostics` at [`loom_http::files::MAX_DIAGNOSTICS_BYTES`]
+/// (CTO review, should-fix 4) -- truncates on a UTF-8 char boundary so
+/// the kept prefix is never invalid UTF-8.
+fn file_op_value_from_recompile_result(
+    result: Result<(), String>,
+) -> loom_http::files::FileOpValue {
+    use loom_http::files::{FileOpValue, MAX_DIAGNOSTICS_BYTES};
+    match result {
+        Ok(()) => FileOpValue::CompileOk,
+        Err(diagnostics) => {
+            if diagnostics.len() <= MAX_DIAGNOSTICS_BYTES {
+                FileOpValue::CompileFailed {
+                    diagnostics,
+                    truncated: false,
+                }
+            } else {
+                let mut cut = MAX_DIAGNOSTICS_BYTES;
+                while cut > 0 && !diagnostics.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                FileOpValue::CompileFailed {
+                    diagnostics: diagnostics[..cut].to_string(),
+                    truncated: true,
+                }
+            }
+        }
     }
 }
 
@@ -2527,6 +2826,10 @@ fn spawn_world_thread(
             }));
             let mut host = NetHost { command_tx };
             let mut audit_cursor: u64 = 0;
+            // OBI-180 M-FS-5 (CTO review of PR #119, must-fix 2): per-uid
+            // compile queue state -- see `CompileSlot`'s doc comment.
+            let mut compile_slots: std::collections::HashMap<String, CompileSlot> =
+                std::collections::HashMap::new();
             // CTO review (OBI-123 N1): rate-limit the "batch dropped"
             // warning below to at most once per interval -- a full/closed
             // `audit_tx` is expected to fail closed-loop for a while under
@@ -2779,6 +3082,12 @@ fn spawn_world_thread(
                         .map(|bytes| (bytes, world.live_connections()));
                     let _ = reply_tx.send(result);
                 }
+                // OBI-180 M-FS-5 (CTO review of PR #119, must-fix 1):
+                // install any compile `World::tick`'s `poll_recompiles`
+                // finished since the last pass, answer the request that
+                // was waiting on it, and start that uid's queued compile
+                // (if any) next -- see `drain_finished_recompiles`'s doc.
+                drain_finished_recompiles(&mut world, &mut host, &mut compile_slots);
                 // OBI-180 M-FS-1: a file-op request from an `/api/v1/files/*`
                 // HTTP handler, drained the same non-blocking way as every
                 // other side-channel input to this loop.
@@ -2790,13 +3099,29 @@ fn spawn_world_thread(
                 // (`FILE_OPS_PER_TICK_BUDGET`) rather than draining the whole
                 // queue unconditionally -- `FILE_OP_QUEUE_DEPTH` (64) file
                 // ops each running a full `exec` could otherwise all land in
-                // one tick once `compile_object` is wired, at real cost to
-                // tick latency; this caps that without needing backpressure
-                // to actually trip.
+                // one tick, at real cost to tick latency; this caps that
+                // without needing backpressure to actually trip. A `Compile`
+                // request never runs a full compile inline (see
+                // `CompileSlot`'s doc) -- it only ever starts or queues one
+                // -- so it counts against this budget the same cheap way
+                // `Read`/`WriteIfMatch`/`List` do.
                 for _ in 0..FILE_OPS_PER_TICK_BUDGET {
                     let Ok(req) = file_op_rx.try_recv() else {
                         break;
                     };
+                    // `Compile` doesn't fit the immediate request/response
+                    // shape every other `FileOpKind` does (CTO review of PR
+                    // #119, must-fix 1/2): it either starts a background
+                    // compile and parks `req` in `compile_slots` until
+                    // `drain_finished_recompiles` answers it, queues it
+                    // behind one already in flight for this uid, or (a
+                    // newer request displacing an older queued one)
+                    // answers `409` immediately -- never an `exec`-bounded
+                    // result on this same pass.
+                    if matches!(req.kind, loom_http::files::FileOpKind::Compile) {
+                        enqueue_compile(&mut world, &mut host, &mut compile_slots, req);
+                        continue;
+                    }
                     let result: Result<loom_http::files::FileOpValue, loom_http::files::FileOpError> =
                         match &req.kind {
                             loom_http::files::FileOpKind::Read => world
@@ -2838,18 +3163,9 @@ fn spawn_world_thread(
                                     Err(loom_http::files::FileOpError::Internal(msg))
                                 }
                             },
-                            loom_http::files::FileOpKind::Compile => world
-                                .call_file_efun(
-                                    &req.uid,
-                                    "compile_object",
-                                    vec![Value::str(&req.path)],
-                                    &mut host,
-                                )
-                                .map_err(loom_http::files::FileOpError::Refused)
-                                .and_then(|v| {
-                                    file_op_value_from_compile(v)
-                                        .map_err(loom_http::files::FileOpError::Refused)
-                                }),
+                            loom_http::files::FileOpKind::Compile => {
+                                unreachable!("handled above, before this match")
+                            }
                         };
                     req.respond(result);
                 }

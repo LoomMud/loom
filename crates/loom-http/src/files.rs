@@ -132,8 +132,15 @@ pub enum FileOpValue {
     /// produced diagnostics (parse/semantic errors) -- not a driver
     /// refusal, so unlike [`FileOpError::Refused`] this is reported to
     /// the client verbatim (M-IDE's "see a diagnostic, fix it" flow
-    /// needs the real compiler message).
-    CompileFailed(String),
+    /// needs the real compiler message). `truncated` is `true` if the
+    /// real diagnostics text was longer than [`MAX_DIAGNOSTICS_BYTES`]
+    /// (CTO review of PR #119, should-fix 4) -- `diagnostics` is always
+    /// the prefix that was kept, never a different (and so misleading)
+    /// substring.
+    CompileFailed {
+        diagnostics: String,
+        truncated: bool,
+    },
 }
 
 /// Which `World` entry point a [`FileOpRequest`] resolves to.
@@ -149,9 +156,16 @@ pub enum FileOpKind {
     },
     /// `World::list_dir(uid, path, ..)` (M-FS-3).
     List,
-    /// `World::call_file_efun(uid, "compile_object", ..)` (M-FS-5's "one
-    /// in-flight compile per uid, newest save wins" -- enforced by
-    /// [`CompileInFlight`] at the HTTP layer, not here).
+    /// `World::begin_file_compile(uid, path, ..)` then, as the
+    /// background compile finishes, `World::take_finished_recompiles`
+    /// (OBI-90 D-P1.5) -- never `World::call_file_efun(uid,
+    /// "compile_object", ..)`, which would run the compile synchronously
+    /// inside a `World::exec` (CTO review of PR #119, must-fix 1). M-FS-5's
+    /// "one in-flight compile per uid, newest save wins" is enforced on
+    /// the world thread, per uid, by `loom-cli`'s drain loop (must-fix
+    /// 2) -- a request superseded by a newer `/compile` for the same uid
+    /// gets [`FileOpError::Superseded`] directly from there, not an
+    /// HTTP-layer race check.
     Compile,
 }
 
@@ -198,6 +212,15 @@ pub enum FileOpError {
     /// never look like a (possibly truncated) successful listing or a
     /// plain `Refused`.
     Internal(String),
+    /// [`FileOpKind::Compile`] only (M-FS-5 "newest save supersedes a
+    /// queued one", CTO review of PR #119, must-fix 2): a newer
+    /// `/compile` request for the same uid arrived while this one was
+    /// still queued behind an in-flight compile, and displaced it --
+    /// this request never ran at all (unlike the old HTTP-layer
+    /// generation-counter check, which let a superseded compile run to
+    /// completion on the world thread and only hid its answer). Mapped
+    /// to `409`; the client should trust the newer request's response.
+    Superseded,
 }
 
 /// One file operation requested by an `/api/v1/files/*` HTTP handler
@@ -271,6 +294,7 @@ fn status_for_file_op_error(err: &FileOpError) -> StatusCode {
         | FileOpError::Closed
         | FileOpError::Internal(_) => StatusCode::SERVICE_UNAVAILABLE,
         FileOpError::Refused(_) => StatusCode::NOT_FOUND,
+        FileOpError::Superseded => StatusCode::CONFLICT,
     }
 }
 
@@ -337,7 +361,7 @@ async fn read_file(
             | FileOpValue::PreconditionFailed
             | FileOpValue::Entries { .. }
             | FileOpValue::CompileOk
-            | FileOpValue::CompileFailed(_),
+            | FileOpValue::CompileFailed { .. },
         )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
         Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -572,7 +596,7 @@ async fn write_file(
             | FileOpValue::Str(_)
             | FileOpValue::Entries { .. }
             | FileOpValue::CompileOk
-            | FileOpValue::CompileFailed(_),
+            | FileOpValue::CompileFailed { .. },
         )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
         Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -643,7 +667,7 @@ async fn list_dir(
             | FileOpValue::QuotaExceeded
             | FileOpValue::PreconditionFailed
             | FileOpValue::CompileOk
-            | FileOpValue::CompileFailed(_),
+            | FileOpValue::CompileFailed { .. },
         )) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         Ok(Err(err)) => status_for_file_op_error(&err).into_response(),
         Err(_join_err) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -674,54 +698,14 @@ fn list_dir_response(entries: Vec<String>, truncated: bool) -> axum::response::R
     response
 }
 
-/// Per-[`HttpState`] generation counter for M-FS-5's "one in-flight
-/// compile per uid (newest save wins)": each uid has one counter, bumped
-/// every time a compile request for that uid starts. A request only
-/// gets to answer the client if its own token is still the latest one
-/// recorded for that uid by the time the compile finishes -- a request
-/// superseded by a newer one for the same uid (the common case: a
-/// builder saves again before the first compile returns) answers `409`
-/// instead of a possibly-stale result, so the client never has to guess
-/// which of two overlapping responses is the current one. This does not
-/// cancel the superseded compile's world-thread work (there is no
-/// cancellation hook into a `World::exec` already running) -- it only
-/// suppresses that response, same bounded scope as the rest of this
-/// slice.
-pub(crate) type CompileInFlight = Arc<Mutex<HashMap<String, u64>>>;
-
-/// Bound on distinct uids tracked by a [`CompileInFlight`] map, same
-/// reasoning and cap as [`MAX_TRACKED_WRITE_UIDS`].
-const MAX_TRACKED_COMPILE_UIDS: usize = 10_000;
-
-/// A fresh, empty compile-in-flight tracker for [`HttpState::new`].
-pub(crate) fn new_compile_in_flight() -> CompileInFlight {
-    Arc::new(Mutex::new(HashMap::new()))
-}
-
-/// Claim the next generation token for `uid`, evicting an arbitrary
-/// tracked uid first if the map is at [`MAX_TRACKED_COMPILE_UIDS`] and
-/// `uid` isn't already tracked (same bounded-map shape as
-/// [`check_write_rate_limit`]).
-fn claim_compile_token(tracker: &CompileInFlight, uid: &str) -> u64 {
-    let mut map = tracker.lock().expect("compile-in-flight mutex poisoned");
-    if map.len() >= MAX_TRACKED_COMPILE_UIDS
-        && !map.contains_key(uid)
-        && let Some(oldest) = map.keys().next().cloned()
-    {
-        map.remove(&oldest);
-    }
-    let entry = map.entry(uid.to_string()).or_insert(0);
-    *entry += 1;
-    *entry
-}
-
-/// `true` if `token` is still the latest one claimed for `uid` -- i.e.
-/// this request was not superseded by a newer compile for the same uid
-/// while it was running.
-fn compile_token_is_current(tracker: &CompileInFlight, uid: &str, token: u64) -> bool {
-    let map = tracker.lock().expect("compile-in-flight mutex poisoned");
-    map.get(uid) == Some(&token)
-}
+/// Bound on a compile's `diagnostics` text (CTO review of PR #119,
+/// should-fix 4): past this many bytes, `loom-cli`'s drain loop keeps
+/// only this prefix and reports [`FileOpValue::CompileFailed`]'s
+/// `truncated: true` -- the compiler's own diagnostics are otherwise
+/// unbounded (one line per error, and a widely-inherited path can fail
+/// many dependents at once), and this is a `200` JSON body, not a
+/// capped-by-construction file read.
+pub const MAX_DIAGNOSTICS_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct CompileQuery {
@@ -732,15 +716,34 @@ pub struct CompileQuery {
 struct CompileResponse {
     ok: bool,
     /// Present (non-empty) only when `ok` is `false`: the compiler's own
-    /// diagnostics text, verbatim (M-IDE "see a diagnostic, fix it").
+    /// diagnostics text, verbatim (M-IDE "see a diagnostic, fix it"),
+    /// capped at [`MAX_DIAGNOSTICS_BYTES`].
     #[serde(skip_serializing_if = "Option::is_none")]
     diagnostics: Option<String>,
+    /// `true` if `diagnostics` was cut short at [`MAX_DIAGNOSTICS_BYTES`]
+    /// (CTO review of PR #119, should-fix 4) -- omitted (not sent as
+    /// `false`) whenever it would be `false`, the same "don't send a
+    /// field whose value carries no information" shape `ListDirResponse`
+    /// uses for its own `truncated`... except that one's `false` *is*
+    /// informative (an untruncated, possibly-empty listing); this one's
+    /// `false` never is (`ok: true` never has diagnostics to truncate,
+    /// and an untruncated failure is the common case).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
 }
 
-fn compile_response(ok: bool, diagnostics: Option<String>) -> axum::response::Response {
+fn compile_response(
+    ok: bool,
+    diagnostics: Option<String>,
+    truncated: bool,
+) -> axum::response::Response {
     let mut response = (
         StatusCode::OK,
-        axum::Json(CompileResponse { ok, diagnostics }),
+        axum::Json(CompileResponse {
+            ok,
+            diagnostics,
+            truncated,
+        }),
     )
         .into_response();
     let headers = response.headers_mut();
@@ -756,31 +759,50 @@ fn compile_response(ok: bool, diagnostics: Option<String>) -> axum::response::Re
 }
 
 /// `POST /api/v1/files/compile?path=...` (M-FS-1/M-FS-5/M-FS-7):
-/// `World::call_file_efun(uid, "compile_object", [path], ..)`, going
-/// through the exact same `authorize()` (`Privilege::P1`,
-/// `Operation::Compile`) and audit path a `compile_object()` LPC call
-/// gets -- this handler adds no second permission check.
+/// `World::begin_file_compile(uid, path, ..)`, going through the exact
+/// same `authorize()` (`Privilege::P1`, `Operation::Compile`) and audit
+/// path a `compile_object()` LPC call gets -- this handler adds no
+/// second permission check -- but the compile itself (parse/check/
+/// codegen/verify of `path`, and every dependent, for a widely-inherited
+/// path) runs off the world thread, on `loom-vm`'s background
+/// compile-worker thread (OBI-90 D-P1.5), never inside a `World::exec`
+/// (CTO review of PR #119 on `c29c7a3`, must-fix 1: the earlier cut of
+/// this handler went through `World::call_file_efun(uid,
+/// "compile_object", ..)`, which ran the whole compile synchronously on
+/// the world thread).
 ///
 /// - `401` no/invalid bearer token.
 /// - `429` the uid's write rate limit is exhausted -- compiling is
 ///   shared with [`check_write_rate_limit`]'s bucket (M-FS-5): a compile
 ///   is at least as expensive as a write, and in practice always follows
-///   one.
-/// - `409` this request was superseded by a newer `/compile` call for
-///   the same uid before it got to answer (M-FS-5 "one in-flight compile
-///   per uid, newest save wins") -- the client should trust the newer
-///   request's response instead.
+///   one. (CTO review of PR #119, should-fix 6: this halves the
+///   effective save rate a builder gets on a save-then-compile flow --
+///   documented here rather than given its own bucket for now; a split
+///   bucket is a tracked follow-up, not a blocker.)
+/// - `409` this request was superseded by a newer `/compile` for the
+///   same uid while it was queued behind an in-flight one for that uid
+///   (M-FS-5 "one in-flight compile per uid, newest save wins", CTO
+///   review of PR #119, must-fix 2) -- enforced on the world thread
+///   itself ([`FileOpError::Superseded`]), not an HTTP-layer race check:
+///   the displaced request's compile never ran at all, rather than
+///   running to completion and only having its *answer* suppressed.
+///   The client should trust the newer request's response instead.
 /// - `404` `path` doesn't authorize (`Privilege::P1`'s `valid_write`-
 ///   style confinement) for this uid, same not-found-shaped refusal as
 ///   `GET`/`PUT` (M-FS-3).
 /// - `503` no file-op channel wired, a full queue, or a world-thread
-///   timeout (M-FS-5).
+///   timeout (M-FS-5) -- a compile slower than [`FILE_OP_REQUEST_
+///   TIMEOUT`] answers `503` here, but its result still installs once
+///   the background compile finishes; this is the same "a `503` doesn't
+///   mean the write didn't land" caveat `PUT` already carries, just for
+///   a compile instead of a write.
 /// - `200` `{"ok": true}` on a clean compile, or `{"ok": false,
-///   "diagnostics": "..."}` when the compiler produced diagnostics --
-///   deliberately still `200`, not a `4xx`/`5xx`: the HTTP request
-///   itself succeeded, the *compile* just found errors, the same
-///   distinction a `200` `GET` makes for a file that happens to contain
-///   broken LPC.
+///   "diagnostics": "...", "truncated": bool}` when the compiler
+///   produced diagnostics -- deliberately still `200`, not a `4xx`/
+///   `5xx`: the HTTP request itself succeeded, the *compile* just found
+///   errors, the same distinction a `200` `GET` makes for a file that
+///   happens to contain broken LPC. `diagnostics` is capped at
+///   [`MAX_DIAGNOSTICS_BYTES`] (CTO review, should-fix 4).
 async fn compile_object(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -795,23 +817,19 @@ async fn compile_object(
     if !check_write_rate_limit(&state.write_rate_limiter, &uid) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
-    let token = claim_compile_token(&state.compile_in_flight, &uid);
     let path = query.path;
-    let compile_uid = uid.clone();
     let result = tokio::task::spawn_blocking(move || {
-        request_file_op(&file_op_tx, &compile_uid, &path, FileOpKind::Compile)
+        request_file_op(&file_op_tx, &uid, &path, FileOpKind::Compile)
     })
     .await;
-    if !compile_token_is_current(&state.compile_in_flight, &uid, token) {
-        return StatusCode::CONFLICT.into_response();
-    }
     match result {
-        Ok(Ok(FileOpValue::CompileOk)) => compile_response(true, None),
-        Ok(Ok(FileOpValue::CompileFailed(diagnostics))) => {
-            compile_response(false, Some(diagnostics))
-        }
-        // `compile_object` never produces these -- a driver bug, not a
-        // client-facing distinction.
+        Ok(Ok(FileOpValue::CompileOk)) => compile_response(true, None, false),
+        Ok(Ok(FileOpValue::CompileFailed {
+            diagnostics,
+            truncated,
+        })) => compile_response(false, Some(diagnostics), truncated),
+        // `begin_file_compile`/`take_finished_recompiles` never produce
+        // these -- a driver bug, not a client-facing distinction.
         Ok(Ok(
             FileOpValue::Null
             | FileOpValue::Str(_)
@@ -936,6 +954,10 @@ mod tests {
         assert_eq!(
             status_for_file_op_error(&FileOpError::Internal("apply threw".to_string())),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status_for_file_op_error(&FileOpError::Superseded),
+            StatusCode::CONFLICT
         );
     }
 
@@ -1651,9 +1673,10 @@ mod tests {
             let (file_op_tx, file_op_rx) = file_op_channel();
             std::thread::spawn(move || {
                 let req = file_op_rx.recv().expect("a request should arrive");
-                req.respond(Ok(FileOpValue::CompileFailed(
-                    "a.wf:3: expected ';'".to_string(),
-                )));
+                req.respond(Ok(FileOpValue::CompileFailed {
+                    diagnostics: "a.wf:3: expected ';'".to_string(),
+                    truncated: false,
+                }));
             });
             let (state, keys) = test_state(Some(file_op_tx));
             let token = bearer_for("frodo", &keys);
@@ -1676,6 +1699,42 @@ mod tests {
                 json["diagnostics"],
                 serde_json::json!("a.wf:3: expected ';'")
             );
+            assert!(json.get("truncated").is_none());
+        }
+
+        /// CTO review of PR #119, should-fix 4: a `diagnostics` string
+        /// longer than [`MAX_DIAGNOSTICS_BYTES`] carries `truncated: true`
+        /// (set here by the fake "world thread", standing in for
+        /// `loom-cli`'s drain loop actually doing the capping -- this
+        /// test only pins the wire shape).
+        #[tokio::test]
+        async fn a_truncated_compile_failure_carries_truncated_true() {
+            let (file_op_tx, file_op_rx) = file_op_channel();
+            std::thread::spawn(move || {
+                let req = file_op_rx.recv().expect("a request should arrive");
+                req.respond(Ok(FileOpValue::CompileFailed {
+                    diagnostics: "a".repeat(MAX_DIAGNOSTICS_BYTES),
+                    truncated: true,
+                }));
+            });
+            let (state, keys) = test_state(Some(file_op_tx));
+            let token = bearer_for("frodo", &keys);
+            let response = app(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/files/compile?path=/builders/frodo/a.wf")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["ok"], serde_json::json!(false));
+            assert_eq!(json["truncated"], serde_json::json!(true));
         }
 
         #[tokio::test]
@@ -1757,25 +1816,23 @@ mod tests {
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
 
-        /// M-FS-5 "one in-flight compile per uid, newest save wins": if
-        /// another compile for the same uid claims a newer token while
-        /// this request is still waiting on the world thread, this
-        /// request must answer `409` instead of its (now-stale) result,
-        /// even though the world thread itself answered successfully.
+        /// M-FS-5 "one in-flight compile per uid, newest save wins",
+        /// now enforced on the world thread (CTO review of PR #119,
+        /// must-fix 2): the fake "world thread" below answers this
+        /// request directly with [`FileOpError::Superseded`] -- standing
+        /// in for `loom-cli`'s drain loop displacing an already-queued
+        /// compile for this uid with a newer one -- and the handler must
+        /// turn that into `409`, the same status the old HTTP-layer
+        /// generation-counter check used, but driven from the real
+        /// per-uid queue this time.
         #[tokio::test]
-        async fn a_superseded_compile_is_409_even_on_a_successful_world_thread_answer() {
+        async fn a_superseded_compile_is_409() {
             let (file_op_tx, file_op_rx) = file_op_channel();
             let (state, keys) = test_state(Some(file_op_tx));
             let token = bearer_for("frodo", &keys);
-            let tracker = state.compile_in_flight.clone();
             std::thread::spawn(move || {
                 let req = file_op_rx.recv().expect("a request should arrive");
-                // Simulate a second, newer `/compile` request for the same
-                // uid claiming its token while this one is still in
-                // flight -- this request's own token (claimed before this
-                // closure ran) is now stale.
-                claim_compile_token(&tracker, "frodo");
-                req.respond(Ok(FileOpValue::CompileOk));
+                req.respond(Err(FileOpError::Superseded));
             });
             let response = app(state)
                 .oneshot(
