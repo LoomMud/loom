@@ -80,6 +80,7 @@ pub mod jwt;
 pub mod ratelimit;
 mod statetoken;
 mod totp;
+mod wsticket;
 
 pub use claims::{AccessClaims, GITHUB_PENDING_PURPOSE, GithubPendingClaims, scopes_for_tier};
 pub use cookie::{
@@ -102,6 +103,7 @@ pub use statetoken::StateTokenKey;
 pub use totp::{
     TotpEnrollment, generate_totp_secret, totp_for_secret, totp_step_for_code, verify_totp_code,
 };
+pub use wsticket::{WsTicketError, WsTicketIdentity};
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -180,6 +182,9 @@ pub enum AuthError {
     InvalidRefreshToken,
     /// The backing directory (Postgres) failed.
     DirectoryUnavailable,
+    /// A D-TM4 WebSocket ticket (`/lsp`'s first frame) was malformed,
+    /// unsigned, expired, or already redeemed once before.
+    InvalidWsTicket,
     /// The per-IP token bucket is empty (M-AUTH-1). Distinct from
     /// [`AuthError::InvalidCredentials`] -- unlike an account lockout,
     /// which must look exactly like a wrong password, an IP-level
@@ -207,6 +212,7 @@ impl std::fmt::Display for AuthError {
             AuthError::RateLimited => "rate limited",
             AuthError::InvalidPendingToken => "invalid pending token",
             AuthError::InvalidOAuthState => "invalid oauth state",
+            AuthError::InvalidWsTicket => "invalid ws ticket",
         };
         f.write_str(s)
     }
@@ -334,6 +340,12 @@ pub struct AuthService {
     /// doc for why. Generated fresh per process; never the same key
     /// across a restart.
     state_key: statetoken::StateTokenKey,
+    /// D-TM4's single-use `/lsp` WebSocket ticket (OBI-180): its own
+    /// signing domain and its own (small, TTL-swept) used-ticket set,
+    /// kept separate from `state_key` even though both are
+    /// `StateTokenKey`-shaped, since a ticket needs single-use tracking
+    /// the OAuth-state/pending-TOTP tokens don't.
+    ws_tickets: Arc<wsticket::WsTicketIssuer>,
 }
 
 impl AuthService {
@@ -346,6 +358,7 @@ impl AuthService {
             idle_ttl: IDLE_SESSION_TTL,
             rate_limiter: Arc::new(RateLimiter::new()),
             state_key: statetoken::StateTokenKey::generate(),
+            ws_tickets: Arc::new(wsticket::WsTicketIssuer::new()),
         }
     }
 
@@ -923,6 +936,34 @@ impl AuthService {
         self.keys
             .decode(token)
             .map_err(|_| AuthError::InvalidRefreshToken)
+    }
+
+    /// `POST /api/v1/ws-ticket` (D-TM4): mint a single-use, 30s ticket
+    /// bound to `claims.sub`+`claims.sid`, for the caller to send as
+    /// `/lsp`'s first WS frame.
+    pub fn issue_ws_ticket(&self, claims: &AccessClaims) -> Result<String, AuthError> {
+        self.ws_tickets
+            .issue(&claims.sub, &claims.sid)
+            .map_err(|_| AuthError::InvalidWsTicket)
+    }
+
+    /// Redeem a D-TM4 ticket from `/lsp`'s first frame: verifies the
+    /// signature and expiry, and consumes it so a second redemption of
+    /// the same ticket fails even within its 30s window.
+    pub fn redeem_ws_ticket(&self, ticket: &str) -> Result<wsticket::WsTicketIdentity, AuthError> {
+        self.ws_tickets
+            .redeem(ticket)
+            .map_err(|_| AuthError::InvalidWsTicket)
+    }
+
+    /// Fresh tier for `uid` (OBI-180, M-LSP-1): `/lsp`'s connect-time
+    /// check and its periodic demotion/removal recheck both use this.
+    /// `Ok(None)` means no `staff` row at all (removed staff). A
+    /// directory error is surfaced as `Err` rather than folded into
+    /// `Ok(None)`, so a caller doing a *periodic* recheck can choose not
+    /// to treat a transient Postgres outage as a demotion.
+    pub async fn current_tier(&self, uid: &str) -> Result<Option<i16>, AuthError> {
+        Ok(self.directory.auth_status_for(uid).await?.map(|s| s.tier))
     }
 
     /// Sign arbitrary claims directly, bypassing `login`/`refresh`
