@@ -29,6 +29,11 @@ permissions:
 # goes first in the chain: nothing may `needs:` it, skip it, or make it
 # optional. `rust`/`deny`/`dco`/`hygiene` (the other required checks) stay
 # outside the lane and unscheduled so they can never be skipped by a lane job.
+# Each gate also carries wall-clock headroom (`timeout-minutes` 30 / 20): the
+# lane stops a second *gate* from racing, not this run's own `rust` job or
+# another PR's builds, and a release build starved past the old 15-minute
+# budget ends the required check as `cancelled` (run 37663331238, 2026-10-07)
+# -- as blocking as a miss, and with no p99 number to read.
 #
 # Residual: GitHub scopes a job-level concurrency group per workflow *and job*,
 # so the hard guarantee is "the same gate never runs twice at once across
@@ -263,7 +268,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     continue-on-error: true
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -316,7 +321,14 @@ jobs:
       cancel-in-progress: false
       queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
-    timeout-minutes: 15
+    # 30, not 15: the lane keeps a second *gate* off the host, but the same
+    # run's `rust` job and another PR's build still share it, and a starved
+    # release build then blows the budget. When that happened on this PR's
+    # first attempt (run 37663331238, 2026-10-07 18:01:00 -> 18:16) the job
+    # did not fail, it was *cancelled* at the timeout -- which blocks a PR
+    # exactly like a miss and says nothing about p99. A gate that can be
+    # cancelled by load is not a gate; slow is survivable, cancelled is not.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: scripts/ci-ensure-tools.sh cc:build-essential python3:python3-minimal

@@ -22,7 +22,8 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
   4. the required checks (rust, deny, dco, hygiene, loadtest-e1-1) cannot be
      skipped or downgraded: no `needs`, no `if`, no `continue-on-error`, and
      `loadtest-e1-1` still runs `loom-loadtest` with `--players 150` and
-     `--fail-on-sla-miss`.
+     `--fail-on-sla-miss`, with enough `timeout-minutes` that host load can
+     only make the measurement slow, never get the job cancelled.
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -40,6 +41,13 @@ REQUIRED_JOBS = ["rust", "deny", "dco", "hygiene", "loadtest-e1-1"]
 # The E1.1 exit criterion (spec v2 section 10): 150 players, p99 < 50 ms,
 # and an SLA miss must fail the job.
 SLA_FLAGS = ["--players 150", "--fail-on-sla-miss"]
+# Wall-clock headroom per gate. The lane removes the *gate* competing with
+# itself; it does not remove the same run's `rust` job, or another PR's
+# builds, from the host. A starved release build must therefore not be able
+# to end the job: run 37663331238 (2026-10-07) hit the old 15-minute budget
+# mid-build and the required check was `cancelled`, which blocks a PR exactly
+# like a miss while saying nothing at all about p99.
+MIN_TIMEOUT = {"loadtest-e1-1": 30, "loadtest-smoke": 20}
 DEFAULT = ".github/workflows/ci.yml"
 
 
@@ -148,6 +156,14 @@ def check_text(text):
             errors.append(f"`{job}` concurrency.queue is {got.get('queue')!r}, "
                           "expected 'max' (pending runs must queue, not be "
                           "cancelled and replaced)")
+        want = MIN_TIMEOUT.get(job)
+        if want is not None:
+            raw = scalar(block, "timeout-minutes")
+            ok = raw is not None and raw.isdigit() and int(raw) >= want
+            if not ok:
+                errors.append(f"`{job}` timeout-minutes is {raw!r}, expected >= {want}: "
+                              "a host under load must end the gate with a measured "
+                              "p99, not a cancellation")
 
     for job, dep in LANE_CHAIN.items():
         if job in jobs:
@@ -245,6 +261,8 @@ MUTANTS = [
     ("required gate made optional",
      lambda t: _prepend(t, "loadtest-e1-1", "    continue-on-error: true\n")),
     ("SLA flag dropped", lambda t: _sub(t, "--fail-on-sla-miss", None)),
+    ("gate timeout cut back to 15",
+     lambda t: _sub(t, "timeout-minutes: 30", "    timeout-minutes: 15\n")),
     ("population lowered", lambda t: _sub(t, "--players 150", "            --players 20 \\\n")),
     ("unrelated job joins the lane",
      lambda t: t.replace("jobs:\n", "jobs:\n  noise:\n    concurrency:\n"
