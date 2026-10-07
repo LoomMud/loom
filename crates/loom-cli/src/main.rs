@@ -639,12 +639,6 @@ struct CompileSlot {
     queued: Option<(String, loom_http::files::FileOpRequest)>,
 }
 
-/// Starts a queued compile for `uid`, if any, once its slot's previous
-/// in-flight compile has finished (`drain_finished_recompiles` empties
-/// `in_flight` before calling this). A `begin_file_compile` refusal here
-/// (an authorization failure -- the same thing a direct `/compile` call
-/// for this uid/path would also get) answers the queued request
-/// immediately rather than leaving it stuck.
 /// Routes one `FileOpKind::Compile` request into `compile_slots` (CTO
 /// review of PR #119, must-fix 2): starts it immediately via
 /// `World::begin_file_compile` if nothing is in flight yet for this uid,
@@ -680,6 +674,12 @@ fn enqueue_compile(
     }
 }
 
+/// Starts a queued compile for `uid`, if any, once its slot's previous
+/// in-flight compile has finished (`drain_finished_recompiles` empties
+/// `in_flight` before calling this). A `begin_file_compile` refusal here
+/// (an authorization failure -- the same thing a direct `/compile` call
+/// for this uid/path would also get) answers the queued request
+/// immediately rather than leaving it stuck.
 fn start_queued_compile(world: &mut World, host: &mut NetHost, uid: &str, slot: &mut CompileSlot) {
     let Some((path, req)) = slot.queued.take() else {
         return;
