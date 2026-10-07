@@ -5,6 +5,40 @@ on:
     branches: [main]
 permissions:
   contents: read
+
+# ── CI load lane (OBI-308) ─────────────────────────────────────────────────
+# `loadtest-e1-1`, `loadtest-smoke` and `bench` measure wall-clock latency on
+# the self-hosted runner set (`vars.CI_RUNS_ON` -> `arc-runner-set-loommud`).
+# A second run on that host makes their numbers meaningless, not wrong: on
+# 2026-10-07 two E1.1 runs sharing one host reported p50 76 ms / p99 593 ms /
+# max 784 ms against the 50 ms SLA, with 0 login failures and 0 disconnects
+# (runs 37658696127 and 37658252388) on a commit whose only change was a test
+# file, while the same commit passed every other job. Contention, not a
+# regression.
+#
+# So these three jobs share the job-level concurrency group
+# `loom-ci-load-lane`, with:
+#   cancel-in-progress: false -- never kill a measurement already running; and
+#   queue: max               -- pending runs wait in FIFO instead of the
+#                               default `single`, where a third run cancels the
+#                               pending one. A *cancelled* required check
+#                               blocks a PR exactly like a failed one, so
+#                               queueing is part of "don't weaken the gate".
+# They are also chained with `needs` -- loadtest-e1-1 -> loadtest-smoke ->
+# bench -- so the three never overlap inside one run either. The required gate
+# goes first in the chain: nothing may `needs:` it, skip it, or make it
+# optional. `rust`/`deny`/`dco`/`hygiene` (the other required checks) stay
+# outside the lane and unscheduled so they can never be skipped by a lane job.
+#
+# Residual: GitHub scopes a job-level concurrency group per workflow *and job*,
+# so the hard guarantee is "the same gate never runs twice at once across
+# PRs". One PR's `bench` can still land on the host while another PR's E1.1
+# measures; that shows up as a bench blip, not a false E1.1 SLA miss. Fixing
+# it properly is runner capacity (ephemeral/dedicated load hosts), deliberately
+# out of scope for OBI-308 -- see results/README.md "CI load lane".
+#
+# These invariants are enforced by scripts/check-ci-load-lane.py, run in the
+# `hygiene` job below.
 jobs:
   rust:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
@@ -70,7 +104,18 @@ jobs:
     # vs its base, same runner, >15% on any workload fails. Method:
     # crates/loom-vm/benches/BASELINE.md. Deliberately NOT a required check
     # (no release cadence to re-baseline against yet).
-    if: github.event_name == 'pull_request'
+    #
+    # Load-lane member (OBI-308): criterion timings are as sensitive to a noisy
+    # neighbour as E1.1's p99, so it waits for the lane and runs after the two
+    # loadtest jobs rather than alongside them. `success()` keeps the default
+    # `needs` semantics -- the event condition alone would run bench even when
+    # the lane jobs were skipped.
+    needs: loadtest-smoke
+    if: github.event_name == 'pull_request' && success()
+    concurrency:
+      group: loom-ci-load-lane
+      cancel-in-progress: false
+      queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -129,6 +174,15 @@ jobs:
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" -o "$workdir/gitleaks.tar.gz"
           tar -xzf "$workdir/gitleaks.tar.gz" -C "$workdir" gitleaks
           "$workdir/gitleaks" git --redact --exit-code 1 .
+      - name: CI load lane invariants (OBI-308)
+        # The latency gates in this workflow are only meaningful on a quiet
+        # host. Keep the lane (concurrency group + DAG order + "no required
+        # check may be skipped") from rotting silently.
+        run: |
+          set -euo pipefail
+          scripts/ci-ensure-tools.sh python3:python3-minimal
+          python3 scripts/check-ci-load-lane.py .github/workflows/ci.yml
+          python3 scripts/check-ci-load-lane.py --self-test .github/workflows/ci.yml
       - uses: fsfe/reuse-action@bb774aa972c2a89ff34781233d275075cbddf542 # v5.0.0
   fuzz-smoke:
     # Weft parser fuzz smoke (OBI-23): <= 60 s of libFuzzer seeded from the
@@ -200,6 +254,14 @@ jobs:
     # E1.1 (150 players) and stretch (500 players) runs are done by hand
     # and their reports committed under `results/` (see loom-loadtest's
     # README and OBI-40).
+    #
+    # Load-lane member (OBI-308): runs after `loadtest-e1-1` in the same group,
+    # so it neither contends with the required gate nor with `bench`.
+    needs: loadtest-e1-1
+    concurrency:
+      group: loom-ci-load-lane
+      cancel-in-progress: false
+      queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     timeout-minutes: 10
     continue-on-error: true
@@ -244,6 +306,15 @@ jobs:
     # an SLA miss (`--fail-on-sla-miss`), scraping loom-http's `/metrics`
     # into the uploaded report. See results/README.md for what this job
     # does and does not prove (runner noise vs. the reference-host record).
+    #
+    # Load-lane holder (OBI-308): the p99 number is meaningless if anything
+    # else is on the host, so this job takes the `loom-ci-load-lane` group
+    # alone-across-runs (queueing, never cancelling) and has no `needs:`/`if:`
+    # of its own -- it is a required check and must never be skipped.
+    concurrency:
+      group: loom-ci-load-lane
+      cancel-in-progress: false
+      queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     timeout-minutes: 15
     steps:
