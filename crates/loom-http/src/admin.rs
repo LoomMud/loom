@@ -538,11 +538,19 @@ mod tests {
         ) -> Result<Option<crate::auth::RefreshRecord>, crate::auth::DirectoryError> {
             Ok(None)
         }
-        async fn refresh_token_rotate(
+        async fn session_revoke_family_by_token(
             &self,
             _token_hash: &str,
-        ) -> Result<crate::auth::RefreshRotation, crate::auth::DirectoryError> {
-            Ok(crate::auth::RefreshRotation::NotFound)
+        ) -> Result<(), crate::auth::DirectoryError> {
+            Ok(())
+        }
+        async fn session_rotate(
+            &self,
+            _old_token_hash: &str,
+            _new_token_hash: &str,
+            _idle_cutoff: time::OffsetDateTime,
+        ) -> Result<crate::auth::SessionRotateOutcome, crate::auth::DirectoryError> {
+            Ok(crate::auth::SessionRotateOutcome::Invalid)
         }
         async fn refresh_token_revoke(
             &self,
