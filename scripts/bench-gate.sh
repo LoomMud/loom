@@ -154,8 +154,12 @@ run() { # arm-round save-name  (arm = base|head|ctrl)
     *) echo "bench-gate: unknown arm $arm" >&2; exit 2 ;;
   esac
   log="$work/logs/${arm}${r}.log"
+  # A header line per round (not a table row, so the comparator ignores it)
+  # so a slow round can be correlated with what the host was doing -- the
+  # missing data in the OBI-312 post-mortem.
+  echo "# arm=$arm round=$r slot=$slot iters=$iters loadavg=$(cut -d' ' -f1-3 /proc/loadavg | tr ' ' '/') ts=$(date -u +%FT%TZ)" > "$log"
   # Same cwd for every arm: the working directory is not part of the measurement.
-  if ! (cd "$bin_dir" && "./$slot/vm_bench" "$iters") >"$log" 2>&1; then
+  if ! (cd "$bin_dir" && "./$slot/vm_bench" "$iters") >>"$log" 2>&1; then
     cat "$log" >&2
     echo "bench-gate: bench run $arm$r failed" >&2
     exit 1
