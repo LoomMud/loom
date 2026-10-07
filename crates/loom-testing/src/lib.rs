@@ -285,7 +285,12 @@ pub fn poll_until_contains(
     timeout: Duration,
     nudge: Option<&str>,
 ) -> String {
-    read_for(reader, needle, timeout, nudge.map(|n| (Duration::from_millis(100), n)))
+    read_for(
+        reader,
+        needle,
+        timeout,
+        nudge.map(|n| (Duration::from_millis(100), n)),
+    )
 }
 
 /// The outcome of one [`read_one_reply`] attempt.
@@ -627,7 +632,11 @@ impl Spawn {
         telnet_bind: &str,
         http_bind: &str,
         want_lines: bool,
-    ) -> (Child, Arc<Mutex<Vec<String>>>, std::sync::mpsc::Receiver<String>) {
+    ) -> (
+        Child,
+        Arc<Mutex<Vec<String>>>,
+        std::sync::mpsc::Receiver<String>,
+    ) {
         let loom_bin = std::env::var("CARGO_BIN_EXE_loom-cli")
             .or_else(|_| std::env::var("CARGO_BIN_EXE_loom_cli"))
             .expect("cargo binary path for loom-cli");
@@ -667,7 +676,11 @@ impl Spawn {
         // stderr is never forwarded as lines: the driver's `tracing` fmt layer
         // writes to stdout, so anything here is a panic message or a library
         // log, which belongs in the post-mortem but not in a test's assertions.
-        drain_pipe(child.stderr.take().expect("piped stderr"), Arc::clone(&log), None);
+        drain_pipe(
+            child.stderr.take().expect("piped stderr"),
+            Arc::clone(&log),
+            None,
+        );
 
         (child, log, line_rx)
     }
@@ -1029,7 +1042,8 @@ mod tests {
         let ports: Vec<u16> = (0..SAMPLE).map(|_| reserve_local_port()).collect();
         for port in &ports {
             assert!(
-                *port >= TEST_PORT_BAND_START && *port < TEST_PORT_BAND_START + TEST_PORT_BAND_WIDTH,
+                *port >= TEST_PORT_BAND_START
+                    && *port < TEST_PORT_BAND_START + TEST_PORT_BAND_WIDTH,
                 "port {port} is outside the test band"
             );
             assert!(
