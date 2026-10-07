@@ -46,6 +46,27 @@ use crate::security::GuardSet;
 pub struct RtError {
     pub message: String,
     pub trace: Vec<String>,
+    /// CTO review (OBI-169, PR #72, must-fix 1): the declaring program
+    /// path for each matching entry in [`Self::trace`] (same length,
+    /// same "most recent frame first" order, `"?"` for a frame with no
+    /// known program -- e.g. the interpreter's own hand-assembled base
+    /// module in unit tests). This is what lets the error inbox
+    /// (`crate::errors`) attribute an error to the program that actually
+    /// raised it (the innermost frame) instead of the entry object's own
+    /// program, which can be a different, less-privileged one several
+    /// `call_other`/apply frames up the chain -- attributing to the
+    /// entry object would otherwise leak a `/secure` program's error
+    /// message to whatever `valid_read` lets the entry object's own
+    /// program see.
+    pub trace_programs: Vec<String>,
+    /// Source line each [`Self::trace`] frame was at when this error
+    /// unwound past it, same length and order as `trace` always (OBI-231,
+    /// spec §8.3: the error inbox's `(program, line, message)` grouping).
+    /// `0` means "unknown" -- the frame never had a pc yet (e.g. the
+    /// native-stack-budget check in `bcvm::registry::Host::call_in`, which
+    /// fails before any `Op` of the callee ever runs) or the running
+    /// `Module`'s `FunctionCode::lines` table is empty (no debug info).
+    pub trace_lines: Vec<u32>,
     /// `false` for tick/call-depth exhaustion (spec: not catchable — a
     /// `try`/`catch` in the unwind path must not stop it). `true` for
     /// everything else, including `throw` and ordinary runtime errors
@@ -62,6 +83,8 @@ impl RtError {
         RtError {
             message: message.into(),
             trace: Vec::new(),
+            trace_programs: Vec::new(),
+            trace_lines: Vec::new(),
             catchable: true,
             thrown: None,
         }
@@ -80,6 +103,8 @@ impl RtError {
         RtError {
             message,
             trace: Vec::new(),
+            trace_programs: Vec::new(),
+            trace_lines: Vec::new(),
             catchable: true,
             thrown: Some(value),
         }
@@ -115,6 +140,14 @@ pub trait ProgramCode {
     /// file).
     fn version(&self) -> u32 {
         0
+    }
+    /// This program's declaring path (`/std/player`, ...), for
+    /// [`RtError::trace_programs`] (OBI-169, CTO review on PR #72,
+    /// must-fix 1). `None` for anything with no real mudlib path (the
+    /// hand-assembled test modules in this file) -- callers fall back to
+    /// `"?"`, same as a frame with no trace at all.
+    fn program_path(&self) -> Option<&str> {
+        None
     }
 }
 
@@ -388,6 +421,37 @@ pub trait Host {
     /// clone/destruct recorded since `mark`, in reverse order, exactly
     /// restoring the prior state.
     fn rollback_atomic(&mut self, _mark: u64) {}
+
+    /// `profile <program>` (spec Phase 2 B5, OBI-170): is a sampling
+    /// window currently open for `program`? Checked once per
+    /// [`Interpreter::push_call`], on *every* Weft function call whether
+    /// or not profiling is in use anywhere -- so the default (`false`,
+    /// no clock read, no allocation) is the only cost the "profiling off
+    /// has unmeasurable overhead" acceptance bar actually has to hold to.
+    fn profiling_active(&self, _program: &str) -> bool {
+        false
+    }
+    /// One profiled call just returned (normally, or by unwinding past
+    /// its frame): `function` is its name. `ticks`/`wall` are
+    /// **inclusive** (gprof "cumulative" -- everything charged/elapsed
+    /// while this frame was on the stack, including whatever it called);
+    /// `self_ticks`/`self_wall` are the same call's own cost with every
+    /// directly-nested call *into the same sampled program* subtracted
+    /// out (CTO review, OBI-170, PR #67 must-fix 2: recursion/nested
+    /// calls must not be double-counted in the figure a builder actually
+    /// reads). Only called when [`Host::profiling_active`] answered
+    /// `true` for `program` at the matching `push_call`, so the default
+    /// (no-op) never runs on the hot "profiling off" path either.
+    fn profile_record(
+        &mut self,
+        _program: &str,
+        _function: &str,
+        _ticks: u64,
+        _self_ticks: u64,
+        _wall: std::time::Duration,
+        _self_wall: std::time::Duration,
+    ) {
+    }
 }
 
 /// One activation: which function, at which instruction, with its own
@@ -432,6 +496,51 @@ struct Frame {
     /// its own" (OBI-35 scope): the host is the only place a `GuardSet`
     /// lives.
     creator_frame: bool,
+    /// `Some(ProfFrame { .. })` iff [`Host::profiling_active`] answered
+    /// `true` for this frame's program when it was pushed (spec Phase 2
+    /// B5, OBI-170): `pop_frame` reports this call's cost once via
+    /// [`Host::profile_record`] using the wall-clock elapsed since
+    /// `start` and the ticks charged since `ticks_before`, inclusive and
+    /// self (CTO review, PR #67 must-fix 2: `child_ticks`/`child_wall`
+    /// subtracted out). `None` (profiling off, or this isn't the sampled
+    /// program) is the common case and the only thing `pop_frame` has to
+    /// check on that path.
+    // `Box`ed (CTO review follow-up, OBI-170, PR #67 bench evidence):
+    // keeps this variant's footprint to one pointer (`Option<Box<T>>`
+    // niche-optimizes the same as a raw pointer) instead of inlining
+    // `ProfFrame`'s four fields into every `Frame` whether or not
+    // profiling is ever used -- `vm_bench`'s `monocall` (minimal
+    // per-call payload, maximally sensitive to `Frame`'s own size)
+    // showed a small but measurable regression with `ProfFrame`
+    // inlined; boxing it removed that (see the PR body's before/after
+    // numbers).
+    prof: Option<Box<ProfFrame>>,
+}
+
+/// A profiled frame's own bookkeeping (CTO review, OBI-170, PR #67
+/// must-fix 2): `child_ticks`/`child_wall` accumulate the **inclusive**
+/// cost of every direct child call that was *also* into the sampled
+/// program (same-program recursion, direct or indirect through this
+/// frame) -- [`Interpreter::pop_frame`] adds a popped child's inclusive
+/// figures here, on its new top-of-stack parent, right before computing
+/// that parent's own self figures when it in turn pops. Subtracting
+/// this from the frame's own inclusive ticks/wall at pop time is what
+/// turns "every frame's inclusive total summed" (which double-counts
+/// recursion depth-many times) into a true per-call self cost.
+///
+/// **Scope note:** only tracks children whose own frame was pushed with
+/// `prof: Some` too, i.e. calls into the *same* sampled program.
+/// recursion through an intervening call into a *different* program is
+/// not subtracted (consistent with this profiler's existing "one
+/// program at a time" scope, `crate::profiler`'s module doc) -- rare in
+/// practice (a function recurses into itself, not through someone
+/// else's code, to become "hot"), and inclusive ticks/wall are still
+/// reported alongside self for exactly this case.
+struct ProfFrame {
+    start: std::time::Instant,
+    ticks_before: u64,
+    child_ticks: u64,
+    child_wall: std::time::Duration,
 }
 
 /// Per-execution limits (spec §5.9): every tick-metered op consumes one
@@ -476,6 +585,19 @@ pub struct Interpreter<'a, H: Host> {
     stack: Vec<Frame>,
     /// Suspend-at-`TickCheck` countdown (D26 test hook); `None` = never.
     suspend_after: Option<u64>,
+    /// The declaring program of `module` itself (OBI-169, CTO review on
+    /// PR #72, must-fix 1): the base-module fallback for
+    /// [`RtError::trace_programs`] when a frame's own `code` is `None`
+    /// (every frame actually run by *this* `Interpreter` instance, since
+    /// `code: None` means "the module this `Interpreter` itself was
+    /// constructed with", not "unknown"). `None` for every call site that
+    /// doesn't know/care (every hand-assembled test module in this file,
+    /// and the base driver module efun dispatch runs against) -- those
+    /// fall back to `"?"`, same as before this field existed. Set via
+    /// [`Self::with_base_program`] by [`crate::bcvm::registry::
+    /// RegistryHost::call_in`], the one real call site that runs a named
+    /// *program's* own module as this `Interpreter`'s base.
+    base_program: Option<Rc<str>>,
 }
 
 impl<'a, H: Host> Interpreter<'a, H> {
@@ -492,7 +614,14 @@ impl<'a, H: Host> Interpreter<'a, H> {
             ticks_left,
             stack: Vec::new(),
             suspend_after: None,
+            base_program: None,
         }
+    }
+
+    /// See [`Self::base_program`]'s doc.
+    pub fn with_base_program(mut self, path: Rc<str>) -> Self {
+        self.base_program = Some(path);
+        self
     }
 
     /// D26 test hook: park the whole call chain at the `n`th `TickCheck`
@@ -543,6 +672,35 @@ impl<'a, H: Host> Interpreter<'a, H> {
     fn frame_name<'s>(&'s self, f: &'s Frame) -> &'s str {
         let m = self.module_of(f);
         &m.strings[m.functions[f.func as usize].name as usize]
+    }
+
+    /// 1-based source line `f` was at when its containing frame unwound
+    /// (OBI-231): the line table entry for the *previous* instruction --
+    /// `f.pc` is already past it, [`Interpreter::step`] increments it
+    /// right after fetching but before executing, so the instruction that
+    /// actually raised/propagated the error is at `f.pc - 1`. `0`
+    /// ("unknown") if `f.pc` is `0` (no instruction has run in this frame
+    /// yet) or the function's line table is empty (no debug info, e.g.
+    /// hand-assembled test bytecode -- see `bytecode::FunctionCode::lines`).
+    fn frame_line(&self, f: &Frame) -> u32 {
+        let m = self.module_of(f);
+        let func = &m.functions[f.func as usize];
+        match (f.pc as usize).checked_sub(1) {
+            Some(idx) => func.lines.get(idx).copied().unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// `"in foo()"`, or `"in foo() at /path.wf:12"` when a line is known
+    /// (OBI-231): the format `RtError::trace` stores and `errors::function_of`
+    /// parses back out.
+    fn format_frame(&self, f: &Frame, line: u32) -> String {
+        let name = self.frame_name(f);
+        if line == 0 {
+            format!("in {name}()")
+        } else {
+            format!("in {name}() at {}:{line}", self.module_of(f).path)
+        }
     }
 
     fn str_of(&self, id: u32) -> &str {
@@ -690,6 +848,18 @@ impl<'a, H: Host> Interpreter<'a, H> {
         if let Some(guard) = creator_guard {
             self.host.enter_creator_frame(guard);
         }
+        // Spec Phase 2 B5 (OBI-170): ask the host once, by program path,
+        // whether a `profile` window wants this call. `false` (the
+        // default, and every ordinary call while profiling is off) skips
+        // straight past the `Instant::now()`/tick snapshot below.
+        let prof = self.host.profiling_active(&m.path).then(|| {
+            Box::new(ProfFrame {
+                start: std::time::Instant::now(),
+                ticks_before: *self.ticks_left,
+                child_ticks: 0,
+                child_wall: std::time::Duration::ZERO,
+            })
+        });
         self.stack.push(Frame {
             code,
             code_ops,
@@ -701,6 +871,7 @@ impl<'a, H: Host> Interpreter<'a, H> {
             handlers: Vec::new(),
             atomic_mark,
             creator_frame: creator_guard.is_some(),
+            prof,
         });
         Ok(())
     }
@@ -712,6 +883,36 @@ impl<'a, H: Host> Interpreter<'a, H> {
     /// ran after `enter_creator_frame`).
     fn pop_frame(&mut self) -> Frame {
         let f = self.stack.pop().unwrap();
+        // Spec Phase 2 B5 (OBI-170): report this call's cost exactly
+        // once, on whichever path popped it (normal return or error
+        // unwind, `pop_frame_on_error` calls through here too). Skipped
+        // entirely when `f.prof` is `None` -- profiling off, or this
+        // frame's program wasn't the one being sampled.
+        if let Some(prof) = &f.prof {
+            let wall = prof.start.elapsed();
+            let ticks = prof.ticks_before.saturating_sub(*self.ticks_left);
+            // CTO review (OBI-170, PR #67, must-fix 2): subtract every
+            // direct child call *into the same sampled program*
+            // (`ProfFrame`'s own doc) so recursion/nested calls are not
+            // double-counted in the self figure.
+            let self_ticks = ticks.saturating_sub(prof.child_ticks);
+            let self_wall = wall.saturating_sub(prof.child_wall);
+            let program = self.module_of(&f).path.to_string();
+            let function = self.frame_name(&f).to_string();
+            self.host
+                .profile_record(&program, &function, ticks, self_ticks, wall, self_wall);
+            // Propagate this frame's *inclusive* cost up to its new
+            // top-of-stack parent's own child accumulator, but only if
+            // that parent is itself being profiled (same sampled
+            // program) -- see `ProfFrame`'s doc for the cross-program
+            // scope note.
+            if let Some(parent) = self.stack.last_mut()
+                && let Some(pprof) = &mut parent.prof
+            {
+                pprof.child_ticks += ticks;
+                pprof.child_wall += wall;
+            }
+        }
         if f.entered {
             self.host.leave_self();
         }
@@ -769,15 +970,36 @@ impl<'a, H: Host> Interpreter<'a, H> {
                     // Any trace already on `e` came from deeper, non-flat
                     // execution (a driver efun's nested run); append every
                     // live frame of this stack beneath it once, then unwind.
+                    // `trace_programs` is extended in lockstep (same
+                    // length, same order, OBI-169 CTO review on PR #72
+                    // must-fix 1) so the error inbox can attribute to the
+                    // *innermost* frame's own declaring program rather
+                    // than the entry object's.
                     if e.trace.len() < 12 {
-                        let names: Vec<String> = self
+                        let take = 12 - e.trace.len();
+                        let frames: Vec<(String, String, u32)> = self
                             .stack
                             .iter()
                             .rev()
-                            .take(12 - e.trace.len())
-                            .map(|f| format!("in {}()", self.frame_name(f)))
+                            .take(take)
+                            .map(|f| {
+                                let line = self.frame_line(f);
+                                let program = f
+                                    .code
+                                    .as_ref()
+                                    .and_then(|c| c.program_path())
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| {
+                                        self.base_program.as_deref().unwrap_or("?").to_string()
+                                    });
+                                (self.format_frame(f, line), program, line)
+                            })
                             .collect();
-                        e.trace.extend(names);
+                        for (name, program, line) in frames {
+                            e.trace.push(name);
+                            e.trace_programs.push(program);
+                            e.trace_lines.push(line);
+                        }
                     }
                     while !self.stack.is_empty() {
                         self.pop_frame_on_error();
@@ -1833,6 +2055,7 @@ mod tests {
                 reg_types: vec![Ty::Int; 6],
                 entry_points: vec![0],
                 code: code.into(),
+                lines: Vec::new(),
                 capture_targets: Vec::new(),
             }],
         }
@@ -1897,6 +2120,98 @@ mod tests {
 
         let message = result.unwrap_err();
         assert!(message.contains("Too deep recursion"), "{message}");
+    }
+
+    /// Spec Phase 2 B5 (OBI-170) integration test: a `Host` that answers
+    /// `profiling_active`/`profile_record` like `RegistryHost` does, wired
+    /// straight to the interpreter's `push_call`/`pop_frame` hooks --
+    /// proves the VM-level wiring (not just `crate::profiler::Profiler`'s
+    /// own unit tests) actually counts calls/ticks for a real, hot,
+    /// recursive Weft function (`countdown`, this module's existing
+    /// fixture) end to end.
+    struct ProfHost {
+        inner: NoHost,
+        target: &'static str,
+        calls: std::cell::RefCell<std::collections::HashMap<String, (u64, u64, u64)>>,
+    }
+    impl Host for ProfHost {
+        fn self_object(&self) -> ObjectId {
+            self.inner.self_object()
+        }
+        fn call_static(&mut self, program: &str, name: &str, args: Vec<Value>) -> R<Value> {
+            self.inner.call_static(program, name, args)
+        }
+        fn call_virtual(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
+            self.inner.call_virtual(name, args)
+        }
+        fn call_other(&mut self, recv: Value, name: &str, args: Vec<Value>) -> R<Value> {
+            self.inner.call_other(recv, name, args)
+        }
+        fn call_efun(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
+            self.inner.call_efun(name, args)
+        }
+        fn load_global(&mut self, owner: &str, name: &str) -> R<Value> {
+            self.inner.load_global(owner, name)
+        }
+        fn store_global(&mut self, owner: &str, name: &str, v: Value) -> R<()> {
+            self.inner.store_global(owner, name, v)
+        }
+        fn profiling_active(&self, program: &str) -> bool {
+            program == self.target
+        }
+        fn profile_record(
+            &mut self,
+            _program: &str,
+            function: &str,
+            ticks: u64,
+            self_ticks: u64,
+            _wall: std::time::Duration,
+            _self_wall: std::time::Duration,
+        ) {
+            let mut calls = self.calls.borrow_mut();
+            let entry = calls.entry(function.to_string()).or_insert((0, 0, 0));
+            entry.0 += 1;
+            entry.1 += ticks;
+            entry.2 += self_ticks;
+        }
+    }
+
+    #[test]
+    fn profiler_hook_counts_calls_and_ticks_for_a_hot_recursive_function() {
+        let module = countdown_module(false);
+        let mut host = ProfHost {
+            inner: NoHost,
+            target: "/test/countdown",
+            calls: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+        let limits = Limits::default();
+        let total_ticks = 1_000_000u64;
+        let mut ticks = total_ticks;
+        let mut interp = Interpreter::new(&module, &mut host, &limits, &mut ticks);
+        let result = interp.call("countdown", vec![Value::Int(50)]);
+        match result.unwrap() {
+            Value::Int(0) => {}
+            other => panic!("expected Int(0), got {other:?}"),
+        }
+        let calls = host.calls.borrow();
+        let (call_count, inclusive_ticks, self_ticks) =
+            *calls.get("countdown").expect("countdown was profiled");
+        // One top-level call plus 50 recursive calls down to the base case.
+        assert_eq!(call_count, 51);
+        assert!(self_ticks > 0, "expected nonzero self ticks charged");
+        // CTO review (OBI-170, PR #67, must-fix 2): the old, inclusive-
+        // only accounting summed every recursive frame's *inclusive*
+        // ticks, which for 51 nested frames could run to roughly 51x the
+        // window's own total -- self ticks summed across every call must
+        // never exceed what the whole window actually charged.
+        let ticks_used = total_ticks - ticks;
+        assert!(
+            self_ticks <= ticks_used,
+            "self ticks ({self_ticks}) must not exceed the window's total ({ticks_used})"
+        );
+        // Inclusive is still reported, and for genuine recursion is
+        // strictly larger than self once there's more than one frame.
+        assert!(inclusive_ticks >= self_ticks);
     }
 
     #[test]
@@ -1976,6 +2291,7 @@ mod tests {
                 reg_types: vec![Ty::array(Ty::Int), Ty::array(Ty::Int), Ty::Int, Ty::Int],
                 entry_points: vec![0],
                 code: code.into(),
+                lines: Vec::new(),
                 capture_targets: Vec::new(),
             }],
         };

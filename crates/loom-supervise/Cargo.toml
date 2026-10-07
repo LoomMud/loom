@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "loom-supervise"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# OBI-184 (P2-O1, design §7.5/§9.2): `loom supervise` is the in-pod
+# supervisor that owns the listening sockets across a copyover and hands
+# them to a new driver process over a `AF_UNIX` control socket with
+# `SCM_RIGHTS`. That syscall-level ancillary-data exchange has no safe std
+# API, so this is -- deliberately, and only here -- the one crate in the
+# workspace that opts out of `unsafe_code = "deny"` (CTO review required
+# before this merges: see OBI-184). Every `unsafe` block is confined to
+# `fdpass.rs`/`listener.rs` and is a thin, tested wrapper around
+# `libc::sendmsg`/`recvmsg`/`fcntl`/`FromRawFd`; nothing above those two
+# modules touches raw fds directly.
+#
+# `"allow"`, not `"warn"`: CI's `cargo clippy --workspace --all-targets
+# -- -D warnings` (`.github/workflows/ci.yml`) promotes every currently-
+# warn-level lint to a hard error, which would defeat a `"warn"`-level
+# exception here just as surely as the workspace's own `"deny"` does --
+# `"allow"` is the only level `-D warnings` cannot touch (there is
+# nothing for it to "promote"), so it is the only level that actually
+# expresses "this is an intentional, reviewed exception," not "the CI
+# flag for reviewing it hasn't been added yet."
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# CTO review (OBI-225): enforce "every unsafe block has a SAFETY comment"
+# mechanically rather than by review vigilance alone, given this crate's
+# whole reason for existing is to carry the workspace's `unsafe_code`
+# exception.
+undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+libc = "0.2.177"
+tracing = "0.1.41"
+
+[dev-dependencies]
+tempfile = "3.14"

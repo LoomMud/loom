@@ -108,7 +108,7 @@ fn auth_context(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> Auth
 /// Extract `sub` from a bearer access token in `Authorization: Bearer ...`.
 /// `None` for a missing header or a token that fails verification --
 /// callers answer `401` either way; they never need to distinguish.
-fn bearer_uid(headers: &HeaderMap, state: &HttpState) -> Option<String> {
+pub(crate) fn bearer_uid(headers: &HeaderMap, state: &HttpState) -> Option<String> {
     let auth = state.auth.as_ref()?;
     let value = headers
         .get(axum::http::header::AUTHORIZATION)?

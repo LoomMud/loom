@@ -37,9 +37,11 @@ mod identity;
 mod lock;
 mod metrics;
 mod propose;
+mod report;
 mod worker;
 
 pub use cli::{GitError, WorktreeRepo};
+pub use github::issues::PullRef;
 pub use github::pulls::{PullRequest, PullRequestOpener};
 pub use github::{
     GitHubAppClient, GitHubAppError, HttpClient, HttpError, HttpResponse, UreqClient,
@@ -49,6 +51,10 @@ pub use lock::TreeLock;
 pub use propose::{
     AllowAllAuthorizer, DenyAllAuthorizer, InMemoryQuota, ProposeAuthorizer, ProposeError,
     ProposeLimits, ProposeQuota, ProposeRequest, ProposeResult,
+};
+pub use report::{
+    MergedCommit, ReportGitHub, ResolvedCommit, comment_body, extract_pr_number, merged_commits,
+    report_recompile, resolve_pull_requests,
 };
 pub use worker::{
     AuditSink, GitConfig, GitWorker, GitWorkerHandle, NoopAudit, ProposeConfig,

@@ -13,14 +13,17 @@
 pub mod bcvm;
 pub mod disk_usage;
 pub mod efuns;
+pub mod errors;
 pub mod fileio;
 pub mod host;
 pub mod object;
+pub mod profiler;
 pub mod quota;
 pub mod rng;
 pub mod roles;
 pub mod scheduler;
 pub mod security;
+pub mod snapshot;
 pub mod world;
 
 use std::path::Path;
@@ -31,9 +34,10 @@ pub use bcvm::vm::RtError;
 pub use host::{Host, NullHost};
 pub use object::ObjectId;
 pub use roles::{DomainRole, Grant, RolesSnapshot};
+pub use snapshot::{SnapshotError, SnapshotJob};
 pub use world::{
-    AccountAuth, AuditRow, BootError, Limits, NullAccountAuth, NullRolesMutations, RolesMutations,
-    World,
+    AccountAuth, AdminErrorGroup, AdminObjectSummary, AdminObjectVars, AdminVarEntry, AuditRow,
+    BootError, Limits, NullAccountAuth, NullRolesMutations, RolesMutations, SessionSummary, World,
 };
 
 /// Parse and link every `.wf` file under `root` without running any code

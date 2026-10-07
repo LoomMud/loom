@@ -120,9 +120,8 @@ fn compile_room() -> loom_compiler::bytecode::Module {
     files.insert("/std/room".to_string(), ROOM_WF.to_string());
     let mut session = Session::new(files);
     match session.compile("/std/room") {
-        Outcome::Ok(checked) => {
-            compile_and_verify(&checked.hir).expect("codegen + verify must succeed on valid HIR")
-        }
+        Outcome::Ok(checked) => compile_and_verify(&checked.hir, &checked.src)
+            .expect("codegen + verify must succeed on valid HIR"),
         Outcome::Failed(report) => panic!("check failed:\n{report}"),
         Outcome::Missing(msg) => panic!("{msg}"),
     }

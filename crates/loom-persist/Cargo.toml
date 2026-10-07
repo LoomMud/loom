@@ -23,6 +23,10 @@ tracing = "0.1.41"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 [dev-dependencies]
+# OBI-276: test-only, to pin `is_reserved_principal` against
+# `loom_vm::security::is_reserved_principal` so the two copies can never
+# silently drift. No production edge from loom-persist to loom-vm.
+loom-vm = { path = "../loom-vm" }
 serde_json = "1.0.145"
 time = { version = "0.3.44", features = ["macros"] }
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "time"] }

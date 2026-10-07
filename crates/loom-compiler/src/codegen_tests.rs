@@ -12,8 +12,8 @@ use crate::verify::verify;
 fn compile_one(src: &str) -> crate::bytecode::Module {
     let (ast, diags) = loom_syntax::parse(src);
     assert!(diags.is_empty(), "{diags:?}");
-    let checked = check_program("/t", &ast, Vec::new(), Vec::new()).expect("checks");
-    super::compile(&checked.hir).expect("codegen")
+    let checked = check_program("/t", src, &ast, Vec::new(), Vec::new()).expect("checks");
+    super::compile(&checked.hir, &checked.src).expect("codegen")
 }
 
 fn compile_mudlib(files: &[(&str, &str)]) -> Vec<crate::bytecode::Module> {
@@ -26,7 +26,7 @@ fn compile_mudlib(files: &[(&str, &str)]) -> Vec<crate::bytecode::Module> {
     for (path, _) in files {
         match session.compile(path) {
             crate::mudlib::Outcome::Ok(c) => {
-                out.push(super::compile(&c.hir).expect("codegen"));
+                out.push(super::compile(&c.hir, &c.src).expect("codegen"));
             }
             crate::mudlib::Outcome::Failed(r) => panic!("{r}"),
             crate::mudlib::Outcome::Missing(r) => panic!("{r}"),
@@ -290,7 +290,7 @@ fn default_params_reject_wrong_arity_at_verify() {
     // Too few arguments is a checker-level error (missing required
     // argument), not something codegen ever sees: confirm the checker
     // rejects it up front.
-    assert!(crate::check::check_program("/t", &ast, Vec::new(), Vec::new()).is_err());
+    assert!(crate::check::check_program("/t", src, &ast, Vec::new(), Vec::new()).is_err());
 }
 
 // ---------------------------------------------------------------------
@@ -490,4 +490,63 @@ fn compound_assign_whole_array_on_global() {
     assert!(text.contains("BinOp.Array Add"), "{text}");
     assert!(text.contains("LoadGlobal"), "{text}");
     assert!(text.contains("StoreGlobal"), "{text}");
+}
+
+// ---------------------------------------------------------------------
+// OBI-231: per-instruction line table.
+// ---------------------------------------------------------------------
+
+#[test]
+fn every_function_has_a_line_table_the_same_length_as_its_code() {
+    let m = compile_one(
+        r#"
+        fn f(x: int) -> int {
+            var y = x + 1
+            if y > 0 {
+                return y
+            }
+            return 0
+        }
+        "#,
+    );
+    let f = &m.functions[0];
+    assert_eq!(f.lines.len(), f.code.len());
+    assert!(f.lines.iter().all(|&l| l >= 1), "{:?}", f.lines);
+}
+
+#[test]
+fn line_table_tracks_statement_granularity_not_just_function_entry() {
+    // Lines 1-indexed from the start of this literal: `fn f...` is line 2
+    // (line 1 is the leading newline from the raw string), `return x + 1`
+    // is line 3.
+    let checked = {
+        let src = "\nfn f(x: int) -> int {\n    return x + 1\n}\n";
+        let (ast, diags) = loom_syntax::parse(src);
+        assert!(diags.is_empty(), "{diags:?}");
+        check_program("/t", src, &ast, Vec::new(), Vec::new()).expect("checks")
+    };
+    let m = super::compile(&checked.hir, &checked.src).expect("codegen");
+    let f = &m.functions[0];
+    // Every op in this one-statement body is attributed to line 3 (the
+    // `return` statement), not line 1 or 2.
+    assert!(
+        f.lines.iter().all(|&l| l == 3),
+        "expected every op on line 3, got {:?}",
+        f.lines
+    );
+}
+
+#[test]
+fn distinct_statements_get_distinct_lines() {
+    let src = "fn f(x: int) -> int {\n    var y = x + 1\n    return y\n}\n";
+    let (ast, diags) = loom_syntax::parse(src);
+    assert!(diags.is_empty(), "{diags:?}");
+    let checked = check_program("/t", src, &ast, Vec::new(), Vec::new()).expect("checks");
+    let m = super::compile(&checked.hir, &checked.src).expect("codegen");
+    let f = &m.functions[0];
+    // `var y = x + 1` is line 2, `return y` is line 3: the line table must
+    // actually distinguish them, not just attribute everything to the
+    // function's first line.
+    assert!(f.lines.contains(&2), "{:?}", f.lines);
+    assert!(f.lines.contains(&3), "{:?}", f.lines);
 }

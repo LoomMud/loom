@@ -1,0 +1,11 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// M-ERR-1 (OBI-287) fixture: code in the workroom of `bob`, a builder
+// with no staff tier, that a T5 player calls into. It forwards to the
+// lib command, so `bob` is on the guard set and must keep `/secure/**`
+// messages redacted. Otherwise a T5 player running builder code would
+// pass secure messages to it.
+pub fn run(filter: string) -> string {
+    return load_object("/cmds/errors").run(filter)
+}

@@ -14,6 +14,7 @@
 //! (`/run/secrets/warp_app.pem`) and kept in memory only -- see
 //! `GitHubAppClient::from_pem_file`.
 
+pub mod issues;
 pub mod jwt;
 pub mod pulls;
 pub mod tls_transport;

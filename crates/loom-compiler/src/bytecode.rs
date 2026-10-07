@@ -81,6 +81,16 @@ pub struct FunctionCode {
     /// 80-byte struct (with heap-allocating `Vec` fields, for `Call`/
     /// `NewMap`/...) on every single instruction before this.
     pub code: Rc<[Op]>,
+    /// 1-based source line for each entry of [`Self::code`] (OBI-231),
+    /// same length as `code` always for anything `loom-compiler`'s own
+    /// `codegen` produced; `0` means "unknown" (no span reached this
+    /// instruction, or -- for bytecode that round-tripped through
+    /// [`decode`] from an encoder that never had a line table at all --
+    /// `lines` is simply empty, see `decode`'s doc). Spec §8.3's error
+    /// inbox groups by `(program, line, message)`; this is what makes
+    /// that `line` available to `loom-vm`'s interpreter instead of only
+    /// the function name.
+    pub lines: Vec<u32>,
     /// See [`crate::ir::Function::capture_targets`].
     pub capture_targets: Vec<Reg>,
 }
@@ -256,7 +266,10 @@ const MAGIC: [u8; 4] = *b"WFBC";
 /// a silent reinterpretation of old bytes under a new meaning. Not the
 /// same thing as a program's semantic version (§7.3); this is the byte
 /// format only.
-const FORMAT_VERSION: u32 = 1;
+///
+/// History: 1 = initial; 2 = per-function `lines` debug table after
+/// `code` (OBI-231).
+const FORMAT_VERSION: u32 = 2;
 const MAX_TY_DEPTH: u32 = 64;
 
 pub fn encode(m: &Module) -> Vec<u8> {
@@ -597,6 +610,13 @@ impl Writer {
         self.put_varu32(f.code.len() as u32);
         for op in f.code.iter() {
             self.put_op(op);
+        }
+        // `lines` is either empty (no debug info at all) or exactly
+        // `code.len()` long (one entry per `Op`, OBI-231); either shape is
+        // valid on the wire, `decode` rejects anything else.
+        self.put_varu32(f.lines.len() as u32);
+        for line in &f.lines {
+            self.put_varu32(*line);
         }
         self.put_reg_vec(&f.capture_targets);
     }
@@ -1146,6 +1166,16 @@ impl<'a> Reader<'a> {
         for _ in 0..n_code {
             code.push(self.get_op()?);
         }
+        let n_lines = self.get_varu32()? as usize;
+        if n_lines != 0 && n_lines != n_code {
+            return Err(DecodeError(
+                "line table length does not match code length".into(),
+            ));
+        }
+        let mut lines = Vec::with_capacity(n_lines);
+        for _ in 0..n_lines {
+            lines.push(self.get_varu32()?);
+        }
         let capture_targets = self.get_reg_vec()?;
         Ok(FunctionCode {
             name,
@@ -1156,6 +1186,7 @@ impl<'a> Reader<'a> {
             reg_types,
             entry_points,
             code: code.into(),
+            lines,
             capture_targets,
         })
     }
@@ -1353,6 +1384,7 @@ mod tests {
                     Op::Return { src: Some(0) },
                 ]
                 .into(),
+                lines: vec![1, 1],
                 capture_targets: vec![0],
             }],
         };
@@ -1361,7 +1393,59 @@ mod tests {
         assert_eq!(back.path.as_ref(), "/std/room");
         assert_eq!(back.functions.len(), 1);
         assert_eq!(back.functions[0].code.len(), 2);
+        assert_eq!(back.functions[0].lines, vec![1, 1]);
         assert_eq!(back.functions[0].capture_targets, vec![0]);
+    }
+
+    /// OBI-231: `lines` being empty (no debug info at all) is a valid wire
+    /// shape, not a mismatch -- distinct from a `lines` present but the
+    /// wrong length, which is malformed (`decode_rejects_mismatched_line_table_length`).
+    #[test]
+    fn roundtrip_with_no_line_table() {
+        let m = Module {
+            path: Rc::from("/x"),
+            strings: vec![],
+            consts: vec![],
+            functions: vec![FunctionCode {
+                name: 0,
+                atomic: false,
+                params: 0,
+                min_arity: 0,
+                ret: Ty::Void,
+                reg_types: vec![],
+                entry_points: vec![0],
+                code: vec![Op::Return { src: None }].into(),
+                lines: Vec::new(),
+                capture_targets: vec![],
+            }],
+        };
+        let back = decode(&encode(&m)).expect("decode");
+        assert!(back.functions[0].lines.is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_mismatched_line_table_length() {
+        let m = Module {
+            path: Rc::from("/x"),
+            strings: vec![],
+            consts: vec![],
+            functions: vec![FunctionCode {
+                name: 0,
+                atomic: false,
+                params: 0,
+                min_arity: 0,
+                ret: Ty::Void,
+                reg_types: vec![],
+                entry_points: vec![0],
+                code: vec![Op::Return { src: None }].into(),
+                // One `Op`, two line entries: malformed (not "no debug
+                // info", and not matching `code.len()` either).
+                lines: vec![1, 2],
+                capture_targets: vec![],
+            }],
+        };
+        let err = decode(&encode(&m)).expect_err("mismatched line table must be rejected");
+        assert!(err.0.contains("line table"), "{err:?}");
     }
 
     #[test]
@@ -1379,6 +1463,7 @@ mod tests {
                 reg_types: vec![],
                 entry_points: vec![0],
                 code: vec![Op::Return { src: None }].into(),
+                lines: vec![1],
                 capture_targets: vec![],
             }],
         };

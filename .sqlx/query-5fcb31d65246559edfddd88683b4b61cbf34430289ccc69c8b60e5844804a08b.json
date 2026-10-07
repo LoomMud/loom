@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, at, kind, caller, effective_principal, apply, class,\n                   guard_set, verdict, detail, argument\n            FROM audit_log\n            WHERE $1::BIGINT IS NULL OR id < $1\n            ORDER BY id DESC\n            LIMIT $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "kind",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "caller",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "effective_principal",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "apply",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "class",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 7,
+        "name": "guard_set",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 8,
+        "name": "verdict",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "detail",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "argument",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "5fcb31d65246559edfddd88683b4b61cbf34430289ccc69c8b60e5844804a08b"
+}

@@ -415,6 +415,286 @@ fn disk_quota_mb_counter_stays_correct_across_overwrite_shrink_and_a_later_write
     );
 }
 
+// -- disk_quota_mb on save_object into the save root (OBI-171) --------------
+
+/// CTO review on PR #75, must-fix 2: `save_object` must go through
+/// `disk_quota_mb` the same way `write_file` does -- charged to the
+/// *writing object's own uid* (`appr`, since a save path carries no uid
+/// in its text the way `/builders/<u>/**` does), seeded from the save
+/// root instead of the mudlib root.
+#[test]
+fn disk_quota_mb_row_denies_a_save_object_that_would_exceed_the_quota() {
+    let (mut world, mut host) = boot();
+    world.set_save_root(common::scratch("quotas-save-root"));
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"disk_quota_mb": 1}"#)));
+
+    // Within quota: comfortably under 1 MB including the JSON envelope's
+    // own overhead.
+    let small = "a".repeat(700_000);
+    world
+        .call(workroom, "set_blob", vec![Value::str(&small)], &mut host)
+        .expect("set_blob");
+    let ok = world
+        .call(
+            workroom,
+            "save_disk",
+            vec![Value::str("/appr-save")],
+            &mut host,
+        )
+        .expect("a save within quota must not raise");
+    assert!(matches!(ok, Value::Bool(true)), "{ok:?}");
+
+    // Over quota: a second, larger save to a *different* path must be
+    // rejected -- `false`, not an error -- and must not land on disk.
+    let big = "a".repeat(900_000);
+    world
+        .call(workroom, "set_blob", vec![Value::str(&big)], &mut host)
+        .expect("set_blob");
+    let audit_before = world.audit_log().len();
+    let result = world
+        .call(
+            workroom,
+            "save_disk",
+            vec![Value::str("/appr-save-2")],
+            &mut host,
+        )
+        .expect("an over-quota save_object must not raise");
+    assert!(matches!(result, Value::Bool(false)), "{result:?}");
+    let new_entries = &world.audit_log()[audit_before..];
+    assert!(
+        new_entries
+            .iter()
+            .any(|e| e.apply == "quota" && e.efun == "disk_quota_mb" && !e.allowed),
+        "expected a disk_quota_mb audit entry, got {new_entries:?}"
+    );
+    assert!(
+        !world.save_root().join("appr-save-2.o").exists(),
+        "a rejected save must not land on disk"
+    );
+}
+
+// -- disk_quota_mb seed order (OBI-236, follow-up to CTO re-review of PR #75) -
+
+/// Save seeds first: before this fix, `DiskUsage` kept one shared counter
+/// per `<u>` (`entry().or_insert_with`), so whichever of `seeded_total`
+/// (the `/builders/<u>/**` walk) or `seeded_save_total` (the save file's
+/// own size) ran first for a given `<u>` silently won that `<u>`'s whole
+/// seed. A `save_object` that ran before the builder ever wrote anything
+/// left the shared counter seeded at the save file's size alone, and the
+/// `/builders/appr/**` tree was never walked at all -- so a builder near
+/// quota could still write about one extra full quota's worth of
+/// `write_file` after that. This drives `save_object` first, then a
+/// `write_file` that only fits if the save's own bytes *and* the
+/// pre-existing `/builders/appr/**` tree both count toward `appr`'s
+/// `disk_quota_mb`.
+#[test]
+fn disk_quota_mb_counts_the_builders_tree_even_when_save_object_seeds_first() {
+    let (mut world, mut host) = boot();
+    world.set_save_root(common::scratch("quotas-save-order-save-first"));
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+
+    // A file already sits under `/builders/appr/**` from a previous
+    // session, well before any quota row exists.
+    let preexisting = "a".repeat(600_000);
+    world
+        .call(
+            workroom,
+            "write_disk",
+            vec![
+                Value::str("/builders/appr/old.txt"),
+                Value::str(&preexisting),
+            ],
+            &mut host,
+        )
+        .expect("write before any quota row is unconditional");
+
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"disk_quota_mb": 1}"#)));
+
+    // `save_object` runs first under the new quota row: this seeds
+    // `appr`'s save pool (a small save, well within quota on its own).
+    let small_save = "a".repeat(1_000);
+    world
+        .call(
+            workroom,
+            "set_blob",
+            vec![Value::str(&small_save)],
+            &mut host,
+        )
+        .expect("set_blob");
+    let ok = world
+        .call(
+            workroom,
+            "save_disk",
+            vec![Value::str("/appr-save")],
+            &mut host,
+        )
+        .expect("small save within quota must not raise");
+    assert!(matches!(ok, Value::Bool(true)), "{ok:?}");
+
+    // Now `write_file`: the pre-existing 600_000-byte `/builders/appr/**`
+    // tree plus this new 600_000-byte file is over the 1 MB quota. If the
+    // directory pool had been left unseeded (the old shared-counter bug),
+    // this write would incorrectly be accepted.
+    let chunk = "a".repeat(600_000);
+    let result = world
+        .call(
+            workroom,
+            "write_disk",
+            vec![Value::str("/builders/appr/new.txt"), Value::str(&chunk)],
+            &mut host,
+        )
+        .expect("an over-quota write_file must not raise");
+    assert!(
+        matches!(result, Value::Bool(false)),
+        "the pre-existing /builders/appr/** tree must count toward the quota: {result:?}"
+    );
+    assert!(
+        !std::path::Path::new(&format!("{}/builders/appr/new.txt", world.root().display()))
+            .exists(),
+        "a rejected write must not land on disk"
+    );
+}
+
+/// Save seeds first, and the save itself is the over-quota write: the
+/// save check must seed and count the `/builders/<u>/**` tree too, not
+/// treat an unseeded directory pool as 0 (OBI-236 CTO review).
+#[test]
+fn disk_quota_mb_save_object_counts_the_builders_tree_when_it_seeds_first() {
+    let (mut world, mut host) = boot();
+    world.set_save_root(common::scratch("quotas-save-order-save-over"));
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+
+    let preexisting = "a".repeat(600_000);
+    world
+        .call(
+            workroom,
+            "write_disk",
+            vec![
+                Value::str("/builders/appr/old.txt"),
+                Value::str(&preexisting),
+            ],
+            &mut host,
+        )
+        .expect("write before any quota row is unconditional");
+
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"disk_quota_mb": 1}"#)));
+
+    // 600_000 bytes already under /builders/appr + a 600_000-byte save is
+    // over the 1 MB quota, and this save is the first quota check for appr.
+    let big_save = "a".repeat(600_000);
+    world
+        .call(workroom, "set_blob", vec![Value::str(&big_save)], &mut host)
+        .expect("set_blob");
+    let result = world
+        .call(
+            workroom,
+            "save_disk",
+            vec![Value::str("/appr-save")],
+            &mut host,
+        )
+        .expect("an over-quota save_object must not raise");
+    assert!(
+        matches!(result, Value::Bool(false)),
+        "the /builders/appr/** tree must count toward a save that seeds first: {result:?}"
+    );
+}
+
+/// `write_file` seeds first: before this fix, seeding the shared counter
+/// from the directory walk alone (no save file in it) meant
+/// `check_save_disk_quota` still unconditionally subtracted the save
+/// file's `old_bytes` from that *same* counter on a later overwrite --
+/// the saturating subtraction then silently undercounted usage by the
+/// size of the old save from that point on, letting further writes
+/// through that should have been rejected. This drives `write_file`
+/// first (seeding the directory pool), then a `save_object` overwrite of
+/// an already-existing save file, and checks the overwrite's own quota
+/// decision is still correct (no undercount).
+#[test]
+fn disk_quota_mb_save_object_overwrite_is_not_undercounted_when_write_file_seeds_first() {
+    let (mut world, mut host) = boot();
+    world.set_save_root(common::scratch("quotas-save-order-write-first"));
+    let workroom = world
+        .load_object("/builders/appr/workroom", &mut host)
+        .expect("load");
+
+    // A save file already exists on disk from a previous process, before
+    // `save_object` has gone through `DiskUsage` this run at all.
+    world
+        .call(
+            workroom,
+            "set_blob",
+            vec![Value::str("preexisting")],
+            &mut host,
+        )
+        .expect("set_blob");
+    let pre_ok = world
+        .call(
+            workroom,
+            "save_disk",
+            vec![Value::str("/appr-save")],
+            &mut host,
+        )
+        .expect("unconditional pre-quota save");
+    assert!(matches!(pre_ok, Value::Bool(true)));
+    let old_save_bytes = std::fs::metadata(world.save_root().join("appr-save.o"))
+        .expect("save file exists")
+        .len();
+    assert!(
+        old_save_bytes > 0,
+        "sanity: the pre-existing save has bytes"
+    );
+
+    world.set_roles_snapshot(Arc::new(roles_with_row(r#"{"disk_quota_mb": 1}"#)));
+
+    // `write_file` runs first under the new quota row: seeds the
+    // directory pool at (close to) the 1 MB quota, leaving only just
+    // enough headroom for the old save's own bytes plus a hair more.
+    let max_bytes = 1u64 << 20;
+    let dir_bytes = max_bytes - old_save_bytes - 10_000;
+    let chunk = "a".repeat(dir_bytes as usize);
+    let ok = world
+        .call(
+            workroom,
+            "write_disk",
+            vec![Value::str("/builders/appr/a.txt"), Value::str(&chunk)],
+            &mut host,
+        )
+        .expect("within quota once the old save's own bytes are counted");
+    assert!(matches!(ok, Value::Bool(true)), "{ok:?}");
+
+    // Overwrite the existing save with something a little bigger: if the
+    // old save's size were undercounted (treated as 0 before the
+    // subtraction, the pre-fix bug), this would be wrongly accepted.
+    let bigger_save = "a".repeat(20_000);
+    world
+        .call(
+            workroom,
+            "set_blob",
+            vec![Value::str(&bigger_save)],
+            &mut host,
+        )
+        .expect("set_blob");
+    let result = world
+        .call(
+            workroom,
+            "save_disk",
+            vec![Value::str("/appr-save")],
+            &mut host,
+        )
+        .expect("an over-quota save_object must not raise");
+    assert!(
+        matches!(result, Value::Bool(false)),
+        "the old save's real on-disk size must be counted, not undercounted to 0: {result:?}"
+    );
+}
+
 // -- move_to confinement (spec ยง7) -------------------------------------------
 
 #[test]

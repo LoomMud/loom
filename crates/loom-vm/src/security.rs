@@ -62,6 +62,16 @@ impl Interner {
     pub fn name(&self, s: Sym) -> &str {
         self.names.get(s as usize).map_or("?", |n| n)
     }
+
+    /// Every interned name, indexed by [`Sym`] (OBI-173 binary snapshots):
+    /// captured once at snapshot time and replayed through [`Interner::
+    /// intern`] in the same order on load, which reproduces identical
+    /// `Sym` values without needing to serialize/remap them at all (each
+    /// call only assigns a new id for a name it has not seen yet, so
+    /// replaying the exact insertion order is sufficient).
+    pub fn all_names(&self) -> &[Rc<str>] {
+        &self.names
+    }
 }
 
 /// `(uid, euid)` of one stack frame (D-S1.1). 8 bytes, `Copy`.

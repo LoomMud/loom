@@ -79,6 +79,15 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     // mass upgrade, not a single recompile), so P1 pending the CTO's
     // sign-off on efun privilege/tier (flagged, not decided here).
     ("upgrade_all", 1, 1, Privilege::P1, 50),
+    // Spec §7.4, OBI-182 (P2-B7): `update --canary N%` -- compile +
+    // install (lazy, same as `compile_object`) plus start routing a
+    // fraction of accesses to it; see `bcvm::registry::RegistryHost::
+    // canary_update_efun`. Same tier/cost ballpark as `compile_object`
+    // (it does a full recompile too).
+    ("canary_update", 4, 4, Privilege::P1, 500),
+    // Introspection for the above; cheap (a map lookup), same tier as
+    // `canary_update` itself -- see `canary_status_efun`.
+    ("canary_status", 1, 1, Privilege::P1, 5),
     ("len", 1, 1, Privilege::P0, 1),
     ("split", 2, 2, Privilege::P0, 5),
     ("join", 2, 2, Privilege::P0, 5),
@@ -127,6 +136,18 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     ("seteuid", 1, 1, Privilege::P3, 10),
     ("read_file", 1, 1, Privilege::P0, 20),
     ("write_file", 2, 2, Privilege::P1, 50),
+    // OBI-171 (spec §8.1): player/character persistence. `save_object`
+    // writes only `persistent` vars, through the §7.3 migration path on
+    // restore; both go through the same confined, atomic
+    // write+rename-backed storage `read_file`/`write_file` use, just a
+    // separate root and a `.o` suffix (`crate::fileio::write_file_atomic`)
+    // -- not the mudlib VFS, so saves never land in the Git-backed `.wf`
+    // tree. `save_object` is P1 (it writes); `restore_object` is P0 like
+    // `read_file` (both still go through `valid_write`/`valid_read` with
+    // `op` set to `"save_object"`/`"restore_object"`, so the master can
+    // apply whatever path policy it wants to this separate namespace).
+    ("save_object", 1, 1, Privilege::P1, 100),
+    ("restore_object", 1, 1, Privilege::P0, 50),
     ("unguarded", 1, 2, Privilege::P4, 10),
     // OBI-36 (S2b), design note D-S2.2: the roles snapshot's read efuns.
     // Secure-only (a driver rule, exactly like `unguarded`'s D-S1.5, not
@@ -149,6 +170,27 @@ const EFUNS: &[(&str, usize, usize, Privilege, u32)] = &[
     ("roles_revoke_grant", 4, 4, Privilege::P3, 50),
     ("roles_propose_tier", 3, 3, Privilege::P3, 50),
     ("roles_approve", 1, 1, Privilege::P3, 50),
+    // OBI-169: `errors(program_prefix)`, the grouped runtime-error inbox
+    // (filtered by the caller's own `valid_read` permission per distinct
+    // program, inside `RegistryHost::driver_efun`'s `"errors"` arm --
+    // same pattern as `read_file`'s VFS gate, just applied once per
+    // program instead of once per call).
+    ("errors", 0, 1, Privilege::P1, 20),
+    // Spec Phase 2 B5 (OBI-170): `profile <program>` sampling. Same
+    // privilege class as `compile_object`/`upgrade_all` (introspection
+    // into another program's running cost, not just the caller's own) --
+    // gated by the generic P1 `valid_efun` pre-check in
+    // `RegistryHost::driver_efun`, no path-specific `valid_*` apply (it
+    // mutates no world state, only a profiling counter).
+    //
+    // `profile_stop`'s optional second arg (should-fix 4, OBI-232):
+    // `force` (default false) to close a window owned by a *different*
+    // principal -- `driver_efun`'s `"profile_stop"` arm additionally
+    // requires its own ad hoc P3 `valid_efun` check (same mechanism
+    // `seteuid` uses) before honoring `force: true`; the static P1 class
+    // here only covers the ordinary (own-window) case.
+    ("profile_start", 1, 1, Privilege::P1, 10),
+    ("profile_stop", 0, 1, Privilege::P1, 10),
 ];
 
 /// `(min args, max args)` of efun `name`, if it exists.
@@ -163,6 +205,32 @@ pub fn arity(name: &str) -> Option<(usize, usize)> {
 /// policy-cache keys never allocate), if it exists.
 pub fn static_name(name: &str) -> Option<&'static str> {
     EFUNS.iter().find(|(n, ..)| *n == name).map(|(n, ..)| *n)
+}
+
+/// Driver-internal `authorize` call sites that are not a player-callable
+/// efun at all, but still want a real (non-`"?"`) name in the audit
+/// trail's `kind` field -- `admin_query` (OBI-279, the CTO review
+/// follow-up to OBI-237 PR #102, non-blocking note 2) is the only one so
+/// far: `bcvm::registry::RegistryHost::admin_valid_read` calls
+/// `authorize("admin_query", ...)` for the HTTP admin-query world-thread
+/// side (`World::admin_list_objects`/`admin_object_vars`/`admin_errors`),
+/// which has no registered efun of that name to resolve (deliberately:
+/// it must never become player-callable). Kept separate from [`EFUNS`]
+/// itself so `admin_query` never gains arity/privilege/tick-cost
+/// metadata, never shows up in `docs/efuns.md`, and never needs a
+/// matching `loom_compiler::efuns` entry for `efun_table_matches_vm` to
+/// agree with.
+const NON_EFUN_AUDIT_KINDS: &[&str] = &["admin_query"];
+
+/// The audit-trail `kind` name for `authorize`'s `efun` argument: the
+/// real efun name if `name` is one ([`static_name`]), else the matching
+/// [`NON_EFUN_AUDIT_KINDS`] entry, else `"?"` (an unrecognized name,
+/// which should not happen from any call site in this crate -- both
+/// sources are exhaustive over every `authorize` caller).
+pub fn audit_kind_name(name: &str) -> &'static str {
+    static_name(name)
+        .or_else(|| NON_EFUN_AUDIT_KINDS.iter().find(|n| **n == name).copied())
+        .unwrap_or("?")
 }
 
 /// The privilege class of efun `name`, if it exists.
@@ -253,6 +321,18 @@ mod tests {
         for p in [Privilege::P1, Privilege::P2, Privilege::P3, Privilege::P4] {
             assert!(p.gated());
         }
+    }
+
+    /// OBI-279: `admin_query` resolves to its own name, not `"?"`, even
+    /// though it is not (and must never become) a registered efun.
+    #[test]
+    fn admin_query_is_a_known_non_efun_audit_kind() {
+        assert!(static_name("admin_query").is_none());
+        assert_eq!(audit_kind_name("admin_query"), "admin_query");
+        assert_eq!(audit_kind_name("not_a_real_name_at_all"), "?");
+        // A real efun still resolves through `static_name`, not the
+        // non-efun list.
+        assert_eq!(audit_kind_name("read_file"), "read_file");
     }
 
     /// Keeps `docs/efuns.md` honest: run with `UPDATE_EFUNS_DOC=1` after

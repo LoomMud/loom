@@ -1,0 +1,18 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Minimal player for the OBI-279 multi-euid unit-test fixture (see
+// `secure/master.wf`'s doc comment) -- never actually used by the test
+// (which calls `World::exec`/`admin_valid_read` directly, not
+// `World::connect`), kept only so `secure/master.wf`'s `connect()` has
+// something real to clone if anything ever does call it.
+pub fn logon() {
+    send(self, "ready\n")
+}
+
+pub fn process_input(line: string) {
+    send(self, "What?\n")
+}
+
+pub fn net_dead() {
+}

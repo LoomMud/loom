@@ -58,13 +58,16 @@
 //! `Persist::github_link`, T4+). An unlinked id is refused outright --
 //! this module has no code path that inserts a `staff` row.
 //!
-//! ## Rate limiting, lockout, and audit (OBI-200)
+//! ## Rate limiting, lockout, and audit (OBI-200, OBI-204)
 //!
 //! [`AuthService::login`]/[`AuthService::totp_confirm`] share one
 //! [`RateLimiter`] (see that module's docs for the exact numbers): a
 //! wrong password or wrong TOTP code counts as a failure toward both a
 //! per-account lockout and a per-IP token bucket, and a locked account
-//! gets exactly the same response as a wrong password. Every login,
+//! gets exactly the same response as a wrong password. Both entry points
+//! key the account lockout by the same resolved staff uid (OBI-204), so
+//! splitting guesses across `login` and `totp_confirm` can't double an
+//! attacker's effective budget. Every login,
 //! refresh-reuse, and TOTP enrol/reset is appended to `audit_log` via
 //! [`StaffDirectory::record_audit`] (M-AUTH-9); see
 //! `docs/threat-model-phase2.md` §6.1 (M-AUTH-1, M-AUTH-2, M-AUTH-9).
@@ -83,8 +86,8 @@ pub use cookie::{
     set_cookie_header, set_cookie_name, staff_csrf_guard_passes,
 };
 pub use directory::{
-    AuditEvent, DirectoryError, RefreshRecord, SessionRotateOutcome, StaffAuthRecord,
-    StaffAuthStatus, StaffDirectory,
+    AdminAuditEntry, AdminDirectoryError, AuditEvent, DirectoryError, RefreshRecord,
+    SessionRotateOutcome, StaffAuthRecord, StaffAuthStatus, StaffDirectory,
 };
 pub use github::{GithubAuthError, GithubIdentityProvider, GithubUser};
 pub use jwt::{AUDIENCE, JwtKeys, TokenPair};
@@ -186,6 +189,102 @@ impl std::fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
+/// Tier floor for role-change actions (M-ADM-2/§5.11.2): a domain lead
+/// (T3) may act (within `roles_set_tier`'s own, narrower SQL rules), but
+/// nothing below that.
+pub const ADMIN_ROLE_CHANGE_MIN_TIER: i16 = 3;
+/// Tier floor to list objects at all (OBI-234, P2-O2 scope: "T3+ to list
+/// at all"). The actual *filtering* within that is `valid_read`, done on
+/// the world side -- this is just the HTTP edge's cheap floor, same role
+/// as [`ADMIN_ROLE_CHANGE_MIN_TIER`] for role changes (UX, not the
+/// security boundary).
+pub const OBJECT_LIST_MIN_TIER: i16 = 3;
+/// Tier floor for `GET /api/v1/admin/who` (OBI-234, CTO review on PR
+/// #98): the scope note doesn't set a floor for `who`, only M-ADM-3's
+/// response-shape rule. T2+ (not T1/builder) is the explicit, more
+/// conservative default the review asked for -- a plain builder token
+/// can no longer enumerate every connected account.
+pub const WHO_MIN_TIER: i16 = 2;
+/// Tier floor for `GET /api/v1/admin/objects/:path/vars` (OBI-234 scope:
+/// "T4, audited per access").
+pub const OBJECT_VARS_MIN_TIER: i16 = 4;
+/// Additional tier floor for variable inspection of anything under
+/// `/secure/` (OBI-234 scope: "`/secure` objects T5 only") -- on top of,
+/// not instead of, [`OBJECT_VARS_MIN_TIER`].
+pub const SECURE_VARS_MIN_TIER: i16 = 5;
+/// Tier floor for `GET /api/v1/admin/errors` (OBI-235 scope: "T3+,
+/// consistent with object listing"). As with [`OBJECT_LIST_MIN_TIER`],
+/// the real per-program filter (`valid_read`) and the `/secure`
+/// redaction rule both live on the world side (`errors` efun /
+/// `crate::admin_query::WorldAdminQuery::errors`); this is only the HTTP
+/// edge's cheap floor.
+pub const ERROR_INBOX_MIN_TIER: i16 = 3;
+/// Step-up MFA freshness window for role changes, grants, another user's
+/// TOTP reset, and broadcast (M-ADM-2): `mfa_at` must be within this many
+/// seconds of "now".
+pub const STEP_UP_WINDOW_SECS: i64 = 5 * 60;
+
+/// A failure from one of the admin (OBI-185) actions on [`AuthService`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminError {
+    /// The caller's tier is below the action's floor (M-ADM-2:
+    /// tier >= 3 for role changes).
+    Forbidden,
+    /// The caller's tier is high enough, but their session has no
+    /// `mfa_at` within the last 5 minutes (M-ADM-2 step-up).
+    StepUpRequired,
+    /// The request body carried a client-supplied `actor`, or otherwise
+    /// failed input validation -- M-ADM-1: the actor is always the
+    /// token's `sub`, never anything the body can override.
+    BadRequest,
+    /// The `security definer` function itself refused the call (M-ADM-1:
+    /// e.g. self-promotion, actor tier too low for *this* target, tier
+    /// outside the Phase-1 1-3 range). The admin UI's own tier/step-up
+    /// checks above are UX, not the security boundary -- this is what
+    /// actually enforces it, and this variant is reachable even if every
+    /// check above it were removed.
+    Rejected(String),
+    /// The directory (Postgres) failed outright.
+    DirectoryUnavailable,
+    /// The world-thread query channel failed outright (busy, timed out,
+    /// or closed -- see `admin_query::WorldQueryError`): distinct from
+    /// [`AdminError::DirectoryUnavailable`] since this is a different
+    /// backend (the live world, not Postgres).
+    WorldUnavailable,
+    /// `object_vars` for a path that isn't a live object (or that
+    /// `valid_read` refused -- the two are indistinguishable on purpose,
+    /// see [`crate::admin_query::WorldAdminQuery::object_vars`]'s doc
+    /// comment).
+    NotFound,
+}
+
+impl From<AdminDirectoryError> for AdminError {
+    fn from(err: AdminDirectoryError) -> Self {
+        match err {
+            AdminDirectoryError::Rejected(message) => AdminError::Rejected(message),
+            AdminDirectoryError::Unavailable => AdminError::DirectoryUnavailable,
+        }
+    }
+}
+
+impl From<crate::admin_query::WorldQueryError> for AdminError {
+    fn from(err: crate::admin_query::WorldQueryError) -> Self {
+        use crate::admin_query::WorldQueryError;
+        match err {
+            WorldQueryError::NotFound => AdminError::NotFound,
+            WorldQueryError::Busy | WorldQueryError::Timeout | WorldQueryError::Closed => {
+                AdminError::WorldUnavailable
+            }
+            // OBI-279: a `valid_read` that failed to produce a real
+            // decision is a different failure than a `Busy`/`Timeout`/
+            // `Closed` channel, but the HTTP-visible outcome (`503`) is
+            // the same -- both mean "the world side could not safely
+            // answer this query right now".
+            WorldQueryError::Internal(_) => AdminError::WorldUnavailable,
+        }
+    }
+}
+
 impl From<DirectoryError> for AuthError {
     fn from(_: DirectoryError) -> Self {
         AuthError::DirectoryUnavailable
@@ -266,18 +365,35 @@ impl AuthService {
         totp_code: Option<&str>,
         ctx: &AuthContext,
     ) -> Result<TokenPair, AuthError> {
-        match self.rate_limiter.check(username, ctx.ip) {
-            RateLimitDecision::IpThrottled => {
-                self.audit(
-                    "auth.login.fail",
-                    None,
-                    ctx,
-                    "deny",
-                    Some("ip_rate_limited".to_string()),
-                )
-                .await;
-                return Err(AuthError::RateLimited);
-            }
+        // OBI-204 review fix: check the (cheap, no-DB) IP bucket before
+        // paying for the `resolve_uid` lookup below, so a throttled IP is
+        // refused without ever touching Postgres.
+        if let Some(ip) = ctx.ip
+            && self.rate_limiter.check_ip(ip) == RateLimitDecision::IpThrottled
+        {
+            self.audit(
+                "auth.login.fail",
+                None,
+                ctx,
+                "deny",
+                Some("ip_rate_limited".to_string()),
+            )
+            .await;
+            return Err(AuthError::RateLimited);
+        }
+
+        // OBI-204: resolve the account limiter key to the staff uid up
+        // front (no password check involved -- this is a plain lookup),
+        // the same namespace `totp_confirm` uses, so a wrong login
+        // password and a wrong TOTP code for the same staff member always
+        // land on the same bucket. A username that doesn't resolve (wrong
+        // username, or the directory itself is unavailable) falls back to
+        // a username-namespaced key -- there is no uid to share, and that
+        // namespace can never collide with a real `uid:` key.
+        let resolved_uid = self.directory.resolve_uid(username).await.unwrap_or(None);
+        let account_key = account_rate_key(resolved_uid.as_deref(), username);
+
+        match self.rate_limiter.check_account(&account_key) {
             RateLimitDecision::AccountLocked => {
                 self.audit(
                     "auth.login.fail",
@@ -290,12 +406,15 @@ impl AuthService {
                 return Err(AuthError::InvalidCredentials);
             }
             RateLimitDecision::Allowed => {}
+            RateLimitDecision::IpThrottled => {
+                unreachable!("check_account never checks the IP bucket")
+            }
         }
 
         let record = match self.directory.staff_login(username, password).await {
             Ok(Some(record)) => record,
             Ok(None) => {
-                self.rate_limiter.record_failure(username);
+                self.rate_limiter.record_failure(&account_key);
                 self.audit(
                     "auth.login.fail",
                     None,
@@ -306,7 +425,12 @@ impl AuthService {
                 .await;
                 return Err(AuthError::InvalidCredentials);
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                // Neither a guess nor a success -- give the reservation
+                // back rather than let it sit as a phantom failure.
+                self.rate_limiter.release(&account_key);
+                return Err(err.into());
+            }
         };
 
         // Re-read tier/TOTP state fresh rather than trusting `record`,
@@ -315,6 +439,9 @@ impl AuthService {
         let status = match self.require_staff_status(&record.uid).await {
             Ok(status) => status,
             Err(err) => {
+                // Not a guess (directory error or removed staff row):
+                // give the reservation back (OBI-204).
+                self.rate_limiter.release(&account_key);
                 self.audit(
                     "auth.login.fail",
                     Some(record.uid.clone()),
@@ -340,7 +467,12 @@ impl AuthService {
             Ok(verified) => verified,
             Err(err) => {
                 if err == AuthError::TotpInvalid {
-                    self.rate_limiter.record_failure(username);
+                    self.rate_limiter.record_failure(&account_key);
+                } else {
+                    // TotpRequired (or any other non-guess outcome): not
+                    // a guess, give the reservation back rather than
+                    // count it toward the lockout.
+                    self.rate_limiter.release(&account_key);
                 }
                 self.audit(
                     "auth.login.fail",
@@ -359,7 +491,7 @@ impl AuthService {
             (vec!["pwd".to_string()], None)
         };
 
-        self.rate_limiter.record_success(username);
+        self.rate_limiter.record_success(&account_key);
         let pair = self
             .issue_tokens(&record.uid, status.tier, generate_sid(), amr, mfa_at)
             .await?;
@@ -557,25 +689,37 @@ impl AuthService {
         code: &str,
         ctx: &AuthContext,
     ) -> Result<(), AuthError> {
-        match self.rate_limiter.check(uid, ctx.ip) {
+        let account_key = uid_rate_key(uid);
+        match self.rate_limiter.check(&account_key, ctx.ip) {
             RateLimitDecision::IpThrottled => return Err(AuthError::RateLimited),
             RateLimitDecision::AccountLocked => return Err(AuthError::TotpInvalid),
             RateLimitDecision::Allowed => {}
         }
 
-        let secret = self
-            .directory
-            .totp_secret_for(uid)
-            .await?
-            .ok_or(AuthError::TotpInvalid)?;
+        let secret = match self.directory.totp_secret_for(uid).await {
+            Ok(Some(secret)) => secret,
+            Ok(None) => {
+                // No secret to check against -- not a guess, give the
+                // reservation back rather than count it as a failure.
+                self.rate_limiter.release(&account_key);
+                return Err(AuthError::TotpInvalid);
+            }
+            Err(err) => {
+                self.rate_limiter.release(&account_key);
+                return Err(err.into());
+            }
+        };
         match self.verify_and_consume_totp(uid, &secret, code).await {
             Ok(()) => {
-                self.directory.totp_confirm(uid).await?;
-                self.rate_limiter.record_success(uid);
+                if let Err(err) = self.directory.totp_confirm(uid).await {
+                    self.rate_limiter.release(&account_key);
+                    return Err(err.into());
+                }
+                self.rate_limiter.record_success(&account_key);
                 Ok(())
             }
             Err(err) => {
-                self.rate_limiter.record_failure(uid);
+                self.rate_limiter.record_failure(&account_key);
                 Err(err)
             }
         }
@@ -590,6 +734,15 @@ impl AuthService {
         self.keys
             .decode(token)
             .map_err(|_| AuthError::InvalidRefreshToken)
+    }
+
+    /// Sign arbitrary claims directly, bypassing `login`/`refresh`
+    /// entirely -- test-only, so `loom-http`'s HTTP-wire admin tests
+    /// (`admin.rs`) can mint a token with a specific tier/`mfa_at`
+    /// without needing a full `StaffDirectory` fake to drive `login`.
+    #[cfg(test)]
+    pub fn sign_for_test(&self, claims: &AccessClaims) -> String {
+        self.keys.encode(claims).expect("encode test claims")
     }
 
     /// Read `uid`'s fresh tier/TOTP status, refusing outright (and
@@ -751,6 +904,373 @@ impl AuthService {
         }
     }
 
+    /// Admin role-tier change (OBI-185, M-ADM-1/M-ADM-2): `claims` is the
+    /// caller's *verified* access-token claims -- `claims.sub` is always
+    /// the actor passed to `roles_set_tier`, never anything the request
+    /// body supplies (the HTTP layer's `AdminSetTierRequest` has no
+    /// `actor` field at all; see `admin.rs`). Enforces tier >= 3
+    /// (§5.11.2) and step-up freshness (`mfa_at` within the last 5
+    /// minutes) *before* ever calling the directory -- but the real
+    /// boundary is `roles_set_tier` itself: a caller who somehow got past
+    /// both checks (e.g. a build with the tier check deleted) still gets
+    /// refused by SQL for anything the function doesn't allow, which is
+    /// what [`AdminError::Rejected`] surfaces. Every outcome -- forbidden,
+    /// step-up required, rejected, or allowed -- is audited (M-ADM-4).
+    pub async fn admin_set_tier(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        target_uid: &str,
+        new_tier: i16,
+        reason: &str,
+    ) -> Result<(), AdminError> {
+        let detail = format!("target={target_uid} new_tier={new_tier}");
+        if claims.tier < ADMIN_ROLE_CHANGE_MIN_TIER {
+            self.audit(
+                "admin.roles.set_tier",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!("{detail} reason=forbidden")),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        if !self.has_fresh_step_up(claims) {
+            self.audit(
+                "admin.roles.set_tier",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!("{detail} reason=step_up_required")),
+            )
+            .await;
+            return Err(AdminError::StepUpRequired);
+        }
+        match self
+            .directory
+            .admin_set_tier(&claims.sub, target_uid, new_tier, reason)
+            .await
+        {
+            Ok(()) => {
+                self.audit(
+                    "admin.roles.set_tier",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(detail),
+                )
+                .await;
+                Ok(())
+            }
+            Err(err) => {
+                let admin_err: AdminError = err.into();
+                let reason_detail = match &admin_err {
+                    AdminError::Rejected(message) => format!("{detail} reason={message}"),
+                    _ => format!("{detail} reason=directory_unavailable"),
+                };
+                self.audit(
+                    "admin.roles.set_tier",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(reason_detail),
+                )
+                .await;
+                Err(admin_err)
+            }
+        }
+    }
+
+    /// Admin audit view (OBI-185, M-ADM-4): read-only, tier-gated the
+    /// same as object listing (§5.11.2-adjacent: T3+), and itself
+    /// audited -- "every admin endpoint audited" includes the audit view.
+    pub async fn admin_audit_recent(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> Result<Vec<AdminAuditEntry>, AdminError> {
+        if claims.tier < ADMIN_ROLE_CHANGE_MIN_TIER {
+            self.audit(
+                "admin.audit.view",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                None,
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        let rows = match self.directory.admin_audit_recent(limit, before_id).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                let admin_err = AdminError::from(err);
+                let reason_detail = match &admin_err {
+                    AdminError::Rejected(message) => {
+                        format!("limit={limit} before_id={before_id:?} reason={message}")
+                    }
+                    _ => format!(
+                        "limit={limit} before_id={before_id:?} reason=directory_unavailable"
+                    ),
+                };
+                self.audit(
+                    "admin.audit.view",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(reason_detail),
+                )
+                .await;
+                return Err(admin_err);
+            }
+        };
+        self.audit(
+            "admin.audit.view",
+            Some(claims.sub.clone()),
+            ctx,
+            "allow",
+            Some(format!("limit={limit} before_id={before_id:?}")),
+        )
+        .await;
+        Ok(rows)
+    }
+
+    /// `GET /api/v1/admin/who` (OBI-234, CTO review on PR #98): tier >= 2
+    /// ([`WHO_MIN_TIER`]) -- a T1 (builder) token alone no longer lists
+    /// every connected account. The scope note didn't set a floor;
+    /// picking one explicitly (over leaving `who` open to any staff
+    /// token) is the more conservative default the review asked for.
+    /// Still audited either way (M-ADM-4), and M-ADM-3 (no email/IP) is
+    /// enforced by [`crate::admin_query::WhoEntry`] simply not having
+    /// those fields, independent of this floor.
+    pub async fn admin_who(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        query: &dyn crate::admin_query::WorldAdminQuery,
+    ) -> Result<Vec<crate::admin_query::WhoEntry>, AdminError> {
+        if claims.tier < WHO_MIN_TIER {
+            self.audit(
+                "admin.who",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some("reason=forbidden".to_string()),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        match query.who().await {
+            Ok(rows) => {
+                self.audit(
+                    "admin.who",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(format!("count={}", rows.len())),
+                )
+                .await;
+                Ok(rows)
+            }
+            Err(err) => {
+                self.audit(
+                    "admin.who",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(format!("reason={err:?}")),
+                )
+                .await;
+                Err(err.into())
+            }
+        }
+    }
+
+    /// `GET /api/v1/admin/objects` (OBI-234, M-ADM-4): tier >= 3
+    /// ([`OBJECT_LIST_MIN_TIER`]) to list at all; the listing itself is
+    /// `valid_read`-filtered on the world side (`query.list_objects`),
+    /// never re-filtered or re-derived here (design note: "do not invent
+    /// a parallel rule set").
+    pub async fn admin_list_objects(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        query: &dyn crate::admin_query::WorldAdminQuery,
+    ) -> Result<Vec<crate::admin_query::ObjectSummary>, AdminError> {
+        if claims.tier < OBJECT_LIST_MIN_TIER {
+            self.audit(
+                "admin.objects.list",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some("reason=forbidden".to_string()),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        match query.list_objects(&claims.sub, claims.tier).await {
+            Ok(rows) => {
+                self.audit(
+                    "admin.objects.list",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(format!("count={}", rows.len())),
+                )
+                .await;
+                Ok(rows)
+            }
+            Err(err) => {
+                self.audit(
+                    "admin.objects.list",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(format!("reason={err:?}")),
+                )
+                .await;
+                Err(err.into())
+            }
+        }
+    }
+
+    /// `GET /api/v1/admin/objects/:path/vars` (OBI-234, M-ADM-4): tier >=
+    /// 4 ([`OBJECT_VARS_MIN_TIER`]) to inspect any object's variables,
+    /// and tier >= 5 ([`SECURE_VARS_MIN_TIER`]) specifically for anything
+    /// under `/secure/` -- both floors are on top of, not instead of,
+    /// `valid_read` itself (`query.object_vars`), which is the real
+    /// boundary on the world side. Every call is audited, allow or deny,
+    /// per access (M-ADM-4's "audited per access" for this endpoint
+    /// specifically).
+    pub async fn admin_object_vars(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        query: &dyn crate::admin_query::WorldAdminQuery,
+        path: &str,
+    ) -> Result<crate::admin_query::ObjectVars, AdminError> {
+        let detail = format!("path={path}");
+        if claims.tier < OBJECT_VARS_MIN_TIER {
+            self.audit(
+                "admin.objects.vars",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!("{detail} reason=forbidden")),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        if is_or_might_be_secure(path) && claims.tier < SECURE_VARS_MIN_TIER {
+            self.audit(
+                "admin.objects.vars",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!("{detail} reason=forbidden_secure")),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        match query.object_vars(&claims.sub, claims.tier, path).await {
+            Ok(vars) => {
+                self.audit(
+                    "admin.objects.vars",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(detail),
+                )
+                .await;
+                Ok(vars)
+            }
+            Err(err) => {
+                self.audit(
+                    "admin.objects.vars",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(format!("{detail} reason={err:?}")),
+                )
+                .await;
+                Err(err.into())
+            }
+        }
+    }
+
+    /// `GET /api/v1/admin/errors` (OBI-235, M-ADM-4): tier >= 3
+    /// ([`ERROR_INBOX_MIN_TIER`]), consistent with [`OBJECT_LIST_MIN_TIER`].
+    /// As with `admin_list_objects`, the per-program `valid_read` filter
+    /// and the `/secure` redaction rule (M-ERR-1) both run on the world
+    /// side (`query.errors`) -- this never re-derives or relaxes either
+    /// one. `program_prefix` is an optional caller-supplied filter (same
+    /// shape as the `errors` efun's own `filter` argument).
+    pub async fn admin_errors(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        query: &dyn crate::admin_query::WorldAdminQuery,
+        program_prefix: Option<&str>,
+    ) -> Result<Vec<crate::admin_query::ErrorGroup>, AdminError> {
+        let detail = program_prefix.map(|p| format!("program_prefix={p}"));
+        if claims.tier < ERROR_INBOX_MIN_TIER {
+            self.audit(
+                "admin.errors",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!(
+                    "{} reason=forbidden",
+                    detail.clone().unwrap_or_default()
+                )),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        match query.errors(&claims.sub, claims.tier, program_prefix).await {
+            Ok(rows) => {
+                self.audit(
+                    "admin.errors",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(format!(
+                        "{} count={}",
+                        detail.unwrap_or_default(),
+                        rows.len()
+                    )),
+                )
+                .await;
+                Ok(rows)
+            }
+            Err(err) => {
+                self.audit(
+                    "admin.errors",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(format!("{} reason={err:?}", detail.unwrap_or_default())),
+                )
+                .await;
+                Err(err.into())
+            }
+        }
+    }
+
+    /// M-ADM-2: a session is "stepped up" if its `mfa_at` is within the
+    /// last 5 minutes. A session that never completed a second factor
+    /// (`mfa_at: None`, e.g. a sub-T3 password-only login) is never
+    /// stepped up, regardless of its current tier.
+    fn has_fresh_step_up(&self, claims: &AccessClaims) -> bool {
+        let Some(mfa_at) = claims.mfa_at else {
+            return false;
+        };
+        let now_secs = now().unix_timestamp();
+        now_secs.saturating_sub(mfa_at) <= STEP_UP_WINDOW_SECS
+    }
+
     /// Append one audit row (M-AUTH-9), logging and swallowing any
     /// directory failure -- see [`StaffDirectory::record_audit`]'s doc
     /// comment for why this never propagates.
@@ -784,6 +1304,62 @@ fn totp_gate_detail(error: &AuthError) -> &'static str {
         AuthError::TotpInvalid => "totp_invalid",
         AuthError::InvalidCredentials => "staff_row_missing",
         _ => "totp_gate_failed",
+    }
+}
+
+/// Does `path` name, or might it after normalization name, something
+/// under `/secure/` (OBI-234, CTO review on PR #98)? This is only the
+/// HTTP edge's T5 floor for [`AuthService::admin_object_vars`] -- the
+/// real gate is `valid_read` on the world side, which resolves the path
+/// for real. This helper exists so the edge floor isn't trivially
+/// bypassed by an unnormalized path (`//secure/x`, `/./secure/x`) while
+/// `valid_read` still (correctly) treats it as `/secure/x`; it fails
+/// *closed*: anything it can't confidently normalize (a `..` segment) is
+/// treated as "might be secure", never waved through as "definitely
+/// not".
+///
+/// Splits on `/`, drops empty segments (collapsing repeated slashes) and
+/// `.` segments; returns `true` if a `..` segment is seen (can't resolve
+/// without knowing the real filesystem, so don't try -- refuse to rule
+/// out `/secure/`) or if the first remaining segment is `"secure"`.
+fn is_or_might_be_secure(path: &str) -> bool {
+    // A `..` anywhere in the path can walk back out past a non-`secure`
+    // prefix (e.g. `/std/../secure/master`), so treat any `..` segment as
+    // "might be secure" rather than only checking the first segment
+    // (CTO re-review must-fix, PR #98 / OBI-185 / OBI-234).
+    if path.split('/').any(|segment| segment == "..") {
+        return true;
+    }
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => continue,
+            "secure" => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// The rate limiter's account key for a resolved staff uid (OBI-204): the
+/// one namespace both [`AuthService::login`] and
+/// [`AuthService::totp_confirm`] use, so a wrong password and a wrong
+/// TOTP code for the same staff member always land on the same bucket.
+fn uid_rate_key(uid: &str) -> String {
+    format!("{}{uid}", ratelimit::UID_KEY_PREFIX)
+}
+
+/// The rate limiter's account key for a login attempt whose username
+/// didn't resolve to a uid (unknown username, or the directory was
+/// unavailable for the resolve lookup) -- namespaced distinctly from
+/// [`uid_rate_key`] so it can never collide with a real uid's bucket.
+fn username_rate_key(username: &str) -> String {
+    format!("user:{username}")
+}
+
+fn account_rate_key(resolved_uid: Option<&str>, username: &str) -> String {
+    match resolved_uid {
+        Some(uid) => uid_rate_key(uid),
+        None => username_rate_key(username),
     }
 }
 

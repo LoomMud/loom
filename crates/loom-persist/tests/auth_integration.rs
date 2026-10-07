@@ -485,7 +485,7 @@ fn rand_github_id() -> i64 {
 // `refresh_tokens`), atomic rotation (`session_rotate`), family-scoped
 // revocation (`session_revoke_family_by_token`), idle expiry, and the
 // revoke-all-for-uid triggers on tier/TOTP/password/GitHub-unlink/staff
-// removal (migration 0006_staff_sessions.sql).
+// removal (migration 0008_staff_sessions.sql).
 // -----------------------------------------------------------------------
 
 async fn session_is_revoked(owner: &sqlx::PgPool, token_hash: &str) -> bool {
@@ -784,7 +784,7 @@ async fn password_change_revokes_every_session_for_the_uid() {
 }
 
 /// Acceptance (M-AUTH-5): removal of the staff row revokes every session
-/// for that uid -- `ON DELETE CASCADE` (migration 0006) means the row is
+/// for that uid -- `ON DELETE CASCADE` (migration 0008) means the row is
 /// gone outright rather than merely `revoked_at`-stamped, which is
 /// stronger than revocation (nothing is left to replay against at all).
 #[tokio::test]

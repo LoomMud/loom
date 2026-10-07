@@ -1,0 +1,34 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// A minimal player for the OBI-237 admin-query fixture: `become NAME`
+// (`seteuid`) simulates `/secure/login` binding an account to a
+// connection after it authenticates (the driver's own `who`/account
+// convention, see `World::who_sessions`'s doc comment); `spawnitem` and
+// `spawnvault` clone the fixture's two other programs (one readable by
+// every euid, one `secure/master.wf`'s `valid_read` denies) so
+// `tests/obi_237_admin_query.rs` can exercise `World::admin_list_objects`/
+// `admin_object_vars`'s real `valid_read` filtering against live clones.
+pub fn logon() {
+    send(self, "ready\n")
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "become" and len(words) == 2 {
+        seteuid(words[1])
+        send(self, "ok\n")
+    } else if verb == "spawnitem" {
+        let it = clone_object("/std/item")
+        send(self, $"{object_name(it)}\n")
+    } else if verb == "spawnvault" {
+        let v = clone_object("/std/vault")
+        send(self, $"{object_name(v)}\n")
+    } else {
+        send(self, "What?\n")
+    }
+}
+
+pub fn net_dead() {
+}

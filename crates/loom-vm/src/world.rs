@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use crate::bcvm::Value;
 use crate::bcvm::compile_worker::{RecompileJob, RecompileSetJob};
 use crate::bcvm::registry::{Compiler, Registry, RegistryHost};
-use crate::bcvm::vm::{Limits as VmLimits, RtError};
+use crate::bcvm::vm::{Host as VmHost, Limits as VmLimits, RtError};
 use crate::host::{Host, NullHost};
 use crate::object::ObjectId;
 use crate::roles::RolesSnapshot;
@@ -28,6 +28,22 @@ use std::sync::Arc;
 
 /// Path of the master object.
 pub const MASTER_PATH: &str = "/secure/master";
+
+/// Default player-save root (spec §8.1, OBI-171): a `saves` directory
+/// *beside* the mudlib root, not inside it -- deliberately outside
+/// whatever directory `compile_object`/the Git-backed VFS (§8.5) treats
+/// as the mudlib's own working tree, so player save files are never
+/// candidates for `git add`, a `revert <file>`, or a recompile sweep.
+/// Falls back to a `saves` subdirectory of `mudlib_root` itself only if
+/// it has no parent at all (e.g. booted at a filesystem root, which
+/// real deployments never do -- `loom-cli`'s `--save-dir` is there for
+/// anyone who needs a different layout).
+fn default_save_root(mudlib_root: &Path) -> PathBuf {
+    match mudlib_root.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join("saves"),
+        _ => mudlib_root.join("saves"),
+    }
+}
 
 /// One [`AuditEntry`], resolved to owned strings, ready for a driver-side
 /// Postgres sink (OBI-36 D-S2.5; see [`World::drain_audit_since`]).
@@ -51,6 +67,84 @@ pub struct AuditRow {
     /// own timestamp, not whenever a sink eventually writes the row --
     /// CTO review, OBI-123 N2).
     pub at_unix_ms: i64,
+}
+
+/// One live connection, as reported by the OBI-237 admin-query
+/// world-thread side (`World::who_sessions`). Mirrors
+/// `loom_http::admin_query::WhoEntry` field-for-field; defined here
+/// (rather than depending on `loom-http` from `loom-vm`) so `loom-cli`'s
+/// bridging code is the only place that needs to know both shapes --
+/// see that module's doc comment (M-ADM-3: never an email or an IP,
+/// neither of which exists anywhere in `World`'s own state for a
+/// connection, so there is no field here to leak one from).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub conn_id: u64,
+    /// The bound account uid, if logged in -- see
+    /// [`World::who_sessions`]'s doc comment for exactly what "logged in"
+    /// means here.
+    pub account: Option<String>,
+    pub connected_at: std::time::SystemTime,
+    pub idle_secs: i64,
+}
+
+/// One object in the OBI-237 admin-query `list_objects` answer, already
+/// filtered by `valid_read` (see [`World::admin_list_objects`]). Mirrors
+/// `loom_http::admin_query::ObjectSummary`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminObjectSummary {
+    pub path: String,
+    pub euid: String,
+}
+
+/// One rendered variable in the OBI-237 admin-query `object_vars` answer.
+/// Mirrors `loom_http::admin_query::VarEntry`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminVarEntry {
+    pub name: String,
+    pub value: String,
+}
+
+/// The OBI-237 admin-query `object_vars` answer for one live object, once
+/// `valid_read` has already passed (see [`World::admin_object_vars`]).
+/// Mirrors `loom_http::admin_query::ObjectVars`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminObjectVars {
+    pub path: String,
+    pub vars: Vec<AdminVarEntry>,
+}
+
+/// One group in the OBI-235/OBI-237 admin-query `errors` answer, already
+/// `valid_read`-filtered per program and M-ERR-1-redacted (see
+/// [`World::admin_errors`]). Mirrors `loom_http::admin_query::ErrorGroup`
+/// field-for-field (which itself mirrors `crate::errors::ErrorRecord`,
+/// except `line` is `Option<u32>` here/there vs. `ErrorRecord`'s `0`-for-
+/// unknown convention).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdminErrorGroup {
+    pub program: String,
+    pub function: String,
+    pub line: Option<u32>,
+    pub message: String,
+    pub redacted: bool,
+    pub count: u64,
+    pub first_seen_unix_ms: u64,
+    pub last_seen_unix_ms: u64,
+    pub sample_trace: Vec<String>,
+}
+
+/// A connection's session timing (OBI-237): `connected_at` is wall-clock
+/// (what `who` reports), `last_activity` is monotonic (`Instant`, so
+/// `idle_secs` can never go backwards under a clock adjustment). Kept
+/// separate from `BcObject` (which already tracks `conn`) because a
+/// connection outlives any single bound object across a `seteuid`/login
+/// flow, and because `Registry::capture`'s snapshot (OBI-173) has no
+/// reason to carry wall-clock session metadata across a copyover --
+/// `World::reconnect` re-seeds it fresh instead (see that method's doc
+/// comment).
+struct ConnSession {
+    connected_at: std::time::SystemTime,
+    last_activity: std::time::Instant,
 }
 
 /// The `account_create`/`account_login` async backend (spec, OBI-85):
@@ -243,6 +337,13 @@ pub struct AccountsCtx<'a> {
 /// so tests (and eventually builder config) can dial it down.
 pub const DEFAULT_HEARTBEAT_INTERVAL_TICKS: u64 = 20;
 
+/// Player autosave cadence (spec §8.1: "players autosave every 5 min",
+/// OBI-171): at the same 100 ms world-tick granularity, 5 minutes is
+/// 3,000 world ticks. A `Limits` field for the same reason
+/// `heartbeat_interval_ticks` is -- tests dial it down instead of
+/// waiting out a real 5 minutes of simulated ticks.
+pub const DEFAULT_AUTOSAVE_INTERVAL_TICKS: u64 = 3_000;
+
 /// Per-execution guard rails (§5.8).
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -261,6 +362,12 @@ pub struct Limits {
     /// many `World::tick()` calls (world ticks), not every tick (OBI-82).
     /// `call_out` delays remain in world ticks and are unaffected by this.
     pub heartbeat_interval_ticks: u64,
+    /// Every currently-connected (interactive) object gets an
+    /// `autosave()` apply once every this many world ticks (spec §8.1,
+    /// OBI-171) -- the driver-side half of "players autosave every 5
+    /// min"; see `World::tick`'s doc comment for the other two triggers
+    /// (quit, net-dead), both routed through `World::disconnect`.
+    pub autosave_interval_ticks: u64,
 }
 
 impl Default for Limits {
@@ -271,6 +378,7 @@ impl Default for Limits {
             mem_quota_bytes: VmLimits::default().mem_quota_bytes,
             eager_upgrade_batch: 200,
             heartbeat_interval_ticks: DEFAULT_HEARTBEAT_INTERVAL_TICKS,
+            autosave_interval_ticks: DEFAULT_AUTOSAVE_INTERVAL_TICKS,
         }
     }
 }
@@ -307,6 +415,13 @@ impl std::error::Error for BootError {}
 /// The game world. Driven by exactly one thread (the world thread, §3.3).
 pub struct World {
     root: PathBuf,
+    /// Player-save root for `save_object`/`restore_object` (spec §8.1,
+    /// OBI-171). Defaults to a `saves` directory *next to* (not inside)
+    /// the mudlib root -- see [`default_save_root`] -- so player save
+    /// data never lands inside the Git-backed `.wf` tree a `revert`/
+    /// recompile or `git pull` operates on; overridable with
+    /// [`World::set_save_root`] (`loom-cli`'s `--save-dir`).
+    save_root: PathBuf,
     registry: Registry,
     compiler: Compiler,
     master: Option<ObjectId>,
@@ -368,6 +483,12 @@ pub struct World {
     /// `disk_quota_mb`'s per-`<u>` byte counter (OBI-137 S1): see
     /// `crate::disk_usage::DiskUsage`.
     disk_usage: crate::disk_usage::DiskUsage,
+    /// Grouped runtime-error inbox (OBI-169, spec §8.3): see
+    /// `crate::errors::ErrorInbox`. Fed uniformly by `World::exec`.
+    errors: crate::errors::ErrorInbox,
+    /// Per-connection session timing (OBI-237 admin query `who`): see
+    /// [`ConnSession`].
+    sessions: HashMap<u64, ConnSession>,
 }
 
 /// Identifies one [`World::begin_recompile`] call, so its eventual result
@@ -470,6 +591,118 @@ impl TickShareWindow {
     }
 }
 
+/// `PUT /api/v1/files/content`'s precondition (OBI-180 M-FS-6): either
+/// the caller's `ETag` must match the file's current contents (update),
+/// or the file must not exist yet (create).
+#[derive(Debug, Clone)]
+pub enum FileMatchPrecondition {
+    /// `If-Match: "<etag>"` -- the file must currently exist and hash to
+    /// exactly this `sha256` hex digest (quoted or not; compared after
+    /// stripping surrounding `"`).
+    IfMatch(String),
+    /// `If-None-Match: *` -- the file must not currently exist.
+    IfNoneMatchStar,
+}
+
+/// Outcome of [`World::call_file_write_if_match`], distinct from its
+/// `Err(String)` (an authorization refusal or I/O failure, same shape as
+/// [`World::call_file_efun`]'s): all three of these are a successful,
+/// authorized attempt that ran to completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCasOutcome {
+    /// The write happened.
+    Written,
+    /// `write_file` refused for disk quota, not authorization (OBI-137
+    /// S1) -- the precondition was satisfied, the write itself just
+    /// didn't happen.
+    QuotaExceeded,
+    /// The precondition didn't hold (stale `If-Match`, or
+    /// `If-None-Match: *` against a file that already exists).
+    PreconditionFailed,
+}
+
+/// Why [`World::list_dir`] didn't return a listing (OBI-180 M-FS-3, CTO
+/// review on PR #117 must-fix 2): distinguishes an outright refusal
+/// (reserved principal, or a malformed path that never reaches a
+/// `valid_read` apply at all) from a genuine failure partway through
+/// evaluating the listing (a `valid_read` apply that threw or exhausted
+/// its tick budget, or an unexpected `fileio` I/O error). The HTTP layer
+/// maps `Refused` the same "looks like not found" way as a plain
+/// `valid_read` no (M-FS-3); `Internal` is a `503`, the same split
+/// `loom_http::admin_query::WorldQueryError::Internal` already draws for
+/// the admin endpoints (OBI-279) -- a `valid_read` that can't produce a
+/// real decision must never look like a (possibly truncated) successful
+/// listing or a plain refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListDirError {
+    Refused(String),
+    Internal(String),
+}
+
+/// Cap on how many directory entries [`World::list_dir`] evaluates and
+/// returns in one call (CTO review on PR #117, should-fix 1): each entry
+/// costs one `valid_read` apply (a cache miss plus `MISS_CHARGE` the
+/// first time) inside a single `exec`, so an unbounded directory could
+/// otherwise exhaust the exec's tick budget (becoming an `Internal`
+/// error for the *whole* listing) or hold the world thread for a long
+/// time. Entries are evaluated in the sorted order `fileio::list_dir`
+/// already returns, so the cap always keeps the same prefix regardless
+/// of how many of them end up `valid_read`-filtered out.
+pub const MAX_LIST_ENTRIES: usize = 1000;
+
+/// [`World::list_dir`]'s successful result: the (`valid_read`-filtered,
+/// possibly [`MAX_LIST_ENTRIES`]-truncated) entry names, plus whether
+/// the real directory had more entries than made it into `names`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListDirResult {
+    pub names: Vec<String>,
+    pub truncated: bool,
+}
+
+/// `sha256(contents)`, hex-encoded (OBI-180 M-FS-6). Deliberately
+/// duplicated in `loom_http::files::etag_for` rather than shared: sharing
+/// it would mean `loom-http` depending on `loom-vm` (or vice versa) just
+/// for a ten-line hash function, a dependency edge neither crate
+/// otherwise needs (see that module's doc for why `loom-http` stays
+/// `loom-vm`-free). Both sides must still agree byte-for-byte, so any
+/// change here needs the matching change there, and vice versa -- a unit
+/// test on each side pins the same fixture string to the same digest.
+fn file_etag_hex(contents: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(contents.as_bytes());
+    let mut s = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// `true` if `contents` hashes to `expected` (already unquoted). Used
+/// only by [`World::call_file_write_if_match`]'s `If-Match` branch.
+fn file_etag_matches(contents: &str, expected: &str) -> bool {
+    file_etag_hex(contents) == expected
+}
+
+#[cfg(test)]
+mod file_etag_tests {
+    use super::*;
+
+    /// Pins `file_etag_hex` to the exact same digest
+    /// `loom_http::files::etag_for`'s own test pins for the same fixture
+    /// string (minus quoting) -- both sides must agree byte-for-byte on
+    /// what `sha256("int x;")` hex-encodes to, since one computes the
+    /// `ETag` a client sees and the other independently verifies the
+    /// `If-Match` built from it.
+    #[test]
+    fn pinned_against_the_loom_http_fixture() {
+        assert_eq!(
+            file_etag_hex("int x;"),
+            "e13e332bd08e13cbe2aee094e130ed23878b3b554be5b9a665a83e63caa987ae"
+        );
+    }
+}
+
 impl World {
     /// Boot a world from `mudlib_root`: compile and load `/secure/master.wf`.
     pub fn boot(mudlib_root: &Path) -> Result<World, BootError> {
@@ -482,6 +715,7 @@ impl World {
         }
         let mut w = World {
             root: mudlib_root.to_path_buf(),
+            save_root: default_save_root(mudlib_root),
             registry: Registry::default(),
             compiler: Compiler::new(mudlib_root.to_path_buf()),
             master: None,
@@ -507,6 +741,8 @@ impl World {
             last_call_out_quota_uid: None,
             tick_share: HashMap::new(),
             disk_usage: crate::disk_usage::DiskUsage::default(),
+            errors: crate::errors::ErrorInbox::new(),
+            sessions: HashMap::new(),
         };
         let mut null = NullHost;
         let sentinel = ObjectId {
@@ -520,6 +756,92 @@ impl World {
             .map_err(|e| BootError::Master(e.report()))?;
         w.master = Some(master);
         Ok(w)
+    }
+
+    /// Begin a binary world snapshot (design spec §8.1 model 2, OBI-173):
+    /// captures the object graph copy-on-write and returns a job the
+    /// caller drives to completion with
+    /// `SnapshotJob::encode_step`/`encode_all` -- see `crate::snapshot`'s
+    /// module docs for the full copy-on-write story and current scope
+    /// limits. The capture itself (`Registry::capture`) is the *entire*
+    /// synchronous "pause" this costs the world thread: its result does
+    /// not borrow `self`, so further `World::tick` calls can run
+    /// immediately after this returns, even while the job's bytes are
+    /// still being encoded.
+    ///
+    /// `Err` only while an `atomic fn` scope is open (see
+    /// `Registry::capture`'s own docs for why).
+    pub fn begin_snapshot(
+        &self,
+    ) -> Result<crate::snapshot::SnapshotJob, crate::snapshot::SnapshotError> {
+        self.registry
+            .capture()
+            .map(crate::snapshot::SnapshotJob::new)
+            .map_err(|_| crate::snapshot::SnapshotError::AtomicScopeOpen)
+    }
+
+    /// Load a binary world snapshot into a fresh driver process (the
+    /// standby side of copyover, design spec §8.1/OBI-173): `mudlib_root`
+    /// is compiled on demand per distinct program path the snapshot
+    /// references, exactly as [`World::boot`] would, and every object's
+    /// dynamic state (vars, placement, connections) is restored from
+    /// `bytes`. Does **not** run master's `connect()`/boot-time applies --
+    /// `master` is simply whichever restored object was registered under
+    /// [`MASTER_PATH`], `None` if the snapshot had none.
+    ///
+    /// Fails cleanly (no panic) on a bad magic, an incompatible ABI
+    /// version, a truncated/corrupt file, a value kind this build cannot
+    /// yet decode, or a program path that no longer compiles against this
+    /// `mudlib_root` -- see `crate::snapshot::SnapshotError`.
+    pub fn load_snapshot(
+        mudlib_root: &Path,
+        limits: Limits,
+        bytes: &[u8],
+    ) -> Result<World, crate::snapshot::SnapshotError> {
+        if !mudlib_root.is_dir() {
+            return Err(crate::snapshot::SnapshotError::Restore(format!(
+                "{} is not a directory",
+                mudlib_root.display()
+            )));
+        }
+        let decoded = crate::snapshot::decode_snapshot(bytes)?;
+        let mut registry = Registry::default();
+        let mut compiler = Compiler::new(mudlib_root.to_path_buf());
+        registry
+            .restore(decoded, &mut compiler)
+            .map_err(crate::snapshot::SnapshotError::Restore)?;
+        let master = registry.names.get(MASTER_PATH).copied();
+        Ok(World {
+            root: mudlib_root.to_path_buf(),
+            registry,
+            compiler,
+            master,
+            limits,
+            scheduler: Scheduler::new(),
+            pending_recompiles: Vec::new(),
+            finished_recompiles: Vec::new(),
+            next_recompile_token: 0,
+            pending_recompile_sets: Vec::new(),
+            finished_recompile_sets: Vec::new(),
+            next_recompile_set_token: 0,
+            save_root: default_save_root(mudlib_root),
+            account_auth: Box::new(NullAccountAuth),
+            account_next_id: 0,
+            account_pending: HashMap::new(),
+            account_results: VecDeque::new(),
+            security: SecurityState::new(),
+            roles: Arc::new(RolesSnapshot::empty()),
+            roles_generation: 0,
+            roles_backend: Box::new(NullRolesMutations),
+            roles_next_id: 0,
+            roles_pending: HashMap::new(),
+            roles_results: VecDeque::new(),
+            last_call_out_quota_uid: None,
+            tick_share: HashMap::new(),
+            disk_usage: crate::disk_usage::DiskUsage::default(),
+            errors: crate::errors::ErrorInbox::new(),
+            sessions: HashMap::new(),
+        })
     }
 
     /// Install the real `account_create`/`account_login` backend (OBI-85);
@@ -644,6 +966,19 @@ impl World {
         &self.root
     }
 
+    /// The player-save root (spec §8.1, OBI-171) `save_object`/
+    /// `restore_object` read and write under.
+    pub fn save_root(&self) -> &Path {
+        &self.save_root
+    }
+
+    /// Override the player-save root (`loom-cli`'s `--save-dir`); defaults
+    /// to [`default_save_root`] of the mudlib root this world was booted
+    /// from. Takes effect for every save/restore from this call on.
+    pub fn set_save_root(&mut self, dir: PathBuf) {
+        self.save_root = dir;
+    }
+
     /// Run `body` against a fresh [`RegistryHost`] with driver context
     /// wired up (network host, `this_player`, bound connection, master).
     /// `acting` is the object whose own euid seeds this execution's guard
@@ -723,6 +1058,8 @@ impl World {
             cut_guard,
             input_actor,
             &mut self.disk_usage,
+            &mut self.errors,
+            self.save_root.clone(),
         );
         let result = body(&mut rh);
         // OBI-121 S2c `tick_share_per_min`: charge whatever ticks this
@@ -734,7 +1071,390 @@ impl World {
             self.record_tick_share_usage(uid, used);
         }
         self.registry.debug_assert_atomic_scope_closed();
+        // OBI-169: every execution's `Err` is recorded in the error inbox
+        // here, uniformly -- independent of whether the caller also
+        // reports it to a player (`World::report`) or silently drops it
+        // (a heartbeat, a `call_out`, `net_dead`, an eager upgrade
+        // migration, an `account_result`/`roles_result` drain).
+        if let Err(e) = &result {
+            self.note_error(acting, e);
+        }
         result
+    }
+
+    /// Record `e` in the error inbox (OBI-169), attributed to the
+    /// **innermost** frame's own declaring program (`e.trace_programs`'s
+    /// first entry -- most recent frame first, same order as
+    /// `e.trace`), falling back to `acting`'s own program only when the
+    /// error carries no trace at all (raised before any frame ever
+    /// pushed, e.g. `start`'s "no function" lookup failure).
+    ///
+    /// CTO review (OBI-169, PR #72, must-fix 1): attributing to
+    /// `acting`'s program instead -- the *entry* object, not where the
+    /// error actually originated -- would leak a `/secure` program's
+    /// error message (which can embed input) to anyone who can
+    /// `valid_read` the entry object's own, less-privileged program, any
+    /// time a cross-object/program call chain (`call_other`, an apply)
+    /// fails several frames deep inside something the caller could never
+    /// read directly. The grouping key's `program` (and the redaction
+    /// rule below) must both be keyed on the real origin.
+    ///
+    /// Grouped by `(program, line, message)` per spec §8.3 (OBI-231):
+    /// `line` comes from the same innermost frame as `program`
+    /// (`e.trace_lines`, parallel to `e.trace_programs`).
+    fn note_error(&mut self, acting: ObjectId, e: &RtError) {
+        let program = e.trace_programs.first().cloned().unwrap_or_else(|| {
+            self.registry
+                .get(acting)
+                .map(|o| o.program.path.to_string())
+                .unwrap_or_else(|| "?".to_string())
+        });
+        let function = crate::errors::function_of(e);
+        let line = crate::errors::line_of(e);
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let redacted = program.starts_with("/secure/");
+        self.errors.record(
+            &program,
+            &function,
+            line,
+            &e.message,
+            &e.trace,
+            now_unix_ms,
+            redacted,
+        );
+    }
+
+    /// The grouped runtime-error inbox (OBI-169), unfiltered by
+    /// permission: for tests/introspection and the driver's
+    /// `/api/v1/errors` HTTP handler, which has no in-game caller to
+    /// filter by (unlike the `errors` efun -- see `loom-http`'s doc
+    /// comment on that route for the admin-only rationale).
+    /// `program_prefix` matches [`crate::errors::ErrorInbox::snapshot`].
+    pub fn errors_snapshot(&self, program_prefix: Option<&str>) -> Vec<crate::errors::ErrorRecord> {
+        self.errors.snapshot(program_prefix)
+    }
+
+    /// `GET /api/v1/admin/who`'s real data (OBI-237, the world-thread side
+    /// of the admin query channel, OBI-234 follow-up): one row per live
+    /// connection, in ascending `conn` id order.
+    ///
+    /// `account` is the bound object's current *euid*, but only once it
+    /// differs from the object's immutable `uid` -- i.e. only once
+    /// something has `seteuid`'d it, which in a real mudlib is exactly
+    /// what `/secure/login` does once a connection authenticates (see
+    /// `bcvm::registry::RegistryHost::check_confinement`'s doc comment
+    /// for the same euid-is-the-account convention this driver already
+    /// relies on for `move_to` confinement). A connection still at a
+    /// login/creation prompt -- never `seteuid`'d -- reports `None`. This
+    /// is a convention, not a dedicated "logged in" flag: the driver has
+    /// no concept of its own of what "logged in" means (spec: entirely
+    /// mudlib policy), so this is the best available proxy, not an
+    /// invented parallel one.
+    ///
+    /// Never an email or an IP address: neither exists anywhere in
+    /// `World`'s own state for a connection (M-ADM-3), so there is no
+    /// field here to leak one from even by accident.
+    pub fn who_sessions(&self) -> Vec<SessionSummary> {
+        let mut out: Vec<SessionSummary> = self
+            .registry
+            .conns
+            .iter()
+            .filter_map(|(&conn_id, &ob)| {
+                let o = self.registry.get(ob)?;
+                let session = self.sessions.get(&conn_id)?;
+                let account = (o.euid != o.uid).then(|| self.principal_name(o.euid).to_string());
+                let idle_secs = std::time::Instant::now()
+                    .saturating_duration_since(session.last_activity)
+                    .as_secs() as i64;
+                Some(SessionSummary {
+                    conn_id,
+                    account,
+                    connected_at: session.connected_at,
+                    idle_secs,
+                })
+            })
+            .collect();
+        out.sort_unstable_by_key(|s| s.conn_id);
+        out
+    }
+
+    /// `GET /api/v1/admin/objects`'s real data (OBI-237): every live
+    /// object whose *declaring program* `caller_euid` can `valid_read` --
+    /// the exact `Operation::Read`/`authorize` call path every other
+    /// `valid_read` call-site uses (`bcvm::registry::RegistryHost::
+    /// admin_valid_read`'s doc comment; the `errors` efun's own
+    /// per-program filter is the closest existing precedent, down to "a
+    /// denied program's objects are silently omitted, not an error" --
+    /// see `errors_efun`'s doc comment). The decision is cached per
+    /// distinct program for the duration of this one call (same reason
+    /// `errors_efun` does it: many objects commonly share one program,
+    /// and the security decision cache would dedupe the `valid_read`
+    /// apply calls anyway, but this skips even the cache lookups).
+    ///
+    /// Run inside a `cut_guard` carrying exactly `caller_euid` as both
+    /// `uid` and `euid` (D-S1.2 rule 5's cut semantics): the admin caller
+    /// has no live in-game object at all (an HTTP request, not a
+    /// connection), so there is no `self_object` principal to derive a
+    /// guard from the normal way -- this is the explicit substitute,
+    /// exactly as a scheduled `call_out`'s captured guard substitutes for
+    /// its own missing "current" principal.
+    ///
+    /// `caller_tier` is accepted for parity with `loom_http::admin_query::
+    /// WorldAdminQuery`'s signature but intentionally unused: the world
+    /// side's permission boundary is `valid_read` alone, never a parallel
+    /// tier-based rule (HTTP's own T3 floor has already run by the time
+    /// this is called -- this is the *real* gate behind it, same spec
+    /// reasoning as `errors_efun`'s T5 redaction note).
+    ///
+    /// CTO review (OBI-279, follow-up to OBI-237 PR #102, non-blocking
+    /// note 1): `Err` (a tick-budget or other runtime failure inside
+    /// `valid_read` itself, surfaced by [`RegistryHost::admin_valid_read`]
+    /// rather than silently treated as a denial the way it would be for
+    /// an in-game efun's `valid_*` gate) propagates out of this method,
+    /// not swallowed into an empty, successful-looking `Vec` -- the HTTP
+    /// edge turns this into a `503` (`WorldQueryError`), not "nothing
+    /// readable". A `valid_read` that runs and returns a plain `bool`,
+    /// allow or deny, is unaffected: this only changes what happens when
+    /// `valid_read` *itself* fails to produce an answer at all.
+    pub fn admin_list_objects(
+        &mut self,
+        caller_euid: &str,
+        _caller_tier: i16,
+        host: &mut dyn Host,
+    ) -> Result<Vec<AdminObjectSummary>, RtError> {
+        // CTO review (OBI-237 PR #102, must-fix B1): `caller_euid` is an
+        // HTTP-authenticated staff `sub`, never validated against the
+        // driver's reserved-principal rule the way an in-game `seteuid`
+        // is (`bcvm::registry::RegistryHost::check_reserved_euid`,
+        // D-S3.1/M-FS-1). Refused *before* interning: `syms.intern("root")`
+        // reuses `security::ROOT` (sym 0), which `GuardSet::with` drops
+        // as the identity element, leaving an **empty** guard -- D-S1.2's
+        // "an all-root stack is allowed without asking the master" rule,
+        // meaning a staff account literally named `root` (or `mudlib`, or
+        // any `domain:*`) would silently get root's own unconditional
+        // `valid_read` pass, `/secure` included, instead of being denied.
+        // `is_reserved_principal` denies exactly those names, the same
+        // check `check_reserved_euid` applies to an in-game `seteuid`.
+        if crate::security::is_reserved_principal(caller_euid) {
+            return Ok(Vec::new());
+        }
+        let master = self.master_or_sentinel();
+        let euid_sym = self.registry.syms.intern(caller_euid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: euid_sym,
+            euid: euid_sym,
+        });
+        let ids = self.registry.ids();
+        self.exec(host, master, None, None, Some(guard), None, None, |h| {
+            let mut decided: HashMap<String, bool> = HashMap::new();
+            let mut out = Vec::new();
+            for id in ids {
+                let Some(o) = h.registry.get(id) else {
+                    continue;
+                };
+                let program_path = o.program.path.to_string();
+                let name = o.name.clone();
+                let euid_sym = o.euid;
+                let allowed = match decided.get(&program_path) {
+                    Some(&a) => a,
+                    None => {
+                        let a = h.admin_valid_read("list_objects", &program_path)?;
+                        decided.insert(program_path, a);
+                        a
+                    }
+                };
+                if !allowed {
+                    continue;
+                }
+                let euid = h.registry.syms.name(euid_sym).to_string();
+                out.push(AdminObjectSummary { path: name, euid });
+            }
+            Ok(out)
+        })
+    }
+
+    /// `GET /api/v1/admin/objects/:path/vars`'s real data (OBI-237):
+    /// `path`'s variables, once `caller_euid` passes the exact same
+    /// `valid_read` gate as [`World::admin_list_objects`] -- on `path`'s
+    /// *declaring program*, not the instance path, same as every other
+    /// `valid_read` call-site.
+    ///
+    /// `None` both for a `path` that does not resolve to a live object
+    /// ([`World::find_object`]) and for one `valid_read` refuses --
+    /// deliberately indistinguishable (the trait doc comment this
+    /// mirrors, `loom_http::admin_query::WorldAdminQuery::object_vars`,
+    /// requires exactly this: "never a different error shape", so the
+    /// HTTP layer can't be used to probe which `/secure` paths exist).
+    /// This is also where `/secure` confidentiality is actually
+    /// enforced -- the HTTP edge's T5 tier floor is a convenience, not
+    /// the real boundary; a master whose `valid_read` denies a
+    /// `/secure/**` program to a tier-5 caller is still obeyed here.
+    ///
+    /// CTO review (OBI-237 PR #102, non-blocking note): this renders
+    /// *every* variable `valid_read` lets the caller see, with no
+    /// credential-shaped-name scrubbing of its own (e.g. `/secure/login`'s
+    /// transient `pending_pw` would render like any other var). That is
+    /// deliberate, not an oversight: `valid_read` is the one real
+    /// confidentiality boundary this method enforces (the line above),
+    /// and a master whose policy lets a caller read a program at all is
+    /// trusted to have already decided that caller may see its state --
+    /// adding a second, driver-guessed "looks like a credential" filter
+    /// on top would be exactly the kind of parallel permission rule this
+    /// issue's design note says not to invent. A mudlib that stores a
+    /// real secret in a plain (non-`persistent`, non-`/secure`-gated)
+    /// var is a mudlib-side `valid_read` policy bug, not something this
+    /// method can detect from here.
+    ///
+    /// CTO review (OBI-279, follow-up to OBI-237 PR #102, non-blocking
+    /// note 1): `Err` (a tick-budget or other runtime failure inside
+    /// `valid_read` itself) propagates out of this method, same as
+    /// [`World::admin_list_objects`]'s doc comment -- distinct from the
+    /// `Ok(None)` this method already uses for "doesn't exist" and "a
+    /// real, completed `valid_read` denied it", which stay deliberately
+    /// indistinguishable from each other, just not from "the permission
+    /// check itself never completed".
+    pub fn admin_object_vars(
+        &mut self,
+        caller_euid: &str,
+        _caller_tier: i16,
+        path: &str,
+        host: &mut dyn Host,
+    ) -> Result<Option<AdminObjectVars>, RtError> {
+        // CTO review (OBI-237 PR #102, must-fix B1): see
+        // `admin_list_objects`'s doc comment for why this check must run
+        // before `syms.intern(caller_euid)`, not after.
+        if crate::security::is_reserved_principal(caller_euid) {
+            return Ok(None);
+        }
+        let master = self.master_or_sentinel();
+        let euid_sym = self.registry.syms.intern(caller_euid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: euid_sym,
+            euid: euid_sym,
+        });
+        let target = self.find_object(path);
+        let path = path.to_string();
+        self.exec(host, master, None, None, Some(guard), None, None, |h| {
+            let Some(id) = target else {
+                return Ok(None);
+            };
+            let Some(o) = h.registry.get(id) else {
+                return Ok(None);
+            };
+            let program_path = o.program.path.to_string();
+            if !h.admin_valid_read("object_vars", &program_path)? {
+                return Ok(None);
+            }
+            let Some(o) = h.registry.get(id) else {
+                return Ok(None);
+            };
+            let raw: Vec<(String, Value)> = o
+                .vars
+                .iter()
+                .map(|((_, name), v)| (name.to_string(), v.clone()))
+                .collect();
+            let mut vars: Vec<AdminVarEntry> = raw
+                .into_iter()
+                .map(|(name, value)| {
+                    let value = crate::bcvm::heap::display(&value, &|oid| {
+                        h.registry
+                            .get(oid)
+                            .map_or_else(|| "<destructed>".to_string(), |o| o.name.clone())
+                    });
+                    AdminVarEntry { name, value }
+                })
+                .collect();
+            vars.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+            Ok(Some(AdminObjectVars {
+                path: path.clone(),
+                vars,
+            }))
+        })
+    }
+
+    /// `GET /api/v1/admin/errors`'s real data (OBI-235, OBI-237): every
+    /// error-inbox group (`World::errors_snapshot`, OBI-169) whose
+    /// *program* `caller_euid` can `valid_read`, optionally narrowed to
+    /// `program_prefix` first (`errors_snapshot`'s own filter -- same
+    /// semantics as the `errors` efun's own `filter` argument). Exactly
+    /// `errors_efun`'s own per-program permission filter and M-ERR-1
+    /// redaction rule, just invoked for an HTTP admin caller instead of
+    /// an in-game one: a denied program's groups are silently omitted,
+    /// not an error, and a `/secure/**` origin's message is redacted to
+    /// any caller below `caller_tier` 5, independent of whether
+    /// `valid_read` itself already let a lower tier through (see
+    /// `errors_efun`'s own doc comment for why that floor is
+    /// driver-enforced, not conditioned on the master's policy).
+    ///
+    /// `caller_tier` here *is* used (unlike `admin_list_objects`/
+    /// `admin_object_vars`'s `_caller_tier`): M-ERR-1's redaction rule is
+    /// specifically tier-keyed, not `valid_read`-keyed, both in the
+    /// `errors` efun and here -- the HTTP-authenticated staff tier is
+    /// the same tier space the master's roles snapshot uses (T5 is
+    /// `/secure`'s own floor throughout the admin-query surface, e.g.
+    /// `loom-http`'s `SECURE_VARS_MIN_TIER`).
+    ///
+    /// CTO review (OBI-279, follow-up to OBI-237 PR #102, non-blocking
+    /// note 1): `Err` (a tick-budget or other runtime failure inside
+    /// `valid_read` itself) propagates out of this method, same as
+    /// [`World::admin_list_objects`]'s doc comment.
+    pub fn admin_errors(
+        &mut self,
+        caller_euid: &str,
+        caller_tier: i16,
+        program_prefix: Option<&str>,
+        host: &mut dyn Host,
+    ) -> Result<Vec<AdminErrorGroup>, RtError> {
+        // CTO review (OBI-237 PR #102, must-fix B1): see
+        // `admin_list_objects`'s doc comment for why this check must run
+        // before `syms.intern(caller_euid)`, not after.
+        if crate::security::is_reserved_principal(caller_euid) {
+            return Ok(Vec::new());
+        }
+        let master = self.master_or_sentinel();
+        let euid_sym = self.registry.syms.intern(caller_euid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: euid_sym,
+            euid: euid_sym,
+        });
+        let rows = self.errors_snapshot(program_prefix);
+        self.exec(host, master, None, None, Some(guard), None, None, |h| {
+            let mut decided: HashMap<String, bool> = HashMap::new();
+            let mut out = Vec::new();
+            for row in rows {
+                let allowed = match decided.get(&row.program) {
+                    Some(&a) => a,
+                    None => {
+                        let a = h.admin_valid_read("errors", &row.program)?;
+                        decided.insert(row.program.clone(), a);
+                        a
+                    }
+                };
+                if !allowed {
+                    continue;
+                }
+                let message = if row.redacted && caller_tier < 5 {
+                    "<redacted>".to_string()
+                } else {
+                    row.message
+                };
+                out.push(AdminErrorGroup {
+                    program: row.program,
+                    function: row.function,
+                    line: if row.line == 0 { None } else { Some(row.line) },
+                    message,
+                    redacted: row.redacted,
+                    count: row.count,
+                    first_seen_unix_ms: row.first_seen_unix_ms,
+                    last_seen_unix_ms: row.last_seen_unix_ms,
+                    sample_trace: row.sample_trace,
+                });
+            }
+            Ok(out)
+        })
     }
 
     /// `tick_share_per_min` (OBI-121 S2c §3, OBI-137 S2): does `uid`'s
@@ -834,6 +1554,17 @@ impl World {
             }
         };
         self.registry.bind(conn, player);
+        // OBI-237: session timing for the admin `who` query -- recorded
+        // only once the connection is actually bound to a live object
+        // (never for a connection master's own `connect()` refused and
+        // closed above).
+        self.sessions.insert(
+            conn,
+            ConnSession {
+                connected_at: std::time::SystemTime::now(),
+                last_activity: std::time::Instant::now(),
+            },
+        );
         if let Err(e) = self.exec(
             host,
             player,
@@ -863,6 +1594,11 @@ impl World {
         let Some(&ob) = self.registry.conns.get(&conn) else {
             return;
         };
+        // OBI-237: any input at all resets the idle clock `who` reports,
+        // independent of whether `process_input` itself succeeds below.
+        if let Some(session) = self.sessions.get_mut(&conn) {
+            session.last_activity = std::time::Instant::now();
+        }
         let actor = self.registry.get(ob).map(|o| o.euid);
         let r = self.exec(
             host,
@@ -885,15 +1621,123 @@ impl World {
         }
     }
 
-    /// The connection went away: unbind, then `net_dead()` on the object.
+    /// Copyover handoff, new-process side (design §7.5 step 3, OBI-221):
+    /// call once per connection the driver has just re-adopted (its raw
+    /// fd handed over by the supervisor via `loom-supervise`'s
+    /// `SCM_RIGHTS` fd-passing and turned into a live `loom-net` session
+    /// bound to this same `conn` id) after loading a world from
+    /// [`World::load_snapshot`]. Unlike [`World::connect`], the
+    /// conn->object binding already exists -- restored verbatim from the
+    /// snapshot's connection table (`registry.conns`/`bind_seq`, OBI-173)
+    /// -- so this does *not* call master's `connect()`/`logon()` again;
+    /// it only gives the bound object a hook to re-bind any local state
+    /// (e.g. re-subscribe GMCP, print a reconnect banner) to its new
+    /// connection. A missing `reconnect()` apply is not an error: not
+    /// every interactive type needs one, and a snapshot taken before this
+    /// apply existed in the mudlib must still load and run.
+    ///
+    /// Does nothing if `conn` is not a connection the loaded snapshot
+    /// actually bound (the caller is expected to drive this once per
+    /// entry of the connection table it got back from the snapshot, but
+    /// an unknown/already-handled id here is a caller bug, not a panic).
+    pub fn reconnect(&mut self, conn: u64, host: &mut dyn Host) {
+        let Some(&ob) = self.registry.conns.get(&conn) else {
+            return;
+        };
+        // OBI-237: a copyover's new process has no memory of the old
+        // process's session timing (it is wall-clock metadata, not part
+        // of `Registry::capture`'s snapshot -- see `ConnSession`'s doc
+        // comment), so `who` treats every reconnected session as freshly
+        // connected at copyover time rather than silently omitting it.
+        self.sessions.entry(conn).or_insert_with(|| ConnSession {
+            connected_at: std::time::SystemTime::now(),
+            last_activity: std::time::Instant::now(),
+        });
+        let r = self.exec(host, ob, Some(ob), Some(conn), None, None, None, |h| {
+            h.call_apply(ob, "reconnect", Vec::new())
+        });
+        if let Err(e) = r {
+            World::report(host, conn, &e);
+        }
+    }
+
+    /// Run the `reconnect()` apply once on **every** loaded object
+    /// (docs/copyover.md, OBI-184 decision): the scheduler is not part of
+    /// the snapshot, so a fresh process starts with no pending
+    /// `call_out`s and no heartbeat subscribers, and `reconnect()` is
+    /// where any object -- interactive or not -- re-arms them.
+    ///
+    /// Order: first every connection the loaded snapshot bound, in
+    /// ascending `conn` id order, through [`World::reconnect`] (so the
+    /// body runs with that connection bound and can write to it
+    /// immediately); then every other live object, in ascending object
+    /// index order, with no connection context. An object destructed by
+    /// an earlier `reconnect()` body in the same pass is skipped.
+    ///
+    /// The copyover driver calls this once, after it has finished
+    /// re-adopting every handed-off socket into `loom-net`'s session
+    /// table under the same `conn` ids the snapshot recorded, not before
+    /// (a `reconnect()` apply that tries to write to its connection
+    /// before the session exists has nothing to write to).
+    pub fn reconnect_all(&mut self, host: &mut dyn Host) {
+        let conns = self.live_connections();
+        let bound: std::collections::HashSet<ObjectId> = conns
+            .iter()
+            .filter_map(|c| self.registry.conns.get(c).copied())
+            .collect();
+        for conn in conns {
+            self.reconnect(conn, host);
+        }
+        let mut rest: Vec<ObjectId> = self
+            .registry
+            .ids()
+            .into_iter()
+            .filter(|ob| !bound.contains(ob))
+            .collect();
+        rest.sort_unstable_by_key(|ob| ob.index);
+        for ob in rest {
+            if self.registry.get(ob).is_none() {
+                continue;
+            }
+            // Same as `World::tick`'s heartbeat/call_out errors: there is
+            // no connection to report to, and one object's failing hook
+            // must not stop the rest of the pass.
+            let _ = self.exec(host, ob, None, None, None, None, None, |h| {
+                h.call_apply(ob, "reconnect", Vec::new())
+            });
+        }
+    }
+
+    /// The live connection ids a loaded snapshot bound, in ascending
+    /// order -- the exact order/identity the copyover driver must adopt
+    /// handed-off fds under (see `crate::snapshot`'s connection-table
+    /// docs and `loom-supervise::fdpass`'s fixed-order handoff) before
+    /// calling [`World::reconnect_all`].
+    pub fn live_connections(&self) -> Vec<u64> {
+        let mut conns: Vec<u64> = self.registry.conns.keys().copied().collect();
+        conns.sort_unstable();
+        conns
+    }
+
+    /// The connection went away: `autosave()` (spec §8.1, OBI-171: both
+    /// an explicit `quit` -- the mudlib's `quit` command calls the
+    /// `disconnect()` efun, which closes the connection and lands here
+    /// once the transport reports it closed -- and a real net-dead drop
+    /// end up on this exact path, so one hook covers both triggers), then
+    /// unbind, then `net_dead()` on the object. Each runs as its own
+    /// `exec` so an `autosave()` failure can never suppress `net_dead()`.
     pub fn disconnect(&mut self, conn: u64, host: &mut dyn Host) {
         let Some(ob) = self.registry.conns.remove(&conn) else {
             return;
         };
+        self.sessions.remove(&conn);
+        // Errors have nowhere to go (the connection is gone).
+        let _ = self.exec(host, ob, Some(ob), None, None, None, None, |h| {
+            h.call_apply(ob, "autosave", Vec::new())
+        });
         if let Some(o) = self.registry.get_mut(ob) {
             o.conn = None;
         }
-        // Errors have nowhere to go (the connection is gone).
         let _ = self.exec(host, ob, Some(ob), None, None, None, None, |h| {
             h.call_apply(ob, "net_dead", Vec::new())
         });
@@ -970,6 +1814,45 @@ impl World {
                 );
             }
         }
+        // Player autosave (spec §8.1, OBI-171): every currently-connected
+        // object gets an `autosave()` apply once every
+        // `Limits::autosave_interval_ticks` world ticks (default 5 min).
+        // Collected into a `Vec` first -- `conns` borrows `self.registry`
+        // and `exec` needs `&mut self` -- sorted by connection id for a
+        // stable, reproducible order instead of whatever a `HashMap`
+        // iteration happens to produce.
+        let autosave_interval = self.limits.autosave_interval_ticks.max(1);
+        if world_tick.is_multiple_of(autosave_interval) {
+            let mut targets: Vec<(u64, ObjectId)> = self
+                .registry
+                .conns
+                .iter()
+                .map(|(&c, &ob)| (c, ob))
+                .collect();
+            targets.sort_by_key(|(c, _)| *c);
+            for (_, ob) in targets {
+                if self.registry.get(ob).is_none() {
+                    continue; // destructed since it connected
+                }
+                let autosave_quota_uid = self
+                    .registry
+                    .get(ob)
+                    .map_or(crate::security::ROOT, |o| o.owner);
+                if self.tick_share_breached(autosave_quota_uid) {
+                    continue;
+                }
+                let _ = self.exec(
+                    host,
+                    ob,
+                    Some(ob),
+                    None,
+                    None,
+                    None,
+                    Some(autosave_quota_uid),
+                    |h| h.call_apply(ob, "autosave", Vec::new()),
+                );
+            }
+        }
         for call in due {
             if self.registry.get(call.ob).is_none() {
                 continue; // destructed in the same tick it was scheduled for
@@ -1037,6 +1920,57 @@ impl World {
         // OBI-36: same reasoning for roles_result -- bounded latency even
         // on an otherwise idle world.
         self.drain_roles_results(host);
+        self.poll_canaries();
+    }
+
+    /// P2-B7 (OBI-182, spec §7.4): decide every in-flight canary's fate
+    /// for this tick -- auto-rollback the instant its new-error budget
+    /// (P2-B4) is exceeded, or auto-promote once its window has elapsed
+    /// without that happening. Runs every tick (cheap: one `HashMap`
+    /// lookup into the error inbox per active canary, and there is never
+    /// more than a handful of these live at once) rather than on its own
+    /// cadence, so a tight `max_new_errors: 0` budget rolls back within
+    /// one tick of the first new error, not up to a whole heartbeat
+    /// interval later.
+    fn poll_canaries(&mut self) {
+        if self.registry.canaries.is_empty() {
+            return;
+        }
+        let now_tick = self.scheduler.tick();
+        // Collect decisions before mutating `self.registry.canaries`
+        // (promote/rollback both remove the entry): iterating and
+        // mutating the same map at once would either not compile (an
+        // active borrow) or skip entries after a removal, depending on
+        // iteration order.
+        enum Decision {
+            Promote,
+            Rollback,
+        }
+        let mut decisions: Vec<(String, Decision)> = Vec::new();
+        for (path, canary) in self.registry.canaries.iter() {
+            let new_errors = self
+                .errors
+                .count_for_program(path)
+                .saturating_sub(canary.errors_at_start);
+            if new_errors > canary.max_new_errors {
+                decisions.push((path.clone(), Decision::Rollback));
+            } else if now_tick >= canary.started_tick + canary.window_ticks {
+                decisions.push((path.clone(), Decision::Promote));
+            }
+        }
+        for (path, decision) in decisions {
+            match decision {
+                Decision::Promote => {
+                    self.registry.promote_canary(&path);
+                    metrics::counter!("loom_canary_promoted_total", "program" => path).increment(1);
+                }
+                Decision::Rollback => {
+                    self.registry.rollback_canary(&path);
+                    metrics::counter!("loom_canary_rolled_back_total", "program" => path)
+                        .increment(1);
+                }
+            }
+        }
     }
 
     /// The current world tick (`Scheduler::advance`'s counter; advanced by
@@ -1137,6 +2071,13 @@ impl World {
     /// tick's batch (OBI-89, tests/introspection).
     pub fn eager_upgrade_queue_len(&self) -> usize {
         self.scheduler.eager_upgrade_queue_len()
+    }
+
+    /// Whether `path` has a canary in flight right now (P2-B7, OBI-182,
+    /// tests/introspection) -- cleared the instant `World::tick`
+    /// auto-promotes or auto-rolls-back.
+    pub fn canary_active(&self, path: &str) -> bool {
+        self.registry.canaries.contains_key(path)
     }
 
     /// Drain every warning recorded by a *lazy* per-instance upgrade since
@@ -1291,6 +2232,221 @@ impl World {
         .map_err(|e| e.report())
     }
 
+    /// Spec M-FS-1 (OBI-180/OBI-179 threat model): run `efun` (`read_file`,
+    /// `write_file`, `compile_object`, and nothing else so far) as a
+    /// world-thread execution whose *entire* guard set is exactly `{uid}`
+    /// -- no inherited call stack, no `this_player`/connection context.
+    /// This is the seam a driver-side caller (`/api/v1/files/*`, OBI-180's
+    /// HTTP handlers; the `/lsp` route's `ReadAuthorizer`) goes through
+    /// instead of running LPC bytecode: `h.call_efun` is the exact same
+    /// dispatch a running program's `CallEfun` instruction would reach, so
+    /// `security::normalize_file_path` -> `authorize()`'s `valid_*` apply
+    /// on the real master -> `fileio` all run unchanged (D-TM5: this is
+    /// deliberately *not* a second, HTTP-side permission check mirroring
+    /// the master -- it *is* the master's own check, just entered by the
+    /// driver). Quotas (`ticks_quota_uid: Some(sym)`) and the audit log
+    /// (`exec`'s own `note_error`, plus `authorize`'s `SecurityState::
+    /// record`) are the same unmodified paths every other caller gets.
+    ///
+    /// Refuses a reserved principal (`root`, `mudlib`, `*:*`) outright
+    /// (D-S3.1) -- there is no HTTP-reachable way to mint one of those
+    /// guards, unlike `seteuid`, which at least requires `/secure` code.
+    ///
+    /// `efun` is restricted to the small allowlist this driver entry
+    /// point is meant for (OBI-180 review, non-blocking item 1): a public
+    /// `World` method that ran *any* named efun on the master's behalf
+    /// would be a general driver-side efun runner, not the narrow
+    /// file-op seam this is documented as.
+    pub fn call_file_efun(
+        &mut self,
+        uid: &str,
+        efun: &str,
+        args: Vec<Value>,
+        host: &mut dyn Host,
+    ) -> Result<Value, String> {
+        if crate::security::is_reserved_principal(uid) {
+            return Err(format!("`{uid}` is a reserved principal"));
+        }
+        if !matches!(efun, "read_file" | "write_file" | "compile_object") {
+            return Err(format!("`{efun}` is not a file-op efun"));
+        }
+        let sym = self.registry.syms.intern(uid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: sym,
+            euid: sym,
+        });
+        let acting = self.master_or_sentinel();
+        self.exec(
+            host,
+            acting,
+            None,
+            None,
+            Some(guard),
+            None,
+            Some(sym),
+            |h| h.call_efun(efun, args),
+        )
+        .map_err(|e| e.report())
+    }
+
+    /// Atomic compare-and-swap `write_file` (OBI-180 M-FS-6, CTO review
+    /// must-fix 1): reads the file, checks `precondition` against its
+    /// current contents, and -- only if it holds -- writes `new_text`,
+    /// all inside **one** [`Self::exec`] call. The world thread processes
+    /// one `exec` to completion before looking at anything else (another
+    /// HTTP request, a scheduled `call_out`, LPC code calling `write_file`
+    /// directly), so nothing can land between the read and the write the
+    /// way it could across two separate [`Self::call_file_efun`] calls
+    /// (the lost-update window the CTO review flagged) -- this replaces
+    /// that two-request shape for `PUT`, not just adds to it.
+    ///
+    /// A failed read (refused by `valid_read`, or an I/O error) is
+    /// propagated as `Err` without ever reaching `write_file` -- never a
+    /// fail-open fall-through to an unconditional write (review must-fix
+    /// 2).
+    pub fn call_file_write_if_match(
+        &mut self,
+        uid: &str,
+        path: &str,
+        precondition: FileMatchPrecondition,
+        new_text: &str,
+        host: &mut dyn Host,
+    ) -> Result<FileCasOutcome, String> {
+        if crate::security::is_reserved_principal(uid) {
+            return Err(format!("`{uid}` is a reserved principal"));
+        }
+        let sym = self.registry.syms.intern(uid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: sym,
+            euid: sym,
+        });
+        let acting = self.master_or_sentinel();
+        let path_for_read = Value::str(path);
+        let path_for_write = Value::str(path);
+        let new_text = new_text.to_string();
+        self.exec(
+            host,
+            acting,
+            None,
+            None,
+            Some(guard),
+            None,
+            Some(sym),
+            move |h| {
+                let current = h.call_efun("read_file", vec![path_for_read])?;
+                let existing: Option<String> = match current {
+                    Value::Null => None,
+                    other => other.as_str().map(|s| s.to_string()),
+                };
+                let satisfied = match &precondition {
+                    FileMatchPrecondition::IfNoneMatchStar => existing.is_none(),
+                    FileMatchPrecondition::IfMatch(expected) => existing
+                        .as_deref()
+                        .map(|contents| file_etag_matches(contents, expected.trim_matches('"')))
+                        .unwrap_or(false),
+                };
+                if !satisfied {
+                    return Ok(FileCasOutcome::PreconditionFailed);
+                }
+                match h.call_efun("write_file", vec![path_for_write, Value::str(&new_text)])? {
+                    Value::Bool(true) => Ok(FileCasOutcome::Written),
+                    Value::Bool(false) => Ok(FileCasOutcome::QuotaExceeded),
+                    other => Err(RtError::new(format!(
+                        "write_file returned an unexpected value: {other:?}"
+                    ))),
+                }
+            },
+        )
+        .map_err(|e| e.report())
+    }
+
+    /// `GET /api/v1/files/list?path=...` (OBI-180 M-FS-3): immediate
+    /// entries of a mudlib-absolute directory, filtered by `valid_read`.
+    /// `Ok(None)` if the directory itself doesn't authorize for `uid` or
+    /// doesn't exist (M-FS-3: a listing you can't read looks exactly
+    /// like one that doesn't exist, same as `read_file`'s `Null`) --
+    /// otherwise each entry's bare name is *additionally* checked
+    /// against `valid_read` on its own full path and dropped if refused,
+    /// the same per-entry filtering `World::admin_list_objects` already
+    /// does for live objects (`RegistryHost::admin_valid_read`'s doc
+    /// comment).
+    ///
+    /// Deliberately goes through `admin_valid_read` rather than a new
+    /// LPC-visible `get_dir` efun: no new efun means no new
+    /// language-surface addition (`EFUNS` table, `driver_efun` dispatch,
+    /// `valid_efun` privilege class) for a feature that is really just a
+    /// driver-side read, exactly the same reasoning `admin_list_objects`/
+    /// `admin_object_vars` already apply.
+    ///
+    /// `Err(ListDirError::Internal)` (CTO review on PR #117, must-fix 2;
+    /// same bug class OBI-279 fixed for the admin endpoints) if a
+    /// `valid_read` apply itself throws or exhausts its tick budget, or
+    /// `fileio` hits a real I/O error -- for *either* the directory-level
+    /// check or any individual entry. Never a silently shorter listing:
+    /// every per-entry `admin_valid_read` call uses `?`, so one entry's
+    /// apply failure fails the whole call instead of just being dropped
+    /// (which would look like a complete, successful listing that
+    /// happens to be missing an entry).
+    ///
+    /// Dotfiles are hidden (`fileio::list_dir`'s own doc comment) and the
+    /// result is capped at [`MAX_LIST_ENTRIES`] entries, sorted by name,
+    /// with [`ListDirResult::truncated`] set when the real directory had
+    /// more (CTO review on PR #117, should-fix 1/2).
+    pub fn list_dir(
+        &mut self,
+        uid: &str,
+        path: &str,
+        host: &mut dyn Host,
+    ) -> Result<Option<ListDirResult>, ListDirError> {
+        if crate::security::is_reserved_principal(uid) {
+            return Err(ListDirError::Refused(format!(
+                "`{uid}` is a reserved principal"
+            )));
+        }
+        let path = crate::security::normalize_file_path(path).map_err(ListDirError::Refused)?;
+        let sym = self.registry.syms.intern(uid);
+        let guard = crate::security::GuardSet::empty().with(crate::security::Principal {
+            uid: sym,
+            euid: sym,
+        });
+        let acting = self.master_or_sentinel();
+        let root = self.root().to_path_buf();
+        self.exec(
+            host,
+            acting,
+            None,
+            None,
+            Some(guard),
+            None,
+            Some(sym),
+            move |h| {
+                if !h.admin_valid_read("get_dir", &path)? {
+                    return Ok(None);
+                }
+                match crate::fileio::list_dir(&root, &path) {
+                    Ok(Some(entries)) => {
+                        let trimmed = path.trim_end_matches('/');
+                        let truncated = entries.len() > MAX_LIST_ENTRIES;
+                        let mut filtered = Vec::with_capacity(entries.len().min(MAX_LIST_ENTRIES));
+                        for name in entries.into_iter().take(MAX_LIST_ENTRIES) {
+                            let child = format!("{trimmed}/{name}");
+                            if h.admin_valid_read("get_dir", &child)? {
+                                filtered.push(name);
+                            }
+                        }
+                        Ok(Some(ListDirResult {
+                            names: filtered,
+                            truncated,
+                        }))
+                    }
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(RtError::new(e)),
+                }
+            },
+        )
+        .map_err(|e| ListDirError::Internal(e.report()))
+    }
+
     pub fn find_object(&self, name: &str) -> Option<ObjectId> {
         self.registry
             .names
@@ -1310,6 +2466,15 @@ impl World {
 
     pub fn environment(&self, ob: ObjectId) -> Option<ObjectId> {
         self.registry.get(ob).and_then(|o| o.env)
+    }
+
+    /// `ob`'s current inventory (tests/introspection; mirrors
+    /// `environment`, its inverse).
+    pub fn inventory(&self, ob: ObjectId) -> Vec<ObjectId> {
+        self.registry
+            .get(ob)
+            .map(|o| o.inventory.clone())
+            .unwrap_or_default()
     }
 
     /// Current version of a registered program.
@@ -1497,6 +2662,82 @@ impl World {
         self.registry.quota_breaches.get(tier, quota)
     }
 
+    /// `profile <program>` (spec Phase 2 B5, OBI-170): open a sampling
+    /// window on `program` (normalized, same rule as `compile_object`'s
+    /// path argument) -- mirrors the `profile_start` efun, for a
+    /// host-side (test/admin-command) caller that doesn't want to go
+    /// through a Weft call to use it.
+    ///
+    /// `owner` is this caller's principal (CTO review, OBI-170 PR #67
+    /// should-fix 4 / OBI-232): if a window is already open under a
+    /// *different* owner, this fails instead of silently discarding it
+    /// (no more "last write wins") -- the caller must have that owner
+    /// call `profile_stop` first, or call `profile_stop` here with
+    /// `force: true` themselves (a host-side caller is trusted to decide
+    /// that for itself; there is no master/efun-privilege gate at this
+    /// level, unlike the `profile_stop` efun's P3 check).
+    ///
+    /// Exception (OBI-238, follow-up to should-fix 5): a window that has
+    /// already hit its own auto-expiry cap is replaced outright, even by
+    /// a different owner, no `profile_stop`/`force` required -- an
+    /// expired window is not sampling anything anymore (`wants` already
+    /// answers `false` for it), so refusing to replace it would just let
+    /// a builder who forgot to close their window block everyone else's
+    /// profiling indefinitely.
+    pub fn profile_start(&mut self, program: &str, owner: &str) -> Result<(), String> {
+        let path = loom_compiler::mudlib::normalize_path(program)?;
+        if let Some(existing) = &self.registry.profiler
+            && existing.owner() != owner
+            && !existing.is_expired()
+        {
+            return Err(format!(
+                "profile: a window on {:?} is already open, owned by {} -- profile_stop() it \
+                 first (or force-close it)",
+                existing.program(),
+                existing.owner()
+            ));
+        }
+        self.registry.profiler = Some(crate::profiler::Profiler::new(path, owner.to_string()));
+        Ok(())
+    }
+
+    /// Close the window `profile_start` opened and render its report
+    /// (see `crate::profiler::ProfileReport::render`) -- mirrors the
+    /// `profile_stop` efun. `None` if no window was open.
+    ///
+    /// Refuses to close a window owned by a different `caller` unless
+    /// `force` is set (should-fix 4, OBI-232) -- the caller decides for
+    /// itself whether it is entitled to force (this host-side entry
+    /// point has no master/privilege model of its own to check against).
+    pub fn profile_stop(&mut self, caller: &str, force: bool) -> Option<String> {
+        let owner = self.registry.profiler.as_ref()?.owner().to_string();
+        if owner != caller && !force {
+            return Some(format!(
+                "profile_stop(): this window is owned by {owner}, not {caller} -- pass \
+                 force: true to close it anyway"
+            ));
+        }
+        self.registry.profiler.take().map(|p| p.report().render())
+    }
+
+    /// The program path a `profile` window is currently sampling, if one
+    /// is open.
+    pub fn profiling_program(&self) -> Option<&str> {
+        self.registry.profiler.as_ref().map(|p| p.program())
+    }
+
+    /// **Test-only.** Force the currently-open `profile` window straight
+    /// to expired -- see `Profiler::force_expire_for_test`'s doc for why
+    /// (OBI-238's integration test needs to exercise auto-expiry without
+    /// actually waiting `MAX_WINDOW` or making `MAX_CALLS` real calls).
+    /// A no-op if no window is open.
+    #[doc(hidden)]
+    pub fn force_expire_profiler_for_test(&mut self) {
+        if let Some(p) = self.registry.profiler.as_mut() {
+            p.force_expire_for_test();
+        }
+    }
+
     /// `ob`'s owner uid (OBI-121 S2c: immutable, set at creation --
     /// `BcObject::uid`), resolved to its name.
     /// `ob`'s owner uid (OBI-121 S2c: immutable, set at creation --
@@ -1608,6 +2849,73 @@ mod tick_share_window_tests {
             w.used(6000),
             4,
             "a slot's stale usage from 60 buckets ago must not leak into a reused slot"
+        );
+    }
+}
+
+/// OBI-279 (CTO review of PR #102, must-fix 1): `RegistryHost::
+/// admin_valid_read`'s per-euid decision loop must behave exactly like
+/// `authorize`'s own (both now share `RegistryHost::decide`) -- a
+/// src-level unit test, not a `tests/obi_279_admin_query_errors.rs`
+/// integration test, because exercising a genuinely multi-principal cut
+/// guard means calling `World::exec`/`RegistryHost::admin_valid_read`
+/// directly (both `pub(crate)`/private, not reachable from outside this
+/// crate) -- `World`'s own public admin-query methods only ever build a
+/// single-principal guard (one HTTP-authenticated staff euid), so this
+/// is the only way to prove the shared loop's multi-euid behavior at
+/// all.
+#[cfg(test)]
+mod admin_query_tests {
+    use super::*;
+    use crate::security::{GuardSet, Principal};
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures")).join(name)
+    }
+
+    /// A cut guard carrying two distinct euids, `"first"` pushed before
+    /// `"second"` (push order, `GuardSet::euids`): `secure/master.wf`'s
+    /// `valid_read` denies outright for `"first"` and raises a runtime
+    /// error for `"second"`. If the per-euid loop incorrectly kept
+    /// asking after `"first"` already denied (the bug this guards
+    /// against: an earlier, hand-duplicated copy of this loop in
+    /// `admin_valid_read` only stopped early on an apply *error*, not on
+    /// an ordinary denial), this would see `"second"`'s error and answer
+    /// `Err`, not the plain `Ok(false)` a single, shared decision loop
+    /// gives.
+    #[test]
+    fn admin_valid_read_stops_at_the_first_denying_euid_in_a_multi_principal_guard() {
+        let root = fixture("admin_query_two_euid");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = NullHost;
+
+        let master = world.master.expect("fixture has a master");
+        let first = world.registry.syms.intern("first");
+        let second = world.registry.syms.intern("second");
+        let guard = GuardSet::empty()
+            .with(Principal {
+                uid: first,
+                euid: first,
+            })
+            .with(Principal {
+                uid: second,
+                euid: second,
+            });
+
+        let result = world.exec(
+            &mut host,
+            master,
+            None,
+            None,
+            Some(guard),
+            None,
+            None,
+            |h| h.admin_valid_read("x", "/std/item"),
+        );
+        assert!(
+            matches!(result, Ok(false)),
+            "must deny at the first (\"first\") euid and never reach the \
+             second (\"second\") euid's error-raising valid_read, got {result:?}"
         );
     }
 }

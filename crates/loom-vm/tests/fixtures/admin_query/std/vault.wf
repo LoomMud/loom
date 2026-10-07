@@ -1,0 +1,14 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// A program `secure/master.wf`'s `valid_read` denies outright
+// (OBI-237): `tests/obi_237_admin_query.rs` checks that a live clone of
+// this program is omitted from a non-root `World::admin_list_objects`
+// answer, and that `World::admin_object_vars` on it answers `None` for
+// any euid but `root` -- the real `/secure`/permission boundary the
+// admin-query world-thread side must enforce itself, independent of the
+// HTTP edge's own tier floor.
+var secret: int = 99
+
+pub fn create() {
+}
