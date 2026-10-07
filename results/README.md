@@ -109,6 +109,66 @@ recorder to render. That's a separate instrumentation gap, not a bug in
 the scrape itself -- `--metrics-url` will start carrying real server-side
 histograms once that lands.
 
+## CI load lane (OBI-308)
+
+**Invariant: `loadtest-e1-1`, `loadtest-smoke` and `bench` must never run at
+the same time as each other, on the same runner set, as anything else that
+loads that host.** Their output is wall-clock latency, not correctness: a
+neighbour on the machine does not flip a pass to a *different* pass/fail
+signal, it silently moves the percentiles. So a p99 measured under
+contention is not "a slower p99", it is a number that means nothing.
+
+What that looked like on 2026-10-07, one host, two runs in flight:
+
+| Run | In flight at the same time | command p50 | p99 | max | login failures | disconnects |
+|---|---|---|---|---|---|---|
+| 37654269961 (PR #124, `ad944c6`) | nothing | quiet-host numbers | **< 50 ms** | — | 0 | 0 |
+| 37658696127 (PR #124, `4c1f631`) | run 37658252388 (PR #126): a second `cargo build --release` + a second 150-player E1.1 | 76 ms | **593 ms** | 784 ms | 0 | 0 |
+
+`4c1f631` differs from `ad944c6` by a test file only. A 12x SLA miss with
+zero errors and zero disconnects is a contention signature, not a latency
+regression -- and `bench`/`loadtest-smoke` passed on the same commit, because
+a >15% relative gate and a 20-player smoke run tolerate noise that a 50 ms
+absolute p99 budget does not.
+
+How the lane is held (`.github/workflows/ci.yml`, header comment):
+
+- Each of the three jobs is in the job-level concurrency group
+  `loom-ci-load-lane`, so a second PR's copy of the same gate **queues**
+  instead of racing.
+- `cancel-in-progress: false` -- a measurement already running is never
+  killed. `queue: max` -- pending runs wait in FIFO instead of the default
+  `single`, where the third run cancels the pending one. A *cancelled*
+  required check blocks a PR exactly like a failed one, so queueing (not
+  replacing) is part of not weakening the gate.
+- The jobs are also chained with `needs` inside a run:
+  `loadtest-e1-1` -> `loadtest-smoke` -> `bench`. The required gate goes
+  first and has no `needs:`/`if:` of its own, so nothing upstream can skip
+  it; the two non-required gates wait for it instead of competing with it.
+- `scripts/check-ci-load-lane.py` asserts all of the above (and that the
+  gate still runs 150 players with `--fail-on-sla-miss`, and that no
+  required check became skippable or optional), plus a `--self-test` of 14
+  mutations. Both run in the required `hygiene` job, so the lane cannot rot
+  silently and the comment here cannot drift from the workflow.
+
+**What the lane does *not* claim.** GitHub scopes a job-level concurrency
+group per workflow *and job*, so the hard guarantee is "the same gate never
+runs twice at once". Two *different* gates from two different PRs (PR A's
+`bench` against PR B's `loadtest-e1-1`) can still land on the host together;
+the `needs` chain removes that overlap inside a run, not across runs. The
+same-run `rust` job (`cargo test --workspace`) and the `fuzz-smoke*` jobs also
+stay parallel, and `release-image.yml` builds are outside the lane. All of
+that is runner capacity, not YAML: the durable fix is a dedicated/ephemeral
+load host, which is a CTO call and explicitly out of scope for OBI-308.
+
+**If you see `loadtest-e1-1` waiting** ("Waiting for job to run" on the
+checks tab): that is the lane working. One E1.1 slot costs ~3.5 min of
+runner wall-clock (build cache warm), so a queue of two PRs clears in well
+under ten. Do not respond to a wait, or to a p99 miss on a run that overlapped
+another, by raising the threshold, dropping the population, marking the check
+optional, or re-running it into a quiet window by hand -- `hygiene` fails
+those changes.
+
 ## Limitations
 
 - **Negotiated telnet options (R1a/OBI-26)** are exercised from the bot side
