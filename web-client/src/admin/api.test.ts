@@ -189,6 +189,84 @@ test("refresh: a non-OK response resolves to false and never calls setAccessToke
   assert.equal(called, false);
 });
 
+test("refresh: two concurrent calls single-flight to exactly one /auth/refresh fetch", async () => {
+  // A deliberate delay so both calls are genuinely in flight together --
+  // without it the dedup would still pass by accident (the in-flight
+  // promise is recorded synchronously, before either fetch resolves),
+  // but this makes the race explicit rather than incidental.
+  let resolveFetch: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    resolveFetch = resolve;
+  });
+  const original = global.fetch;
+  let fetchCount = 0;
+  global.fetch = (async () => {
+    fetchCount += 1;
+    await gate;
+    return new Response(JSON.stringify({ access_token: "fresh-token" }), { status: 200 });
+  }) as typeof fetch;
+  restoreFetch = () => {
+    global.fetch = original;
+  };
+
+  let stored: string | null = null;
+  const api = new AdminApi({
+    baseUrl: "",
+    getAccessToken: () => null,
+    setAccessToken: (t) => {
+      stored = t;
+    },
+  });
+
+  const first = api.refresh();
+  const second = api.refresh();
+  resolveFetch?.();
+  const [a, b] = await Promise.all([first, second]);
+
+  assert.equal(a, true);
+  assert.equal(b, true);
+  assert.equal(fetchCount, 1);
+  assert.equal(stored, "fresh-token");
+});
+
+test("refresh: uses navigator.locks.request to serialize across tabs when available", async () => {
+  const { restore } = installFetch(() => ({ status: 200, body: { access_token: "fresh-token" } }));
+  restoreFetch = restore;
+
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  let requestedWith: string | undefined;
+  Object.defineProperty(globalThis, "navigator", {
+    value: {
+      locks: {
+        request: async (name: string, callback: () => Promise<unknown>) => {
+          requestedWith = name;
+          return callback();
+        },
+      },
+    },
+    configurable: true,
+  });
+  const restoreNavigator = () => {
+    if (descriptor) {
+      Object.defineProperty(globalThis, "navigator", descriptor);
+    }
+  };
+  const previousRestore = restoreFetch;
+  restoreFetch = () => {
+    previousRestore?.();
+    restoreNavigator();
+  };
+
+  const api = new AdminApi({
+    baseUrl: "",
+    getAccessToken: () => null,
+    setAccessToken: () => {},
+  });
+  const ok = await api.refresh();
+  assert.equal(ok, true);
+  assert.equal(requestedWith, "loom-admin-auth-refresh");
+});
+
 test("logout: sends credentials same-origin and the X-Loom-Auth header", async () => {
   const { calls, restore } = installFetch(() => ({ status: 204 }));
   restoreFetch = restore;
