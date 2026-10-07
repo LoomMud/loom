@@ -442,9 +442,10 @@ mod tests {
     #[test]
     fn round_trips() {
         let keys = keys();
-        let token = keys.encode(&sample_claims()).unwrap();
+        let claims = sample_claims();
+        let token = keys.encode(&claims).unwrap();
         let decoded = keys.decode(&token).unwrap();
-        assert_eq!(decoded, sample_claims());
+        assert_eq!(decoded, claims);
     }
 
     #[test]
@@ -578,6 +579,17 @@ mod tests {
     /// Acceptance: "rotation (old kid still verifies during overlap)".
     #[test]
     fn rotation_keeps_the_old_kid_verifiable_during_the_overlap_window() {
+        // Each token gets its own claims captured *once* and reused for
+        // both encode and the later assert_eq. `sample_claims()` stamps
+        // `iat`/`nbf`/`exp` from `OffsetDateTime::now_utc()` on every
+        // call, so comparing an encode-then-decode round trip against a
+        // *second*, independently-called `sample_claims()` is a timing
+        // flake: it fails whenever a wall-clock second boundary falls
+        // between the two calls (OBI-302 triage -- seen on main @
+        // `9a201b3`).
+        let old_claims = sample_claims();
+        let new_claims = sample_claims();
+
         // The old server: only the (soon-to-be-retired) key is active.
         let old_keys = JwtKeys::from_keyset(
             "2026-01",
@@ -586,7 +598,7 @@ mod tests {
             AUDIENCE,
         )
         .unwrap();
-        let old_token = old_keys.encode(&sample_claims()).unwrap();
+        let old_token = old_keys.encode(&old_claims).unwrap();
 
         // The rotated server: a new active key, but the old one is kept
         // in the verifier keyset for the overlap window.
@@ -602,11 +614,11 @@ mod tests {
         .unwrap();
 
         // A token signed before the rotation (old kid) still verifies...
-        assert_eq!(rotated_keys.decode(&old_token).unwrap(), sample_claims());
+        assert_eq!(rotated_keys.decode(&old_token).unwrap(), old_claims);
         // ...and a freshly issued token uses (and verifies against) the
         // new active key.
-        let new_token = rotated_keys.encode(&sample_claims()).unwrap();
-        assert_eq!(rotated_keys.decode(&new_token).unwrap(), sample_claims());
+        let new_token = rotated_keys.encode(&new_claims).unwrap();
+        assert_eq!(rotated_keys.decode(&new_token).unwrap(), new_claims);
 
         // Once the old key is dropped from the keyset entirely (overlap
         // window over), the old token no longer verifies.
@@ -638,7 +650,12 @@ mod tests {
             AUDIENCE,
         )
         .unwrap();
-        let old_token = old_keys.encode(&sample_claims()).unwrap();
+        // Captured once and reused below -- see the comment in
+        // `rotation_keeps_the_old_kid_verifiable_during_the_overlap_window`
+        // for why a second, independently-called `sample_claims()` would
+        // be a timing flake (OBI-302).
+        let old_claims = sample_claims();
+        let old_token = old_keys.encode(&old_claims).unwrap();
 
         // The rotated server: the old kid's *seed* has been destroyed by
         // the operator; only its public key remains in the key file.
@@ -657,7 +674,7 @@ mod tests {
         .unwrap();
 
         // The old token still verifies...
-        assert_eq!(rotated_keys.decode(&old_token).unwrap(), sample_claims());
+        assert_eq!(rotated_keys.decode(&old_token).unwrap(), old_claims);
         // ...but a public-only kid can never be `active_kid` -- there is
         // no seed in this process to sign with.
         let cannot_sign = JwtKeys::from_keyset(
@@ -684,8 +701,9 @@ mod tests {
         .unwrap();
 
         let keys = JwtKeys::from_key_file(&path, ISSUER, AUDIENCE).unwrap();
-        let token = keys.encode(&sample_claims()).unwrap();
-        assert_eq!(keys.decode(&token).unwrap(), sample_claims());
+        let claims = sample_claims();
+        let token = keys.encode(&claims).unwrap();
+        assert_eq!(keys.decode(&token).unwrap(), claims);
     }
 
     /// Acceptance: a key file with a public-only retired kid (the
@@ -717,12 +735,14 @@ mod tests {
             AUDIENCE,
         )
         .unwrap();
-        let old_token = old_keys.encode(&sample_claims()).unwrap();
-        assert_eq!(keys.decode(&old_token).unwrap(), sample_claims());
+        let old_claims = sample_claims();
+        let old_token = old_keys.encode(&old_claims).unwrap();
+        assert_eq!(keys.decode(&old_token).unwrap(), old_claims);
 
         // And this loaded keyset signs with the active (seed-backed) kid.
-        let token = keys.encode(&sample_claims()).unwrap();
-        assert_eq!(keys.decode(&token).unwrap(), sample_claims());
+        let claims = sample_claims();
+        let token = keys.encode(&claims).unwrap();
+        assert_eq!(keys.decode(&token).unwrap(), claims);
     }
 
     #[test]

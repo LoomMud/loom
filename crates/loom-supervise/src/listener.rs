@@ -212,7 +212,14 @@ mod tests {
         // simplest possible proof that `child_fd` is still open and is
         // the *same* socket in a freshly exec'd process: write through
         // it and read the bytes back on the parent's paired end.
-        let mut child = Command::new("sh")
+        // Use `bash`, not `sh` (Ubuntu's `/bin/sh` is dash): dash's `>&N`
+        // redirection only parses single-digit fds and fails with
+        // "Bad fd number" (exit 2) once other tests in the same process
+        // have enough fds open that `child_fd` reaches double digits --
+        // the exact flake seen under parallel `cargo test` (OBI-302).
+        // Bash accepts multi-digit fds in `>&N`, so it isn't sensitive
+        // to how many fds happen to be open already.
+        let mut child = Command::new("bash")
             .arg("-c")
             .arg(format!("echo -n ok >&{child_fd}"))
             .stdin(Stdio::null())

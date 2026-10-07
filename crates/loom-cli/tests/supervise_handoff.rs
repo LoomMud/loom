@@ -699,9 +699,19 @@ fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
     // (same fixed 12-byte shape as the very first one, since it's the
     // same `TelnetCodec::start()` call every new `run_connection` task
     // makes) so the line-based reads below see only real text.
+    // OBI-302 triage: this must read through the `BufReader`, not its
+    // underlying socket directly. `reader.get_mut().read_exact(..)` reads
+    // from the raw fd and skips whatever the `BufReader` had already
+    // buffered ahead of the last `read_line` call that found "Exits:" --
+    // on a slow/loaded CI runner the fresh preamble bytes can already be
+    // sitting in that internal buffer by the time we get here, so reading
+    // from the raw socket instead reads *past* them into real response
+    // text, desyncing every read after this one (the intermittent "stream
+    // did not contain valid UTF-8" failure). `Read::read_exact` on the
+    // `BufReader` itself drains its internal buffer first, then falls
+    // through to the socket only for whatever's left.
     let mut fresh_preamble = [0_u8; 12];
     reader
-        .get_mut()
         .read_exact(&mut fresh_preamble)
         .expect("read the fresh telnet negotiation preamble the readopt triggers");
     send_line(&mut reader, "look");
