@@ -155,13 +155,23 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   (run 37663331238, 2026-10-07 18:01:00Z -> 18:16Z, cancelled mid-build while
   an intentionally contending probe PR ran eight jobs beside it). Slow is
   survivable; cancelled is not.
+- **Runner choice is separate from the lane.** The three gates pick their
+  runner from `vars.CI_LOAD_RUNS_ON` (OBI-311) and fall back to the shared set
+  when it is unset, so moving the gate onto a dedicated scale set is one
+  Actions variable, not a code change. The guard refuses a bare label in a
+  gate's `runs-on` -- a required check pinned to a scale set that is down or
+  absent queues forever -- and refuses `CI_LOAD_RUNS_ON` on any other job, so
+  the load runner cannot quietly become a second place where builds starve the
+  gate. See `docs/ci-runners.md`.
 - `scripts/check-ci-load-lane.py` asserts all of the above (and that the
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
-  headroom, and that no required check became skippable or optional), plus a
-  `--self-test` of 17 mutations (18 cases). Both run in the required `hygiene`
-  job, so the lane cannot rot silently and the comment here cannot drift from
-  the workflow. The mutation set now includes "`rust` leaves the lane" and
-  "`web-client` joins the lane", i.e. it guards both directions of membership.
+  headroom, that no required check became skippable or optional, and that only
+  the gates route through the load runner), plus a `--self-test` of 20
+  mutations (21 cases). Both run in the required `hygiene` job, so the lane
+  cannot rot silently and the comment here cannot drift from the workflow. The
+  mutation set now includes "`rust` leaves the lane" and "`web-client` joins
+  the lane", i.e. it guards both directions of membership, plus "a gate is
+  pinned to a bare load label" and "`deny` takes the load runner".
 
 **How job-level groups are actually scoped (measured, not assumed).** The
 first version of this section claimed GitHub scopes a job-level concurrency
@@ -191,9 +201,16 @@ heavy job at a time repo-wide. Observed queue depth on 2026-10-07: run
 non-required). Contention is not free either: `rust` took 6 min on a quiet
 host, 10 min beside three fuzz jobs, and 35+ min with three runs piled on, and
 `fuzz-smoke-bytecode` once burned its whole 15-minute budget inside the
-cache-restore step without ever running its payload. If the resulting CI
-latency is unacceptable, the fix is capacity, not YAML: a dedicated
-load-runner label for the gates, which is OBI-311's remaining decision.
+cache-restore step without ever running its payload. Run `37688350822` took
+**43.5 min** from creation to a fully green required set (pre-lane ~10 min),
+and 14 of the gate's 16 m 45 s were cache restore and `cargo build --release`
+around a **91-second** measurement.
+
+So the lane is the interim answer and capacity is the durable one: OBI-311 is
+decided in favour of a dedicated load scale set behind `CI_LOAD_RUNS_ON`, and
+when that set exists `rust` and the `fuzz-smoke*` jobs should leave the group
+(`LANE_HEAVY` in `scripts/check-ci-load-lane.py` is the single place to change)
+so throughput comes back while the gate stays quiet.
 
 **If you see `loadtest-e1-1` waiting** ("Waiting for job to run" on the
 checks tab): that is the lane working, and it has been watched working three
