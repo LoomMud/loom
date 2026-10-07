@@ -105,16 +105,25 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
   bench:
-    # VM benchmark regression gate (OBI-25 / OBI-118): this PR's merge commit
-    # vs its base, same runner, >15% on any workload fails. Method:
-    # crates/loom-vm/benches/BASELINE.md. Deliberately NOT a required check
-    # (no release cadence to re-baseline against yet).
+    # VM benchmark regression gate (OBI-25 / OBI-118 / OBI-312): this PR's
+    # base vs its working tree, same runner, >15% on any workload fails.
+    # Method: crates/loom-vm/benches/BASELINE.md. Deliberately NOT a required
+    # check (no release cadence to re-baseline against yet).
     #
     # Load-lane member (OBI-308): criterion timings are as sensitive to a noisy
     # neighbour as E1.1's p99, so it waits for the lane and runs after the two
     # loadtest jobs rather than alongside them. `success()` keeps the default
     # `needs` semantics -- the event condition alone would run bench even when
     # the lane jobs were skipped.
+    #
+    # OBI-312: this gate failed PR #131 with priv_control at ratio 1.177 on a
+    # diff with no `.rs` in it, and the two arms turned out to build
+    # *byte-identical* `vm_bench` binaries. A two-arm gate cannot tell "the
+    # code got slower" from "the runner moved", so it reported a measurement
+    # artifact as a code regression. It now runs a third arm -- a
+    # byte-identical copy of the head binary -- and exits 3 (`INVALID
+    # harness`) when that control fails to measure 1.00. Threshold, rounds,
+    # iterations and the workload list are unchanged.
     needs: loadtest-smoke
     if: github.event_name == 'pull_request' && success()
     concurrency:
@@ -122,6 +131,13 @@ jobs:
       cancel-in-progress: false
       queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
+    # ~5 min observed on the 2-vCPU runner (run 37689038963: 22:28:09 ->
+    # 22:32:50) for two builds + 6 rounds x 2 arms; three arms per round makes
+    # it ~1.5x. Headroom so host load can only make the gate slow, never hang
+    # the lane. Keep this value distinct from the loadtest gates' 20/30: the
+    # check-ci-load-lane self-test mutates the first `timeout-minutes: 30` in
+    # the file, which must stay loadtest-e1-1's.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -132,6 +148,15 @@ jobs:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: scripts/bench-gate.sh "${{ github.event.pull_request.base.sha }}"
+      - name: Upload raw round data
+        # The verdict is a min-of-medians; OBI-312 could not be diagnosed from
+        # CI because the per-round numbers were thrown away. Keep them.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-rounds-${{ github.run_id }}
+          path: target/bench-gate/logs/
+          if-no-files-found: warn
   deny:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     steps:
@@ -188,6 +213,15 @@ jobs:
           scripts/ci-ensure-tools.sh python3:python3-minimal
           python3 scripts/check-ci-load-lane.py .github/workflows/ci.yml
           python3 scripts/check-ci-load-lane.py --self-test .github/workflows/ci.yml
+      - name: bench gate comparator self-test (OBI-312)
+        # The `bench` job's exit code decides whether a red gate means "this
+        # code got slower" (1) or "the harness cannot measure 1.00" (3). That
+        # classification is testable without any release build, so test it
+        # here on synthetic round logs instead of in the lane under load.
+        run: |
+          set -euo pipefail
+          scripts/ci-ensure-tools.sh python3:python3-minimal
+          python3 scripts/bench_compare.py --self-test
       - uses: fsfe/reuse-action@bb774aa972c2a89ff34781233d275075cbddf542 # v5.0.0
   fuzz-smoke:
     # Weft parser fuzz smoke (OBI-23): <= 60 s of libFuzzer seeded from the
