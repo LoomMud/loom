@@ -96,26 +96,19 @@ pub fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// The only valid [`OAuthStateClaims::purpose`] value. Checked on
-/// decode as a belt-and-suspenders check -- [`OAUTH_STATE_AUDIENCE`] is
-/// the real cross-type guard (OBI-201 review must-fix).
+/// The only valid [`OAuthStateClaims::purpose`] value.
 pub const OAUTH_STATE_PURPOSE: &str = "github_oauth_state";
-
-/// [`OAuthStateClaims`]'s pinned `aud` (OBI-201 review must-fix):
-/// distinct from [`crate::auth::AUDIENCE`] (access tokens) and from
-/// [`crate::auth::claims::GITHUB_PENDING_AUDIENCE`] (the GitHub-login
-/// TOTP-pending token), so [`crate::auth::jwt::JwtKeys::decode_claims`]
-/// refuses a cross-type token outright, not just via the `purpose`
-/// field.
-pub const OAUTH_STATE_AUDIENCE: &str = "loom-oauth-state";
 
 /// What the `__Host-` state cookie carries (OBI-201, M-AUTH-7): the
 /// `state` value GitHub must echo back, and the PKCE verifier that
 /// matches the `code_challenge` sent in the authorize request. Signed
-/// (via [`crate::auth::JwtKeys::encode_claims`]) rather than opaque +
-/// server-side-stored, since the driver already has a signing key and
-/// this keeps the OAuth flow stateless (no extra table, no cleanup job
-/// for abandoned flows). The cookie is `HttpOnly`/`Secure` so the
+/// (via [`crate::auth::AuthService::sign_oauth_state`], itself backed by
+/// a [`super::statetoken::StateTokenKey`] -- a signing domain entirely
+/// separate from the staff access-token EdDSA keyset, see that module's
+/// doc) rather than opaque + server-side-stored, since the driver
+/// already has a signing key and this keeps the OAuth flow stateless (no
+/// extra table, no cleanup job for abandoned flows). The cookie is
+/// `HttpOnly`/`Secure` so the
 /// verifier never reaches page JS; it is still sent to GitHub, in the
 /// clear, as part of the (server-to-server, TLS) token exchange, which is
 /// exactly what PKCE expects.
@@ -124,10 +117,14 @@ pub struct OAuthStateClaims {
     pub state: String,
     pub verifier: String,
     pub purpose: String,
-    pub iss: String,
-    pub aud: String,
     pub iat: i64,
     pub exp: i64,
+}
+
+impl super::statetoken::HasExpiry for OAuthStateClaims {
+    fn expires_at(&self) -> i64 {
+        self.exp
+    }
 }
 
 /// Configuration for [`LiveGithubProvider`]. `token_url`/`user_url` are

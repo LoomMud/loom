@@ -40,7 +40,6 @@ use std::path::Path;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -331,31 +330,10 @@ impl JwtKeys {
     }
 
     pub fn encode(&self, claims: &AccessClaims) -> Result<String, JwtError> {
-        self.encode_claims(claims)
-    }
-
-    pub fn decode(&self, token: &str) -> Result<AccessClaims, JwtError> {
-        self.decode_claims(token)
-    }
-
-    /// Sign any claims type pinned to its own `aud`/`typ`
-    /// ([`TokenAudience`]) as an EdDSA JWT, using the active signing key.
-    /// Shared by access tokens ([`Self::encode`]) and the two short-lived
-    /// GitHub-OAuth claims types ([`super::claims::GithubPendingClaims`],
-    /// [`super::github::OAuthStateClaims`]) so there is exactly one
-    /// signing implementation -- never two copies that could drift. Each
-    /// type's pinned `aud`+`typ` (not just a `purpose` field) is what
-    /// stops a token of one type from ever being accepted as another,
-    /// even though all three currently share this one signing key
-    /// (OBI-201 review must-fix).
-    pub fn encode_claims<T: Serialize + TokenAudience>(
-        &self,
-        claims: &T,
-    ) -> Result<String, JwtError> {
         let header = Header {
             alg: "EdDSA".to_string(),
             kid: self.active_kid.clone(),
-            typ: T::TYP.to_string(),
+            typ: "JWT".to_string(),
         };
         let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).map_err(|_| JwtError)?);
         let claims_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).map_err(|_| JwtError)?);
@@ -365,22 +343,7 @@ impl JwtKeys {
         Ok(format!("{signing_input}.{signature_b64}"))
     }
 
-    /// Verify and decode any `DeserializeOwned` claims type pinned to its
-    /// own `aud`/`typ` ([`TokenAudience`]/[`ClaimsIssAud`]) and carrying
-    /// an expiry ([`Expires`]). Pins `alg: EdDSA` (no negotiation, so
-    /// `alg: none` and a stale HS256 token are both refused outright),
-    /// verifies the signature, checks `kid` is in the verifier keyset,
-    /// and -- the OBI-201 review must-fix -- checks the JWT header `typ`
-    /// and the claims' own `aud` against `T::TYP`/`T::AUD` specifically,
-    /// not a single service-wide audience: an access token, a GitHub-
-    /// login TOTP-pending token, and an OAuth-state token share this
-    /// signing key but can never cross-decode as each other, even before
-    /// `purpose` (an additional, belt-and-suspenders check each of those
-    /// two claims types also carries) is ever inspected.
-    pub fn decode_claims<T>(&self, token: &str) -> Result<T, JwtError>
-    where
-        T: DeserializeOwned + Expires + TokenAudience + ClaimsIssAud,
-    {
+    pub fn decode(&self, token: &str) -> Result<AccessClaims, JwtError> {
         let mut parts = token.split('.');
         let (Some(header_b64), Some(claims_b64), Some(signature_b64), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -394,9 +357,6 @@ impl JwtKeys {
             // Pinned algorithm: no negotiation, so neither `alg: none`
             // nor a (now entirely hypothetical, since there's no shared
             // secret to confuse it with) HS256 token verifies.
-            return Err(JwtError);
-        }
-        if header.typ != T::TYP {
             return Err(JwtError);
         }
 
@@ -417,132 +377,24 @@ impl JwtKeys {
             .map_err(|_| JwtError)?;
 
         let claims_bytes = URL_SAFE_NO_PAD.decode(claims_b64).map_err(|_| JwtError)?;
-        let claims: T = serde_json::from_slice(&claims_bytes).map_err(|_| JwtError)?;
+        let claims: AccessClaims = serde_json::from_slice(&claims_bytes).map_err(|_| JwtError)?;
 
-        if claims.iss() != self.issuer {
+        if claims.iss != self.issuer {
             return Err(JwtError);
         }
-        if claims.aud() != T::expected_aud(self) {
+        if claims.aud != self.audience {
             return Err(JwtError);
         }
 
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        if claims.exp() <= now {
+        if claims.exp <= now {
             return Err(JwtError);
         }
-        if let Some(nbf) = claims.nbf_opt()
-            && nbf > now + NBF_SKEW_SECS
-        {
+        if claims.nbf > now + NBF_SKEW_SECS {
             return Err(JwtError);
         }
 
         Ok(claims)
-    }
-}
-
-/// A claims type that carries a Unix-seconds expiry, so
-/// [`JwtKeys::decode_claims`] can enforce it generically.
-pub trait Expires {
-    fn exp(&self) -> i64;
-}
-
-/// `iss`/`aud` accessors so [`JwtKeys::decode_claims`] can check both
-/// generically, against each claims type's own pinned
-/// [`TokenAudience::AUD`] (OBI-201 review must-fix) rather than a single
-/// service-wide audience.
-pub trait ClaimsIssAud {
-    fn iss(&self) -> &str;
-    fn aud(&self) -> &str;
-    /// `nbf`, if this claims type carries one. Only [`AccessClaims`]
-    /// does; the short-lived GitHub-OAuth claims types rely on `exp`
-    /// alone (a 5-10 minute token has no meaningful "not yet valid"
-    /// window to enforce).
-    fn nbf_opt(&self) -> Option<i64> {
-        None
-    }
-}
-
-/// Pins a claims type's expected `aud` and JWT header `typ` (OBI-201
-/// review must-fix): the actual cross-type-confusion guard -- not
-/// `purpose` alone, which [`super::claims::GithubPendingClaims`]/
-/// [`super::github::OAuthStateClaims`] also carry only as a redundant,
-/// belt-and-suspenders check. `expected_aud` takes `&JwtKeys` (rather
-/// than being a bare constant) so [`AccessClaims`] can defer to
-/// [`JwtKeys::audience`] -- which some callers (tests, and in principle
-/// a future multi-tenant `iss`) configure away from [`AUDIENCE`] -- while
-/// the two short-lived GitHub-OAuth claims types stay pinned to their own
-/// fixed, never-configurable audiences.
-pub trait TokenAudience {
-    const TYP: &'static str;
-    fn expected_aud(keys: &JwtKeys) -> String;
-}
-
-impl Expires for AccessClaims {
-    fn exp(&self) -> i64 {
-        self.exp
-    }
-}
-
-impl ClaimsIssAud for AccessClaims {
-    fn iss(&self) -> &str {
-        &self.iss
-    }
-    fn aud(&self) -> &str {
-        &self.aud
-    }
-    fn nbf_opt(&self) -> Option<i64> {
-        Some(self.nbf)
-    }
-}
-
-impl TokenAudience for AccessClaims {
-    const TYP: &'static str = "JWT";
-    fn expected_aud(keys: &JwtKeys) -> String {
-        keys.audience().to_string()
-    }
-}
-
-impl Expires for super::claims::GithubPendingClaims {
-    fn exp(&self) -> i64 {
-        self.exp
-    }
-}
-
-impl ClaimsIssAud for super::claims::GithubPendingClaims {
-    fn iss(&self) -> &str {
-        &self.iss
-    }
-    fn aud(&self) -> &str {
-        &self.aud
-    }
-}
-
-impl TokenAudience for super::claims::GithubPendingClaims {
-    const TYP: &'static str = "loom-github-pending+jwt";
-    fn expected_aud(_keys: &JwtKeys) -> String {
-        super::claims::GITHUB_PENDING_AUDIENCE.to_string()
-    }
-}
-
-impl Expires for super::github::OAuthStateClaims {
-    fn exp(&self) -> i64 {
-        self.exp
-    }
-}
-
-impl ClaimsIssAud for super::github::OAuthStateClaims {
-    fn iss(&self) -> &str {
-        &self.iss
-    }
-    fn aud(&self) -> &str {
-        &self.aud
-    }
-}
-
-impl TokenAudience for super::github::OAuthStateClaims {
-    const TYP: &'static str = "loom-oauth-state+jwt";
-    fn expected_aud(_keys: &JwtKeys) -> String {
-        super::github::OAUTH_STATE_AUDIENCE.to_string()
     }
 }
 
@@ -903,73 +755,5 @@ mod tests {
         .unwrap();
 
         assert!(JwtKeys::from_key_file(&path, ISSUER, AUDIENCE).is_err());
-    }
-
-    /// OBI-201 review must-fix: an access token, a GitHub-login
-    /// TOTP-pending token, and an OAuth-state token share this one
-    /// signing key, but each is pinned to its own `aud` + JWT header
-    /// `typ` -- a token minted as one type is refused outright as any
-    /// other, not just distinguished by a `purpose` field a future bug
-    /// could skip checking.
-    #[test]
-    fn distinct_claims_types_never_cross_decode() {
-        use crate::auth::claims::{
-            GITHUB_PENDING_AUDIENCE, GITHUB_PENDING_PURPOSE, GithubPendingClaims,
-        };
-        use crate::auth::github::{OAUTH_STATE_AUDIENCE, OAUTH_STATE_PURPOSE, OAuthStateClaims};
-
-        let keys = keys();
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-
-        let access_token = keys.encode(&sample_claims()).unwrap();
-        let pending_token = keys
-            .encode_claims(&GithubPendingClaims {
-                github_id: 42,
-                purpose: GITHUB_PENDING_PURPOSE.to_string(),
-                iss: ISSUER.to_string(),
-                aud: GITHUB_PENDING_AUDIENCE.to_string(),
-                iat: now,
-                exp: now + 300,
-            })
-            .unwrap();
-        let state_token = keys
-            .encode_claims(&OAuthStateClaims {
-                state: "s".to_string(),
-                verifier: "v".to_string(),
-                purpose: OAUTH_STATE_PURPOSE.to_string(),
-                iss: ISSUER.to_string(),
-                aud: OAUTH_STATE_AUDIENCE.to_string(),
-                iat: now,
-                exp: now + 600,
-            })
-            .unwrap();
-
-        // Each token decodes fine as its own type...
-        assert!(keys.decode(&access_token).is_ok());
-        assert!(
-            keys.decode_claims::<GithubPendingClaims>(&pending_token)
-                .is_ok()
-        );
-        assert!(keys.decode_claims::<OAuthStateClaims>(&state_token).is_ok());
-
-        // ...but never as any other type.
-        assert!(
-            keys.decode_claims::<GithubPendingClaims>(&access_token)
-                .is_err()
-        );
-        assert!(
-            keys.decode_claims::<OAuthStateClaims>(&access_token)
-                .is_err()
-        );
-        assert!(keys.decode(&pending_token).is_err());
-        assert!(
-            keys.decode_claims::<OAuthStateClaims>(&pending_token)
-                .is_err()
-        );
-        assert!(keys.decode(&state_token).is_err());
-        assert!(
-            keys.decode_claims::<GithubPendingClaims>(&state_token)
-                .is_err()
-        );
     }
 }

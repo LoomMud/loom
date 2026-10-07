@@ -57,11 +57,10 @@ pub struct HttpState {
     web_root: Option<PathBuf>,
     auth: Option<auth::AuthService>,
     github: Option<std::sync::Arc<dyn auth::GithubIdentityProvider>>,
-    /// The non-secret half of the GitHub OAuth app config (OBI-201,
-    /// M-AUTH-7): client id + exact redirect URI, which
-    /// `/auth/github/start` needs to build the authorize URL. `None`
-    /// whenever [`Self::github`] is `None` -- both are set together by
-    /// [`Self::with_github`].
+    /// The (non-secret) half of the GitHub OAuth app config (OBI-201):
+    /// client id + exact redirect URI, which `/auth/github/start` needs
+    /// to build the authorize URL. `Some` iff [`Self::with_github`] was
+    /// called.
     github_login: Option<auth::GithubLoginConfig>,
     /// M-AUTH-6: the exact `Origin` values `/auth/refresh` and
     /// `/auth/logout` accept (no CORS for anything else). Empty by
@@ -117,8 +116,8 @@ impl HttpState {
     /// authorization-code + PKCE flow. Unset by default; requires
     /// [`Self::with_auth`] to also be set, since GitHub login still goes
     /// through the same `AuthService`. `login_config` is the non-secret
-    /// half (client id + exact redirect URI) the `/auth/github/start`
-    /// handler needs to build the authorize URL.
+    /// half (client id + exact redirect URI) `/auth/github/start` needs
+    /// to build the authorize URL.
     pub fn with_github(
         mut self,
         github: std::sync::Arc<dyn auth::GithubIdentityProvider>,

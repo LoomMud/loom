@@ -1927,16 +1927,15 @@ fn staff_origins_from_env() -> Vec<String> {
 
 /// GitHub OAuth app settings for staff login (OBI-201, M-AUTH-7). All
 /// three (`LOOM_GITHUB_CLIENT_ID`, `LOOM_GITHUB_CLIENT_SECRET`,
-/// `LOOM_GITHUB_REDIRECT_URI`) must be set, non-empty, or `/auth/github/*`
-/// doesn't mount at all -- there is no "GitHub login with no secret"
-/// state. An empty string (e.g. a compose/.env placeholder someone forgot
-/// to fill in) is treated the same as unset, not as a present-but-blank
-/// credential (should-fix from the OBI-195/OBI-201 review). The redirect
-/// URI must parse as an `https://` URL -- GitHub itself enforces an exact
-/// match against the OAuth app's registered callback, so a malformed
-/// value here just means every callback fails closed, not a security
-/// hole, but failing at startup is a much clearer signal than at the
-/// first login attempt.
+/// `LOOM_GITHUB_REDIRECT_URI`) must be set, non-empty, or
+/// `/auth/github/*` doesn't mount at all -- there is no "GitHub login
+/// with no secret" state. An empty string (e.g. a compose/.env
+/// placeholder someone forgot to fill in) is treated the same as unset,
+/// not as a present-but-blank credential. The redirect URI must parse as
+/// an `https://` URL -- GitHub itself enforces an exact match against
+/// the OAuth app's registered callback, so a malformed value here just
+/// means every callback fails closed, not a security hole, but failing
+/// at startup is a much clearer signal than at the first login attempt.
 fn github_oauth_config_from_env() -> Option<loom_http::auth::GithubOAuthConfig> {
     let client_id = non_empty_env("LOOM_GITHUB_CLIENT_ID")?;
     let client_secret = non_empty_env("LOOM_GITHUB_CLIENT_SECRET")?;
