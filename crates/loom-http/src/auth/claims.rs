@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! JWT access-token claims and the tier -> scopes mapping (OBI-174,
-//! OBI-197/M-AUTH-4, D-TM3).
+//! OBI-197/M-AUTH-4, D-TM3, OBI-201/M-AUTH-7).
 
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +54,48 @@ pub struct AccessClaims {
     /// (e.g. a sub-T3 password-only login).
     pub mfa_at: Option<i64>,
 }
+
+/// Claims for a short-lived, single-purpose token identifying a GitHub
+/// numeric user id that OAuth already resolved but which still needs a
+/// TOTP code to finish signing in (OBI-201, M-AUTH-7: "GitHub counts as
+/// the password factor only"). Carries `github_id`, not a staff uid --
+/// [`crate::auth::AuthService::github_login`] re-resolves the link fresh
+/// when this is redeemed, the same as the original OAuth callback would
+/// have, rather than trusting a uid baked into an earlier token (a link
+/// could be revoked in between).
+///
+/// Deliberately **not** [`AccessClaims`] with placeholder tier/scopes --
+/// a field-shape collision would let a pending token decode as (or be
+/// confused with) a real access token. Three independent guards stop
+/// cross-decoding even though this shares a signing key with
+/// [`AccessClaims`] (OBI-201 review must-fix): the field shapes differ
+/// (`AccessClaims` has no `purpose`, this has no `tier`/`scopes`), the
+/// pinned `aud` ([`GITHUB_PENDING_AUDIENCE`], checked by
+/// [`crate::auth::jwt::JwtKeys::decode_claims`] against every claims
+/// type's own `TokenAudience::AUD`) differs from [`crate::auth::AUDIENCE`],
+/// and the JWT header `typ` (`TokenAudience::TYP`) differs from the
+/// access token's `"JWT"`. `purpose` is kept as a fourth, belt-and-
+/// suspenders check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubPendingClaims {
+    pub github_id: i64,
+    pub purpose: String,
+    pub iss: String,
+    pub aud: String,
+    pub iat: i64,
+    pub exp: i64,
+}
+
+/// The only valid [`GithubPendingClaims::purpose`] value. Checked on
+/// decode, not just set on encode.
+pub const GITHUB_PENDING_PURPOSE: &str = "github_totp_pending";
+
+/// [`GithubPendingClaims`]'s pinned `aud` (OBI-201 review must-fix):
+/// distinct from [`crate::auth::AUDIENCE`] (access tokens) and from
+/// [`crate::auth::github::OAUTH_STATE_AUDIENCE`] (the OAuth state
+/// cookie), so [`crate::auth::jwt::JwtKeys::decode_claims`] refuses a
+/// cross-type token outright, not just via the `purpose` field.
+pub const GITHUB_PENDING_AUDIENCE: &str = "loom-github-pending";
 
 /// Derive the scope set an access token gets for `tier` (design §9).
 /// Deliberately additive/cumulative -- a higher tier keeps every scope of
