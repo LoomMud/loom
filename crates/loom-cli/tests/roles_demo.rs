@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! OBI-123 (loom-cli roles wiring, design OBI-36 \u00a78): the DB-worker
-//! snapshot loader, `LISTEN roles_changed`, the expiry timer, the
-//! `RolesMutations` dispatch (`ChannelRolesMutations`/`run_roles_manager`
-//! in `src/main.rs`), and the `audit_log` sink, exercised end to end
-//! against a real `loom serve` subprocess and a real Postgres -- same
-//! two-login harness as `loom-persist`'s own integration tests (D-27.4).
+//! OBI-123 (loom-cli roles wiring, design OBI-36 §8): the DB-worker snapshot
+//! loader, `LISTEN roles_changed`, the expiry timer, the `RolesMutations`
+//! dispatch (`ChannelRolesMutations`/`run_roles_manager` in `src/main.rs`),
+//! and the `audit_log` sink, exercised end to end against a real `loom serve`
+//! subprocess and a real Postgres -- same two-login harness as
+//! `loom-persist`'s own integration tests (D-27.4).
 //!
 //! Skips (like every DB-backed test in this workspace, D-27.7) unless
 //! `LOOM_TEST_DB_MIGRATE_URL`/`LOOM_TEST_DATABASE_URL` are set, or fails
@@ -18,20 +18,43 @@
 //! never read that variable. Point `LOOM_TEST_DB_MIGRATE_URL`/
 //! `LOOM_TEST_DATABASE_URL` at a disposable/dedicated Postgres instead --
 //! `scripts/with-disposable-postgres.sh` provisions and tears one down for
-//! exactly this purpose. `Persist::connect`/`run_migrations` also
-//! hard-fail (OBI-151's belt-and-suspenders check) if the URL still looks
-//! like the control-plane DB.
+//! exactly this purpose. `Persist::connect`/`run_migrations` also hard-fail
+//! (OBI-151's belt-and-suspenders check) if the URL still looks like the
+//! control-plane DB.
+//!
+//! OBI-305: the subprocess itself, its ports, its captured output and the
+//! telnet transcript reading all come from `loom_testing`. The
+//! file-specific part of that harness -- a per-test log *file* plus a
+//! `dump_log` that only ran in two places -- is replaced by the shared
+//! in-memory tail, which is printed on every panic (`assert_alive`, a dropped
+//! connection, a needle timeout) rather than only on early exit.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::io::BufReader;
+use std::net::TcpStream;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use loom_testing::{
+    Reply, Server, Spawn, poll_until_contains, read_one_reply, read_until_contains, send_line,
+};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
+
+/// These tests assert on decisions that arrive asynchronously (a notify-driven
+/// snapshot swap, an expiry timer), so every wait is bounded by its own needle
+/// timeout and the socket read timeout stays short.
+const READ_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Every process test here boots the same `roles` mudlib against a real
+/// Postgres with the same log level; only the ports (which `loom_testing`
+/// reserves) and the seeded rows differ.
+fn spawn_roles_server(app_url: &str) -> Server {
+    let mudlib = loom_testing::fixture(env!("CARGO_MANIFEST_DIR"), "roles");
+    Spawn::serve(&mudlib)
+        .with_env("DATABASE_URL", app_url)
+        .with_log("loom_cli=debug,loom_vm=info,loom_persist=debug")
+        .start()
+}
 
 /// Every test here spawns a real `loom serve` subprocess and hits the
 /// same shared Postgres instance (through its own connection pool *and*
@@ -237,26 +260,17 @@ fn mutation_from_secure_roles_reaches_sql_with_the_interactives_euid_as_actor() 
         seed_domain_member(&fx.owner, &domain, &member_uid, "member").await;
     });
 
-    let mudlib = fixture("roles");
-    let port = reserve_local_port();
-    let bind = format!("127.0.0.1:{port}");
-    let mut server = LoomServer::spawn(&mudlib, &bind, &fx.app_url);
-
-    let stream = connect_with_retry(&bind, Duration::from_secs(5));
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
-    let mut conn = BufReader::new(stream);
-    read_until_contains(&mut conn, "Welcome.", Duration::from_secs(5));
+    let mut server = spawn_roles_server(&fx.app_url);
+    let mut conn = reconnect(&mut server, &[]);
 
     send_line(&mut conn, &format!("become {lead_uid}"));
     read_until_contains(&mut conn, "ok", Duration::from_secs(2));
 
     send_line(&mut conn, &format!("settier {member_uid} 2 promotion"));
-    let out = poll_until_contains(&mut conn, "req ", Duration::from_secs(2));
+    let out = poll_until_contains(&mut conn, "req ", Duration::from_secs(2), None);
     assert!(out.contains("req "), "{out}");
 
-    let out = poll_until_contains(&mut conn, "roles_result ", Duration::from_secs(15));
+    let out = poll_until_contains(&mut conn, "roles_result ", Duration::from_secs(15), None);
     assert!(
         out.contains("roles_result 1 true"),
         "expected the promotion to succeed: {out}"
@@ -314,17 +328,8 @@ fn a_roles_changed_notify_swaps_the_snapshot_and_flushes_the_security_cache() {
         seed_staff(&fx.owner, &uid, account, 1).await; // T1: valid_write denies (< 2)
     });
 
-    let mudlib = fixture("roles");
-    let port = reserve_local_port();
-    let bind = format!("127.0.0.1:{port}");
-    let mut server = LoomServer::spawn(&mudlib, &bind, &fx.app_url);
-
-    let stream = connect_with_retry(&bind, Duration::from_secs(5));
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
-    let mut conn = BufReader::new(stream);
-    read_until_contains(&mut conn, "Welcome.", Duration::from_secs(5));
+    let mut server = spawn_roles_server(&fx.app_url);
+    let mut conn = reconnect(&mut server, &[]);
 
     send_line(&mut conn, &format!("become {uid}"));
     read_until_contains(&mut conn, "ok", Duration::from_secs(2));
@@ -336,7 +341,7 @@ fn a_roles_changed_notify_swaps_the_snapshot_and_flushes_the_security_cache() {
     // reason; settle first so the test is about the notify, not a race
     // with the very first load).
     send_line(&mut conn, "writefile /roles_demo_notify.txt hi");
-    let out = poll_until_contains(&mut conn, "denied", Duration::from_secs(5));
+    let out = poll_until_contains(&mut conn, "denied", Duration::from_secs(5), None);
     assert!(out.contains("denied"), "T1 must be denied: {out}");
 
     // Direct owner-connection UPDATE: no `roles_set_tier` call, so no
@@ -357,9 +362,10 @@ fn a_roles_changed_notify_swaps_the_snapshot_and_flushes_the_security_cache() {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         send_line(&mut conn, "writefile /roles_demo_notify.txt hi");
-        match read_one_reply(&mut conn, Duration::from_secs(2)) {
+        let reply = read_one_reply(&mut conn, Duration::from_secs(2));
+        match reply {
             Reply::Line(l) if l.trim_end() == "true" => break,
-            Reply::Closed => conn = reconnect(&bind, &[&format!("become {uid}")]),
+            Reply::Closed => conn = reconnect(&mut server, &[&format!("become {uid}")]),
             Reply::Line(_) | Reply::Timeout => {}
         }
         if Instant::now() > deadline {
@@ -377,8 +383,8 @@ fn a_roles_changed_notify_swaps_the_snapshot_and_flushes_the_security_cache() {
 /// happen.
 ///
 /// (CTO review N4: kept the reconnect-on-`Reply::Closed` retry below even
-/// after B1's `run_roles_manager` reliability fix -- that fix is about
-/// the *server's* reload loop never permanently stopping, not about the
+/// after B1's `run_roles_manager` reliability fix -- that fix is about the
+/// *server's* reload loop never permanently stopping, not about the
 /// occasional "connection closed" this test's own telnet client observed
 /// against a real, Postgres-backed server under CI load, which is a
 /// separate, still not fully root-caused symptom.)
@@ -402,17 +408,8 @@ fn an_expired_grant_disappears_from_the_snapshot_without_a_restart() {
         insert_expiring_grant(&fx.owner, &uid, &granter, GRANT_TTL_SECS).await;
     });
 
-    let mudlib = fixture("roles");
-    let port = reserve_local_port();
-    let bind = format!("127.0.0.1:{port}");
-    let mut server = LoomServer::spawn(&mudlib, &bind, &fx.app_url);
-
-    let stream = connect_with_retry(&bind, Duration::from_secs(5));
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
-    let mut conn = BufReader::new(stream);
-    read_until_contains(&mut conn, "Welcome.", Duration::from_secs(5));
+    let mut server = spawn_roles_server(&fx.app_url);
+    let mut conn = reconnect(&mut server, &[]);
 
     // Retry (not a single request): the boot-time snapshot load is async,
     // so an immediate `hasgrant` could race a world that has not yet
@@ -421,9 +418,10 @@ fn an_expired_grant_disappears_from_the_snapshot_without_a_restart() {
     let load_deadline = Instant::now() + Duration::from_secs(8);
     loop {
         send_line(&mut conn, &query);
-        match read_one_reply(&mut conn, Duration::from_secs(1)) {
+        let reply = read_one_reply(&mut conn, Duration::from_secs(1));
+        match reply {
             Reply::Line(l) if l.trim_end() == "hasgrant true" => break,
-            Reply::Closed => conn = reconnect(&bind, &[]),
+            Reply::Closed => conn = reconnect(&mut server, &[]),
             Reply::Line(_) | Reply::Timeout => {}
         }
         if Instant::now() > load_deadline {
@@ -436,9 +434,10 @@ fn an_expired_grant_disappears_from_the_snapshot_without_a_restart() {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         send_line(&mut conn, &query);
-        match read_one_reply(&mut conn, Duration::from_secs(1)) {
+        let reply = read_one_reply(&mut conn, Duration::from_secs(1));
+        match reply {
             Reply::Line(l) if l.trim_end() == "hasgrant false" => break,
-            Reply::Closed => conn = reconnect(&bind, &[]),
+            Reply::Closed => conn = reconnect(&mut server, &[]),
             Reply::Line(_) | Reply::Timeout => {}
         }
         if Instant::now() > deadline {
@@ -462,21 +461,12 @@ fn audit_log_has_a_row_for_a_denied_p2_plus_check() {
         return;
     };
 
-    let mudlib = fixture("roles");
-    let port = reserve_local_port();
-    let bind = format!("127.0.0.1:{port}");
-    let mut server = LoomServer::spawn(&mudlib, &bind, &fx.app_url);
-
-    let stream = connect_with_retry(&bind, Duration::from_secs(5));
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
-    let mut conn = BufReader::new(stream);
-    read_until_contains(&mut conn, "Welcome.", Duration::from_secs(5));
+    let mut server = spawn_roles_server(&fx.app_url);
+    let mut conn = reconnect(&mut server, &[]);
 
     let marker = unique_uid("denyfile");
     send_line(&mut conn, &format!("writefile /{marker}.txt hi"));
-    let out = poll_until_contains(&mut conn, "denied", Duration::from_secs(5));
+    let out = poll_until_contains(&mut conn, "denied", Duration::from_secs(5), None);
     assert!(out.contains("denied"), "{out}");
 
     rt.block_on(async {
@@ -496,285 +486,20 @@ fn audit_log_has_a_row_for_a_denied_p2_plus_check() {
     server.assert_alive();
 }
 
-/// The outcome of one [`read_one_reply`] attempt.
-enum Reply {
-    Line(String),
-    /// Nothing arrived within the timeout; try again.
-    Timeout,
-    /// The peer closed the connection (`read_line` returned `Ok(0)`).
-    /// Occasionally observed in CI against a real Postgres-backed server
-    /// under load, root cause not fully pinned down; callers that can
-    /// reconnect and retry should treat this the same as a timeout rather
-    /// than failing outright (see `reconnect` below).
-    Closed,
-}
-
-/// Reads exactly one line (one command's reply), waiting up to `timeout`.
-fn read_one_reply(reader: &mut BufReader<TcpStream>, timeout: Duration) -> Reply {
-    let deadline = Instant::now() + timeout;
-    let mut line = String::new();
-    loop {
-        match reader.read_line(&mut line) {
-            Ok(0) => return Reply::Closed,
-            Ok(_) => return Reply::Line(line.replace("\r\n", "\n")),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock =>
-            {
-                if Instant::now() > deadline {
-                    return Reply::Timeout;
-                }
-            }
-            Err(err) => panic!("socket read failed while waiting for a reply: {err}"),
-        }
-    }
-}
-
-/// (Re)connect to `bind` and read past the `Welcome.` banner, then
-/// replay `warmup` commands (e.g. `become <uid>`) to restore any
-/// per-connection state a reconnect would otherwise lose. Used both for
-/// the first connection and to recover from an occasional
-/// [`Reply::Closed`].
-fn reconnect(bind: &str, warmup: &[&str]) -> BufReader<TcpStream> {
-    let stream = connect_with_retry(bind, Duration::from_secs(5));
-    stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .unwrap();
-    let mut conn = BufReader::new(stream);
+/// (Re)connect and read past the `Welcome.` banner, then replay `warmup`
+/// commands (e.g. `become <uid>`) to restore any per-connection state a
+/// reconnect would otherwise lose. Used both for the first connection and to
+/// recover from an occasional [`Reply::Closed`].
+///
+/// `loom_testing` owns the connect-with-retry and the startup negotiation
+/// drain; a `serve` subprocess hands its readiness connection to the first
+/// session and answers every later one with its own (OBI-305).
+fn reconnect(server: &mut Server, warmup: &[&str]) -> BufReader<TcpStream> {
+    let mut conn = server.session().into_reader(READ_TIMEOUT);
     read_until_contains(&mut conn, "Welcome.", Duration::from_secs(5));
     for cmd in warmup {
         send_line(&mut conn, cmd);
         read_one_reply(&mut conn, Duration::from_secs(2));
     }
     conn
-}
-
-fn send_line(reader: &mut BufReader<TcpStream>, line: &str) {
-    let stream = reader.get_mut();
-    stream
-        .write_all(line.as_bytes())
-        .unwrap_or_else(|err| panic!("write command `{line}` failed: {err}"));
-    stream
-        .write_all(b"\n")
-        .unwrap_or_else(|err| panic!("write newline for `{line}` failed: {err}"));
-    stream
-        .flush()
-        .unwrap_or_else(|err| panic!("flush command `{line}` failed: {err}"));
-}
-
-/// [`read_until_contains`], but re-sends `line`'s command itself every
-/// ~100ms while waiting (an idle connection would otherwise never re-poll
-/// an async result -- see `accounts_demo.rs`'s copy of this same helper).
-fn poll_until_contains(
-    reader: &mut BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    let deadline = Instant::now() + timeout;
-    let mut transcript = String::new();
-
-    loop {
-        if transcript.contains(needle) {
-            return transcript;
-        }
-        if Instant::now() > deadline {
-            panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => transcript.push_str(&line.replace("\r\n", "\n")),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
-        }
-    }
-}
-
-fn read_until_contains(
-    reader: &mut BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    let deadline = Instant::now() + timeout;
-    let mut transcript = String::new();
-
-    loop {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => {
-                let normalized = line.replace("\r\n", "\n");
-                transcript.push_str(&normalized);
-                if transcript.contains(needle) {
-                    return transcript;
-                }
-            }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
-        }
-    }
-}
-
-fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(mut stream) => {
-                drain_telnet_preamble(&mut stream);
-                return stream;
-            }
-            Err(err) if Instant::now() < deadline => {
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::ConnectionRefused
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::TimedOut
-                ) {
-                    std::thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
-                panic!("failed to connect to {addr}: {err}");
-            }
-            Err(err) => panic!("failed to connect to {addr} before timeout: {err}"),
-        }
-    }
-}
-
-/// See `accounts_demo.rs`'s copy of this helper: `loom serve` negotiates a
-/// fixed 12-byte telnet preamble before any text protocol.
-fn drain_telnet_preamble(stream: &mut TcpStream) {
-    use std::io::Read;
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble");
-}
-
-fn reserve_local_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("read local addr").port()
-}
-
-struct LoomServer {
-    child: Child,
-    log_path: PathBuf,
-}
-
-impl LoomServer {
-    fn spawn(mudlib: &Path, bind: &str, database_url: &str) -> Self {
-        let loom_bin = std::env::var("CARGO_BIN_EXE_loom-cli")
-            .or_else(|_| std::env::var("CARGO_BIN_EXE_loom_cli"))
-            .expect("cargo binary path for loom-cli");
-        let http_port = reserve_local_port();
-        let log_path = scratch("roles-demo-log").join("server.log");
-        // `loom_obs::init_tracing`'s `fmt` layer writes to stdout, not
-        // stderr (`tracing_subscriber::fmt`'s default) -- capture both
-        // into the same file so `dump_log` actually sees the driver's
-        // `error!`/`warn!` output, not just an empty file.
-        let log_file = std::fs::File::create(&log_path).expect("create loom serve log file");
-        let log_file_2 = log_file.try_clone().expect("clone log file handle");
-
-        let child = Command::new(loom_bin)
-            .arg("serve")
-            .arg("--mudlib")
-            .arg(mudlib)
-            .env("LOOM_TELNET_ADDR", bind)
-            .env("LOOM_HTTP_ADDR", format!("127.0.0.1:{http_port}"))
-            .env("DATABASE_URL", database_url)
-            .env("RUST_LOG", "loom_cli=debug,loom_vm=info,loom_persist=debug")
-            .stdin(Stdio::null())
-            .stdout(log_file)
-            .stderr(log_file_2)
-            .spawn()
-            .expect("spawn loom serve");
-
-        Self { child, log_path }
-    }
-
-    fn assert_alive(&mut self) {
-        if let Some(status) = self.child.try_wait().expect("poll server process") {
-            self.dump_log();
-            panic!("loom server exited early with status {status}");
-        }
-    }
-
-    /// Print the server's captured stderr (RUST_LOG output) so a CI
-    /// failure that never got as far as `assert_alive` -- a dropped
-    /// connection, a timeout waiting for a reply -- still shows *why* the
-    /// subprocess went away, instead of just "connection closed".
-    fn dump_log(&self) {
-        match std::fs::read_to_string(&self.log_path) {
-            Ok(text) => eprintln!(
-                "---- loom serve stderr ({}) ----\n{text}",
-                self.log_path.display()
-            ),
-            Err(err) => eprintln!("(could not read {}: {err})", self.log_path.display()),
-        }
-    }
-}
-
-impl Drop for LoomServer {
-    fn drop(&mut self) {
-        let status = self.child.try_wait().ok().flatten();
-        // Dump whenever we are unwinding from a panic, regardless of
-        // whether the process had already exited on its own by this
-        // point: a bare "connection closed"/timeout panic on its own does
-        // not say *why*, and waiting for `assert_alive` to be the one
-        // place that dumps misses every panic that happens before a test
-        // ever gets there.
-        if std::thread::panicking() {
-            eprintln!("loom serve process status at drop: {status:?}");
-            self.dump_log();
-        }
-        if status.is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-static N: AtomicU32 = AtomicU32::new(0);
-
-fn scratch(tag: &str) -> PathBuf {
-    let n = N.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{tag}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir scratch");
-    dir
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).expect("mkdir destination");
-    for entry in std::fs::read_dir(from).expect("read fixture directory") {
-        let path = entry.expect("fixture entry").path();
-        let dest = to.join(path.file_name().expect("fixture filename"));
-        if path.is_dir() {
-            copy_dir(&path, &dest);
-        } else {
-            std::fs::copy(&path, &dest).expect("copy fixture file");
-        }
-    }
-}
-
-fn fixture(name: &str) -> PathBuf {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name);
-    let dir = scratch(name);
-    copy_dir(&src, &dir);
-    dir
 }
