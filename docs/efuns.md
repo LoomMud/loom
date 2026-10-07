@@ -15,9 +15,12 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `move_to` | `move_to(Object) -> Void` | P0 | 2 |
 | `send` | `send(Optional(Object), String) -> Void` | P0 | 2 |
 | `disconnect` | `disconnect(Optional(Object)) -> Void` | P2 | 2 |
+| `set_echo` | `set_echo(Optional(Object), Bool) -> Void` | P0 | 2 |
 | `bind_connection` | `bind_connection(Object) -> Void` | P3 | 2 |
 | `compile_object` | `compile_object(String) -> Optional(String)` | P1 | 500 |
 | `upgrade_all` | `upgrade_all(String) -> Int` | P1 | 50 |
+| `canary_update` | `canary_update(String, Int, Int, Int) -> Optional(String)` | P1 | 500 |
+| `canary_status` | `canary_status(String) -> Optional(Map(String, Any))` | P1 | 5 |
 | `len` | `len(string \| [T] \| {K: V}) -> Int` | P0 | 1 |
 | `split` | `split(String, String) -> Array(String)` | P0 | 5 |
 | `join` | `join(Array(String), String) -> String` | P0 | 5 |
@@ -41,6 +44,8 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `seteuid` | `seteuid(String) -> Void` | P3 | 10 |
 | `read_file` | `read_file(String) -> Optional(String)` | P0 | 20 |
 | `write_file` | `write_file(String, String) -> Bool` | P1 | 50 |
+| `save_object` | `save_object(String) -> Bool` | P1 | 100 |
+| `restore_object` | `restore_object(String) -> Bool` | P0 | 50 |
 | `unguarded` | `unguarded(String, Array(Any)?) -> Any` | P4 | 10 |
 | `roles_tier` | `roles_tier(String) -> Int` | P0 | 2 |
 | `roles_is_member` | `roles_is_member(String, String) -> Bool` | P0 | 2 |
@@ -54,3 +59,6 @@ Generated from `loom_vm::efuns` (privilege class, tick cost, arity) and `loom_co
 | `roles_revoke_grant` | `roles_revoke_grant(String, String, String, String) -> Int` | P3 | 50 |
 | `roles_propose_tier` | `roles_propose_tier(String, Int, String) -> Int` | P3 | 50 |
 | `roles_approve` | `roles_approve(Int) -> Int` | P3 | 50 |
+| `errors` | `errors(String?) -> Array(Map(String, Any))` | P1 | 20 |
+| `profile_start` | `profile_start(String) -> Void` | P1 | 10 |
+| `profile_stop` | `profile_stop(Bool?) -> String` | P1 | 10 |

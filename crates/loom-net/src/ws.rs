@@ -56,6 +56,12 @@ enum ServerEnvelope<'a> {
         package: &'a str,
         payload: &'a serde_json::Value,
     },
+    /// WS equivalent of telnet's `IAC WILL/WONT ECHO` (OBI-176): the web
+    /// client masks its input field while `enabled` is `false` and
+    /// restores plain text entry once it comes back `true`.
+    Echo {
+        enabled: bool,
+    },
 }
 
 /// Runs one accepted WebSocket connection. Mirrors `run_connection` in
@@ -94,6 +100,37 @@ pub(crate) async fn run_ws_connection(
                         }
                     }
                     ConnControl::Close => {
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                    ConnControl::SetEcho(enabled) => {
+                        let env = ServerEnvelope::Echo { enabled };
+                        if send_json(&mut sink, &env).await.is_err() {
+                            break;
+                        }
+                    }
+                    ConnControl::Reclaim(reply_tx) => {
+                        // Copyover fd hand-off (OBI-184) has no WebSocket
+                        // story yet -- reclaiming a raw TCP fd back out of
+                        // an upgraded `axum` WebSocket is a separate,
+                        // not-yet-needed follow-up (today's E2.2-docker
+                        // gate only exercises telnet bots). Answer `None`
+                        // rather than silently dropping the request, so a
+                        // caller that asks for a WS connection's socket
+                        // gets a clear "not available", not a hang.
+                        //
+                        // Reviewed (OBI-227): `run_server_full` already
+                        // removed this connection's `ConnEntry` before
+                        // sending the `Reclaim` control, so nothing can
+                        // route further `NetCommand`s here even if this
+                        // loop kept running -- a zombie that still reads
+                        // the client's input and emits `NetEvent::Line`s
+                        // for a `conn_id` the registry no longer tracks.
+                        // Since a `None` reply means this session does
+                        // not survive the copyover, actually end it here:
+                        // close the socket and fall through to the normal
+                        // disconnect bookkeeping below.
+                        let _ = reply_tx.send(None);
                         let _ = sink.send(Message::Close(None)).await;
                         break;
                     }

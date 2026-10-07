@@ -1,0 +1,5 @@
+var short_desc: string = "An empty room"
+
+pub fn short() -> string {
+    return short_desc
+}

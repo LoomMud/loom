@@ -1,0 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// /domains/start/broken: deliberately has a type error, for the
+// diagnostics integration test (OBI-168).
+
+inherit /std/room
+
+pub fn oops() -> int {
+    let x: int = "not an int"
+    return x
+}

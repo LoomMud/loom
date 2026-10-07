@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -92,6 +92,12 @@ pub enum NetCommand {
     /// one connection. Silently dropped if the connection never enabled
     /// GMCP or has since disconnected.
     SendGmcp(ConnId, String, serde_json::Value),
+    /// Turn local client echo on/off around a no-echo input (spec §9,
+    /// OBI-176): telnet gets `IAC WILL ECHO`/`IAC WONT ECHO`, WebSocket
+    /// gets an `{"type":"echo","enabled":...}` envelope the web client
+    /// uses to mask the field. `enabled = false` is the password-prompt
+    /// state.
+    SetEcho(ConnId, bool),
 }
 
 /// Output framing: the world sends text verbatim and owns its line breaks
@@ -115,7 +121,55 @@ enum ConnControl {
     Send(String),
     Close,
     SendGmcp(String, serde_json::Value),
+    SetEcho(bool),
+    /// Copyover, old-process side (design §7.5 step 2, OBI-184): stop this
+    /// connection's read/write loop *without* treating it as a disconnect
+    /// (no `NetEvent::Disconnected`, so the world never runs `net_dead()`
+    /// on the bound object), reunite the split `TcpStream`, and hand it
+    /// back through the carried `oneshot::Sender`.
+    ///
+    /// `None` means no usable `TcpStream` came back -- either the
+    /// connection is a WebSocket (no raw-fd story yet; see `ws.rs`'s
+    /// handler, which also disconnects the session when this happens) or
+    /// its task had already exited on its own between the reclaim request
+    /// and the attempt to deliver it. **Reviewed (OBI-227): any `None`
+    /// desyncs `fdpass::send_fds`' position-only fd<->`ConnId` matching
+    /// (there is no fd to send for that slot), so the copyover driver
+    /// (`loom-supervise`/`loom-cli`, not yet built) must treat `None` as
+    /// "this conn_id does not cross the copyover" -- skip it in the send
+    /// order on the old side and do not expect it in `live_connections()`
+    /// on the new side -- rather than sending a placeholder or shifting
+    /// every later fd by one.** `reunite` on two halves that genuinely
+    /// came from the same `into_split()` call cannot itself fail, so a
+    /// telnet connection's reclaim always sends `Some` once the task
+    /// actually processes the request.
+    Reclaim(oneshot::Sender<Option<TcpStream>>),
 }
+
+/// One pending "take this connection back as a raw `TcpStream`" request
+/// (OBI-184's copyover hand-off, old-process side): matches a `ConnId` to
+/// the `oneshot::Sender` [`run_server_full`] replies on. Kept as its own
+/// channel rather than a `NetCommand` variant because `NetCommand` derives
+/// `Clone`/`PartialEq`/`Eq` (for `Host`/test ergonomics elsewhere) and a
+/// `oneshot::Sender` cannot implement any of those.
+///
+/// Ordering (reviewed, OBI-227): `reclaim_rx` and `command_rx` are read
+/// from the same unbiased `tokio::select!` as every other event source in
+/// [`run_server_full`], so a `Send`/`Close`/`SetEcho` for a `ConnId` can
+/// still be in flight on `command_rx` when that id's reclaim request is
+/// processed -- harmless (the stale command just finds no entry once the
+/// reclaim removes it, or lands on the connection microseconds before it
+/// stops), but the driver issuing reclaim requests must not assume a
+/// command it just sent landed before the reclaim it sends next. The
+/// copyover driver's actual required order is coarser than per-command
+/// interleaving and is the caller's (not this module's) responsibility to
+/// enforce: quiesce new input to the objects being handed off, drain any
+/// commands already queued for them, reclaim every live connection (in
+/// the order `live_connections()` on the new side will expect, per
+/// [`ConnControl::Reclaim`]'s docs), and only then take the world
+/// snapshot -- reclaiming after the snapshot would hand off a connection
+/// the snapshot never recorded as still bound.
+pub type ReclaimRequest = (ConnId, oneshot::Sender<Option<TcpStream>>);
 
 #[derive(Debug)]
 struct ConnEntry {
@@ -137,13 +191,17 @@ pub async fn run_server(
     // never sees a closed channel (which would otherwise short-circuit
     // `tokio::select!`'s `else` branch); nothing ever sends on it.
     let (_ws_accept_tx, ws_accept_rx) = mpsc::channel(1);
-    run_server_with_ws(
+    let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+    let (_reclaim_tx, reclaim_rx) = mpsc::channel(1);
+    run_server_full(
         listener,
         config,
         event_tx,
         command_rx,
         shutdown_rx,
         ws_accept_rx,
+        adopt_rx,
+        reclaim_rx,
     )
     .await
 }
@@ -159,9 +217,68 @@ pub async fn run_server_with_ws(
     listener: TcpListener,
     config: NetConfig,
     event_tx: mpsc::Sender<NetEvent>,
+    command_rx: mpsc::Receiver<NetCommand>,
+    shutdown_rx: watch::Receiver<bool>,
+    ws_accept_rx: mpsc::Receiver<axum::extract::ws::WebSocket>,
+) -> io::Result<()> {
+    // See `run_server`'s own comment: nothing sends on these either, they
+    // just have to stay open for `run_server_full`'s select arms.
+    let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+    let (_reclaim_tx, reclaim_rx) = mpsc::channel(1);
+    run_server_full(
+        listener,
+        config,
+        event_tx,
+        command_rx,
+        shutdown_rx,
+        ws_accept_rx,
+        adopt_rx,
+        reclaim_rx,
+    )
+    .await
+}
+
+/// Copyover, new-process side (design §7.5 step 3, OBI-221): a connection
+/// `loom-supervise`'s `SCM_RIGHTS` fd-passing (`loom-supervise::fdpass`,
+/// OBI-184) handed this process as a raw, already-connected fd, now a
+/// `std::net::TcpStream` the caller has converted with
+/// [`std::os::fd::FromRawFd`] (this crate deliberately does not touch
+/// raw fds itself -- that conversion, and deciding the fd really is a
+/// `TcpStream` and not some other kind of socket, is the copyover driver's
+/// job, not `loom-net`'s) and put into non-blocking mode so
+/// [`tokio::net::TcpStream::from_std`] accepts it.
+///
+/// `conn` is the id to re-key this session under -- the copyover driver
+/// is expected to pass the *same* `conn` id
+/// [`loom_vm::World::live_connections`] recorded for this socket in the
+/// snapshot's connection table, in the same order
+/// `loom-supervise::fdpass::recv_fds` handed the fds back (see that
+/// module's docs: the wire format has no self-describing framing, so
+/// order is the only correlation the two sides share), so that once this
+/// session is live the driver's `World::reconnect_all` resolves the right
+/// object for the right socket. The caller, not `run_server_full`, is
+/// responsible for making sure `conn` does not collide with a live
+/// freshly-accepted connection's id -- in practice this means draining
+/// every adopted connection before the listener accepts anything new,
+/// which is exactly the copyover hand-off order already.
+pub type AdoptedConn = (ConnId, TcpStream);
+
+/// `run_server_with_ws` plus one more input source: already-connected
+/// sockets pushed in by the copyover driver (see [`AdoptedConn`]'s docs),
+/// each re-keyed under its own caller-chosen `ConnId` instead of this
+/// function's auto-incrementing counter. Both `run_server`/
+/// `run_server_with_ws` are thin wrappers over this with an `adopt_rx`
+/// nothing ever sends on.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_server_full(
+    listener: TcpListener,
+    config: NetConfig,
+    event_tx: mpsc::Sender<NetEvent>,
     mut command_rx: mpsc::Receiver<NetCommand>,
     mut shutdown_rx: watch::Receiver<bool>,
     mut ws_accept_rx: mpsc::Receiver<axum::extract::ws::WebSocket>,
+    mut adopt_rx: mpsc::Receiver<AdoptedConn>,
+    mut reclaim_rx: mpsc::Receiver<ReclaimRequest>,
 ) -> io::Result<()> {
     let mut next_conn_id: ConnId = 1;
     let mut conns: HashMap<ConnId, ConnEntry> = HashMap::new();
@@ -175,6 +292,89 @@ pub async fn run_server_with_ws(
             }
             Some(conn_id) = closed_rx.recv() => {
                 conns.remove(&conn_id);
+            }
+            Some((conn, reply_tx)) = reclaim_rx.recv() => {
+                // Copyover, old-process side (design §7.5 step 2): hand
+                // this connection's raw socket back to the caller instead
+                // of tearing it down. `conns.remove` here (not after the
+                // task exits via `closed_tx`) stops routing any further
+                // `NetCommand`s at this id in *this* process immediately --
+                // the connection is, from this process's point of view,
+                // already gone to its new owner, even though the task
+                // itself is still finishing its reunite-and-reply.
+                match conns.remove(&conn) {
+                    Some(entry) => {
+                        // `try_send` would leave a live connection stranded
+                        // on `Full`/`Closed`: the entry is already removed
+                        // above (so nothing in *this* loop can retry it),
+                        // and dropping `reply_tx` on the spot turns the
+                        // caller's `oneshot::Receiver::await` into a bare
+                        // `RecvError` instead of the documented `None`.
+                        // Block on the send instead, off the main select
+                        // loop (so one slow/backed-up connection can't
+                        // stall every other connection's reclaim/adopt/
+                        // command handling), and recover `reply_tx` out of
+                        // the failed send's payload to answer `None` if
+                        // the connection task had already exited on its
+                        // own in the meantime.
+                        tokio::spawn(async move {
+                            if let Err(mpsc::error::SendError(ConnControl::Reclaim(reply_tx))) =
+                                entry.tx.send(ConnControl::Reclaim(reply_tx)).await
+                            {
+                                debug!(conn, "reclaim requested but connection task had already exited");
+                                let _ = reply_tx.send(None);
+                            }
+                        });
+                    }
+                    None => {
+                        debug!(conn, "reclaim requested for an unknown/already-gone connection");
+                        let _ = reply_tx.send(None);
+                    }
+                }
+            }
+            Some((conn_id, stream)) = adopt_rx.recv() => {
+                if let Err(err) = stream.set_nodelay(true) {
+                    debug!(conn_id, %err, "set_nodelay failed on adopted connection");
+                }
+                debug!(conn_id, "adopted a pre-connected (copyover) connection");
+                // Keep the auto-increment counter clear of every adopted
+                // id, so a connection accepted off the listener right
+                // after a batch of adoptions can never collide with one.
+                if conn_id >= next_conn_id {
+                    next_conn_id = conn_id + 1;
+                }
+                // CTO review (OBI-266): deliberately *not*
+                // `event_tx.send(NetEvent::Connected(conn_id))` here,
+                // unlike every other connection source in this loop.
+                // An adopted connection is, by definition, one the world
+                // already has (or is about to have, via `World::
+                // load_snapshot`) a real binding for -- `Connected`
+                // driving `World::connect` would call master `connect()`
+                // unconditionally and bind a *second*, fresh player to
+                // this id, orphaning whatever was already bound (no
+                // `net_dead`, no autosave) regardless of whether this is
+                // a same-process reclaim/readopt round trip or a real
+                // cross-process copyover landing on a freshly-restored
+                // `World`. The whole point of adopting under a caller-
+                // chosen `ConnId` instead of the auto-increment counter
+                // is that the caller (and the `World`) already knows
+                // what this connection *is* -- `World::reconnect_all`
+                // (OBI-221) is the mechanism that re-attaches a restored
+                // binding to its (re)adopted connection, not `connect`.
+                // The connection is still fully live and reachable below
+                // (`conns.insert`) the moment this arm finishes --
+                // nothing here waits for a "ready" signal that doesn't
+                // exist.
+
+                let (tx, rx) = mpsc::channel(config.output_queue_depth);
+                let conn_event_tx = event_tx.clone();
+                let conn_closed_tx = closed_tx.clone();
+                let conn_config = config.clone();
+                let task = tokio::spawn(async move {
+                    run_connection(conn_id, stream, conn_config, rx, conn_event_tx, conn_closed_tx).await;
+                });
+
+                conns.insert(conn_id, ConnEntry { tx, task });
             }
             Some(socket) = ws_accept_rx.recv() => {
                 let conn_id = next_conn_id;
@@ -249,6 +449,25 @@ pub async fn run_server_with_ws(
                             }
                         }
                     }
+                    NetCommand::SetEcho(conn, enabled) => {
+                        let Some(entry) = conns.get(&conn) else {
+                            continue;
+                        };
+
+                        match entry.tx.try_send(ConnControl::SetEcho(enabled)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!(conn, "disconnecting slow client: output queue full");
+                                if let Some(entry) = conns.remove(&conn) {
+                                    entry.task.abort();
+                                }
+                                let _ = event_tx.send(NetEvent::Disconnected(conn)).await;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                conns.remove(&conn);
+                            }
+                        }
+                    }
                 }
             }
             accepted = listener.accept() => {
@@ -307,6 +526,7 @@ async fn run_connection(
     );
 
     let mut disconnected_sent = false;
+    let mut reclaimed_reply: Option<oneshot::Sender<Option<TcpStream>>> = None;
 
     let start_bytes = codec.start();
     if !start_bytes.is_empty() && writer.write_all(&start_bytes).await.is_err() {
@@ -339,6 +559,16 @@ async fn run_connection(
                             }
                         }
                         ConnControl::Close => {
+                            break;
+                        }
+                        ConnControl::SetEcho(enabled) => {
+                            let bytes = codec.set_echo(enabled);
+                            if !bytes.is_empty() && writer.write_all(&bytes).await.is_err() {
+                                break;
+                            }
+                        }
+                        ConnControl::Reclaim(reply_tx) => {
+                            reclaimed_reply = Some(reply_tx);
                             break;
                         }
                     }
@@ -404,6 +634,20 @@ async fn run_connection(
                 else => break,
             }
         }
+    }
+
+    if let Some(reply_tx) = reclaimed_reply {
+        // Copyover hand-off, not a disconnect: no `NetEvent::Disconnected`
+        // (the world must not run `net_dead()` on this object), and no
+        // `closed_tx` notification either -- `run_server_full` already
+        // removed this connection's `ConnEntry` before it ever sent
+        // `ConnControl::Reclaim`, specifically so it wouldn't be waiting
+        // on this task's own bookkeeping to know the handoff happened.
+        let stream = reader
+            .reunite(writer)
+            .expect("reunite: reader/writer came from the same into_split() call");
+        let _ = reply_tx.send(Some(stream));
+        return;
     }
 
     if !disconnected_sent {
@@ -501,6 +745,12 @@ impl TelnetCodec {
     /// connection that never agreed to speak it.
     fn gmcp_enabled(&self) -> bool {
         self.options.is_enabled_us(telnet::OPT_GMCP)
+    }
+
+    /// Bytes to send to flip local client echo on/off (OBI-176): see
+    /// `TelnetOptionTable::set_echo`.
+    fn set_echo(&mut self, enabled: bool) -> Vec<u8> {
+        self.options.set_echo(enabled)
     }
 
     fn feed(&mut self, chunk: &[u8]) -> CodecOutcome {
@@ -989,6 +1239,40 @@ mod tests {
 
         let _ = codec.feed(&[IAC, DO, telnet::OPT_GMCP]); // client agrees
         assert!(codec.gmcp_enabled());
+    }
+
+    #[test]
+    fn set_echo_sends_will_then_wont_echo() {
+        // OBI-176: turning off local echo for a password prompt claims
+        // `IAC WILL ECHO` (the server will do the echoing, so a
+        // well-behaved client stops echoing locally); turning it back on
+        // gives `IAC WONT ECHO`.
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        assert_eq!(codec.set_echo(false), vec![IAC, WILL, telnet::OPT_ECHO]);
+        assert_eq!(codec.set_echo(true), vec![IAC, WONT, telnet::OPT_ECHO]);
+    }
+
+    #[test]
+    fn set_echo_is_idempotent_once_settled() {
+        // Calling `set_echo` again with the state already where it wants
+        // is a silent no-op (Q method, RFC 1143 §7): no repeated WILL/WONT
+        // spam on the wire for e.g. two consecutive password prompts with
+        // no echo-on in between.
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        assert_eq!(codec.set_echo(false), vec![IAC, WILL, telnet::OPT_ECHO]);
+        assert!(codec.set_echo(false).is_empty());
+
+        assert_eq!(codec.set_echo(true), vec![IAC, WONT, telnet::OPT_ECHO]);
+        assert!(codec.set_echo(true).is_empty());
+    }
+
+    #[test]
+    fn set_echo_on_with_echo_never_turned_off_is_a_silent_no_op() {
+        // A connection that never had its echo disabled (every ordinary
+        // line of input) must not get a stray `WONT ECHO` the first time
+        // something calls `set_echo(true)` just to be safe.
+        let mut codec = TelnetCodec::new(4096, 20, 5.0, Vec::new());
+        assert!(codec.set_echo(true).is_empty());
     }
 
     #[test]
@@ -1535,6 +1819,85 @@ mod tests {
         echo.abort();
     }
 
+    /// OBI-176 acceptance: "test with a raw telnet client transcript".
+    /// `NetCommand::SetEcho` sent around a line of input must put `IAC
+    /// WILL ECHO` on the wire before the no-echo prompt and `IAC WONT
+    /// ECHO` after the input line comes back, with the prompt/line text
+    /// untouched either side -- a raw socket never speaks telnet back, so
+    /// this is read byte-for-byte rather than through a telnet-aware
+    /// client library.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_echo_puts_will_then_wont_echo_on_the_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server = tokio::spawn(run_server(listener, config, event_tx, cmd_rx, shutdown_rx));
+
+        // Stands in for /secure/login.wf: on the connection's first line
+        // (the account name) turn echo off and send a "Password:" prompt;
+        // on the second line (the password) turn echo back on.
+        let driver = tokio::spawn(async move {
+            let mut turn = 0;
+            while let Some(event) = event_rx.recv().await {
+                if let NetEvent::Line(conn, _line) = event {
+                    turn += 1;
+                    if turn == 1 {
+                        let _ = cmd_tx.send(NetCommand::SetEcho(conn, false)).await;
+                        let _ = cmd_tx
+                            .send(NetCommand::Send(conn, "Password: ".to_string()))
+                            .await;
+                    } else {
+                        let _ = cmd_tx.send(NetCommand::SetEcho(conn, true)).await;
+                        let _ = cmd_tx
+                            .send(NetCommand::Send(conn, "Welcome.\n".to_string()))
+                            .await;
+                    }
+                }
+            }
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        drain_preamble(&mut client).await;
+
+        // OBI-222: `SetEcho` and `Send` are two separate `ConnCommand`s
+        // that `run_connection` writes to the socket with two separate
+        // `write_all` calls; the IAC bytes and the prompt text are *not*
+        // guaranteed to land in the same TCP read on the client side --
+        // under scheduling pressure (observed on the self-hosted CI
+        // runner pool) the connection task can be preempted between the
+        // two writes, so a single `client.read()` can return just the
+        // IAC sequence. Read exactly the expected number of bytes
+        // (looping internally via `read_exact`, same pattern as
+        // `drain_preamble` above) instead of asserting both writes
+        // coalesce into one `read()`.
+        client.write_all(b"legolas\r\n").await.unwrap();
+        let expected = [&[IAC, WILL, telnet::OPT_ECHO][..], b"Password: "].concat();
+        let mut buf = vec![0_u8; expected.len()];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(
+            buf, expected,
+            "expected IAC WILL ECHO immediately before the password prompt"
+        );
+
+        client.write_all(b"hunter2\r\n").await.unwrap();
+        let expected = [&[IAC, WONT, telnet::OPT_ECHO][..], b"Welcome.\r\n"].concat();
+        let mut buf = vec![0_u8; expected.len()];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(
+            buf, expected,
+            "expected IAC WONT ECHO immediately after the password line"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+        driver.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supports_fifty_concurrent_clients() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1654,6 +2017,279 @@ mod tests {
         assert_eq!(&fast_buf[..n], b"ok\r\n");
 
         let _ = slow.readable().await;
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    /// Copyover, new-process side (OBI-221): a connection pushed through
+    /// `run_server_full`'s `adopt_rx` under a caller-chosen `ConnId`
+    /// (standing in for one `loom-supervise::fdpass` handed over as a raw
+    /// fd, already converted to a `TcpStream` by the copyover driver --
+    /// see `run_server_full`'s doc comment for why that conversion isn't
+    /// this crate's job) is immediately live and reachable under *that*
+    /// id, not an auto-incremented one -- every `NetCommand` keyed by it
+    /// reaches the right socket. Deliberately does **not** wait for a
+    /// `NetEvent::Connected` (CTO review, OBI-266/B1: an adopted
+    /// connection must never fire one at all -- see the dedicated
+    /// `adopted_connection_never_emits_a_connected_event` test and
+    /// `adopt_rx`'s own arm comment in `run_server_full` for why).
+    /// Retries the first `NetCommand::Send` briefly: nothing here signals
+    /// "the connection is registered and its task has started", so a
+    /// send immediately after `adopt_tx.send` can legitimately race the
+    /// task spawn by a few scheduler ticks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adopted_connection_is_keyed_by_the_caller_chosen_conn_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, _event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_ws_tx, ws_rx) = mpsc::channel(1);
+        let (adopt_tx, adopt_rx) = mpsc::channel(4);
+        let (_reclaim_tx, reclaim_rx) = mpsc::channel(4);
+
+        let server = tokio::spawn(run_server_full(
+            listener,
+            config,
+            event_tx,
+            cmd_rx,
+            shutdown_rx,
+            ws_rx,
+            adopt_rx,
+            reclaim_rx,
+        ));
+
+        // Stand in for "a socket some other listener (pre-copyover) already
+        // accepted, and the supervisor handed this process as a raw fd":
+        // a plain TCP connection to a throwaway listener, nothing to do
+        // with `run_server_full`'s own listener above.
+        let stub_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stub_addr = stub_listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(stub_addr).await.unwrap();
+        let (server_side, _peer) = stub_listener.accept().unwrap();
+        server_side.set_nonblocking(true).unwrap();
+
+        const RECONNECTED_ID: ConnId = 4242;
+        adopt_tx
+            .send((RECONNECTED_ID, TcpStream::from_std(server_side).unwrap()))
+            .await
+            .unwrap();
+
+        // The adopted session is a real, live `loom-net` connection:
+        // `NetCommand::Send` keyed by its id reaches `client`'s socket.
+        // Retried briefly (no `Connected` event to wait on anymore, see
+        // this test's own doc comment) -- `try_send` on a not-yet-
+        // registered id is simply dropped by `run_server_full` (there is
+        // no entry in `conns` yet), not an error, so this polls until it
+        // lands.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        drain_preamble(&mut client).await;
+        let mut buf = [0_u8; 8];
+        loop {
+            let _ = cmd_tx
+                .send(NetCommand::Send(RECONNECTED_ID, "hi\n".to_string()))
+                .await;
+            match tokio::time::timeout(std::time::Duration::from_millis(100), client.read(&mut buf))
+                .await
+            {
+                Ok(Ok(n)) if n > 0 => {
+                    assert_eq!(&buf[..n], b"hi\r\n");
+                    break;
+                }
+                _ if tokio::time::Instant::now() >= deadline => {
+                    panic!("adopted connection never became reachable via NetCommand::Send")
+                }
+                _ => continue,
+            }
+        }
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    /// CTO review (OBI-266/B1): the actual regression this guards
+    /// against -- `run_server_full` firing `NetEvent::Connected` for an
+    /// adopted connection drives `World::connect`, which unconditionally
+    /// calls master `connect()` and binds a *fresh* player to that
+    /// `ConnId`, orphaning whatever object a restored snapshot (or a
+    /// same-process reclaim/readopt round trip) already bound there --
+    /// no `net_dead`, no autosave, every player effectively logged out
+    /// and replaced on every adoption. Proves the absence directly:
+    /// adopt a connection, then confirm no `NetEvent::Connected` for its
+    /// id arrives in a generous window, while other event traffic
+    /// (a `Line` from real client input) still flows normally.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adopted_connection_never_emits_a_connected_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_ws_tx, ws_rx) = mpsc::channel(1);
+        let (adopt_tx, adopt_rx) = mpsc::channel(4);
+        let (_reclaim_tx, reclaim_rx) = mpsc::channel(4);
+
+        let server = tokio::spawn(run_server_full(
+            listener,
+            config,
+            event_tx,
+            cmd_rx,
+            shutdown_rx,
+            ws_rx,
+            adopt_rx,
+            reclaim_rx,
+        ));
+
+        let stub_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stub_addr = stub_listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(stub_addr).await.unwrap();
+        let (server_side, _peer) = stub_listener.accept().unwrap();
+        server_side.set_nonblocking(true).unwrap();
+
+        const RECONNECTED_ID: ConnId = 4343;
+        adopt_tx
+            .send((RECONNECTED_ID, TcpStream::from_std(server_side).unwrap()))
+            .await
+            .unwrap();
+
+        // Real client input still flows (proving the connection is
+        // genuinely live and the event loop is running, not just
+        // silent), while we watch for the one event that must never
+        // appear.
+        drain_preamble(&mut client).await;
+        client.write_all(b"hello\r\n").await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut saw_line = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv()).await
+            {
+                Ok(Some(NetEvent::Connected(id))) if id == RECONNECTED_ID => panic!(
+                    "adopted connection must never emit NetEvent::Connected (CTO review, OBI-266/B1)"
+                ),
+                Ok(Some(NetEvent::Line(id, _))) if id == RECONNECTED_ID => saw_line = true,
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        assert!(
+            saw_line,
+            "never saw the adopted connection's own input -- the connection wasn't actually live, so the absence of Connected proves nothing"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    /// Copyover, old-process side (OBI-184): a live connection, reclaimed
+    /// via `reclaim_rx`, comes back as a real, usable `TcpStream` -- and
+    /// the world never sees a spurious `NetEvent::Disconnected` for it
+    /// (reclaiming is a hand-off, not a close; a real `net_dead()` call
+    /// on the bound object would be wrong here).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaimed_connection_is_a_live_stream_with_no_disconnect_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_ws_tx, ws_rx) = mpsc::channel(1);
+        let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+        let (reclaim_tx, reclaim_rx) = mpsc::channel(4);
+
+        let server = tokio::spawn(run_server_full(
+            listener,
+            config,
+            event_tx,
+            cmd_rx,
+            shutdown_rx,
+            ws_rx,
+            adopt_rx,
+            reclaim_rx,
+        ));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let conn = loop {
+            match event_rx.recv().await.expect("event channel closed") {
+                NetEvent::Connected(id) => break id,
+                _ => continue,
+            }
+        };
+        drain_preamble(&mut client).await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reclaim_tx.send((conn, reply_tx)).await.unwrap();
+        let mut reclaimed = reply_rx
+            .await
+            .expect("reclaim reply channel dropped")
+            .expect("reclaim should succeed for a live connection");
+
+        // The reclaimed stream is live and independent of `client`: write
+        // through it and read on the client side.
+        reclaimed.write_all(b"hi from reclaimed\n").await.unwrap();
+        let mut buf = [0_u8; 32];
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hi from reclaimed\n");
+
+        // No spurious disconnect: the next event (if any arrives before
+        // shutdown) must not be `Disconnected(conn)`.
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+        while let Ok(ev) = event_rx.try_recv() {
+            if let NetEvent::Disconnected(id) = ev {
+                assert_ne!(
+                    id, conn,
+                    "reclaimed connection must not also fire Disconnected"
+                );
+            }
+        }
+    }
+
+    /// Copyover, old-process side (OBI-184): reclaiming a `ConnId` that
+    /// isn't (or is no longer) live must answer `None` promptly, not hang
+    /// the caller's `oneshot::Receiver::await` -- this is the "connection
+    /// task had already exited on its own" path reviewed in OBI-227.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaiming_an_unknown_conn_id_answers_none() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, _event_rx) = mpsc::channel(256);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_ws_tx, ws_rx) = mpsc::channel(1);
+        let (_adopt_tx, adopt_rx) = mpsc::channel(1);
+        let (reclaim_tx, reclaim_rx) = mpsc::channel(4);
+
+        let server = tokio::spawn(run_server_full(
+            listener,
+            config,
+            event_tx,
+            cmd_rx,
+            shutdown_rx,
+            ws_rx,
+            adopt_rx,
+            reclaim_rx,
+        ));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reclaim_tx.send((99999, reply_tx)).await.unwrap();
+        let reclaimed = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .expect("reclaim of an unknown conn id must answer promptly, not hang")
+            .expect("reclaim reply channel dropped");
+        assert!(
+            reclaimed.is_none(),
+            "reclaiming an unknown conn id must answer None"
+        );
 
         shutdown_tx.send(true).unwrap();
         server.await.unwrap().unwrap();

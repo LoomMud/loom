@@ -28,22 +28,45 @@ struct FakeStaff {
 #[derive(Default)]
 struct FakeDirectoryInner {
     staff: HashMap<String, FakeStaff>, // keyed by username (== uid in these tests)
-    refresh_tokens: HashMap<String, RefreshRecord>, // keyed by token_hash
+    sessions: HashMap<String, FakeSession>, // keyed by token_hash
     github_links: HashMap<i64, String>,
     audit_events: Vec<AuditEvent>,
+    /// How many times [`StaffDirectory::resolve_uid`] has been called
+    /// (OBI-204 review fix): used to prove `login` checks the IP bucket
+    /// *before* paying for this lookup.
+    resolve_uid_calls: u32,
+    /// How many times [`StaffDirectory::admin_set_tier`] has actually
+    /// reached the directory (OBI-185): used to prove a forbidden/
+    /// step-up-refused call never gets this far.
+    admin_set_tier_calls: u32,
+    /// When `true`, [`StaffDirectory::admin_audit_recent`] fails outright
+    /// (CTO review on PR #98: proving the deny path is audited too, not
+    /// just the tier-floor refusal).
+    fail_admin_audit: bool,
 }
 
-#[derive(Default, Clone)]
-struct FakeDirectory {
+#[derive(Clone)]
+struct FakeSession {
+    staff_uid: String,
+    expires_at: OffsetDateTime,
+    revoked_at: Option<OffsetDateTime>,
+    sid: String,
+    amr: Vec<String>,
+    mfa_at: Option<OffsetDateTime>,
+    last_used_at: OffsetDateTime,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct FakeDirectory {
     inner: Arc<Mutex<FakeDirectoryInner>>,
 }
 
 impl FakeDirectory {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    fn add_staff(&self, uid: &str, password: &str, tier: i16) {
+    pub(crate) fn add_staff(&self, uid: &str, password: &str, tier: i16) {
         self.inner.lock().unwrap().staff.insert(
             uid.to_string(),
             FakeStaff {
@@ -68,7 +91,14 @@ impl FakeDirectory {
         self.inner.lock().unwrap().staff.get_mut(uid).unwrap().tier = tier;
     }
 
-    fn link_github(&self, github_id: i64, uid: &str) {
+    /// Make the next (and every subsequent) [`StaffDirectory::
+    /// admin_audit_recent`] call fail with
+    /// [`AdminDirectoryError::Unavailable`] (CTO review on PR #98).
+    fn fail_admin_audit(&self) {
+        self.inner.lock().unwrap().fail_admin_audit = true;
+    }
+
+    pub(crate) fn link_github(&self, github_id: i64, uid: &str) {
         self.inner
             .lock()
             .unwrap()
@@ -84,7 +114,7 @@ impl FakeDirectory {
     /// login with a real code succeeds must set up "already confirmed"
     /// this way instead of spending the one real code available to it on
     /// confirmation.
-    fn confirm_totp_for_test(&self, uid: &str) {
+    pub(crate) fn confirm_totp_for_test(&self, uid: &str) {
         self.inner
             .lock()
             .unwrap()
@@ -94,16 +124,27 @@ impl FakeDirectory {
             .totp_confirmed = true;
     }
 
-    /// Directly mark a refresh token revoked (simulating an admin/logout
-    /// action taken through some other path). Exercised indirectly by
-    /// every test that calls [`AuthService::logout`]; kept as a direct
-    /// helper too since a future test may want to revoke without going
-    /// through the service.
+    /// Directly mark a session revoked (simulating an admin/logout
+    /// action taken through some other path, or the OBI-198 revoke-all
+    /// trigger -- exercised directly here since the fake directory has
+    /// no triggers).
     #[allow(dead_code)]
     fn revoke_for_test(&self, token_plaintext: &str) {
         let hash = hash_token(token_plaintext);
-        if let Some(record) = self.inner.lock().unwrap().refresh_tokens.get_mut(&hash) {
-            record.revoked_at = Some(now());
+        if let Some(session) = self.inner.lock().unwrap().sessions.get_mut(&hash) {
+            session.revoked_at = Some(now());
+        }
+    }
+
+    /// Simulate the OBI-198 revoke-all-for-uid trigger (tier change, TOTP
+    /// reset, GitHub unlink, staff removal, or password change all end up
+    /// here in Postgres).
+    fn revoke_all_for_uid_for_test(&self, uid: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        for session in inner.sessions.values_mut() {
+            if session.staff_uid == uid {
+                session.revoked_at = Some(now());
+            }
         }
     }
 
@@ -112,14 +153,36 @@ impl FakeDirectory {
         self.inner
             .lock()
             .unwrap()
-            .refresh_tokens
+            .sessions
             .get(&hash)
             .map(|r| r.revoked_at.is_some())
             .unwrap_or(false)
     }
 
+    /// Back-date a session's `last_used_at` past the idle cutoff, for the
+    /// idle-expiry test -- simulating a session nobody has refreshed in a
+    /// while without sleeping real hours.
+    fn backdate_last_used_for_test(&self, token_plaintext: &str, last_used_at: OffsetDateTime) {
+        let hash = hash_token(token_plaintext);
+        if let Some(session) = self.inner.lock().unwrap().sessions.get_mut(&hash) {
+            session.last_used_at = last_used_at;
+        }
+    }
+
     fn audit_events(&self) -> Vec<AuditEvent> {
         self.inner.lock().unwrap().audit_events.clone()
+    }
+
+    fn admin_set_tier_calls(&self) -> u32 {
+        self.inner.lock().unwrap().admin_set_tier_calls
+    }
+
+    fn tier_of(&self, uid: &str) -> Option<i16> {
+        self.inner.lock().unwrap().staff.get(uid).map(|s| s.tier)
+    }
+
+    fn resolve_uid_calls(&self) -> u32 {
+        self.inner.lock().unwrap().resolve_uid_calls
     }
 }
 
@@ -143,6 +206,12 @@ impl StaffDirectory for FakeDirectory {
             totp_secret: staff.totp_secret.clone(),
             totp_confirmed: staff.totp_confirmed,
         }))
+    }
+
+    async fn resolve_uid(&self, username: &str) -> Result<Option<String>, DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.resolve_uid_calls += 1;
+        Ok(inner.staff.get(username).map(|s| s.uid.clone()))
     }
 
     async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError> {
@@ -205,13 +274,20 @@ impl StaffDirectory for FakeDirectory {
         uid: &str,
         token_hash: &str,
         expires_at: OffsetDateTime,
+        sid: &str,
+        amr: &[String],
+        mfa_at: Option<OffsetDateTime>,
     ) -> Result<(), DirectoryError> {
-        self.inner.lock().unwrap().refresh_tokens.insert(
+        self.inner.lock().unwrap().sessions.insert(
             token_hash.to_string(),
-            RefreshRecord {
+            FakeSession {
                 staff_uid: uid.to_string(),
                 expires_at,
                 revoked_at: None,
+                sid: sid.to_string(),
+                amr: amr.to_vec(),
+                mfa_at,
+                last_used_at: now(),
             },
         );
         Ok(())
@@ -225,54 +301,95 @@ impl StaffDirectory for FakeDirectory {
             .inner
             .lock()
             .unwrap()
-            .refresh_tokens
+            .sessions
             .get(token_hash)
-            .cloned())
-    }
-
-    async fn refresh_token_rotate(
-        &self,
-        token_hash: &str,
-    ) -> Result<RefreshRotation, DirectoryError> {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(record) = inner.refresh_tokens.get_mut(token_hash) else {
-            return Ok(RefreshRotation::NotFound);
-        };
-        if record.revoked_at.is_some() {
-            return Ok(RefreshRotation::Reused {
-                staff_uid: record.staff_uid.clone(),
-            });
-        }
-        if record.expires_at <= now() {
-            return Ok(RefreshRotation::Expired);
-        }
-        record.revoked_at = Some(now());
-        Ok(RefreshRotation::Rotated {
-            staff_uid: record.staff_uid.clone(),
-        })
+            .map(|s| RefreshRecord {
+                staff_uid: s.staff_uid.clone(),
+                expires_at: s.expires_at,
+                revoked_at: s.revoked_at,
+                sid: s.sid.clone(),
+                amr: s.amr.clone(),
+                mfa_at: s.mfa_at,
+            }))
     }
 
     async fn refresh_token_revoke(&self, token_hash: &str) -> Result<(), DirectoryError> {
-        if let Some(record) = self
-            .inner
-            .lock()
-            .unwrap()
-            .refresh_tokens
-            .get_mut(token_hash)
-        {
-            record.revoked_at = Some(now());
+        if let Some(session) = self.inner.lock().unwrap().sessions.get_mut(token_hash) {
+            session.revoked_at = Some(now());
         }
         Ok(())
     }
 
     async fn refresh_token_revoke_all(&self, uid: &str) -> Result<(), DirectoryError> {
         let mut inner = self.inner.lock().unwrap();
-        for record in inner.refresh_tokens.values_mut() {
-            if record.staff_uid == uid {
-                record.revoked_at = Some(now());
+        for session in inner.sessions.values_mut() {
+            if session.staff_uid == uid {
+                session.revoked_at = Some(now());
             }
         }
         Ok(())
+    }
+
+    async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<(), DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(sid) = inner.sessions.get(token_hash).map(|s| s.sid.clone()) else {
+            return Ok(());
+        };
+        for session in inner.sessions.values_mut() {
+            if session.sid == sid {
+                session.revoked_at = Some(now());
+            }
+        }
+        Ok(())
+    }
+
+    async fn session_rotate(
+        &self,
+        old_token_hash: &str,
+        new_token_hash: &str,
+        idle_cutoff: OffsetDateTime,
+    ) -> Result<SessionRotateOutcome, DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(session) = inner.sessions.get(old_token_hash).cloned() else {
+            return Ok(SessionRotateOutcome::Invalid);
+        };
+
+        if session.revoked_at.is_some() {
+            // Reuse: kill the whole family.
+            for other in inner.sessions.values_mut() {
+                if other.sid == session.sid && other.revoked_at.is_none() {
+                    other.revoked_at = Some(now());
+                }
+            }
+            return Ok(SessionRotateOutcome::Reused {
+                staff_uid: session.staff_uid,
+            });
+        }
+
+        if session.expires_at <= now() || session.last_used_at <= idle_cutoff {
+            return Ok(SessionRotateOutcome::Invalid);
+        }
+
+        inner.sessions.get_mut(old_token_hash).unwrap().revoked_at = Some(now());
+        inner.sessions.insert(
+            new_token_hash.to_string(),
+            FakeSession {
+                staff_uid: session.staff_uid.clone(),
+                expires_at: session.expires_at,
+                revoked_at: None,
+                sid: session.sid.clone(),
+                amr: session.amr.clone(),
+                mfa_at: session.mfa_at,
+                last_used_at: now(),
+            },
+        );
+        Ok(SessionRotateOutcome::Rotated {
+            staff_uid: session.staff_uid,
+            sid: session.sid,
+            amr: session.amr,
+            mfa_at: session.mfa_at,
+            expires_at: session.expires_at,
+        })
     }
 
     async fn github_lookup(&self, github_id: i64) -> Result<Option<String>, DirectoryError> {
@@ -289,12 +406,92 @@ impl StaffDirectory for FakeDirectory {
         self.inner.lock().unwrap().audit_events.push(event);
         Ok(())
     }
+
+    /// A simplified re-implementation of `roles_set_tier`'s own rules
+    /// (OBI-185, M-ADM-1): self-promotion, Phase-1 tier range, and actor
+    /// tier floor. This is the fake's analogue of "the SQL function is
+    /// the real boundary" -- tests exercise it to prove `AuthService`'s
+    /// tier/step-up checks are UX, not the only thing standing between a
+    /// caller and an illegal promotion.
+    async fn admin_set_tier(
+        &self,
+        actor: &str,
+        target_uid: &str,
+        new_tier: i16,
+        _reason: &str,
+    ) -> Result<(), AdminDirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.admin_set_tier_calls += 1;
+        if actor == target_uid {
+            return Err(AdminDirectoryError::Rejected(
+                "self-promotion is not permitted".to_string(),
+            ));
+        }
+        if !(1..=3).contains(&new_tier) {
+            return Err(AdminDirectoryError::Rejected(
+                "roles_set_tier may only set tiers 1-3 in Phase 1".to_string(),
+            ));
+        }
+        let actor_tier = inner.staff.get(actor).map(|s| s.tier).unwrap_or(0);
+        if actor_tier < 3 {
+            return Err(AdminDirectoryError::Rejected(
+                "actor tier may not change roles".to_string(),
+            ));
+        }
+        let Some(staff) = inner.staff.get_mut(target_uid) else {
+            return Err(AdminDirectoryError::Rejected(
+                "no account found for uid".to_string(),
+            ));
+        };
+        staff.tier = new_tier;
+        Ok(())
+    }
+
+    async fn admin_audit_recent(
+        &self,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> Result<Vec<AdminAuditEntry>, AdminDirectoryError> {
+        let inner = self.inner.lock().unwrap();
+        if inner.fail_admin_audit {
+            return Err(AdminDirectoryError::Unavailable);
+        }
+        let mut rows: Vec<AdminAuditEntry> = inner
+            .audit_events
+            .iter()
+            .enumerate()
+            .map(|(idx, event)| AdminAuditEntry {
+                id: idx as i64,
+                at: now(),
+                kind: event.kind.to_string(),
+                caller: event.uid.clone(),
+                effective_principal: None,
+                apply: None,
+                class: None,
+                argument: None,
+                guard_set: Vec::new(),
+                verdict: event.verdict.to_string(),
+                detail: event.detail.clone(),
+            })
+            .collect();
+        rows.reverse();
+        if let Some(before) = before_id {
+            rows.retain(|r| r.id < before);
+        }
+        rows.truncate(limit.max(0) as usize);
+        Ok(rows)
+    }
 }
 
-fn test_service(directory: FakeDirectory) -> AuthService {
+pub(crate) fn test_service(directory: FakeDirectory) -> AuthService {
     AuthService::new(
         Arc::new(directory),
-        JwtKeys::from_secret(b"test-only-secret-not-for-prod"),
+        JwtKeys::single(
+            [1u8; 32],
+            "test-kid",
+            "https://build.loommud.com/",
+            jwt::AUDIENCE,
+        ),
     )
 }
 
@@ -410,7 +607,12 @@ async fn forged_access_token_is_rejected() {
     // Attacker re-signs the *same* claims (tier escalated to 5) with a
     // different key -- simulating "I control the JSON, not the secret".
     let forged_claims = AccessClaims { tier: 5, ..claims };
-    let attacker_keys = JwtKeys::from_secret(b"attacker-controlled-key-not-the-servers");
+    let attacker_keys = JwtKeys::single(
+        [2u8; 32],
+        "test-kid",
+        "https://build.loommud.com/",
+        jwt::AUDIENCE,
+    );
     let forged = attacker_keys.encode(&forged_claims).unwrap();
 
     assert!(service.verify_access_token(&forged).is_err());
@@ -437,10 +639,7 @@ async fn refresh_reflects_the_directorys_current_tier_not_a_stale_claim() {
     // production) -- not through any token the client holds.
     directory.set_tier("boromir", 2);
 
-    let refreshed = service
-        .refresh(&pair.refresh_token, None, &ctx())
-        .await
-        .unwrap();
+    let refreshed = service.refresh(&pair.refresh_token, &ctx()).await.unwrap();
     let refreshed_claims = service
         .verify_access_token(&refreshed.access_token)
         .unwrap();
@@ -454,7 +653,7 @@ async fn refresh_reflects_the_directorys_current_tier_not_a_stale_claim() {
     // And a demotion takes effect just as readily.
     directory.set_tier("boromir", 0);
     let refreshed_again = service
-        .refresh(&refreshed.refresh_token, None, &ctx())
+        .refresh(&refreshed.refresh_token, &ctx())
         .await
         .unwrap();
     let claims_again = service
@@ -475,12 +674,68 @@ async fn expired_refresh_token_is_refused() {
     let pair = service.login("pippin", "took", None, &ctx()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let result = service.refresh(&pair.refresh_token, None, &ctx()).await;
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
 }
 
+/// Acceptance (OBI-198, M-AUTH-5): "idle expiry enforced" -- a session
+/// not rotated within the idle window is refused even though its 14-day
+/// absolute expiry hasn't passed.
+#[tokio::test]
+async fn idle_expired_refresh_token_is_refused() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("frodo", "ringbearer", 1);
+    let service = test_service(directory.clone()).with_idle_ttl(Duration::from_secs(60));
+
+    let pair = service
+        .login("frodo", "ringbearer", None, &ctx())
+        .await
+        .unwrap();
+    directory.backdate_last_used_for_test(
+        &pair.refresh_token,
+        OffsetDateTime::now_utc() - time::Duration::seconds(120),
+    );
+
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
+}
+
+/// Acceptance (OBI-198, M-AUTH-5): a tier change (or TOTP reset/GitHub
+/// unlink/password change/staff removal -- all funnel into the same
+/// Postgres `staff_sessions_revoke_for_uid` trigger, see
+/// `loom-persist/migrations/0008_staff_sessions.sql`) revokes every
+/// session for the uid, not just one family.
+#[tokio::test]
+async fn revoke_all_for_uid_kills_every_family() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("sam", "gaffer", 1);
+    let service = test_service(directory.clone());
+
+    let pair_a = service.login("sam", "gaffer", None, &ctx()).await.unwrap();
+    let pair_b = service.login("sam", "gaffer", None, &ctx()).await.unwrap();
+
+    directory.revoke_all_for_uid_for_test("sam");
+
+    assert_eq!(
+        service
+            .refresh(&pair_a.refresh_token, &ctx())
+            .await
+            .unwrap_err(),
+        AuthError::InvalidRefreshToken
+    );
+    assert_eq!(
+        service
+            .refresh(&pair_b.refresh_token, &ctx())
+            .await
+            .unwrap_err(),
+        AuthError::InvalidRefreshToken
+    );
+}
+
 /// Acceptance: "revoked ... refresh" refused, and a revoked-token replay
-/// (stolen refresh token scenario) takes down the whole session family.
+/// (stolen refresh token scenario) takes down the whole session family --
+/// but a *different* family for the same uid is untouched (OBI-198:
+/// family-scoped, not uid-wide).
 #[tokio::test]
 async fn revoked_refresh_token_is_refused_and_replay_revokes_the_family() {
     let directory = FakeDirectory::new();
@@ -494,33 +749,88 @@ async fn revoked_refresh_token_is_refused_and_replay_revokes_the_family() {
     service.logout(&pair.refresh_token).await.unwrap();
     assert!(directory.is_revoked(&pair.refresh_token));
 
-    let result = service.refresh(&pair.refresh_token, None, &ctx()).await;
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
 
-    // Rotate a second, legitimate session, then simulate a thief replaying
-    // the *old* rotated-out token -- every outstanding token for the uid
-    // should die, including the legitimate rotated one.
+    // Rotate a second, legitimate session *in a different family* (a
+    // separate login), then simulate a thief replaying the *old*
+    // rotated-out token -- every outstanding token in that token's family
+    // should die, including the legitimately-rotated one, but a wholly
+    // separate family for the same uid survives.
     let pair2 = service
         .login("merry", "brandybuck", None, &ctx())
         .await
         .unwrap();
-    let rotated = service
-        .refresh(&pair2.refresh_token, None, &ctx())
+    let other_family = service
+        .login("merry", "brandybuck", None, &ctx())
         .await
         .unwrap();
+    let rotated = service.refresh(&pair2.refresh_token, &ctx()).await.unwrap();
     // `pair2.refresh_token` is now revoked (rotated out); replaying it:
-    let replay_result = service.refresh(&pair2.refresh_token, None, &ctx()).await;
+    let replay_result = service.refresh(&pair2.refresh_token, &ctx()).await;
     assert_eq!(replay_result.unwrap_err(), AuthError::InvalidRefreshToken);
     // The legitimately-rotated token is now dead too.
-    let result = service.refresh(&rotated.refresh_token, None, &ctx()).await;
+    let result = service.refresh(&rotated.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
+    // A separate family for the same uid is untouched.
+    let unaffected = service.refresh(&other_family.refresh_token, &ctx()).await;
+    assert!(unaffected.is_ok());
+}
+
+/// Acceptance (OBI-203): a refreshed token keeps the login's `sid`,
+/// `amr`, and `mfa_at` -- not a fresh `sid` per issuance and not
+/// `amr: ["refresh"]`/`mfa_at: None`.
+#[tokio::test]
+async fn refresh_carries_forward_the_logins_sid_amr_and_mfa_at() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gimli", "dwarf", 3);
+    let service = test_service(directory.clone());
+
+    // Confirm directly against the directory rather than through
+    // `service.totp_confirm` -- that would consume this test's one
+    // deterministic real code (TOTP replay protection, OBI-195 review fix
+    // 4) and leave nothing left for the login below to present.
+    let enrollment = service.totp_enroll("gimli", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gimli");
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gimli").unwrap();
+
+    let fresh_code = totp.generate_current().to_string();
+    let pair = service
+        .login("gimli", "dwarf", Some(&fresh_code), &ctx())
+        .await
+        .unwrap();
+    let claims = service.verify_access_token(&pair.access_token).unwrap();
+    assert_eq!(claims.amr, vec!["pwd".to_string(), "otp".to_string()]);
+    assert!(claims.mfa_at.is_some());
+
+    let refreshed = service.refresh(&pair.refresh_token, &ctx()).await.unwrap();
+    let refreshed_claims = service
+        .verify_access_token(&refreshed.access_token)
+        .unwrap();
+    // Same token family, not a fresh one.
+    assert_eq!(refreshed_claims.sid, claims.sid);
+    // The original login's authentication context, not "refresh".
+    assert_eq!(refreshed_claims.amr, claims.amr);
+    assert_eq!(refreshed_claims.mfa_at, claims.mfa_at);
+
+    // A second rotation still carries the same family/context forward.
+    let refreshed_again = service
+        .refresh(&refreshed.refresh_token, &ctx())
+        .await
+        .unwrap();
+    let claims_again = service
+        .verify_access_token(&refreshed_again.access_token)
+        .unwrap();
+    assert_eq!(claims_again.sid, claims.sid);
+    assert_eq!(claims_again.amr, claims.amr);
+    assert_eq!(claims_again.mfa_at, claims.mfa_at);
 }
 
 #[tokio::test]
 async fn unknown_refresh_token_is_refused() {
     let directory = FakeDirectory::new();
     let service = test_service(directory);
-    let result = service.refresh("never-issued-token", None, &ctx()).await;
+    let result = service.refresh("never-issued-token", &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
 }
 
@@ -617,9 +927,14 @@ async fn github_pending_token_is_not_a_bearer_of_arbitrary_claims() {
     directory.link_github(99, "gandalf");
     let service = test_service(directory);
 
-    let attacker_keys = JwtKeys::from_secret(b"attacker-controlled-key-not-the-servers");
-    let forged = attacker_keys
-        .encode_claims(&GithubPendingClaims {
+    // A different (attacker-controlled) state-token key, not the
+    // server's -- `AuthService` never exposes its own `StateTokenKey`,
+    // only whether a token verifies against it (must-fix 2, PR #78 CTO
+    // review: this signing domain is now entirely separate from the
+    // EdDSA staff access-token keyset).
+    let attacker_key = StateTokenKey::generate();
+    let forged = attacker_key
+        .encode(&GithubPendingClaims {
             github_id: 99,
             purpose: GITHUB_PENDING_PURPOSE.to_string(),
             iat: OffsetDateTime::now_utc().unix_timestamp(),
@@ -717,6 +1032,46 @@ async fn wrong_totp_codes_count_toward_the_account_lockout() {
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
 }
 
+/// OBI-204 acceptance: `login`'s wrong-password failures and
+/// `totp_confirm`'s wrong-code failures land on the *same* account
+/// counter -- both resolve to the one `uid:` namespaced key, so an
+/// attacker can't double their effective guess budget by splitting
+/// attempts across the two entry points.
+#[tokio::test]
+async fn wrong_login_password_and_wrong_totp_confirm_share_one_account_counter() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory);
+
+    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+    let code = totp.generate_current().to_string();
+    service
+        .totp_confirm("gandalf", &code, &ctx())
+        .await
+        .unwrap();
+
+    // 3 wrong login passwords...
+    for _ in 0..3 {
+        let result = service.login("gandalf", "wrong", None, &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+    }
+    // ...and 2 wrong TOTP codes via totp_confirm -- 5 total against the
+    // same account.
+    for _ in 0..2 {
+        let result = service.totp_confirm("gandalf", "000000", &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::TotpInvalid);
+    }
+
+    // The account is now locked from the combined count -- even the
+    // correct password+code combo is refused.
+    let fresh_code = totp.generate_current().to_string();
+    let result = service
+        .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
 /// A missing TOTP code ("not supplied") is not a guess and must not count
 /// toward the lockout.
 #[tokio::test]
@@ -740,6 +1095,36 @@ async fn a_missing_totp_code_does_not_count_as_a_failure() {
     }
 
     // Still not locked -- the current code succeeds.
+    let fresh_code = totp.generate_current().to_string();
+    assert!(
+        service
+            .login("gandalf", "mithrandir", Some(&fresh_code), &ctx())
+            .await
+            .is_ok()
+    );
+}
+
+/// OBI-204 CTO review: an in-flight reservation must never *itself* set
+/// the lockout. After 4 wrong passwords, a correct password with no TOTP
+/// code (`TotpRequired`, the normal two-step login flow) releases its
+/// reservation; it must not leave the account locked for 15 minutes.
+#[tokio::test]
+async fn totp_required_after_four_failures_does_not_lock_the_account() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "mithrandir", 3);
+    let service = test_service(directory.clone());
+
+    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gandalf");
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+
+    for _ in 0..4 {
+        let result = service.login("gandalf", "wrong", None, &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+    }
+    let result = service.login("gandalf", "mithrandir", None, &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
+
     let fresh_code = totp.generate_current().to_string();
     assert!(
         service
@@ -776,6 +1161,33 @@ async fn ip_bucket_throttles_logins_across_many_accounts() {
     let other_ip = ctx_from("203.0.113.51");
     let result = service.login("nobody-5", "whatever", None, &other_ip).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
+/// OBI-204 review fix: `login` checks the (cheap, no-DB) IP bucket
+/// *before* resolving the username to a uid, so a throttled IP never pays
+/// for that lookup.
+#[tokio::test]
+async fn login_checks_the_ip_bucket_before_resolving_the_account() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("frodo", "ringbearer", 1);
+    let service = test_service(directory.clone()).with_rate_limiter(RateLimiter::with_test_tuning(
+        5,
+        std::time::Duration::from_secs(900),
+        std::time::Duration::from_secs(900),
+        1.0,
+        std::time::Duration::from_secs(3600),
+    ));
+
+    let from_ip = ctx_from("198.51.100.20");
+    // Spends the IP bucket's one token.
+    let _ = service.login("frodo", "wrong", None, &from_ip).await;
+    assert_eq!(directory.resolve_uid_calls(), 1);
+
+    // The bucket is now dry: a second attempt must be refused by the IP
+    // check alone, without ever calling `resolve_uid` again.
+    let result = service.login("frodo", "wrong", None, &from_ip).await;
+    assert_eq!(result.unwrap_err(), AuthError::RateLimited);
+    assert_eq!(directory.resolve_uid_calls(), 1);
 }
 
 /// Acceptance: "audit rows written for each event" -- login ok, login
@@ -824,11 +1236,11 @@ async fn refresh_reuse_is_audited() {
         .await
         .unwrap();
     let rotated = service
-        .refresh(&pair.refresh_token, None, &from_ip)
+        .refresh(&pair.refresh_token, &from_ip)
         .await
         .unwrap();
     // Replaying the now-rotated-out token is reuse.
-    let _ = service.refresh(&pair.refresh_token, None, &from_ip).await;
+    let _ = service.refresh(&pair.refresh_token, &from_ip).await;
 
     let events = directory.audit_events();
     let reuse = events
@@ -1012,7 +1424,7 @@ async fn promotion_to_t3_requires_totp_on_the_next_refresh() {
         .unwrap();
     directory.set_tier("aragorn", 3);
 
-    let result = service.refresh(&pair.refresh_token, None, &ctx()).await;
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
 }
 
@@ -1118,7 +1530,7 @@ async fn refresh_for_a_removed_staff_row_is_refused_and_revokes_sessions() {
         .unwrap();
     directory.remove_staff("boromir");
 
-    let result = service.refresh(&pair.refresh_token, None, &ctx()).await;
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
 }
 
@@ -1136,8 +1548,248 @@ async fn concurrent_refresh_rotation_only_succeeds_once() {
 
     let pair = service.login("pippin", "took", None, &ctx()).await.unwrap();
 
-    let first = service.refresh(&pair.refresh_token, None, &ctx()).await;
-    let second = service.refresh(&pair.refresh_token, None, &ctx()).await;
+    let first = service.refresh(&pair.refresh_token, &ctx()).await;
+    let second = service.refresh(&pair.refresh_token, &ctx()).await;
     assert!(first.is_ok());
     assert_eq!(second.unwrap_err(), AuthError::InvalidRefreshToken);
+}
+
+// ---------------------------------------------------------------------------
+// OBI-185 (P2-O2 admin UI): role management through `admin_set_tier`, and
+// the audit view through `admin_audit_recent`. See
+// `docs/threat-model-phase2.md` M-ADM-1 ("role mutations only through the
+// existing `roles_*` security-definer functions; actor = the token's
+// `sub`") and M-ADM-2 (step-up MFA + tier >= 3 for role changes).
+// ---------------------------------------------------------------------------
+
+fn fake_claims(sub: &str, tier: i16, mfa_at: Option<i64>) -> AccessClaims {
+    let now_secs = now().unix_timestamp();
+    AccessClaims {
+        sub: sub.to_string(),
+        tier,
+        scopes: scopes_for_tier(tier),
+        iss: "https://build.loommud.com/".to_string(),
+        aud: jwt::AUDIENCE.to_string(),
+        iat: now_secs,
+        nbf: now_secs,
+        exp: now_secs + 600,
+        sid: "sid".to_string(),
+        amr: vec!["pwd".to_string(), "otp".to_string()],
+        mfa_at,
+    }
+}
+
+/// M-ADM-2: a T3 actor with a fresh step-up may change another uid's
+/// tier within `roles_set_tier`'s own rules, and the change (and its
+/// audit row) actually lands.
+#[tokio::test]
+async fn admin_set_tier_succeeds_for_t3_with_fresh_step_up() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("lead", "pw", 3);
+    directory.add_staff("apprentice", "pw", 1);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("lead", 3, Some(now().unix_timestamp()));
+    service
+        .admin_set_tier(&claims, &ctx(), "apprentice", 2, "promotion")
+        .await
+        .expect("T3 with fresh step-up may promote T1 -> T2");
+
+    assert_eq!(directory.tier_of("apprentice"), Some(2));
+    let events = directory.audit_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "admin.roles.set_tier" && e.verdict == "allow"),
+        "role change must be audited as allow: {events:?}"
+    );
+}
+
+/// M-ADM-2: tier < 3 is refused by `AuthService` itself, before the
+/// directory (and therefore the SQL function) is ever called.
+#[tokio::test]
+async fn admin_set_tier_forbidden_below_tier_3() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("builder", "pw", 2);
+    directory.add_staff("target", "pw", 1);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("builder", 2, Some(now().unix_timestamp()));
+    let result = service
+        .admin_set_tier(&claims, &ctx(), "target", 2, "nope")
+        .await;
+    assert_eq!(result, Err(AdminError::Forbidden));
+    assert_eq!(
+        directory.admin_set_tier_calls(),
+        0,
+        "a forbidden caller must never reach the directory/SQL layer"
+    );
+    let events = directory.audit_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "admin.roles.set_tier" && e.verdict == "deny"),
+        "the forbidden attempt must still be audited: {events:?}"
+    );
+}
+
+/// M-ADM-2: tier >= 3 but no fresh step-up (`mfa_at` absent or stale) is
+/// refused -- a mere bearer token is not enough for a role change.
+#[tokio::test]
+async fn admin_set_tier_requires_fresh_step_up() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("lead", "pw", 3);
+    directory.add_staff("target", "pw", 1);
+    let service = test_service(directory.clone());
+
+    // No mfa_at at all.
+    let claims = fake_claims("lead", 3, None);
+    let result = service
+        .admin_set_tier(&claims, &ctx(), "target", 2, "no mfa")
+        .await;
+    assert_eq!(result, Err(AdminError::StepUpRequired));
+
+    // Stale mfa_at (older than the 5-minute window).
+    let stale = fake_claims("lead", 3, Some(now().unix_timestamp() - 600));
+    let result = service
+        .admin_set_tier(&stale, &ctx(), "target", 2, "stale mfa")
+        .await;
+    assert_eq!(result, Err(AdminError::StepUpRequired));
+
+    assert_eq!(directory.admin_set_tier_calls(), 0);
+}
+
+/// M-ADM-1: a request that somehow got a T5 claim is still refused for a
+/// T3->T4 promotion -- `roles_set_tier`'s own Phase-1 range check (here
+/// re-implemented by the fake, the real boundary in Postgres) is what
+/// actually stops this, not `AuthService`'s tier floor (which only
+/// enforces >= 3, not "<= 3"). This is the "even with the UI check
+/// removed" acceptance test: nothing in `AuthService::admin_set_tier`
+/// checks `new_tier` at all before calling the directory.
+#[tokio::test]
+async fn admin_set_tier_t3_to_t4_promotion_is_rejected_by_the_directory() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("root", "pw", 5);
+    directory.add_staff("target", "pw", 3);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("root", 5, Some(now().unix_timestamp()));
+    let result = service
+        .admin_set_tier(&claims, &ctx(), "target", 4, "attempted T4 grant")
+        .await;
+    match result {
+        Err(AdminError::Rejected(message)) => {
+            assert!(message.contains("1-3"), "unexpected message: {message}")
+        }
+        other => panic!("expected AdminError::Rejected, got {other:?}"),
+    }
+    assert_eq!(
+        directory.tier_of("target"),
+        Some(3),
+        "tier must be unchanged after the rejected call"
+    );
+}
+
+/// M-ADM-1: the actor is always `claims.sub` -- there is no parameter on
+/// `admin_set_tier` a caller-controlled body could use to override it.
+/// (The HTTP-layer half of this guarantee -- a body `actor` field is a
+/// 400 -- is covered by `admin::tests` in `loom-http`.)
+#[tokio::test]
+async fn admin_set_tier_self_promotion_is_rejected() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("root", "pw", 5);
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("root", 5, Some(now().unix_timestamp()));
+    let result = service
+        .admin_set_tier(&claims, &ctx(), "root", 4, "self promotion")
+        .await;
+    assert!(matches!(result, Err(AdminError::Rejected(_))));
+}
+
+/// M-ADM-3/M-ADM-4: the audit view itself requires tier >= 3, and its
+/// own access is audited.
+#[tokio::test]
+async fn admin_audit_recent_requires_tier_3_and_is_itself_audited() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("builder", "pw", 2);
+    directory.add_staff("lead", "pw", 3);
+    let service = test_service(directory.clone());
+
+    let low = fake_claims("builder", 2, Some(now().unix_timestamp()));
+    assert_eq!(
+        service
+            .admin_audit_recent(&low, &ctx(), 10, None)
+            .await
+            .unwrap_err(),
+        AdminError::Forbidden
+    );
+
+    let high = fake_claims("lead", 3, Some(now().unix_timestamp()));
+    service
+        .admin_audit_recent(&high, &ctx(), 10, None)
+        .await
+        .expect("T3 may view the audit log");
+
+    let events = directory.audit_events();
+    assert!(
+        events.iter().any(|e| e.kind == "admin.audit.view"),
+        "the audit view itself must be audited: {events:?}"
+    );
+}
+
+/// M-ADM-4 (CTO review on PR #98): a directory failure on the audit view
+/// itself is audited too, not just the tier-floor refusal -- every other
+/// admin route's deny path (e.g. `admin_set_tier`'s `Rejected`/
+/// `DirectoryUnavailable`) already does this; `admin_audit_recent` had
+/// been the one exception.
+#[tokio::test]
+async fn admin_audit_recent_directory_failure_is_audited() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("lead", "pw", 3);
+    directory.fail_admin_audit();
+    let service = test_service(directory.clone());
+
+    let claims = fake_claims("lead", 3, Some(now().unix_timestamp()));
+    let result = service.admin_audit_recent(&claims, &ctx(), 10, None).await;
+    assert_eq!(result.unwrap_err(), AdminError::DirectoryUnavailable);
+
+    let events = directory.audit_events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "admin.audit.view" && e.verdict == "deny"),
+        "a directory failure on the audit view must still be audited: {events:?}"
+    );
+}
+
+/// (CTO review on PR #98): the `/secure/` T5 floor for `admin_object_vars`
+/// is a raw string check against an un-normalized path -- `valid_read`
+/// on the world side is the real gate (it resolves the path for real),
+/// so this is defense in depth only, but it should still fail *closed*
+/// against the obvious bypass attempts rather than waving them through
+/// as "definitely not /secure".
+#[test]
+fn is_or_might_be_secure_normalizes_and_fails_closed() {
+    assert!(is_or_might_be_secure("/secure/master"));
+    assert!(is_or_might_be_secure("//secure/master"), "repeated slashes");
+    assert!(is_or_might_be_secure("/./secure/master"), "a . segment");
+    assert!(
+        is_or_might_be_secure("/../secure/master"),
+        "a .. segment must fail closed, never be waved through"
+    );
+    assert!(!is_or_might_be_secure("/std/room"));
+    assert!(
+        !is_or_might_be_secure("/securex/room"),
+        "prefix, not a segment"
+    );
+    assert!(
+        is_or_might_be_secure("/std/../secure/master"),
+        "a .. segment anywhere, not just first, must fail closed (CTO re-review \
+         must-fix, PR #98 / T5 edge floor)"
+    );
+    assert!(
+        is_or_might_be_secure("/std/x/../../secure/y"),
+        "multiple .. segments must still fail closed"
+    );
 }

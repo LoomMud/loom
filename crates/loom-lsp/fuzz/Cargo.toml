@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# `cargo fuzz` target for loom-lsp's request handlers (trust boundary:
+# builder source, spec `docs/threat-model-phase2.md` M-LSP-4 "add LSP
+# request fuzzing to the nightly fuzz job"). Not a workspace member: it
+# needs nightly and libFuzzer. Run with
+#   scripts/fuzz-smoke.sh lsp              (CI smoke, <= 60 s)
+#   cargo +nightly fuzz run lsp_requests   (from crates/loom-lsp, open-ended)
+
+[package]
+name = "loom-lsp-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+loom-lsp = { path = ".." }
+loom-syntax = { path = "../../loom-syntax" }
+loom-compiler = { path = "../../loom-compiler" }
+
+[[bin]]
+name = "lsp_requests"
+path = "fuzz_targets/lsp_requests.rs"
+test = false
+doc = false
+bench = false
+
+# Keep this crate out of the main workspace.
+[workspace]
+members = ["."]

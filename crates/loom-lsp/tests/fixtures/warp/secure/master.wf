@@ -1,0 +1,10 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// /secure/master: fixture stand-in for the real master object, used only
+// to exercise the M-LSP-2 read-gating test (a T1 session must not get a
+// go-to-definition Location into this file; a T4 session must).
+
+fn valid_read(path: string, euid: string) -> bool {
+    return true
+}

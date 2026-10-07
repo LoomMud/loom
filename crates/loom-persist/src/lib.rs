@@ -34,12 +34,36 @@ use serde_json::Value;
 use sqlx::QueryBuilder;
 use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tracing::warn;
 use uuid::Uuid;
+
+/// The driver's own trusted principal names (OBI-276, CTO review of
+/// LoomMud/loom#102/OBI-237): `root`, `mudlib`, and anything with a `:`
+/// in it (`domain:<d>`) -- `loom_vm::security::is_reserved_principal`'s
+/// exact predicate, duplicated here rather than pulled in as a
+/// production dependency, since `loom-persist` has no business depending
+/// on the VM/language crate for anything else. No staff row may ever
+/// carry one of these as its `uid`: `root` interns to `ROOT` (sym 0), and
+/// a guard set holding it is the *empty* guard set -- full privilege.
+/// `tests::reserved_principal_matches_loom_vm` pins this copy against
+/// `loom_vm::security::is_reserved_principal` (a dev-dependency only) so
+/// the two definitions can never silently drift apart.
+///
+/// Every place a staff account `uid` is created or renamed
+/// (`roles_set_tier`, `roles_propose_tier`, `roles_approve_proposal`, all
+/// three as a belt-and-braces SQL-side check too -- see
+/// `migrations/0006_reserved_principal_staff_guard.sql`) and every place an existing
+/// row's `uid` is read back for login/token issue (`staff_login`,
+/// `staff_uid_for_username`, `staff_auth_status`) must refuse a reserved
+/// uid outright, so a row created with one before this fix shipped still
+/// can never authenticate.
+pub fn is_reserved_principal(uid: &str) -> bool {
+    uid == "root" || uid == "mudlib" || uid.contains(':')
+}
 
 const ARGON_M_COST_KIB: u32 = 19 * 1024;
 const ARGON_T_COST: u32 = 2;
@@ -64,6 +88,14 @@ pub enum PersistError {
     /// that looks like Paperclip's control-plane DB.
     #[error("{0}")]
     ControlPlaneDbRejected(String),
+    /// OBI-276: a caller tried to create, rename, or promote a staff
+    /// account to a `uid` [`is_reserved_principal`] names as a trusted
+    /// driver principal (`root`, `mudlib`, `domain:<d>`). Refused before
+    /// ever reaching Postgres; the `roles_*` security-definer functions
+    /// refuse it again on the SQL side (`migrations/0006_reserved_principal_staff_guard.sql`)
+    /// as a belt-and-braces check for any caller that bypasses this crate.
+    #[error("uid `{0}` is a reserved driver principal and cannot be staff")]
+    ReservedPrincipal(String),
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +109,24 @@ pub struct Persist {
     /// user's wrong-password attempt would, so response timing never
     /// reveals whether a username exists.
     dummy_password_hash: String,
+    /// Bounds how many Argon2id verifies (real or dummy) can run
+    /// concurrently on the blocking pool (OBI-204 review fix, must-fix
+    /// 2): each verify at `m=19MiB` holds that much memory for its
+    /// duration, and Tokio's blocking pool defaults to up to 512 threads,
+    /// so without a cap a login flood could reserve `512 * 19MiB` (~9.5
+    /// GiB) of memory concurrently. The permit is held for the duration
+    /// of the `spawn_blocking` closure, not just the `.await`.
+    argon2_concurrency: Arc<tokio::sync::Semaphore>,
 }
+
+/// Max Argon2id verifies (real or dummy) running at once (OBI-204 review
+/// fix 2). Chosen to keep peak Argon2 memory well under 512 MiB
+/// (`32 * 19 MiB` ~= 608 MiB is already generous for a single-replica
+/// StatefulSet; tune alongside the pod's memory limit if that changes)
+/// while still giving the 150-simulated-player load test (E1.1) plenty of
+/// headroom -- login/TOTP attempts are a small fraction of in-game
+/// traffic and never happen on the world thread's own executor.
+const ARGON2_MAX_CONCURRENCY: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
@@ -178,15 +227,27 @@ pub struct StaffAuthRecord {
     pub totp_confirmed: bool,
 }
 
-/// A `refresh_tokens` row (OBI-174). Only ever looked up by
-/// [`Persist::refresh_token_lookup`]'s SHA-256 hash of the bearer token --
-/// the plaintext token itself is never stored.
+/// A `refresh_tokens` row (OBI-174, `sid`/`amr`/`mfa_at` added OBI-203).
+/// Only ever looked up by [`Persist::refresh_token_lookup`]'s SHA-256 hash
+/// of the bearer token -- the plaintext token itself is never stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshTokenRecord {
     pub id: Uuid,
     pub staff_uid: String,
     pub expires_at: OffsetDateTime,
     pub revoked_at: Option<OffsetDateTime>,
+    /// The token-family id established at login and carried forward on
+    /// every rotation of this family (OBI-203, M-AUTH-5): the key reuse
+    /// detection and family revocation are keyed off.
+    pub sid: String,
+    /// The authentication methods that produced the *login* that started
+    /// this family -- carried forward unchanged across rotation (OBI-203).
+    pub amr: Vec<String>,
+    /// The most recent MFA completion at the time this family's login
+    /// happened, if any -- carried forward unchanged across rotation so
+    /// the M-ADM-2 step-up freshness window is measured from the original
+    /// authentication, not reset by every refresh.
+    pub mfa_at: Option<OffsetDateTime>,
 }
 
 /// Fresh tier + TOTP enrolment state for a uid (OBI-174/OBI-195 review fix
@@ -199,19 +260,35 @@ pub struct StaffTierStatus {
     pub totp_confirmed: bool,
 }
 
-/// The outcome of [`Persist::refresh_token_rotate`] (OBI-195 review fix 1):
-/// lookup-then-revoke used to be two statements, letting two concurrent
-/// presentations of the same refresh token both see "not yet revoked" and
-/// both succeed, which defeats reuse detection. A single
-/// `UPDATE ... WHERE revoked_at IS NULL AND expires_at > NOW() RETURNING`
-/// makes at most one caller ever observe [`RefreshTokenRotation::Rotated`]
-/// for a given token.
+/// The outcome of [`Persist::session_rotate`] (OBI-198 re-review,
+/// must-fix 1 and 2; supersedes the OBI-195 `refresh_token_rotate`/
+/// `RefreshTokenRotation` design this was rebased onto -- `session_rotate`
+/// is strictly more atomic, since it also carries `sid`/`amr`/`mfa_at`/
+/// `expires_at` forward and takes the staff-row lock): a single atomic
+/// consume-and-insert, so two concurrent rotations of the same token can
+/// never both win, and the new row always inherits the consumed row's
+/// `expires_at`/`sid`/`amr`/`mfa_at` rather than recomputing any of them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RefreshTokenRotation {
-    Rotated { staff_uid: String },
+pub enum SessionRotateOutcome {
+    /// The old token was unrevoked, within its absolute expiry, and
+    /// within its idle window: it is now revoked and a fresh row exists
+    /// under `new_token_hash`, same family (`sid`), same `amr`/`mfa_at`,
+    /// same `expires_at`.
+    Rotated {
+        staff_uid: String,
+        sid: String,
+        amr: Vec<String>,
+        mfa_at: Option<OffsetDateTime>,
+        expires_at: OffsetDateTime,
+    },
+    /// The old token was already revoked (a rotated-out or previously-
+    /// revoked token replayed) -- this is what a stolen refresh token
+    /// looks like, so the whole family (every row sharing its `sid`) is
+    /// now revoked too.
     Reused { staff_uid: String },
-    Expired,
-    NotFound,
+    /// Unknown token hash, or a known one past its absolute/idle expiry
+    /// (not revoked, just stale -- no family-wide response needed).
+    Invalid,
 }
 
 /// A row from the `active_grants` view (already excludes expired grants).
@@ -241,6 +318,24 @@ pub struct RolesRows {
 /// Postgres sink for the driver's in-memory audit ring.
 #[derive(Debug, Clone)]
 pub struct AuditRow {
+    pub at: OffsetDateTime,
+    pub kind: String,
+    pub caller: Option<String>,
+    pub effective_principal: Option<String>,
+    pub apply: Option<String>,
+    pub class: Option<i16>,
+    pub argument: Option<String>,
+    pub guard_set: Vec<String>,
+    pub verdict: String,
+    pub detail: Option<String>,
+}
+
+/// One `audit_log` row as read back by [`Persist::audit_log_recent`]
+/// (OBI-185, M-ADM-4): the admin audit view's row shape, with the
+/// serial `id` the write side ([`AuditRow`]) never carries.
+#[derive(Debug, Clone)]
+pub struct AuditLogEntry {
+    pub id: i64,
     pub at: OffsetDateTime,
     pub kind: String,
     pub caller: Option<String>,
@@ -514,6 +609,7 @@ impl Persist {
             pool,
             argon2,
             dummy_password_hash,
+            argon2_concurrency: Arc::new(tokio::sync::Semaphore::new(ARGON2_MAX_CONCURRENCY)),
         })
     }
 
@@ -522,10 +618,45 @@ impl Persist {
     /// time as a wrong-password attempt against a real one (OBI-200,
     /// M-AUTH-2). The result is always discarded -- this exists purely
     /// for its timing, never its outcome.
-    fn dummy_verify(&self, password: &str) {
-        let parsed = PasswordHash::new(&self.dummy_password_hash)
-            .expect("the dummy hash computed in from_pool is always a valid PHC string");
-        let _ = self.argon2.verify_password(password.as_bytes(), &parsed);
+    ///
+    /// Runs on `spawn_blocking` (OBI-204): Argon2id at these parameters
+    /// is tens of milliseconds of pure CPU, and running it inline would
+    /// block whatever async worker thread handles the request for that
+    /// long -- never acceptable on the world thread's executor.
+    async fn dummy_verify(&self, password: &str) {
+        let argon2 = self.argon2.clone();
+        let dummy_hash = self.dummy_password_hash.clone();
+        let password = password.to_string();
+        let permit = self.argon2_concurrency.clone().acquire_owned().await;
+        let _ = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let parsed = PasswordHash::new(&dummy_hash)
+                .expect("the dummy hash computed in from_pool is always a valid PHC string");
+            argon2.verify_password(password.as_bytes(), &parsed)
+        })
+        .await;
+    }
+
+    /// Verify `password` against `password_hash` off the calling task
+    /// (OBI-204), returning `true` only on a successful Argon2id match. A
+    /// `spawn_blocking` panic/join failure is treated as a verify failure,
+    /// never as a success.
+    async fn verify_password_blocking(&self, password: &str, password_hash: &str) -> Result<bool> {
+        let argon2 = self.argon2.clone();
+        let password_hash = password_hash.to_string();
+        let password = password.to_string();
+        let permit = self.argon2_concurrency.clone().acquire_owned().await;
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let parsed = PasswordHash::new(&password_hash)
+                .map_err(|error| PersistError::PasswordHash(error.to_string()))?;
+            Ok::<bool, PersistError>(argon2.verify_password(password.as_bytes(), &parsed).is_ok())
+        })
+        .await;
+        match result {
+            Ok(inner) => inner,
+            Err(_join_err) => Ok(false),
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -569,16 +700,13 @@ impl Persist {
         let Some(row) = row else {
             // OBI-200, M-AUTH-2: dummy verify so timing doesn't reveal that
             // this username doesn't exist.
-            self.dummy_verify(password);
+            self.dummy_verify(password).await;
             return Ok(None);
         };
 
-        let parsed = PasswordHash::new(&row.password_hash)
-            .map_err(|error| PersistError::PasswordHash(error.to_string()))?;
-        if self
-            .argon2
-            .verify_password(password.as_bytes(), &parsed)
-            .is_err()
+        if !self
+            .verify_password_blocking(password, &row.password_hash)
+            .await?
         {
             return Ok(None);
         }
@@ -614,24 +742,30 @@ impl Persist {
         let Some(row) = row else {
             // OBI-200, M-AUTH-2: dummy verify so timing doesn't reveal that
             // this username doesn't exist (or isn't staff).
-            self.dummy_verify(password);
+            self.dummy_verify(password).await;
             return Ok(None);
         };
         use sqlx::Row;
         let password_hash: String = row.try_get("password_hash")?;
 
-        let parsed = PasswordHash::new(&password_hash)
-            .map_err(|error| PersistError::PasswordHash(error.to_string()))?;
-        if self
-            .argon2
-            .verify_password(password.as_bytes(), &parsed)
-            .is_err()
+        if !self
+            .verify_password_blocking(password, &password_hash)
+            .await?
         {
             return Ok(None);
         }
 
+        let uid: String = row.try_get("uid")?;
+        if is_reserved_principal(&uid) {
+            // OBI-276 defence in depth: a row created with a reserved uid
+            // before this fix shipped must still never authenticate, even
+            // with the right password. Same generic refusal as a bad
+            // password/username -- never leaks that the row exists.
+            return Ok(None);
+        }
+
         Ok(Some(StaffAuthRecord {
-            uid: row.try_get("uid")?,
+            uid,
             account_id: row.try_get("account_id")?,
             tier: row.try_get("tier")?,
             totp_secret: row.try_get("totp_secret")?,
@@ -639,6 +773,25 @@ impl Persist {
                 .try_get::<Option<OffsetDateTime>, _>("totp_confirmed_at")?
                 .is_some(),
         }))
+    }
+
+    /// Resolve a login username to its staff uid, with no password
+    /// check at all (OBI-204): used only to pick a stable, uid-namespaced
+    /// rate-limiter key *before* the password is verified, so `login`'s
+    /// account lockout and `totp_confirm`'s account lockout are always
+    /// the same bucket for the same staff member. `None` for a username
+    /// that doesn't exist or isn't staff -- callers fall back to a
+    /// username-namespaced key in that case. Also `None` for a reserved
+    /// uid (OBI-276 defence in depth): a pre-existing reserved-uid row
+    /// must look exactly like "no such staff member" everywhere.
+    pub async fn staff_uid_for_username(&self, username: &str) -> Result<Option<String>> {
+        let row: Option<String> = sqlx::query_scalar(
+            "SELECT s.uid FROM accounts a JOIN staff s ON s.account_id = a.id WHERE a.username = $1",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.filter(|uid| !is_reserved_principal(uid)))
     }
 
     /// Enrol (or re-enrol) `uid`'s TOTP secret via the `auth_totp_enroll`
@@ -703,22 +856,31 @@ impl Persist {
     }
 
     /// Record a newly-issued refresh token. Only `token_hash` (SHA-256 of
-    /// the bearer token, computed by loom-http) is ever stored.
+    /// the bearer token, computed by loom-http) is ever stored. `sid` is
+    /// the token-family id (fresh at login, carried forward on rotation --
+    /// see `loom-http`'s `AuthService::issue_tokens`), and `amr`/`mfa_at`
+    /// describe the family's *original* authentication context (OBI-203).
     pub async fn refresh_token_insert(
         &self,
         staff_uid: &str,
         token_hash: &str,
         expires_at: OffsetDateTime,
+        sid: &str,
+        amr: &[String],
+        mfa_at: Option<OffsetDateTime>,
     ) -> Result<Uuid> {
         use sqlx::Row;
         let row = sqlx::query(
-            "INSERT INTO refresh_tokens (staff_uid, token_hash, expires_at)
-             VALUES ($1, $2, $3)
+            "INSERT INTO staff_sessions (staff_uid, token_hash, expires_at, sid, amr, mfa_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING id",
         )
         .bind(staff_uid)
         .bind(token_hash)
         .bind(expires_at)
+        .bind(sid)
+        .bind(amr)
+        .bind(mfa_at)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.try_get("id")?)
@@ -735,7 +897,8 @@ impl Persist {
     ) -> Result<Option<RefreshTokenRecord>> {
         use sqlx::Row;
         let row = sqlx::query(
-            "SELECT id, staff_uid, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
+            "SELECT id, staff_uid, expires_at, revoked_at, sid, amr, mfa_at \
+             FROM staff_sessions WHERE token_hash = $1",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
@@ -748,64 +911,16 @@ impl Persist {
             staff_uid: row.try_get("staff_uid")?,
             expires_at: row.try_get("expires_at")?,
             revoked_at: row.try_get("revoked_at")?,
+            sid: row.try_get("sid")?,
+            amr: row.try_get("amr")?,
+            mfa_at: row.try_get("mfa_at")?,
         }))
-    }
-
-    /// Atomically rotate a refresh token (OBI-174, OBI-195 review fix 1):
-    /// a single `UPDATE ... WHERE revoked_at IS NULL AND expires_at > NOW()
-    /// RETURNING` replaces the old lookup-then-revoke pair, so at most one
-    /// concurrent caller ever sees [`RefreshTokenRotation::Rotated`] for a
-    /// given token -- a second, racing presentation of the same bearer
-    /// value (the classic replay-of-a-stolen-token shape) always lands on
-    /// [`RefreshTokenRotation::Reused`], never on a second success.
-    pub async fn refresh_token_rotate(&self, token_hash: &str) -> Result<RefreshTokenRotation> {
-        use sqlx::Row;
-        let updated = sqlx::query(
-            "UPDATE refresh_tokens
-             SET revoked_at = NOW()
-             WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()
-             RETURNING staff_uid",
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        if let Some(row) = updated {
-            return Ok(RefreshTokenRotation::Rotated {
-                staff_uid: row.try_get("staff_uid")?,
-            });
-        }
-
-        // The UPDATE matched nothing: find out why, purely to classify the
-        // refusal (a reused/already-dead token is a stronger signal than a
-        // hash that was never issued) -- this second, read-only query does
-        // not reopen the race the UPDATE above closed, since nothing here
-        // changes state.
-        let existing = sqlx::query(
-            "SELECT staff_uid, expires_at, revoked_at FROM refresh_tokens WHERE token_hash = $1",
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(match existing {
-            Some(row) => {
-                let revoked_at: Option<OffsetDateTime> = row.try_get("revoked_at")?;
-                if revoked_at.is_some() {
-                    RefreshTokenRotation::Reused {
-                        staff_uid: row.try_get("staff_uid")?,
-                    }
-                } else {
-                    RefreshTokenRotation::Expired
-                }
-            }
-            None => RefreshTokenRotation::NotFound,
-        })
     }
 
     /// Revoke a single refresh token by its bearer-value hash (logout, or
     /// rotating it out after a single use).
     pub async fn refresh_token_revoke(&self, token_hash: &str) -> Result<()> {
-        sqlx::query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL")
+        sqlx::query("UPDATE staff_sessions SET revoked_at = NOW() WHERE token_hash = $1 AND revoked_at IS NULL")
             .bind(token_hash)
             .execute(&self.pool)
             .await?;
@@ -817,11 +932,166 @@ impl Persist {
     /// stolen refresh token, so the whole session family is killed, not
     /// just the one token).
     pub async fn refresh_token_revoke_all(&self, uid: &str) -> Result<()> {
-        sqlx::query("UPDATE refresh_tokens SET revoked_at = NOW() WHERE staff_uid = $1 AND revoked_at IS NULL")
+        sqlx::query("UPDATE staff_sessions SET revoked_at = NOW() WHERE staff_uid = $1 AND revoked_at IS NULL")
             .bind(uid)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Revoke every unrevoked session sharing `token_hash`'s `sid`
+    /// (family) -- OBI-198, M-AUTH-5: "logout revokes the family", not
+    /// just the one presented token. A no-op (not an error) if
+    /// `token_hash` is unknown.
+    ///
+    /// Goes through the `staff_sessions_revoke_family` security-definer
+    /// function (migration 0008) rather than a plain `UPDATE` (OBI-219,
+    /// same shape as `session_rotate`'s must-fix 2): it takes
+    /// `FOR UPDATE` on the owning `staff` row before revoking, which
+    /// conflicts with `session_rotate`'s `FOR SHARE` on that same row,
+    /// so a rotation racing this logout can't leave its freshly-rotated
+    /// row unrevoked (see the migration's doc comment).
+    pub async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<()> {
+        sqlx::query("SELECT staff_sessions_revoke_family($1)")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Atomically rotate the session identified by `old_token_hash` to a
+    /// fresh `new_token_hash` (OBI-198 re-review, must-fix 1 and 2):
+    ///
+    /// - **Must-fix 1 (absolute expiry must not slide):** the new row
+    ///   inherits the *consumed* row's `expires_at`, `sid`, `amr`, and
+    ///   `mfa_at` verbatim -- nothing here computes a fresh `now() + 14d`,
+    ///   so a session's 14-day absolute cap is fixed at login and never
+    ///   extended by a later rotation.
+    /// - **Must-fix 2 (serialize against revoke-all):** before touching
+    ///   any row, this takes `SELECT ... FOR SHARE` on the owning
+    ///   `staff` row, in the same transaction as the consume+insert.
+    ///   `staff_sessions_revoke_for_uid` (migration 0008) takes
+    ///   `FOR UPDATE` on that same row before its revoke `UPDATE` --
+    ///   `FOR UPDATE` conflicts with `FOR SHARE`, so whichever side asks
+    ///   first completes first and the other sees a fully-committed,
+    ///   consistent result (see the migration's doc comment for the two
+    ///   orderings). Without this, a tier change/password change/TOTP
+    ///   reset/GitHub unlink racing a concurrent refresh could miss the
+    ///   newly-inserted row.
+    ///
+    /// `idle_cutoff` is "now minus the idle TTL": a session whose
+    /// `last_used_at` is at or before it is treated as idle-expired, same
+    /// as a session past its absolute `expires_at`.
+    pub async fn session_rotate(
+        &self,
+        old_token_hash: &str,
+        new_token_hash: &str,
+        idle_cutoff: OffsetDateTime,
+    ) -> Result<SessionRotateOutcome> {
+        use sqlx::Row;
+        let mut tx = self.pool.begin().await?;
+
+        let Some(owner_row) =
+            sqlx::query("SELECT staff_uid FROM staff_sessions WHERE token_hash = $1")
+                .bind(old_token_hash)
+                .fetch_optional(&mut *tx)
+                .await?
+        else {
+            tx.commit().await?;
+            return Ok(SessionRotateOutcome::Invalid);
+        };
+        let owner_uid: String = owner_row.try_get("staff_uid")?;
+
+        // Serialize against `staff_sessions_revoke_for_uid`'s `FOR
+        // UPDATE` on the same row -- see migration 0008's doc comment.
+        // Taken through `staff_sessions_lock_for_rotate` (security
+        // definer) since Postgres's row-locking clauses require
+        // `UPDATE`/`DELETE` privilege on the table, which `loom_app`
+        // never has on `staff` (D-27.4: `SELECT` only). A missing
+        // `staff` row (shouldn't happen for a session that was ever
+        // legitimately issued, but cheap to tolerate) just means
+        // nothing to lock against; proceed.
+        sqlx::query("SELECT staff_sessions_lock_for_rotate($1)")
+            .bind(&owner_uid)
+            .execute(&mut *tx)
+            .await?;
+
+        let consumed = sqlx::query(
+            "UPDATE staff_sessions
+             SET revoked_at = NOW()
+             WHERE token_hash = $1
+               AND revoked_at IS NULL
+               AND expires_at > NOW()
+               AND last_used_at > $2
+             RETURNING staff_uid, sid, amr, mfa_at, expires_at",
+        )
+        .bind(old_token_hash)
+        .bind(idle_cutoff)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(consumed) = consumed else {
+            // Didn't match the guarded UPDATE above -- find out why.
+            let existing =
+                sqlx::query("SELECT sid, revoked_at FROM staff_sessions WHERE token_hash = $1")
+                    .bind(old_token_hash)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(existing) = existing else {
+                tx.commit().await?;
+                return Ok(SessionRotateOutcome::Invalid);
+            };
+            let revoked_at: Option<OffsetDateTime> = existing.try_get("revoked_at")?;
+            if revoked_at.is_none() {
+                // Not revoked, but didn't match: past its absolute or
+                // idle expiry. Stale, not malicious -- no family-wide
+                // response.
+                tx.commit().await?;
+                return Ok(SessionRotateOutcome::Invalid);
+            }
+            // Already revoked and presented again: a stolen (rotated-out,
+            // or previously logged-out) refresh token. Kill the whole
+            // family.
+            let sid: String = existing.try_get("sid")?;
+            sqlx::query(
+                "UPDATE staff_sessions SET revoked_at = NOW() WHERE sid = $1 AND revoked_at IS NULL",
+            )
+            .bind(&sid)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok(SessionRotateOutcome::Reused {
+                staff_uid: owner_uid,
+            });
+        };
+
+        let staff_uid: String = consumed.try_get("staff_uid")?;
+        let sid: String = consumed.try_get("sid")?;
+        let amr: Vec<String> = consumed.try_get("amr")?;
+        let mfa_at: Option<OffsetDateTime> = consumed.try_get("mfa_at")?;
+        let expires_at: OffsetDateTime = consumed.try_get("expires_at")?;
+
+        sqlx::query(
+            "INSERT INTO staff_sessions (staff_uid, token_hash, expires_at, sid, amr, mfa_at, last_used_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW())",
+        )
+        .bind(&staff_uid)
+        .bind(new_token_hash)
+        .bind(expires_at)
+        .bind(&sid)
+        .bind(&amr)
+        .bind(mfa_at)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(SessionRotateOutcome::Rotated {
+            staff_uid,
+            sid,
+            amr,
+            mfa_at,
+            expires_at,
+        })
     }
 
     /// Resolve a numeric GitHub user id to a linked staff uid
@@ -999,6 +1269,9 @@ impl Persist {
         new_tier: i16,
         reason: &str,
     ) -> Result<()> {
+        if is_reserved_principal(target_uid) {
+            return Err(PersistError::ReservedPrincipal(target_uid.to_string()));
+        }
         sqlx::query!(
             "SELECT roles_set_tier($1, $2, $3, $4)",
             actor,
@@ -1111,6 +1384,12 @@ impl Persist {
     /// staff uid is refused outright rather than silently minting a
     /// tier-0 token the way a `tier_of`-based check used to.
     pub async fn staff_auth_status(&self, uid: &str) -> Result<Option<StaffTierStatus>> {
+        if is_reserved_principal(uid) {
+            // OBI-276 defence in depth: refuse before even asking
+            // Postgres, so a pre-existing reserved-uid row can never
+            // mint or refresh a token.
+            return Ok(None);
+        }
         use sqlx::Row;
         let row =
             sqlx::query("SELECT tier, totp_secret, totp_confirmed_at FROM staff WHERE uid = $1")
@@ -1239,6 +1518,9 @@ impl Persist {
         new_tier: i16,
         reason: &str,
     ) -> Result<i64> {
+        if is_reserved_principal(target_uid) {
+            return Err(PersistError::ReservedPrincipal(target_uid.to_string()));
+        }
         let id = sqlx::query_scalar!(
             "SELECT roles_propose_tier($1, $2, $3, $4) as \"id!\"",
             actor,
@@ -1289,6 +1571,57 @@ impl Persist {
         });
         builder.build().execute(&self.pool).await?;
         Ok(())
+    }
+
+    /// Read back the most recent `audit_log` rows, newest first (OBI-185,
+    /// M-ADM-4: the admin audit view). `before_id`, if set, only returns
+    /// rows strictly older than that id (keyset pagination -- stable
+    /// under concurrent inserts, unlike an `OFFSET`). `limit` is clamped
+    /// to 200 so a caller can never force an unbounded read of the whole
+    /// table through this path.
+    ///
+    /// Read-only: `loom_app` has `SELECT` on `audit_log` (0007 migration)
+    /// and nothing else, so this is the only operation this function (or
+    /// any other `loom_app` code path) can perform against the table --
+    /// there is no corresponding update/delete method because there is no
+    /// grant that would let one work.
+    pub async fn audit_log_recent(
+        &self,
+        limit: i64,
+        before_id: Option<i64>,
+    ) -> Result<Vec<AuditLogEntry>> {
+        let limit = limit.clamp(1, 200);
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, at, kind, caller, effective_principal, apply, class,
+                   guard_set, verdict, detail, argument
+            FROM audit_log
+            WHERE $1::BIGINT IS NULL OR id < $1
+            ORDER BY id DESC
+            LIMIT $2
+            "#,
+            before_id,
+            limit,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| AuditLogEntry {
+                id: row.id,
+                at: row.at,
+                kind: row.kind,
+                caller: row.caller,
+                effective_principal: row.effective_principal,
+                apply: row.apply,
+                class: row.class,
+                argument: row.argument,
+                guard_set: row.guard_set.unwrap_or_default(),
+                verdict: row.verdict,
+                detail: row.detail,
+            })
+            .collect())
     }
 }
 
@@ -1784,5 +2117,96 @@ mod tests {
             event,
             DbEvent::AccountResult { ok: false, ref detail, .. } if detail == "bad_credentials"
         ));
+    }
+
+    /// OBI-204 review must-fix 2: Argon2id verifies (real or dummy) run
+    /// under a semaphore, so no more than [`ARGON2_MAX_CONCURRENCY`] of
+    /// them ever hold their ~19 MiB of memory at once, however many
+    /// logins arrive concurrently. `connect_lazy` means this never
+    /// actually dials Postgres -- [`Persist::dummy_verify`] never touches
+    /// the pool at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn argon2_verify_concurrency_is_bounded_by_a_semaphore() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://user:pass@localhost/nonexistent")
+            .expect("connect_lazy never dials out, so this never fails");
+        let persist = Arc::new(Persist::from_pool(pool).unwrap());
+        assert_eq!(
+            persist.argon2_concurrency.available_permits(),
+            ARGON2_MAX_CONCURRENCY
+        );
+
+        let total = ARGON2_MAX_CONCURRENCY * 3;
+        let mut handles = Vec::with_capacity(total);
+        for _ in 0..total {
+            let persist = persist.clone();
+            handles.push(tokio::spawn(async move {
+                persist.dummy_verify("whatever-password").await;
+            }));
+        }
+
+        // Poll for up to ~1s for the permit count to bottom out: with 3x
+        // as many callers as permits, and each real Argon2id verify
+        // taking several milliseconds of CPU, the semaphore should be
+        // fully saturated (0 available) at some point while the first
+        // wave is still running.
+        let mut min_seen = ARGON2_MAX_CONCURRENCY;
+        for _ in 0..200 {
+            min_seen = min_seen.min(persist.argon2_concurrency.available_permits());
+            if min_seen == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            min_seen, 0,
+            "expected the semaphore to be fully saturated at some point under {total} \
+             concurrent callers against only {ARGON2_MAX_CONCURRENCY} permits"
+        );
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        // Every permit is returned once every verify has finished.
+        assert_eq!(
+            persist.argon2_concurrency.available_permits(),
+            ARGON2_MAX_CONCURRENCY
+        );
+    }
+
+    /// OBI-276: `loom-persist`'s copy of the reserved-principal predicate
+    /// must refuse exactly the names `loom_vm::security::is_reserved_principal`
+    /// does, on the same test vectors that crate pins itself against
+    /// (`loom_vm::security::tests::reserved_principals`) -- this is the
+    /// "duplicate it with a test that pins both lists to the same
+    /// values" defence the issue asked for, since `loom-persist` has no
+    /// production dependency on `loom-vm`.
+    #[test]
+    fn reserved_principal_matches_loom_vm() {
+        let reserved = [
+            "root",
+            "mudlib",
+            "domain:shire",
+            "builders:root",
+            "a:b",
+            ":",
+        ];
+        let allowed = ["frodo", "rooted", "mud", "legolas", ""];
+        for r in reserved {
+            assert!(is_reserved_principal(r), "{r}");
+            assert_eq!(
+                is_reserved_principal(r),
+                loom_vm::security::is_reserved_principal(r),
+                "loom-persist and loom-vm disagree on {r}"
+            );
+        }
+        for a in allowed {
+            assert!(!is_reserved_principal(a), "{a}");
+            assert_eq!(
+                is_reserved_principal(a),
+                loom_vm::security::is_reserved_principal(a),
+                "loom-persist and loom-vm disagree on {a}"
+            );
+        }
     }
 }

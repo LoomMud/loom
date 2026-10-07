@@ -1,0 +1,5 @@
+var tag: string = "alpha-v1"
+
+pub fn get_tag() -> string {
+    return tag
+}

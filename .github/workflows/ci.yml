@@ -158,6 +158,21 @@ jobs:
           workspaces: crates/loom-compiler/fuzz
       - run: cargo install cargo-fuzz --locked
       - run: FUZZ_SECONDS=45 scripts/fuzz-smoke.sh bytecode
+  fuzz-smoke-lsp:
+    # loom-lsp request-handler fuzz smoke (OBI-168, spec M-LSP-4): <= 60 s
+    # of libFuzzer over arbitrary (offset, source) pairs. Not (yet) a
+    # required check on `main`.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/ci-ensure-tools.sh cc:build-essential c++:build-essential
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly (2026-09-27)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: crates/loom-lsp/fuzz
+      - run: cargo install cargo-fuzz --locked
+      - run: FUZZ_SECONDS=45 scripts/fuzz-smoke.sh lsp
   web-client:
     # Minimal TS web client (OBI-39): build + unit tests, and an npm
     # dependency licence gate mirroring `deny.toml`'s OSI allow-list (the
@@ -174,6 +189,7 @@ jobs:
         with:
           node-version: "22"
       - run: npm install --include=dev
+      - run: npm run lint
       - run: npm run build
       - run: npm test
       - run: npm run check-licenses
@@ -221,4 +237,53 @@ jobs:
         with:
           name: loadtest-smoke-report
           path: results/ci-smoke.*
+  loadtest-e1-1:
+    # E1.1 regression gate (150 players, p99 < 50 ms, OBI-177): a required
+    # check. Scales up loadtest-smoke's same real `loom serve` + warp mudlib
+    # fixture to the full exit-criterion population and fails the build on
+    # an SLA miss (`--fail-on-sla-miss`), scraping loom-http's `/metrics`
+    # into the uploaded report. See results/README.md for what this job
+    # does and does not prove (runner noise vs. the reference-host record).
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/ci-ensure-tools.sh cc:build-essential python3:python3-minimal
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-27)
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: LoomMud/warp
+          path: warp
+      - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
+      - name: run loom serve + E1.1 load test (150 players)
+        run: |
+          set -uo pipefail
+          ./target/release/loom-cli serve --mudlib warp > /tmp/loom-serve.log 2>&1 &
+          echo $! > /tmp/loom-serve.pid
+          for i in $(seq 1 50); do
+            python3 -c "import socket; socket.create_connection(('127.0.0.1',4000),timeout=1).close()" 2>/dev/null && break
+            sleep 0.2
+          done
+          ./target/release/loom-loadtest \
+            --addr 127.0.0.1:4000 \
+            --mix warp/loadbot/mix.tsv \
+            --players 150 \
+            --duration-secs 90 \
+            --ramp-per-sec 15 \
+            --slow-reader-fraction 0.1 \
+            --metrics-url http://127.0.0.1:4001/metrics \
+            --out results/ci-e1-1 \
+            --fail-on-sla-miss
+          status=$?
+          kill "$(cat /tmp/loom-serve.pid)" || true
+          cat /tmp/loom-serve.log
+          exit $status
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: loadtest-e1-1-report
+          path: results/ci-e1-1.*
 

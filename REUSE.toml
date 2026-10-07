@@ -1,6 +1,6 @@
 version = 1
 
 [[annotations]]
-path = ["Cargo.lock", "README.md", "CONTRIBUTING.md", ".gitignore", "crates/*/fuzz/Cargo.lock", "crates/*/fuzz/.gitignore", ".github/**", "docs/**", "crates/*/tests/golden/**", "crates/*/tests/fixtures/**", "crates/loom-net/tests/seeds/**", ".sqlx/**", "results/**", "crates/loom-loadtest/README.md", "web-client/package.json", "web-client/package-lock.json", "web-client/tsconfig.json"]
+path = ["Cargo.lock", "README.md", "CONTRIBUTING.md", ".gitignore", "crates/*/fuzz/Cargo.lock", "crates/*/fuzz/.gitignore", ".github/**", "docs/**", "crates/*/tests/golden/**", "crates/*/tests/fixtures/**", "crates/loom-git/src/github/testdata/**", "crates/loom-git/tests/testdata/**", "crates/loom-net/tests/seeds/**", ".sqlx/**", "results/**", "crates/loom-loadtest/README.md", "web-client/package.json", "web-client/package-lock.json", "web-client/tsconfig.json"]
 SPDX-FileCopyrightText = "2026 Oberfield"
 SPDX-License-Identifier = "AGPL-3.0-only"

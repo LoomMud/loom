@@ -1,0 +1,44 @@
+// SPDX-FileCopyrightText: 2026 Oberfield
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Master object for the OBI-279 admin-query-budget fixture: like
+// `admin_query`'s own master, except `valid_read` busy-loops forever
+// instead of answering -- it tick-exhausts against its own `APPLY_TICKS`
+// budget (`bcvm::registry::RegistryHost::run_cut`'s own isolated budget
+// for a master apply, not the calling execution's). This is what lets
+// `tests/obi_279_admin_query_errors.rs` exercise the "a master whose
+// `valid_read` exhausts the budget gets an error, not an empty list"
+// acceptance criterion (OBI-279, CTO review of PR #102, non-blocking
+// note 1): a real mudlib master might do this by accident (an infinite
+// loop bug in `valid_read` itself), and the admin-query world-thread
+// side must surface that as a failure, not silently render "nothing
+// readable".
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_upgrade(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    while true {
+    }
+    return true
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_seteuid(ob: object, e: string) -> bool {
+    return true
+}

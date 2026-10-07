@@ -32,9 +32,12 @@ impl std::fmt::Display for CompileError {
 impl std::error::Error for CompileError {}
 
 /// Compile checked HIR to a verified `Module`. Never returns a `Module`
-/// that hasn't passed [`loom_compiler::verify::verify`].
-pub fn compile_and_verify(hir: &hir::Program) -> Result<Module, CompileError> {
-    let module = loom_compiler::codegen::compile(hir).map_err(CompileError::Codegen)?;
+/// that hasn't passed [`loom_compiler::verify::verify`]. `src` is the
+/// program's source text (OBI-231): the only thing `loom_compiler::codegen`
+/// needs to turn `hir`'s byte-offset spans into the bytecode's
+/// per-instruction line table.
+pub fn compile_and_verify(hir: &hir::Program, src: &str) -> Result<Module, CompileError> {
+    let module = loom_compiler::codegen::compile(hir, src).map_err(CompileError::Codegen)?;
     loom_compiler::verify::verify(&module).map_err(CompileError::Verify)?;
     Ok(module)
 }

@@ -200,6 +200,162 @@ pub fn convert_enum(old: &EnumVal, new: &Rc<EnumTy>) -> Migrated {
     }))
 }
 
+/// By-name, lossless-or-portable conversion of a **type-erased portable
+/// value** (spec r5 §7.3: "restored saves" are the same portable form
+/// `upgrade()`'s `old` map uses -- struct → `{field: value}`, enum →
+/// `{"$variant": name, "$payload": [...]}`) against a *target* schema.
+/// This is [`convert_struct`]/[`convert_enum`]'s sibling for
+/// [`crate::persist::decode_value`]'s output (OBI-171 `restore_object`):
+/// those two take an already-typed *old* runtime value and a *new*
+/// schema; `hydrate` takes a plain portable `Value` (scalars/array/map,
+/// with no struct/enum identity at all -- a save file was written by
+/// some possibly-long-gone program version) and the *current* schema,
+/// and tries to build a value that actually conforms to it.
+///
+/// Every branch mirrors [`value_matches_ty`]'s shape rules but builds a
+/// [`Value`] instead of only checking one, and a struct/enum is still one
+/// *unit* (lossy as a whole, not field-by-field) for the same silent-
+/// data-loss reason [`convert_struct`]'s doc explains. Object-typed
+/// fields/vars are always lossy: a live `ObjectId` from a previous driver
+/// run cannot mean anything after a restart (spec: function values are
+/// never saved, §5.2.2 rule 4; object references are the same kind of
+/// not-meaningful-after-restart value, just not spelled out as its own
+/// rule).
+pub fn hydrate(portable: &Value, ty: &Ty) -> Migrated {
+    let lossy = || Migrated::Lossy {
+        portable: portable.clone(),
+    };
+    match ty {
+        Ty::Any => Migrated::Lossless(portable.clone()),
+        Ty::Optional(inner) => {
+            if matches!(portable, Value::Null) {
+                Migrated::Lossless(Value::Null)
+            } else {
+                hydrate(portable, inner)
+            }
+        }
+        Ty::Null => {
+            if matches!(portable, Value::Null) {
+                Migrated::Lossless(Value::Null)
+            } else {
+                lossy()
+            }
+        }
+        Ty::Int => match portable {
+            Value::Int(n) => Migrated::Lossless(Value::Int(*n)),
+            _ => lossy(),
+        },
+        Ty::Float => match portable {
+            Value::Float(f) => Migrated::Lossless(Value::Float(*f)),
+            _ => lossy(),
+        },
+        Ty::Bool => match portable {
+            Value::Bool(b) => Migrated::Lossless(Value::Bool(*b)),
+            _ => lossy(),
+        },
+        Ty::String => match portable.as_str() {
+            Some(s) => Migrated::Lossless(Value::str(s)),
+            None => lossy(),
+        },
+        // A restored object reference never means anything after a
+        // restart (no instance this id named still exists) -- always
+        // lossy, regardless of what `portable` happens to hold.
+        Ty::Object => lossy(),
+        Ty::Array(elem) => match portable.as_array() {
+            Some(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for it in items {
+                    match hydrate(it, elem) {
+                        Migrated::Lossless(v) => out.push(v),
+                        Migrated::Lossy { .. } => return lossy(),
+                    }
+                }
+                Migrated::Lossless(Value::array(out))
+            }
+            None => lossy(),
+        },
+        Ty::Map(key_ty, val_ty) => match portable.as_map() {
+            Some(m) => {
+                let mut out = MapData::default();
+                for (k, v) in &m.entries {
+                    match (hydrate(k, key_ty), hydrate(v, val_ty)) {
+                        (Migrated::Lossless(kk), Migrated::Lossless(vv)) => out.insert(kk, vv),
+                        _ => return lossy(),
+                    }
+                }
+                Migrated::Lossless(Value::map(out))
+            }
+            None => lossy(),
+        },
+        Ty::Struct(s) => {
+            let Some(m) = portable.as_map() else {
+                return lossy();
+            };
+            let mut fields = Vec::with_capacity(s.fields.len());
+            for f in &s.fields {
+                let found = m
+                    .entries
+                    .iter()
+                    .find(|(k, _)| k.as_str() == Some(&*f.name))
+                    .map(|(_, v)| v);
+                match found {
+                    Some(v) => match hydrate(v, &f.ty) {
+                        Migrated::Lossless(vv) => fields.push((f.name.clone(), vv)),
+                        Migrated::Lossy { .. } => return lossy(),
+                    },
+                    None => match &f.default {
+                        Some(c) => fields.push((f.name.clone(), const_to_value(c))),
+                        None => return lossy(),
+                    },
+                }
+            }
+            Migrated::Lossless(Value::struct_val(StructVal {
+                module: s.module.clone(),
+                name: s.name.clone(),
+                fields,
+            }))
+        }
+        Ty::Enum(e) => {
+            let Some(m) = portable.as_map() else {
+                return lossy();
+            };
+            let variant_name = m
+                .entries
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("$variant"))
+                .and_then(|(_, v)| v.as_str());
+            let payload = m
+                .entries
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("$payload"))
+                .and_then(|(_, v)| v.as_array());
+            let (Some(vname), Some(payload)) = (variant_name, payload) else {
+                return lossy();
+            };
+            let Some(variant) = e.variants.iter().find(|v| &*v.name == vname) else {
+                return lossy();
+            };
+            if variant.payload.len() != payload.len() {
+                return lossy();
+            }
+            let mut out = Vec::with_capacity(payload.len());
+            for (pv, pty) in payload.iter().zip(&variant.payload) {
+                match hydrate(pv, pty) {
+                    Migrated::Lossless(v) => out.push(v),
+                    Migrated::Lossy { .. } => return lossy(),
+                }
+            }
+            Migrated::Lossless(Value::enum_val(EnumVal {
+                module: e.module.clone(),
+                name: e.name.clone(),
+                variant: Rc::from(vname),
+                payload: out,
+            }))
+        }
+        Ty::Void | Ty::Never | Ty::Fn(_) | Ty::Error => lossy(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,5 +543,156 @@ mod tests {
         other.module = Rc::from("/std/other");
         let ty = Ty::Struct(struct_ty(vec![field("hp", Ty::Int, None)]));
         assert!(!value_matches_ty(&Value::struct_val(other), &ty));
+    }
+
+    // --- `hydrate`: by-name conversion of a type-erased *portable* value
+    // (what `crate::bcvm::persist::decode_value` hands back from a save
+    // file) against the *current* schema (OBI-171). ---
+
+    #[test]
+    fn hydrate_scalars_from_portable() {
+        assert!(matches!(
+            hydrate(&Value::Int(5), &Ty::Int),
+            Migrated::Lossless(Value::Int(5))
+        ));
+        assert!(matches!(
+            hydrate(&Value::str("hi"), &Ty::String),
+            Migrated::Lossless(v) if v.equals(&Value::str("hi"))
+        ));
+        assert!(matches!(
+            hydrate(&Value::Int(5), &Ty::String),
+            Migrated::Lossy { .. }
+        ));
+    }
+
+    #[test]
+    fn hydrate_null_into_optional_is_lossless() {
+        assert!(matches!(
+            hydrate(&Value::Null, &Ty::optional(Ty::Int)),
+            Migrated::Lossless(Value::Null)
+        ));
+    }
+
+    #[test]
+    fn hydrate_object_typed_var_is_always_lossy() {
+        // A restored object reference never means anything after a
+        // restart, regardless of what the save file happened to hold.
+        assert!(matches!(
+            hydrate(&Value::Null, &Ty::Object),
+            Migrated::Lossy { .. }
+        ));
+    }
+
+    #[test]
+    fn hydrate_struct_from_a_field_map_by_name() {
+        let portable = Value::struct_val(old_struct(&[
+            ("hp", Value::Int(10)),
+            ("name", Value::str("orc")),
+        ]));
+        // `old_struct` built a `StructVal` directly; round it through the
+        // same field-map shape a save file decodes to.
+        let portable = struct_portable(portable.as_struct().unwrap());
+        let new = Ty::Struct(struct_ty(vec![
+            field("name", Ty::String, None),
+            field("hp", Ty::Int, None),
+        ]));
+        match hydrate(&portable, &new) {
+            Migrated::Lossless(v) => {
+                let s = v.as_struct().unwrap();
+                assert!(s.field("hp").unwrap().equals(&Value::Int(10)));
+                assert!(s.field("name").unwrap().equals(&Value::str("orc")));
+            }
+            Migrated::Lossy { .. } => panic!("expected a lossless hydrate"),
+        }
+    }
+
+    #[test]
+    fn hydrate_struct_fills_an_added_field_from_its_default() {
+        let portable = struct_portable(&old_struct(&[("hp", Value::Int(10))]));
+        let new = Ty::Struct(struct_ty(vec![
+            field("hp", Ty::Int, None),
+            field("shield", Ty::Int, Some(ConstVal::Int(0))),
+        ]));
+        match hydrate(&portable, &new) {
+            Migrated::Lossless(v) => {
+                let s = v.as_struct().unwrap();
+                assert!(s.field("shield").unwrap().equals(&Value::Int(0)));
+            }
+            Migrated::Lossy { .. } => panic!("expected the default to fill the new field"),
+        }
+    }
+
+    #[test]
+    fn hydrate_struct_is_lossy_when_a_field_type_changed() {
+        let portable = struct_portable(&old_struct(&[("hp", Value::Int(10))]));
+        let new = Ty::Struct(struct_ty(vec![field("hp", Ty::String, None)]));
+        match hydrate(&portable, &new) {
+            Migrated::Lossy { portable } => {
+                let m = portable.as_map().unwrap();
+                assert!(m.get(&Value::str("hp")).unwrap().equals(&Value::Int(10)));
+            }
+            Migrated::Lossless(_) => panic!("an int-typed field became string; must be lossy"),
+        }
+    }
+
+    #[test]
+    fn hydrate_enum_from_variant_and_payload_by_name() {
+        let ev = EnumVal {
+            module: Rc::from("/std/combat"),
+            name: Rc::from("DamageKind"),
+            variant: Rc::from("Fire"),
+            payload: vec![Value::Int(5)],
+        };
+        let portable = enum_portable(&ev);
+        let new = Ty::Enum(enum_ty(vec![
+            variant("Slash", vec![]),
+            variant("Fire", vec![Ty::Int]),
+        ]));
+        match hydrate(&portable, &new) {
+            Migrated::Lossless(v) => {
+                let e = v.as_enum().unwrap();
+                assert_eq!(&*e.variant, "Fire");
+                assert!(e.payload[0].equals(&Value::Int(5)));
+            }
+            Migrated::Lossy { .. } => panic!("expected the variant to resolve by name"),
+        }
+    }
+
+    #[test]
+    fn hydrate_enum_is_lossy_when_its_variant_was_removed() {
+        let ev = EnumVal {
+            module: Rc::from("/std/combat"),
+            name: Rc::from("DamageKind"),
+            variant: Rc::from("Poison"),
+            payload: vec![],
+        };
+        let portable = enum_portable(&ev);
+        let new = Ty::Enum(enum_ty(vec![variant("Slash", vec![])]));
+        assert!(matches!(hydrate(&portable, &new), Migrated::Lossy { .. }));
+    }
+
+    #[test]
+    fn hydrate_array_and_map_recurse_elementwise() {
+        let portable = Value::array(vec![Value::Int(1), Value::Int(2)]);
+        assert!(matches!(
+            hydrate(&portable, &Ty::array(Ty::Int)),
+            Migrated::Lossless(_)
+        ));
+        assert!(matches!(
+            hydrate(&portable, &Ty::array(Ty::String)),
+            Migrated::Lossy { .. }
+        ));
+
+        let mut m = MapData::default();
+        m.insert(Value::str("a"), Value::Int(1));
+        let portable = Value::map(m);
+        assert!(matches!(
+            hydrate(&portable, &Ty::map(Ty::String, Ty::Int)),
+            Migrated::Lossless(_)
+        ));
+        assert!(matches!(
+            hydrate(&portable, &Ty::map(Ty::String, Ty::String)),
+            Migrated::Lossy { .. }
+        ));
     }
 }

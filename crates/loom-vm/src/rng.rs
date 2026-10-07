@@ -20,6 +20,19 @@ impl Rng {
         Rng(seed)
     }
 
+    /// The raw generator state (OBI-173 binary snapshots): opaque, just
+    /// enough to resume an identical sequence via [`Rng::from_state`].
+    /// Not `seed` in the `LOOM_RANDOM_SEED` sense -- it is whatever the
+    /// counter has advanced to since boot.
+    pub fn state(&self) -> u64 {
+        self.0
+    }
+
+    /// Resume a generator from a state captured by [`Rng::state`].
+    pub fn from_state(state: u64) -> Rng {
+        Rng(state)
+    }
+
     /// `LOOM_RANDOM_SEED` if set and parses as a `u64`, else a
     /// non-deterministic seed.
     pub fn from_env_or_random() -> Rng {
