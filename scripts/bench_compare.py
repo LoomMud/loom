@@ -30,9 +30,10 @@ reported the same way as a control miss.
 Exit codes:
   0  within tolerance
   1  regression: head/base exceeds 1 + THRESHOLD on a workload, control OK
-  2  usage / no comparable data / a required arm is missing
+  2  usage / no comparable data / a required arm is missing entirely
   3  INVALID harness: the control arm (or an identical-binary `head/base`
-     pair) exceeded tolerance, so the measurement -- not the PR -- is broken
+     pair) exceeded tolerance, or a workload both `base` and `head` timed has
+     no control sample -- so the measurement, not the PR, is broken
 
 Stdlib only. Prints a Markdown table and appends it to $GITHUB_STEP_SUMMARY
 when that is set, plus a `bench-rounds.csv` of every raw round next to the
@@ -127,12 +128,18 @@ def evaluate(logs_dir: Path, threshold: float) -> tuple:
         "| workload | base | head | head/base | ctrl | ctrl/head | rounds | verdict |",
         "|---|---:|---:|---:|---:|---:|---:|---|",
     ]
-    regressions, invalid, detail = [], [], []
+    regressions, invalid, detail, ctrl_gaps = [], [], [], []
     worst_ctrl = 1.0
     for workload in sorted(data):
         base, head, ctrl = (data[workload][a] for a in ARMS)
         if not (base and head and ctrl):
             missing = [a for a, v in zip(ARMS, (base, head, ctrl)) if not v]
+            if base and head and not ctrl:
+                # `ctrl` is a copy of the head binary, so a workload both
+                # other arms timed must appear there; if it does not, a
+                # control round died and this gate cannot validate itself.
+                ctrl_gaps.append(workload)
+                missing = [f"{m} sample -- cannot trust this row" for m in missing]
             lines.append(
                 f"| `{workload}` | | | | | | | missing {', '.join(missing)} (skipped) |"
             )
@@ -206,6 +213,15 @@ def evaluate(logs_dir: Path, threshold: float) -> tuple:
         det.append("</details>")
         report += "\n" + "\n".join(det)
 
+    if ctrl_gaps:
+        report += (
+            "\n\nbench-gate: INVALID harness -- no control sample for "
+            f"{', '.join(ctrl_gaps)} while both `base` and `head` produced one: "
+            "a `ctrl` round died or printed a truncated table, so this run "
+            "cannot demonstrate that it measures 1.00. Re-run on a host that "
+            "can complete all three arms."
+        )
+        return report, 3
     if invalid:
         report += (
             f"\n\nbench-gate: INVALID harness -- {len(invalid)} workload(s) could not "
@@ -340,6 +356,21 @@ def self_test() -> int:
             failures += 1
         else:
             print("ok   unit conversion: exit 0")
+
+        # A workload both other arms timed must also appear in the control.
+        d = Path(td) / "ctrlgap"
+        d.mkdir()
+        for r in (1, 2):
+            (d / f"base{r}.log").write_text(_table(b + _ms([("other", 1.0)])))
+            (d / f"head{r}.log").write_text(_table(h_slow + _ms([("other", 1.0)])))
+            (d / f"ctrl{r}.log").write_text(_table(_ms([("other", 1.0)])))
+        (d / "meta.env").write_text("identical_binaries=false\n")
+        got = evaluate(d, 0.15)[1]
+        if got != 3:
+            print(f"FAIL workload missing from the control arm: exit {got}, want 3", file=sys.stderr)
+            failures += 1
+        else:
+            print("ok   workload missing from the control arm is an error: exit 3")
 
         # A missing control arm must be an error, not a silent pass.
         d = Path(td) / "noctrl"

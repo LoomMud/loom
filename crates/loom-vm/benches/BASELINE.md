@@ -156,7 +156,9 @@ threshold.
 `scripts/bench_compare.py` parses the Markdown tables `vm_bench` itself
 prints (stdlib Python, no external deps), writes the comparison table -- plus
 the per-round medians of anything that moved -- to the job summary, and exits
-`0` pass / `1` regression / `2` usage or missing arm / `3` invalid harness.
+`0` pass / `1` regression / `2` usage or a completely missing arm / `3`
+invalid harness (control out of tolerance, identical binaries moving, or no
+control sample for a workload the other two arms timed).
 `python3 scripts/bench_compare.py --self-test` checks that classifier on
 synthetic logs, and runs in `hygiene`, so the semantics cannot rot without a
 release build noticing.
