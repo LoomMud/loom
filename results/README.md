@@ -160,24 +160,45 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   the lane cannot rot silently and the comment here cannot drift from the
   workflow.
 
-**What the lane does *not* claim.** GitHub scopes a job-level concurrency
-group per workflow *and job*, so the hard guarantee is "the same gate never
-runs twice at once". Two *different* gates from two different PRs (PR A's
-`bench` against PR B's `loadtest-e1-1`) can still land on the host together;
-the `needs` chain removes that overlap inside a run, not across runs. The
-same-run `rust` job (`cargo test --workspace`) and the `fuzz-smoke*` jobs also
-stay parallel, and `release-image.yml` builds are outside the lane. All of
-that is runner capacity, not YAML: the durable fix is a dedicated/ephemeral
-load host, which is a CTO call and explicitly out of scope for OBI-308.
+**What the lane does *not* claim.** It holds one *gate* at a time on the
+runner set; it does not deliver a quiet host. A gate still shares its machine
+with its own run's `rust`, `fuzz-smoke*` and `deny` jobs, and with whatever
+else the scale set is running. Measured on 2026-10-07, three runs queued
+behind each other in the lane inside 30 minutes:
+
+| run | gate waited | gate window | result |
+|---|---|---|---|
+| `37674762546` (push, `main` `8174d57`) | - | 19:37 -> 19:44 | **PASS**, with its own `rust` still running beside it |
+| `37674844425` (PR #124 `8da41c3`) | pending 19:31-19:45 | 19:45 -> 19:55 | **FAIL** p99 1977 ms, 7725 commands sent (22% fewer), 0 login failures, 0 disconnects -- while its own `cargo clippy --workspace` had been running since 19:31 and took 35 min |
+| `37675041540` (PR #126 `9992769`) | pending 19:31-19:55 | 19:55 -> 20:01 | **PASS**, by then its `rust` had finished at 19:43 |
+
+The serialization and the FIFO hand-off did their job: three gates, one at a
+time, none cancelled, none co-scheduled. What #124 shows is the **residual**: a
+miss can still be host noise when the gate's own run is building the workspace
+beside it, so a lane-quiet miss is not yet proof of a latency regression --
+before believing a number, check whether that run's `rust`/`fuzz` jobs were in
+flight (and a low `commands sent` count with 0 failures is the tell).
+
+Two questions stay open and are tracked off this ticket: whether adding `rust`
+and the fuzz jobs to `loom-ci-load-lane` would serialize them against the gate
+inside a run -- GitHub's syntax docs never say how a job-level group is scoped
+across different jobs of one workflow, so that is an experiment, not an
+assumption -- and the known-good answer, capacity: a dedicated load-runner
+label so the gates get a machine of their own. The same window's `main`
+`rust` failure (`accounts_demo.rs:149`, "timed out waiting for `result 1`",
+with three runs piled on one scale set) is the same capacity story from the
+test side.
 
 **If you see `loadtest-e1-1` waiting** ("Waiting for job to run" on the
 checks tab): that is the lane working, and it has been watched working. On
 2026-10-07 PR #128 (carrying this change) took the lane at 18:01:00Z; the
 probe PR #129's `loadtest-e1-1` sat `pending` from 18:00:58Z and only started
 at 18:20:35Z, ~19.5 minutes later, *after* #128's job left the group -- it was
-never cancelled and never co-scheduled. One E1.1 slot costs ~3.5 min of
-runner wall-clock (build cache warm), so a queue of two PRs clears in well
-under ten. Do not respond to a wait, or to a p99 miss on a run that overlapped
+never cancelled and never co-scheduled; its gate then measured **p99 24.47 ms**
+(p50 3.01 / p95 16.34, n 9916, 0 login failures, 0 disconnects). The 19:31-20:01
+three-run queue above is the same mechanism on real PRs. One E1.1 slot costs
+4-10 min of runner wall-clock depending on build cache, so a queue of two PRs
+clears in well under twenty. Do not respond to a wait, or to a p99 miss on a run that overlapped
 another, by raising the threshold, dropping the population, marking the check
 optional, or re-running it into a quiet window by hand -- `hygiene` fails
 those changes.

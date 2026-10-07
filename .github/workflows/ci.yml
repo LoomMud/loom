@@ -35,12 +35,18 @@ permissions:
 # budget ends the required check as `cancelled` (run 37663331238, 2026-10-07)
 # -- as blocking as a miss, and with no p99 number to read.
 #
-# Residual: GitHub scopes a job-level concurrency group per workflow *and job*,
-# so the hard guarantee is "the same gate never runs twice at once across
-# PRs". One PR's `bench` can still land on the host while another PR's E1.1
-# measures; that shows up as a bench blip, not a false E1.1 SLA miss. Fixing
-# it properly is runner capacity (ephemeral/dedicated load hosts), deliberately
-# out of scope for OBI-308 -- see results/README.md "CI load lane".
+# Residual (measured 2026-10-07, not guessed): the lane holds one *gate* at a
+# time; it does not deliver a quiet host. A gate still shares its machine with
+# its own run's `rust`, `fuzz-smoke*` and `deny` jobs. #124's `loadtest-e1-1`
+# (19:45-19:55Z) ran beside its own `cargo clippy --workspace` (from 19:31Z,
+# 35 min+) and missed at p99 1977 ms with 22% fewer commands sent -- on the
+# same host where `main`'s gate passed 8 minutes earlier (p99 < 50 ms) and
+# #126's passed 6 minutes later. Whether pulling those jobs into this group
+# would serialize them against the gate is undocumented (GitHub's syntax docs
+# never say how a job-level group is scoped across different jobs in one
+# workflow), so that needs an experiment rather than an assumption. The
+# known-good answer is capacity: a dedicated load-runner label for the gates.
+# Both are follow-ups to OBI-308, deliberately not folded into this change.
 #
 # These invariants are enforced by scripts/check-ci-load-lane.py, run in the
 # `hygiene` job below.
