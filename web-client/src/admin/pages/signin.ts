@@ -9,8 +9,11 @@ import type { TokenStore } from "../tokenstore.js";
 /** Staff sign-in (`POST /auth/login`, OBI-174). Shown whenever the
  * token store is empty. Stores the access token and the *username* (the
  * step-up modal needs the username; the token only carries the uid).
- * The refresh token is deliberately not persisted -- an expired admin
- * session signs in again rather than silently refreshing. */
+ * The refresh token itself is never stored here, or anywhere in JS
+ * (OBI-198): it only ever travels as the `__Host-loom_rt` HttpOnly
+ * cookie the server set on this response, which `AdminApi.refresh`
+ * (OBI-297) rides on for silent re-auth before the 10-minute access
+ * token expires. */
 export function renderSignInPage(
   root: HTMLElement,
   api: AdminApi,
