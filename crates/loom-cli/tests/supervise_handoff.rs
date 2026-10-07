@@ -43,6 +43,15 @@
 //! introducing. [`Supervisor::start`] now declares `LOOM_RUNNING_VERSION`
 //! to match the file each test seeds, so a test gets exactly the one
 //! version change it asks for.
+//!
+//! Four tests at the bottom of this file pin those properties directly so
+//! they cannot come back unnoticed: the port band
+//! ([`reserved_test_ports_stay_in_the_non_ephemeral_band`]), the startup
+//! attribution ([`a_supervisor_blocked_from_its_bind_reports_its_own_reason`]),
+//! the version baseline
+//! ([`booting_with_a_matching_desired_version_triggers_no_copyover`]), and
+//! binary-safe transcript reads
+//! ([`transcript_reads_survive_binary_telnet_noise_between_lines`]).
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -1230,5 +1239,173 @@ fn reserved_test_ports_stay_in_the_non_ephemeral_band() {
         unique.len(),
         ports.len(),
         "reserve_local_port handed out the same port twice"
+    );
+}
+
+/// OBI-292 regression guard for the *attribution* half of the
+/// `ECONNRESET` failure: a supervisor that cannot bind its telnet port
+/// exits for a startup-only reason, and the one line that names the cause
+/// used to be thrown away (`Stdio::null()`), which is why CI showed a
+/// mystery reset instead of `failed to bind ...: Address already in use`.
+///
+/// The lost-port race itself cannot be scheduled deterministically, but
+/// its *consequence* can: this test holds the port the supervisor is told
+/// to bind, so the supervisor's `bind` fails for a reason under test
+/// control rather than by chance. Two properties are then asserted, both
+/// of which the pre-fix harness failed: [`wait_until_serving`] reports the
+/// failure as a reason (so [`spawn_until_serving_inner`] retries on fresh
+/// ports instead of letting the test connect into a dying backlog), and
+/// [`Supervisor::captured_log`] still holds the supervisor's own words.
+#[test]
+fn a_supervisor_blocked_from_its_bind_reports_its_own_reason() {
+    let mudlib = fixture("tworoom");
+    let telnet_bind = bind_string(reserve_local_port());
+    let http_bind = bind_string(reserve_local_port());
+
+    // Occupy the telnet port the supervisor is about to be told to bind.
+    let squatter = std::net::TcpListener::bind(&telnet_bind)
+        .unwrap_or_else(|err| panic!("could not occupy {telnet_bind} for the test: {err}"));
+
+    let (mut supervisor, _lines) = Supervisor::start(&mudlib, &telnet_bind, &http_bind, None);
+
+    let reason = match wait_until_serving(&mut supervisor, &telnet_bind) {
+        Ok(_stream) => {
+            drop(squatter);
+            panic!("the supervisor served on {telnet_bind} even though this test holds it bound")
+        }
+        Err(reason) => reason,
+    };
+    let log = supervisor.captured_log();
+    drop(squatter);
+
+    // Two shapes of the same lost-port race, depending on who won it: a
+    // listener on the port (this test) accepts the connect into its own
+    // backlog and then goes quiet, and a bare TIME_WAIT socket refuses it.
+    // Either way the *supervisor* is the thing that failed, and that is
+    // what the startup reason has to say rather than "the preamble did not
+    // arrive".
+    assert!(
+        reason.contains("supervisor exited") || reason.contains(&telnet_bind),
+        "the startup failure was not attributed to the supervisor itself: {reason}"
+    );
+    assert!(
+        log.contains("failed to bind") && log.contains(&telnet_bind),
+        "the supervisor's own output was discarded, so a startup failure is undiagnosable \
+         (this is what made CI's `Connection reset by peer` a mystery). Reason was: {reason}\n\
+         --- captured supervisor output ---\n{log}"
+    );
+}
+
+/// OBI-292 regression guard for the third failure mode: `supervise` seeds
+/// its desired-version baseline from the *running* build (deliberate, CTO
+/// review on OBI-256), and `tokio::time::interval`'s tick 0 fires
+/// immediately -- so a file that already holds `DESIRED_VERSION_INITIAL`
+/// while the supervisor believes it is running `0.0.1` is a *change*
+/// nobody asked for. The documented response to a detected change is a
+/// copyover request, so the child ran a reclaim/readopt round trip over
+/// the very connection a test was still introducing: that is how
+/// `reclaim_and_readopt_round_trip_keeps_the_connection_alive` failed with
+/// an empty transcript.
+///
+/// Deterministic rather than a timing margin: the watcher's first tick
+/// happens before the standby child finishes booting, so by the time the
+/// readiness barrier in [`spawn_until_serving`] returns, an unsolicited
+/// change would already have been logged. The test then asserts the
+/// watcher is still alive by making exactly the one change it does want.
+#[test]
+fn booting_with_a_matching_desired_version_triggers_no_copyover() {
+    let mudlib = fixture("tworoom");
+    let version_dir = scratch("version-boot-baseline");
+    let version_file = version_dir.join("desired-version");
+    std::fs::write(&version_file, format!("{DESIRED_VERSION_INITIAL}\n"))
+        .expect("write initial desired-version");
+
+    let (mut supervisor, _telnet_bind, _stream, line_rx) =
+        spawn_until_serving_with_version_file(&mudlib, &version_file);
+
+    // Anything the watcher said on its way up is in the channel already
+    // (it is unbounded, so nothing is lost between the drain thread and
+    // the first `recv`), and in the log. Collect it before changing
+    // anything, so the only possible "changed" line is an unsolicited one.
+    let boot_window = Duration::from_millis(3 * 200 + 500); // 3 poll intervals + slack
+    let mut boot_lines = Vec::new();
+    let deadline = Instant::now() + boot_window;
+    while Instant::now() < deadline {
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => boot_lines.push(strip_ansi(&line)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    let unsolicited: Vec<&String> = boot_lines
+        .iter()
+        .filter(|line| {
+            line.contains("desired version changed") && line.contains(DESIRED_VERSION_INITIAL)
+        })
+        .collect();
+    let all_output = supervisor.captured_log();
+    assert!(
+        unsolicited.is_empty(),
+        "the version watcher reported the file's *initial* content as a change, so `supervise` \
+         forwarded a copyover request the test never asked for. Seed the supervisor's running \
+         version to match what the test writes (LOOM_RUNNING_VERSION in `Supervisor::start`). \
+         Lines: {unsolicited:?}\n--- supervisor output ---\n{all_output}"
+    );
+
+    // The guard would be vacuous if the watcher simply never ran, so make
+    // exactly one change and require it to be detected.
+    std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_deliberate_change = false;
+    while Instant::now() < deadline && !saw_deliberate_change {
+        // Lines still buffered from the boot window must be consumed first.
+        if let Ok(line) = line_rx.recv_timeout(Duration::from_millis(200)) {
+            saw_deliberate_change =
+                strip_ansi(&line).contains("desired version changed") && line.contains("v2.0.0");
+        }
+    }
+    assert!(
+        saw_deliberate_change,
+        "the watcher never detected the deliberate change to v2.0.0 either, so this test cannot \
+         tell a silent watcher from a correct one"
+    );
+    supervisor.assert_alive();
+}
+
+/// OBI-292 regression guard for the `stream did not contain valid UTF-8
+/// (os error 526)` signature: a telnet stream is *not* text, and
+/// `read_until_contains` used to call `read_line` on it, which fails the
+/// whole test on an IAC byte landing inside a `\n`-terminated chunk. Feed
+/// it exactly that shape -- invalid UTF-8 (`0xFF`/`0xFE` are never valid
+/// UTF-8 lead bytes) followed by the real line -- and require the text
+/// back. Lossy decoding is all any caller here needs, since every caller
+/// only does substring matching.
+#[test]
+fn transcript_reads_survive_binary_telnet_noise_between_lines() {
+    let listener = std::net::TcpListener::bind(bind_string(reserve_local_port()))
+        .expect("loopback listener for the transcript test");
+    let addr = listener.local_addr().expect("listener address");
+    // The client end of a `BufReader<TcpStream>` the server writes to.
+    let stream = TcpStream::connect(addr).unwrap_or_else(|err| panic!("connect to {addr}: {err}"));
+    let server = std::thread::spawn(move || {
+        let (mut peer, _addr) = listener.accept().expect("accept the transcript client");
+        // IAC WILL NEGOTIATE-ABOUT, then an unpaired UTF-8 continuation
+        // byte, then the text the test is waiting for.
+        peer.write_all(&[0xff, 0xfb, 0x18, 0x80, 0xfe])
+            .expect("write binary noise");
+        peer.write_all(b"Exits: north\n")
+            .expect("write the transcript line");
+        std::thread::sleep(Duration::from_millis(200)); // keep the socket open past the read
+        peer.flush().expect("flush");
+    });
+
+    let mut reader = std::io::BufReader::new(stream);
+    let transcript = read_until_contains(&mut reader, "Exits:", Duration::from_secs(2));
+    server.join().expect("transcript server thread");
+
+    assert!(
+        transcript.contains("Exits: north"),
+        "expected the text after the binary noise, got: {transcript:?}"
     );
 }
