@@ -14,10 +14,17 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      with `cancel-in-progress: false` (never kill a running measurement) and
      `queue: max` (a *cancelled* required check blocks a PR as hard as a
      failed one, so waiting runs must queue in FIFO, not replace each other);
-     or is in an OBI-325 escape group, which rule 8 pins to exactly the shape
-     that still puts every runtime-relevant run in the lane;
-  2. no other job may take that group -- unrelated work must not hold the
-     lane that the latency gates are waiting on;
+     or, for the three gates only, is in an OBI-325 escape group, which rule 8
+     pins to exactly the shape that still puts every runtime-relevant run in
+     the lane;
+  2. the CPU-heavy build/fuzz jobs (`rust`, `fuzz-smoke*`) share that same
+     group name unconditionally (they load the host whatever the diff is),
+     because a job-level group is keyed by NAME across the jobs of a workflow --
+     measured, not assumed (probe run 37680869590) -- and a gate that had the
+     lane to itself still missed at p99 1977 ms while its own
+     `cargo clippy --workspace` ran on the host (run 37674844425). The cheap,
+     fast-signalling jobs (`deny`, `dco`, `hygiene`, `web-client`) must stay
+     OUT of the lane, and no other job may take the group either;
   3. the three load jobs are chained with `needs`
      (loadtest-e1-1 -> loadtest-smoke -> bench) so they never overlap inside
      one run either;
@@ -116,9 +123,25 @@ import sys
 from pathlib import Path
 
 LANE_GROUP = "loom-ci-load-lane"
-# In DAG order: the required gate goes first so nothing it depends on can
-# delay or skip it, and the two non-required gates follow it in the lane.
-LANE_JOBS = ["loadtest-e1-1", "loadtest-smoke", "bench"]
+# The load gates, in DAG order: the required gate goes first so nothing it
+# depends on can delay or skip it, and the two non-required gates follow it.
+LANE_GATES = ["loadtest-e1-1", "loadtest-smoke", "bench"]
+# CPU-heavy build/fuzz jobs, admitted to the same group name on purpose. It is
+# shared across jobs of a workflow, not scoped per job id: probe run
+# 37680869590 (PR #132, 2026-10-07) gave `web-client` this group name and the
+# job was serialized against `loadtest-e1-1` inside ONE run (web-client
+# 20:44:43 -> 20:45:01 while the gate sat pending, starting 20:45:40). Gate-
+# only serialization was not enough: run 37674844425's gate had the lane to
+# itself 19:45 -> 19:55 and still reported p99 1977 ms / 7725 commands (22%
+# fewer than the gates either side of it) with 0 login failures, because its
+# own `cargo clippy --workspace` ran on that host since 19:31. On a quiet host
+# the same gate measured p99 23.71 ms (probe run 37680869590, n 10077).
+LANE_HEAVY = ["rust", "fuzz-smoke", "fuzz-smoke-bytecode", "fuzz-smoke-lsp"]
+LANE_JOBS = LANE_HEAVY + LANE_GATES
+# Kept out of the lane so a PR gets its cheap signals (licence, DCO, hygiene,
+# client build) back in seconds instead of behind a queue of builds and
+# 150-player measurements.
+LANE_LIGHT = ["deny", "dco", "hygiene", "web-client"]
 LANE_CHAIN = {"loadtest-smoke": "loadtest-e1-1", "bench": "loadtest-smoke"}
 REQUIRED_JOBS = ["rust", "deny", "dco", "hygiene", "loadtest-e1-1"]
 # OBI-325 review: the one job-level `if:` the required gate may carry. GitHub
@@ -145,12 +168,11 @@ MEASURING_NEEDLES = ["cargo build --release", "--fail-on-sla-miss", "--players",
 # The E1.1 exit criterion (spec v2 section 10): 150 players, p99 < 50 ms,
 # and an SLA miss must fail the job.
 SLA_FLAGS = ["--players 150", "--fail-on-sla-miss"]
-# Wall-clock headroom per gate. The lane removes the *gate* competing with
-# itself; it does not remove the same run's `rust` job, or another PR's
-# builds, from the host. A starved release build must therefore not be able
-# to end the job: run 37663331238 (2026-10-07) hit the old 15-minute budget
+# Wall-clock headroom per gate. A starved release build must not be able to
+# end the job: run 37663331238 (2026-10-07) hit the old 15-minute budget
 # mid-build and the required check was `cancelled`, which blocks a PR exactly
-# like a miss while saying nothing at all about p99.
+# like a miss while saying nothing at all about p99. Lane jobs now queue behind
+# every other heavy job repo-wide, so these are queue-and-run budgets.
 MIN_TIMEOUT = {"loadtest-e1-1": 30, "loadtest-smoke": 20}
 # The `pull_request` activity types that change the commit under test, and the
 # two that a required check cannot afford to lose (OBI-313).
@@ -440,7 +462,7 @@ def check_classifier(jobs):
                           "runs, and the gate would queue on an empty verdict instead of a "
                           "written one -- tolerate it and let the fallback take the lane")
 
-    for job in LANE_JOBS:
+    for job in LANE_GATES:
         block = jobs.get(job) or []
         test = escape_test(job)
         escaped = (submapping(block, "concurrency").get("group") or "") != LANE_GROUP
@@ -960,8 +982,15 @@ def check_text(text, root="."):
         got = submapping(block, "concurrency")
         if not got and "concurrency" not in code:
             errors.append(f"`{job}` has no job-level `concurrency:` -- it can run "
-                          "against a loaded host and its latency numbers are noise")
-        errors += lane_group_error(job, got.get("group"))
+                          "against a loaded host (and disturb one): a gate measures "
+                          "noise, a build causes it")
+        if job in LANE_GATES:
+            errors += lane_group_error(job, got.get("group"))
+        elif got.get("group") != LANE_GROUP:
+            # Heavy jobs have no escape: a build loads the host whatever the
+            # diff is, so only the gates may read the OBI-325 verdict.
+            errors.append(f"`{job}` concurrency.group is {got.get('group')!r}, "
+                          f"expected {LANE_GROUP!r}")
         if got.get("cancel-in-progress") != "false":
             errors.append(f"`{job}` concurrency.cancel-in-progress is "
                           f"{got.get('cancel-in-progress')!r}, expected 'false' "
@@ -992,6 +1021,12 @@ def check_text(text, root="."):
                               "a failed or skipped lane job")
 
     holder_group = re.compile(rf"\bgroup:\s*{LANE_GROUP}\b")
+    for job in LANE_LIGHT:
+        code = "\n".join(l for l in jobs.get(job, []) if not l.lstrip().startswith("#"))
+        if holder_group.search(code):
+            errors.append(f"`{job}` must stay out of {LANE_GROUP!r}: it takes seconds to a "
+                          "minute, and queueing it behind builds and 150-player runs would "
+                          "delay the fast signal a PR author needs")
     for job, block in jobs.items():
         if job in LANE_JOBS:
             continue
@@ -1205,6 +1240,12 @@ MUTANTS = [
     ("gate timeout cut back to 15",
      lambda t: _sub(t, "timeout-minutes: 30", "    timeout-minutes: 15\n")),
     ("population lowered", lambda t: _sub(t, "--players 150", "            --players 20 \\\n")),
+    ("heavy job leaves the lane", lambda t: _drop_concurrency(t, "rust")),
+    ("light job joins the lane",
+     lambda t: t.replace("  web-client:\n", "  web-client:\n    concurrency:\n"
+                                           "      group: loom-ci-load-lane\n"
+                                           "      cancel-in-progress: false\n"
+                                           "      queue: max\n", 1)),
     ("unrelated job joins the lane",
      lambda t: t.replace("jobs:\n", "jobs:\n  noise:\n    concurrency:\n"
                                     "      group: loom-ci-load-lane\n"

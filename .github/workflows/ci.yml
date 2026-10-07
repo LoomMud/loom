@@ -97,7 +97,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# ── CI load lane (OBI-308) ─────────────────────────────────────────────────
+# ── CI load lane (OBI-308, heavy-job membership OBI-311) ───────────────────────
 # `loadtest-e1-1`, `loadtest-smoke` and `bench` measure wall-clock latency on
 # the self-hosted runner set (`vars.CI_RUNS_ON` -> `arc-runner-set-loommud`).
 # A second run on that host makes their numbers meaningless, not wrong: on
@@ -107,8 +107,8 @@ concurrency:
 # file, while the same commit passed every other job. Contention, not a
 # regression.
 #
-# So these three jobs share the job-level concurrency group
-# `loom-ci-load-lane`, with:
+# So the load gates share the job-level concurrency group `loom-ci-load-lane`,
+# with:
 #   cancel-in-progress: false -- never kill a measurement already running; and
 #   queue: max               -- pending runs wait in FIFO instead of the
 #                               default `single`, where a third run cancels the
@@ -121,21 +121,49 @@ concurrency:
 # permitted `needs:` on it is `classify`, the OBI-325 job below that decides
 # whether this diff has to be measured at all -- permitted because rule 8 of
 # scripts/check-ci-load-lane.py proves `classify` cannot be skipped and cannot
-# fail-open, and it has no `if:` of its own. `rust`/`deny`/`dco`/`hygiene` (the
-# other required checks) stay outside the lane and unscheduled so they can never
-# be skipped by a lane job.
-# Each gate also carries wall-clock headroom (`timeout-minutes` 30 / 20): the
-# lane stops a second *gate* from racing, not this run's own `rust` job or
-# another PR's builds, and a release build starved past the old 15-minute
-# budget ends the required check as `cancelled` (run 37663331238, 2026-10-07)
-# -- as blocking as a miss, and with no p99 number to read.
+# fail-open, and it has no `if:` of its own. `rust` joins the lane (below) but
+# keeps no `needs:`/`if:`, so waiting can delay it and never skip it.
+# `deny`/`dco`/`hygiene`/`web-client` stay outside the lane and unscheduled, so
+# they can never be skipped or delayed by lane work and a PR gets its cheap
+# signals back in about a minute.
+# Each gate also carries wall-clock headroom (`timeout-minutes` 30 / 20): lane
+# jobs queue behind every other heavy job in the group, and a release build
+# starved past the old 15-minute budget ends the required check as `cancelled`
+# (run 37663331238, 2026-10-07) -- as blocking as a miss, and with no p99
+# number to read.
 #
-# Residual: GitHub scopes a job-level concurrency group per workflow *and job*,
-# so the hard guarantee is "the same gate never runs twice at once across
-# PRs". One PR's `bench` can still land on the host while another PR's E1.1
-# measures; that shows up as a bench blip, not a false E1.1 SLA miss. Fixing
-# it properly is runner capacity (ephemeral/dedicated load hosts), deliberately
-# out of scope for OBI-308 -- see results/README.md "CI load lane".
+# Scoping, MEASURED rather than assumed (probe run 37680869590, PR #132, also
+# 2026-10-07): a job-level concurrency group is keyed by its NAME across the
+# jobs of a workflow, not per job id. In that run `web-client` -- a different
+# job id, given this same group name -- sat `pending` from 20:17 while only
+# `loadtest-e1-1`-family jobs held the group, and then, once the group freed,
+# `web-client` ran 20:44:43 -> 20:45:01 while `loadtest-e1-1` stayed `pending`
+# and started 39 s later: two different jobs of ONE run, serialized by one
+# group. Earlier prose here claimed the opposite ("scoped per workflow and
+# job"); the docs never say that, and the measurement says it is false.
+#
+# That is why `rust` and the three `fuzz-smoke*` jobs are in this group too.
+# Gate-only serialization was not enough: run 37674844425's `loadtest-e1-1` had
+# the lane to itself from 19:45 -> 19:55 and still reported p99 1977 ms with
+# 7725 commands sent (22% fewer than the gates that passed either side of it)
+# and 0 login failures / 0 disconnects, because its own `cargo clippy
+# --workspace` had been running on that host since 19:31 and took 35 minutes.
+# With the heavy jobs inside the group, the same gate measured p99 23.71 ms
+# (p50 3.05 / p95 16.09 / max 49.29, n 10077, 0 failures, 0 disconnects) on the
+# quiet host in probe run 37680869590 -- 2.1x under the SLA, first try.
+#
+# Cost, stated plainly: the lane now admits every CPU-heavy job, so at most one
+# of them runs repo-wide at a time. Observed queue depth on 2026-10-07 was
+# already real (`loadtest-smoke` waited 16 min and `bench` 33 min on run
+# 37675041540, both non-required), so expect PR runs to take longer end to end.
+# The counter-evidence is that contention is not free either -- `rust` took 6
+# min on a quiet host, 10 min beside three fuzz jobs, and 35+ min with three
+# runs piled on, and `fuzz-smoke-bytecode` once hit its 15-minute budget inside
+# the cache-restore step without ever running its payload (OBI-308 notes). If
+# the added CI latency is unacceptable, the fix is capacity, not YAML: pin the
+# gates to a dedicated load-runner label and take `rust`/`fuzz` back out. That
+# is OBI-311's remaining decision (CTO).
+#
 #
 #
 # ── Who has to wait at all (OBI-325) ──────────────────────────────────────────
@@ -192,6 +220,14 @@ concurrency:
 # workflow-level `concurrency` block above, not anything in the lane.
 jobs:
   rust:
+    # In the load lane (OBI-311): a workspace build/test is the single biggest
+    # CPU disturbance on the runner set, and it is what made a lane-quiet E1.1
+    # miss. It stays a required check and keeps no `needs:`/`if:`, so waiting
+    # for the lane can delay it but can never skip it.
+    concurrency:
+      group: loom-ci-load-lane
+      cancel-in-progress: false
+      queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     services:
       postgres:
@@ -454,6 +490,11 @@ jobs:
   fuzz-smoke:
     # Weft parser fuzz smoke (OBI-23): <= 60 s of libFuzzer seeded from the
     # golden files. Not (yet) a required check on `main`.
+    # In the load lane: libFuzzer is CPU-saturating by design (OBI-311).
+    concurrency:
+      group: loom-ci-load-lane
+      cancel-in-progress: false
+      queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     timeout-minutes: 15
     steps:
@@ -468,6 +509,11 @@ jobs:
   fuzz-smoke-bytecode:
     # Bytecode verifier fuzz smoke (OBI-30): decode+verify, <= 60 s of
     # libFuzzer. Not (yet) a required check on `main`.
+    # In the load lane: CPU-saturating fuzz work (OBI-311).
+    concurrency:
+      group: loom-ci-load-lane
+      cancel-in-progress: false
+      queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     timeout-minutes: 15
     steps:
@@ -483,6 +529,11 @@ jobs:
     # loom-lsp request-handler fuzz smoke (OBI-168, spec M-LSP-4): <= 60 s
     # of libFuzzer over arbitrary (offset, source) pairs. Not (yet) a
     # required check on `main`.
+    # In the load lane: CPU-saturating fuzz work (OBI-311).
+    concurrency:
+      group: loom-ci-load-lane
+      cancel-in-progress: false
+      queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     timeout-minutes: 15
     steps:
