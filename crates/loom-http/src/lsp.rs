@@ -177,20 +177,24 @@ impl SessionLimiter {
 struct WorldReadProvider {
     file_op_tx: FileOpSender,
     uid: String,
-    /// CTO review of PR #122, should-fix: `can_read` immediately
-    /// followed by `read` for the same path (the common pattern --
-    /// opening a document, or `GatedProvider`-style callers) used to
-    /// cost two full `read_file` round trips (10s M-FS-5 budget each)
-    /// for one logical operation, since `can_read` has no lighter-weight
-    /// "exists" query to call instead -- it fetched and discarded the
-    /// whole content just to answer a bool. A single-slot cache keyed by
-    /// the last path asked about is enough to collapse that common
-    /// back-to-back pair into one round trip without adding a new
-    /// file-op kind; it never serves a *different* path's stale answer
-    /// (the key is checked every call), and a cache miss just falls back
-    /// to a fresh round trip, so this is a pure latency optimisation,
-    /// never a correctness-affecting one.
-    cache: Mutex<Option<(String, Result<String, String>)>>,
+    /// CTO re-review of PR #122, must-fix A: this is a one-shot
+    /// `can_read` -> `read` hand-off, not a general-purpose cache. It
+    /// exists only to collapse the common back-to-back pair (the same
+    /// pattern `GatedProvider`/`server.rs`'s callers use -- `can_read`
+    /// immediately followed by `read` on the same path) into a single
+    /// `read_file` round trip (10s M-FS-5 budget each), since `can_read`
+    /// has no lighter-weight "exists" query to call instead.
+    ///
+    /// The previous version kept the slot around after serving it,
+    /// which let a second, unrelated `read` of the same path reuse a
+    /// round trip that happened an arbitrary amount of time earlier --
+    /// returning pre-save content after a save, or `Ok` after `valid_read`
+    /// had since been revoked. `read` now `take()`s the slot: a hit is
+    /// consumed exactly once and a second `read` of the same path (with
+    /// no intervening `can_read`) always goes back to the channel. The
+    /// key is still checked on every access, so a cache entry is never
+    /// served for a *different* path either.
+    pending: Mutex<Option<(String, Result<String, String>)>>,
 }
 
 impl WorldReadProvider {
@@ -198,7 +202,7 @@ impl WorldReadProvider {
         Self {
             file_op_tx,
             uid,
-            cache: Mutex::new(None),
+            pending: Mutex::new(None),
         }
     }
 
@@ -206,34 +210,34 @@ impl WorldReadProvider {
     /// be one of `loom-lsp`'s own bounded blocking-pool threads (spec
     /// M-LSP-4), never an async task.
     fn read_through_channel(&self, path: &str) -> Result<String, String> {
-        if let Some((cached_path, cached)) = self.cache.lock().unwrap().as_ref()
-            && cached_path == path
-        {
-            return cached.clone();
-        }
         let file_path = format!("{path}.wf");
-        let result =
-            match request_file_op(&self.file_op_tx, &self.uid, &file_path, FileOpKind::Read) {
-                Ok(FileOpValue::Str(contents)) => Ok(contents),
-                // M-FS-3: a denial must look exactly like "does not exist" --
-                // `Null` (readable, absent), `Refused` (denied), and a
-                // channel/timeout failure are deliberately not distinguished
-                // here. `Internal`/other `FileOpValue` variants also fall
-                // through to this one "missing" answer.
-                _ => Err("No such file or directory".to_string()),
-            };
-        *self.cache.lock().unwrap() = Some((path.to_string(), result.clone()));
-        result
+        match request_file_op(&self.file_op_tx, &self.uid, &file_path, FileOpKind::Read) {
+            Ok(FileOpValue::Str(contents)) => Ok(contents),
+            // M-FS-3: a denial must look exactly like "does not exist" --
+            // `Null` (readable, absent), `Refused` (denied), and a
+            // channel/timeout failure are deliberately not distinguished
+            // here. `Internal`/other `FileOpValue` variants also fall
+            // through to this one "missing" answer.
+            _ => Err("No such file or directory".to_string()),
+        }
     }
 }
 
 impl loom_lsp::file_provider::FileProvider for WorldReadProvider {
     fn read(&self, path: &str) -> Result<String, String> {
+        if let Some((pending_path, pending)) = self.pending.lock().unwrap().take()
+            && pending_path == path
+        {
+            return pending;
+        }
         self.read_through_channel(path)
     }
 
     fn can_read(&self, path: &str) -> bool {
-        self.read_through_channel(path).is_ok()
+        let result = self.read_through_channel(path);
+        let ok = result.is_ok();
+        *self.pending.lock().unwrap() = Some((path.to_string(), result));
+        ok
     }
 }
 
@@ -289,20 +293,32 @@ async fn lsp_handler(
 /// `true` iff `uid`/`sid` still passes both M-LSP-1 checks: a live tier
 /// at or above [`MIN_LSP_TIER`], *and* `sid`'s token family not revoked
 /// (CTO review of PR #122, must-fix 2 -- a tier check alone misses an
-/// M-AUTH-5 logout/revocation that never touched the uid's tier). A
-/// directory error on either check is treated as "still OK" here, not a
-/// revocation -- see `AuthService::current_tier`/`session_family_live`'s
-/// own docs on why a transient outage must not look like a confirmed
-/// revocation to a periodic recheck.
-async fn still_authorized(auth: &crate::auth::AuthService, uid: &str, sid: &str) -> bool {
+/// M-AUTH-5 logout/revocation that never touched the uid's tier).
+///
+/// `fail_open` controls what a directory error on either check means:
+/// at **connect** (`fail_open = false`, CTO re-review of PR #122,
+/// must-fix B) a directory error must not grant admission -- that would
+/// be a regression from the fail-closed behaviour admission always had
+/// before this check existed, since a brand-new session has no prior
+/// authorization to fall back on. On the **periodic recheck**
+/// (`fail_open = true`) of an already-admitted, already-running
+/// session, the same error must *not* look like a confirmed revocation:
+/// a transient directory outage would otherwise kick every live session
+/// off every time the directory hiccups.
+async fn still_authorized(
+    auth: &crate::auth::AuthService,
+    uid: &str,
+    sid: &str,
+    fail_open: bool,
+) -> bool {
     let tier_live = match auth.current_tier(uid).await {
         Ok(tier) => matches!(tier, Some(t) if t >= MIN_LSP_TIER),
-        Err(_) => true,
+        Err(_) => fail_open,
     };
     if !tier_live {
         return false;
     }
-    auth.session_family_live(sid).await.unwrap_or(true)
+    auth.session_family_live(sid).await.unwrap_or(fail_open)
 }
 
 async fn run_session(
@@ -342,8 +358,10 @@ async fn run_session(
 
     // M-LSP-1: refuse a uid/sid that already fails either check (tier
     // floor, or a revoked token family) before ever starting a session,
-    // not just on the periodic recheck below.
-    if !still_authorized(&auth, &uid, &sid).await {
+    // not just on the periodic recheck below. Fail closed here (CTO
+    // re-review of PR #122, must-fix B): a directory error at connect
+    // must not admit a session that was never actually authorized.
+    if !still_authorized(&auth, &uid, &sid, false).await {
         let _ = socket.send(WsMessage::Close(None)).await;
         return;
     }
@@ -440,7 +458,11 @@ async fn run_session(
                 if socket.send(WsMessage::Ping(Vec::new().into())).await.is_err() { break; }
             }
             _ = recheck.tick() => {
-                if !still_authorized(&auth, &uid, &sid).await {
+                // Fail open here: this is the periodic recheck of an
+                // already-admitted session, so a transient directory
+                // error must not look like a confirmed revocation (see
+                // `still_authorized`'s doc).
+                if !still_authorized(&auth, &uid, &sid, true).await {
                     break;
                 }
             }
@@ -495,6 +517,57 @@ mod tests {
         // A different path still gets its own fresh round trip.
         assert!(provider.can_read("/builders/frodo/b"));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// CTO re-review of PR #122, must-fix A: the `can_read` -> `read`
+    /// hand-off is one-shot. A second `read` of the same path, with no
+    /// intervening `can_read`, must never reuse an old round trip --
+    /// that was the stale-cache bug: a `read` after a save (or after
+    /// `valid_read` was revoked) kept returning the answer from before
+    /// the save/revocation instead of going back to the channel.
+    #[test]
+    fn a_second_read_of_the_same_path_always_makes_a_fresh_round_trip() {
+        use loom_lsp::file_provider::FileProvider;
+        let (file_op_tx, file_op_rx) = file_op_channel();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_in_thread = calls.clone();
+        std::thread::spawn(move || {
+            while let Ok(req) = file_op_rx.recv() {
+                let n = calls_in_thread.fetch_add(1, Ordering::SeqCst);
+                // Simulate the underlying content changing between reads
+                // (a save), and the path going from readable to denied
+                // (a `valid_read` revocation) on the third call.
+                let reply = match n {
+                    0 => Ok(FileOpValue::Str("int x;".to_string())),
+                    1 => Ok(FileOpValue::Str("int y;".to_string())),
+                    _ => Ok(FileOpValue::Null),
+                };
+                req.respond(reply);
+            }
+        });
+        let provider = WorldReadProvider::new(file_op_tx, "frodo".to_string());
+
+        // can_read -> read: the one-shot hand-off, one round trip.
+        assert!(provider.can_read("/builders/frodo/a"));
+        assert_eq!(provider.read("/builders/frodo/a").as_deref(), Ok("int x;"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A second `read` of the same path, with no `can_read` in
+        // between, must not reuse call #1's stale answer.
+        assert_eq!(provider.read("/builders/frodo/a").as_deref(), Ok("int y;"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a read with no preceding can_read must always re-fetch, not reuse a stale answer"
+        );
+
+        // And it must keep tracking the live (denied) answer too, not
+        // the stale `Ok` from call #2.
+        assert_eq!(
+            provider.read("/builders/frodo/a"),
+            Err("No such file or directory".to_string())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -962,6 +1035,36 @@ mod tests {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => {}
             other => {
                 panic!("expected the revoked session family to close the socket, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_directory_error_at_connect_refuses_the_session() {
+        // CTO re-review of PR #122, must-fix B: a directory outage at
+        // connect must not be waved through -- admission used to fail
+        // closed before the tier/session-family check existed, and a
+        // brand-new session has no prior authorization to fall back on.
+        let (addr, auth, directory) = spawn_lsp_server(None).await;
+        directory.seed_live_session_for_test("frodo", "sid-1");
+        let claims = claims_for("frodo", &keys(), "sid-1");
+        let ticket = auth.issue_ws_ticket(&claims).unwrap();
+        directory.fail_directory_for_test();
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
+            .await
+            .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({ "auth": ticket }).to_string().into(),
+        ))
+        .await
+        .unwrap();
+
+        let next = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
+        match next {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => {}
+            other => {
+                panic!("expected a directory error at connect to refuse the session, got {other:?}")
             }
         }
     }

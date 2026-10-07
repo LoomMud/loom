@@ -43,6 +43,13 @@ struct FakeDirectoryInner {
     /// (CTO review on PR #98: proving the deny path is audited too, not
     /// just the tier-floor refusal).
     fail_admin_audit: bool,
+    /// When `true`, [`StaffDirectory::auth_status_for`] and
+    /// [`StaffDirectory::session_family_live`] both fail outright
+    /// (OBI-301, CTO re-review of PR #122, must-fix B): simulates a
+    /// directory outage so a test can prove `/lsp`'s connect-time
+    /// `still_authorized` check fails *closed* while its periodic
+    /// recheck still fails open.
+    fail_directory: bool,
 }
 
 #[derive(Clone)]
@@ -96,6 +103,13 @@ impl FakeDirectory {
     /// [`AdminDirectoryError::Unavailable`] (CTO review on PR #98).
     fn fail_admin_audit(&self) {
         self.inner.lock().unwrap().fail_admin_audit = true;
+    }
+
+    /// Make every subsequent `auth_status_for`/`session_family_live`
+    /// call fail with [`DirectoryError`] (OBI-301, CTO re-review of PR
+    /// #122, must-fix B).
+    pub(crate) fn fail_directory_for_test(&self) {
+        self.inner.lock().unwrap().fail_directory = true;
     }
 
     pub(crate) fn link_github(&self, github_id: i64, uid: &str) {
@@ -248,17 +262,15 @@ impl StaffDirectory for FakeDirectory {
     }
 
     async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .staff
-            .get(uid)
-            .map(|s| StaffAuthStatus {
-                tier: s.tier,
-                totp_secret: s.totp_secret.clone(),
-                totp_confirmed: s.totp_confirmed,
-            }))
+        let inner = self.inner.lock().unwrap();
+        if inner.fail_directory {
+            return Err(DirectoryError);
+        }
+        Ok(inner.staff.get(uid).map(|s| StaffAuthStatus {
+            tier: s.tier,
+            totp_secret: s.totp_secret.clone(),
+            totp_confirmed: s.totp_confirmed,
+        }))
     }
 
     async fn totp_consume_step(&self, uid: &str, step: u64) -> Result<bool, DirectoryError> {
@@ -378,10 +390,11 @@ impl StaffDirectory for FakeDirectory {
 
     async fn session_family_live(&self, sid: &str) -> Result<bool, DirectoryError> {
         let now = now();
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
+        let inner = self.inner.lock().unwrap();
+        if inner.fail_directory {
+            return Err(DirectoryError);
+        }
+        Ok(inner
             .sessions
             .values()
             .any(|s| s.sid == sid && s.revoked_at.is_none() && s.expires_at > now))
