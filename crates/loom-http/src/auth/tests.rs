@@ -148,6 +148,39 @@ impl FakeDirectory {
         }
     }
 
+    /// Seed a `staff_sessions`-shaped row directly (bypassing login/
+    /// refresh entirely), so a test can mint claims with a known `sid`
+    /// via [`crate::auth::AccessClaims`] directly and have
+    /// [`StaffDirectory::session_family_live`] see it as live, the way a
+    /// real login would have inserted one (OBI-180, `/lsp`'s M-LSP-1
+    /// revocation recheck).
+    pub(crate) fn seed_live_session_for_test(&self, uid: &str, sid: &str) {
+        self.inner.lock().unwrap().sessions.insert(
+            format!("test-session-{sid}"),
+            FakeSession {
+                staff_uid: uid.to_string(),
+                expires_at: now() + Duration::from_secs(3600),
+                revoked_at: None,
+                sid: sid.to_string(),
+                amr: vec!["pwd".to_string()],
+                mfa_at: None,
+                last_used_at: now(),
+            },
+        );
+    }
+
+    /// Revoke every session sharing `sid` directly by family id, the way
+    /// [`Self::revoke_all_for_uid_for_test`] does by uid -- used to
+    /// simulate an M-AUTH-5 logout/revocation without a tier change.
+    pub(crate) fn revoke_session_family_for_test(&self, sid: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        for session in inner.sessions.values_mut() {
+            if session.sid == sid {
+                session.revoked_at = Some(now());
+            }
+        }
+    }
+
     fn is_revoked(&self, token_plaintext: &str) -> bool {
         let hash = hash_token(token_plaintext);
         self.inner
@@ -341,6 +374,17 @@ impl StaffDirectory for FakeDirectory {
             }
         }
         Ok(())
+    }
+
+    async fn session_family_live(&self, sid: &str) -> Result<bool, DirectoryError> {
+        let now = now();
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .any(|s| s.sid == sid && s.revoked_at.is_none() && s.expires_at > now))
     }
 
     async fn session_rotate(

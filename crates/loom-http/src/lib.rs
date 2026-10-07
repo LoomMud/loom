@@ -83,6 +83,11 @@ pub struct HttpState {
     /// answers `503` before ever touching this if no file-op channel is
     /// wired.
     lsp_sessions: lsp::SessionLimiter,
+    /// Test-only override for `/lsp`'s timing constants (idle timeout,
+    /// ping interval, first-frame timeout, revocation-recheck interval)
+    /// -- `None` uses the real spec values (M-LSP-1/M-LSP-4). Set via
+    /// [`Self::with_lsp_tuning_for_test`], never by `loom-cli`.
+    lsp_tuning: lsp::LspTuning,
 }
 
 impl HttpState {
@@ -105,6 +110,7 @@ impl HttpState {
             write_rate_limiter: files::new_write_rate_limiter(),
             world_query: None,
             lsp_sessions: lsp::SessionLimiter::default(),
+            lsp_tuning: lsp::LspTuning::default(),
         }
     }
 
@@ -203,6 +209,22 @@ impl HttpState {
 
     pub(crate) fn lsp_sessions(&self) -> &lsp::SessionLimiter {
         &self.lsp_sessions
+    }
+
+    pub(crate) fn lsp_tuning(&self) -> &lsp::LspTuning {
+        &self.lsp_tuning
+    }
+
+    /// Shrink `/lsp`'s timing constants for a fast, deterministic test
+    /// (idle timeout/ping interval/revocation-recheck interval all
+    /// default to tens of seconds, far too slow for a test to wait out
+    /// in real wall-clock time). Test-only -- `loom-cli` never calls
+    /// this, so every real `/lsp` connection gets the spec's actual
+    /// M-LSP-4 values.
+    #[cfg(test)]
+    pub(crate) fn with_lsp_tuning_for_test(mut self, tuning: lsp::LspTuning) -> Self {
+        self.lsp_tuning = tuning;
+        self
     }
 }
 

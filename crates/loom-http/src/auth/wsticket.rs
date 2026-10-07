@@ -88,7 +88,15 @@ impl WsTicketIssuer {
     }
 
     pub fn issue(&self, sub: &str, sid: &str) -> Result<String, StateTokenError> {
-        let mut nonce = [0u8; 16];
+        // CTO review of PR #122, should-fix: match this crate's other
+        // random-identity nonces (refresh-token plaintext, GitHub OAuth
+        // state, `generate_sid`) at 32 bytes / 256 bits, not a smaller
+        // one-off size -- 16 bytes was already enough entropy for this
+        // nonce's actual job (de-duplicating redemptions in an in-memory
+        // map with a 30s TTL), but there is no reason for it to be the
+        // one random identifier in `loom-http` that doesn't match the
+        // rest.
+        let mut nonce = [0u8; 32];
         rand::rng().fill(&mut nonce);
         let claims = WsTicketClaims {
             sub: sub.to_string(),

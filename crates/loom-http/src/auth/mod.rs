@@ -966,6 +966,18 @@ impl AuthService {
         Ok(self.directory.auth_status_for(uid).await?.map(|s| s.tier))
     }
 
+    /// `true` iff `sid`'s token family is still live -- not revoked, not
+    /// expired (OBI-180 M-LSP-1, CTO review of PR #122 must-fix 2):
+    /// `/lsp`'s connect-time check and its periodic recheck both use
+    /// this, the same way they both use [`Self::current_tier`] for the
+    /// tier/removal check. A directory error surfaces as `Err` for the
+    /// same reason `current_tier`'s doc gives: a periodic recheck must
+    /// be able to tell a transient outage apart from a confirmed
+    /// revocation.
+    pub async fn session_family_live(&self, sid: &str) -> Result<bool, AuthError> {
+        Ok(self.directory.session_family_live(sid).await?)
+    }
+
     /// Sign arbitrary claims directly, bypassing `login`/`refresh`
     /// entirely -- test-only, so `loom-http`'s HTTP-wire admin tests
     /// (`admin.rs`) can mint a token with a specific tier/`mfa_at`

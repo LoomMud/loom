@@ -192,6 +192,18 @@ pub trait StaffDirectory: Send + Sync {
     /// (OBI-198: logout revokes the family).
     async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<(), DirectoryError>;
 
+    /// `true` iff at least one unrevoked, unexpired `staff_sessions` row
+    /// shares `sid` (OBI-180 M-LSP-1, CTO review of PR #122 must-fix 2):
+    /// an open `/lsp` session's periodic recheck uses this to close the
+    /// socket the moment its own token family is revoked (M-AUTH-5,
+    /// e.g. a logout or `refresh_token_revoke_all` trigger), which a
+    /// tier/staff-row check alone does not observe -- a session can be
+    /// revoked without any tier change at all. `false` for a `sid` with
+    /// no matching row at all (fail-closed: every real token family has
+    /// a row from the login/refresh that minted it, so a missing row is
+    /// never the legitimate case this method exists to allow through).
+    async fn session_family_live(&self, sid: &str) -> Result<bool, DirectoryError>;
+
     /// Atomically rotate the session for `old_token_hash` to
     /// `new_token_hash` (OBI-198 re-review, must-fix 1/2) -- see
     /// `loom_persist::Persist::session_rotate`.
@@ -350,6 +362,12 @@ impl StaffDirectory for loom_persist::Persist {
 
     async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<(), DirectoryError> {
         loom_persist::Persist::session_revoke_family_by_token(self, token_hash)
+            .await
+            .map_err(|_| DirectoryError)
+    }
+
+    async fn session_family_live(&self, sid: &str) -> Result<bool, DirectoryError> {
+        loom_persist::Persist::session_family_live(self, sid)
             .await
             .map_err(|_| DirectoryError)
     }

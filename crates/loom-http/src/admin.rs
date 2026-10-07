@@ -544,6 +544,12 @@ mod tests {
         ) -> Result<(), crate::auth::DirectoryError> {
             Ok(())
         }
+        async fn session_family_live(
+            &self,
+            _sid: &str,
+        ) -> Result<bool, crate::auth::DirectoryError> {
+            Ok(true)
+        }
         async fn session_rotate(
             &self,
             _old_token_hash: &str,
