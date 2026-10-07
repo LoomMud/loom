@@ -3575,6 +3575,32 @@ impl<'a> RegistryHost<'a> {
         }
     }
 
+    /// Authorizes a compile for `raw_path` exactly as the synchronous
+    /// `compile_object` efun arm does -- same `authorize(P1,
+    /// Operation::Compile)` call, same audit record -- but does not run
+    /// [`Self::recompile`] itself. Used by `World::begin_file_compile`
+    /// (OBI-180 M-FS-5, CTO review of PR #119, must-fix 1): the
+    /// permission check and its audit entry happen here, inside one
+    /// `World::exec` on the world thread, exactly like every other
+    /// file-op efun; the actual parse/check/codegen/verify work (and,
+    /// for a widely-inherited path, every dependent) then runs off the
+    /// world thread via `World::begin_recompile`, which has no
+    /// authorization of its own to run (D-P1.5's existing background
+    /// compile path was only ever reachable from driver-internal
+    /// callers, e.g. tests and tooling, never straight from an
+    /// HTTP-authenticated uid before this). Returns the normalized path
+    /// so the caller hands `begin_recompile` the same string `authorize`
+    /// just checked, not whatever the caller happened to pass in.
+    pub(crate) fn authorize_compile(&mut self, raw_path: &str) -> R<String> {
+        let norm = mudlib::normalize_path(raw_path).map_err(RtError::new)?;
+        self.authorize(
+            "compile_object",
+            Privilege::P1,
+            Operation::Compile { path: &norm },
+        )?;
+        Ok(norm)
+    }
+
     /// Driver-side `valid_read` check (OBI-237, the admin query
     /// world-thread side, OBI-234 follow-up): the exact `authorize`/
     /// `Operation::Read` call path every other `valid_read` call-site
@@ -3620,32 +3646,6 @@ impl<'a> RegistryHost<'a> {
     /// (`decide`'s own doc comment, and `World`'s unit test
     /// `admin_valid_read_stops_at_the_first_denying_euid_in_a_multi_
     /// principal_guard`, cover this).
-    /// Authorizes a compile for `raw_path` exactly as the synchronous
-    /// `compile_object` efun arm does -- same `authorize(P1,
-    /// Operation::Compile)` call, same audit record -- but does not run
-    /// [`Self::recompile`] itself. Used by `World::begin_file_compile`
-    /// (OBI-180 M-FS-5, CTO review of PR #119, must-fix 1): the
-    /// permission check and its audit entry happen here, inside one
-    /// `World::exec` on the world thread, exactly like every other
-    /// file-op efun; the actual parse/check/codegen/verify work (and,
-    /// for a widely-inherited path, every dependent) then runs off the
-    /// world thread via `World::begin_recompile`, which has no
-    /// authorization of its own to run (D-P1.5's existing background
-    /// compile path was only ever reachable from driver-internal
-    /// callers, e.g. tests and tooling, never straight from an
-    /// HTTP-authenticated uid before this). Returns the normalized path
-    /// so the caller hands `begin_recompile` the same string `authorize`
-    /// just checked, not whatever the caller happened to pass in.
-    pub(crate) fn authorize_compile(&mut self, raw_path: &str) -> R<String> {
-        let norm = mudlib::normalize_path(raw_path).map_err(RtError::new)?;
-        self.authorize(
-            "compile_object",
-            Privilege::P1,
-            Operation::Compile { path: &norm },
-        )?;
-        Ok(norm)
-    }
-
     pub(crate) fn admin_valid_read(&mut self, op: &'static str, path: &str) -> R<bool> {
         let kind = crate::efuns::audit_kind_name("admin_query");
         let operation = Operation::Read { path, op };
