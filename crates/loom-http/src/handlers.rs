@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! `/auth/*` HTTP routes (OBI-174, OBI-198). Mounted unconditionally by
-//! [`app`] but every handler checks `HttpState`'s `auth`/`github` fields
-//! and answers `503` if the relevant service isn't configured -- same
-//! "optional, absent by default" shape as `web_root` (OBI-158).
+//! `/auth/*` HTTP routes (OBI-174, OBI-198, OBI-201). Mounted
+//! unconditionally by [`app`] but every handler checks `HttpState`'s
+//! `auth`/`github` fields and answers `503` if the relevant service
+//! isn't configured -- same "optional, absent by default" shape as
+//! `web_root` (OBI-158).
 //!
 //! `/auth/refresh` and `/auth/logout` (OBI-198, D-TM2/M-AUTH-5/M-AUTH-6):
 //! the refresh token travels only as an HttpOnly `__Host-loom_rt` cookie,
@@ -13,6 +14,32 @@
 //! *and* the request carries `X-Loom-Auth: 1` -- see
 //! `crate::auth::staff_csrf_guard_passes`. This service never sends an
 //! `Access-Control-Allow-*` header for any route.
+//!
+//! `/auth/github/*` (OBI-201, M-AUTH-7, CTO review on PR #78): the whole
+//! flow follows the same cookie-session model as password login, not a
+//! separate JSON-token shape --
+//!
+//! - `GET /auth/github/start`: redirects to GitHub's authorize endpoint
+//!   with a PKCE S256 challenge, after setting a short-lived `__Host-`
+//!   state cookie (`state` + PKCE verifier, signed -- see
+//!   `crate::auth::AuthService::sign_oauth_state`).
+//! - `GET /auth/github/callback`: verifies that cookie, exchanges the
+//!   code, and -- on success -- sets the **same** `__Host-loom_rt`
+//!   refresh cookie `/auth/login` does (via
+//!   [`crate::auth::set_cookie_header`]) and `303`s back to the staff
+//!   app, rather than returning a JSON access/refresh token pair (the
+//!   must-fix from that review: a JSON token body here would be
+//!   incompatible with OBI-198's cookie-only session model). A T3+ uid
+//!   that still needs a TOTP code gets a distinct, short-TTL **cookie**
+//!   (`__Host-github_pending`) instead of a JSON `pending_token` --
+//!   `/auth/github/totp` reads it back off the request, never out of a
+//!   body a script would have to hold onto.
+//! - `POST /auth/github/totp`: redeems that pending cookie plus a fresh
+//!   TOTP code, the same way `/auth/login`'s second attempt would,
+//!   setting the refresh cookie on success. Guarded by the same
+//!   Origin + `X-Loom-Auth` CSRF check as `/auth/refresh`/`/auth/logout`
+//!   (defense in depth: it reads one cookie and, on success, sets
+//!   another).
 
 use axum::Json;
 use axum::Router;
@@ -22,40 +49,40 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 use crate::HttpState;
 use crate::auth::{
-    AuthContext, AuthError, GithubAuthError, TokenPair, generate_pkce, generate_state,
+    AuthContext, AuthError, GithubAuthError, OAUTH_STATE_PURPOSE, OAuthStateClaims, TokenPair,
+    generate_pkce, generate_state,
 };
 use crate::client_ip::client_ip;
 
 /// The `__Host-` state cookie (OBI-201, M-AUTH-7): the `__Host-` prefix
-/// itself requires `Secure`, no `Domain` attribute, and `Path=/`, which
-/// is what stops a co-tenant subdomain or a plain-HTTP MITM from ever
-/// being able to set a cookie by this name that our server would accept.
+/// requires `Secure`, no `Domain` attribute, and `Path=/`, which is what
+/// stops a co-tenant subdomain or a plain-HTTP MITM from ever setting a
+/// cookie by this name that our server would accept.
 const GITHUB_STATE_COOKIE: &str = "__Host-github_oauth_state";
 const GITHUB_STATE_TTL_SECS: i64 = 10 * 60;
-
-/// The `__Host-` GitHub-login TOTP-pending-token cookie (OBI-201 review
-/// must-fix #2): path-scoped to `/auth/github/totp`, the only route that
-/// ever reads it, rather than the whole origin -- it carries a bearer
-/// credential for *finishing* a login, not a session, so it has no
-/// business being sent anywhere else.
+/// The pending-TOTP cookie (OBI-201, must-fix from the PR #78 CTO
+/// review): a T3+ GitHub login that still needs a code gets this instead
+/// of a JSON `pending_token` -- `/auth/github/totp` reads it straight off
+/// the request, so a script never has to hold the credential at all.
 const GITHUB_PENDING_COOKIE: &str = "__Host-github_pending";
-const GITHUB_PENDING_COOKIE_PATH: &str = "/auth/github/totp";
 const GITHUB_PENDING_TTL_SECS: i64 = 5 * 60;
-
-/// Where a successful `/auth/github/callback` redirects the browser
-/// (OBI-201 review must-fix #2: a top-level GET navigation must never
-/// carry a token pair as a JSON response body). The SPA is expected to
-/// call `/auth/refresh` on load -- the `__Host-loom_rt` cookie this
-/// redirect just set is all it needs to mint an access token.
-const GITHUB_LOGIN_SUCCESS_REDIRECT: &str = "/";
-/// Where a `totp_required` outcome redirects the browser instead: the
-/// pending-token cookie travels with it (scoped to
-/// [`GITHUB_PENDING_COOKIE_PATH`]), and the SPA's TOTP page posts it plus
-/// a code to `/auth/github/totp`.
-const GITHUB_TOTP_REDIRECT: &str = "/login/totp";
+/// Where `/auth/github/callback` sends the browser after a successful
+/// login (OBI-201): the staff SPA's own root, served by this same origin
+/// (`HttpState::with_web_root`, OBI-158) -- there is no separate "staff
+/// app" origin to redirect to. The SPA's bootstrap already has to call
+/// `POST /auth/refresh` on load to mint a fresh access token from
+/// whatever refresh cookie it finds, so it needs no token on this URL.
+const GITHUB_LOGIN_REDIRECT: &str = "/";
+/// Where `/auth/github/callback` sends the browser when a T3+ uid still
+/// needs a TOTP code: the same SPA root, plus a query marker the client
+/// watches for to prompt for a code and `POST` it to
+/// `/auth/github/totp` (the `__Host-github_pending` cookie travels with
+/// that request automatically; there is nothing to carry in the URL).
+const GITHUB_PENDING_REDIRECT: &str = "/?github_totp_pending=1";
 
 pub fn auth_router() -> Router<HttpState> {
     Router::new()
@@ -77,12 +104,8 @@ struct LoginRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct GithubCallbackQuery {
-    code: Option<String>,
-    state: Option<String>,
-    /// Set instead of `code`/`state` if the user denied the GitHub
-    /// authorization prompt, or GitHub itself refused the request.
-    error: Option<String>,
+struct TotpVerifyRequest {
+    code: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,8 +114,12 @@ struct GithubTotpRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct TotpVerifyRequest {
-    code: String,
+struct GithubCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    /// Set instead of `code`/`state` if the user denied the GitHub
+    /// authorization prompt, or GitHub itself refused the request.
+    error: Option<String>,
 }
 
 /// The access token plus its expiry (design §9/D-TM2, OBI-198): the
@@ -161,15 +188,18 @@ pub(crate) fn bearer_uid(headers: &HeaderMap, state: &HttpState) -> Option<Strin
         .map(|claims| claims.sub)
 }
 
-/// Build the `200 OK` response for a successful login/refresh: the JSON
-/// body (access token only) plus the `Set-Cookie` header carrying the
-/// rotated refresh token (OBI-198, D-TM2).
+/// Build the `200 OK` response for a successful login/refresh/GitHub-totp
+/// completion: the JSON body (access token only) plus the `Set-Cookie`
+/// header carrying the rotated refresh token (OBI-198, D-TM2). Uses
+/// `append`, not `insert` -- a GitHub-login response may also need to
+/// clear the pending-TOTP cookie in the same response (two distinct
+/// `Set-Cookie` headers).
 fn token_response(pair: &TokenPair) -> axum::response::Response {
     let max_age = (pair.refresh_expires_at - time::OffsetDateTime::now_utc())
         .whole_seconds()
         .max(0);
     let mut response = (StatusCode::OK, Json(TokenResponse::from(pair))).into_response();
-    response.headers_mut().insert(
+    response.headers_mut().append(
         crate::auth::set_cookie_name(),
         crate::auth::set_cookie_header(&pair.refresh_token, max_age),
     );
@@ -348,15 +378,23 @@ async fn github_start(State(state): State<HttpState>) -> impl IntoResponse {
 
     let pkce = generate_pkce();
     let csrf_state = generate_state();
-    let cookie_value = match auth.sign_oauth_state(&csrf_state, &pkce.verifier) {
+    let issued_at = OffsetDateTime::now_utc();
+    let claims = OAuthStateClaims {
+        state: csrf_state.clone(),
+        verifier: pkce.verifier,
+        purpose: OAUTH_STATE_PURPOSE.to_string(),
+        iat: issued_at.unix_timestamp(),
+        exp: issued_at.unix_timestamp() + GITHUB_STATE_TTL_SECS,
+    };
+    let cookie_value = match auth.sign_oauth_state(&claims) {
         Ok(value) => value,
         Err(error) => return auth_error_response(error).into_response(),
     };
 
-    // No `scope` parameter (should-fix from the OBI-195/OBI-201 review):
-    // GitHub's default (no-scope) OAuth app grant already returns the
-    // numeric id from `GET /user`, which is all `LiveGithubProvider`
-    // reads -- `read:user` would only ask for more than this flow uses.
+    // No `scope` parameter: GitHub's default (no-scope) OAuth app grant
+    // already returns the numeric id from `GET /user`, which is all
+    // `LiveGithubProvider` reads -- `read:user` would only ask for more
+    // than this flow uses.
     let authorize_url = format!(
         "{base}?client_id={client_id}&redirect_uri={redirect_uri}&state={state}&code_challenge={challenge}&code_challenge_method=S256&allow_signup=false",
         base = login.authorize_url,
@@ -369,11 +407,19 @@ async fn github_start(State(state): State<HttpState>) -> impl IntoResponse {
     let mut response = Redirect::to(&authorize_url).into_response();
     set_cookie(
         response.headers_mut(),
-        &state_cookie_header(&cookie_value, GITHUB_STATE_TTL_SECS),
+        &build_cookie(GITHUB_STATE_COOKIE, &cookie_value, GITHUB_STATE_TTL_SECS),
     );
     response
 }
 
+/// `GET /auth/github/callback` (OBI-201, M-AUTH-7, CTO review on PR #78
+/// must-fix 1): on success, sets the **same** `__Host-loom_rt` refresh
+/// cookie `/auth/login` does and `303`s to the staff app -- never a JSON
+/// access/refresh token body, which would be incompatible with OBI-198's
+/// cookie-only session model. A T3+ uid that still needs a TOTP code gets
+/// a `__Host-github_pending` cookie (not a JSON `pending_token`) and is
+/// redirected to a page that prompts for one and `POST`s it to
+/// `/auth/github/totp`.
 async fn github_callback(
     State(state): State<HttpState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -392,77 +438,49 @@ async fn github_callback(
     let ctx = auth_context(&headers, Some(peer));
 
     // Every response path below clears the state cookie (one-time use)
-    // and sets `Cache-Control: no-store` -- regardless of whether this
-    // response is a JSON error, a `303` to the app (success), or a `303`
-    // to the TOTP page (pending) -- none of which a cache or browser
-    // history should ever retain (OBI-195/OBI-201 review, must-fix #2).
-    let clear_state = |mut response: axum::response::Response| {
+    // and sets `Cache-Control: no-store`.
+    let respond_error = |status: StatusCode, error: &'static str| {
+        let mut response = (status, Json(ErrorResponse { error })).into_response();
         let response_headers = response.headers_mut();
-        set_cookie(response_headers, &clear_state_cookie_header());
+        set_cookie(response_headers, &clear_cookie(GITHUB_STATE_COOKIE));
         response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         response
     };
-    let error_json = |status: StatusCode, body: serde_json::Value| {
-        clear_state((status, Json(body)).into_response())
-    };
 
     if let Some(provider_error) = query.error.as_deref() {
-        // Truncated (should-fix from the OBI-195/OBI-201 review): this is
-        // GitHub's `error` query parameter, attacker-influenced, and
-        // logs must not become an unbounded write amplifier.
+        // Truncated: this is GitHub's `error` query parameter,
+        // attacker-influenced, and logs must not become an unbounded
+        // write amplifier.
         let truncated: String = provider_error.chars().take(64).collect();
         tracing::debug!(error = %truncated, "github oauth: provider-side error");
-        return error_json(
-            StatusCode::UNAUTHORIZED,
-            serde_json::json!({"error": "invalid_code"}),
-        );
+        return respond_error(StatusCode::UNAUTHORIZED, "invalid_code");
     }
     let (Some(code), Some(returned_state)) = (query.code.as_deref(), query.state.as_deref()) else {
-        return error_json(
-            StatusCode::BAD_REQUEST,
-            serde_json::json!({"error": "missing_code_or_state"}),
-        );
+        return respond_error(StatusCode::BAD_REQUEST, "missing_code_or_state");
     };
 
     let Some(cookie_value) = read_cookie(&headers, GITHUB_STATE_COOKIE) else {
-        return error_json(
-            StatusCode::UNAUTHORIZED,
-            serde_json::json!({"error": "invalid_oauth_state"}),
-        );
+        return respond_error(StatusCode::UNAUTHORIZED, "invalid_oauth_state");
     };
     let oauth_state = match auth.verify_oauth_state(&cookie_value) {
         Ok(claims) => claims,
-        Err(_) => {
-            return error_json(
-                StatusCode::UNAUTHORIZED,
-                serde_json::json!({"error": "invalid_oauth_state"}),
-            );
-        }
+        Err(_) => return respond_error(StatusCode::UNAUTHORIZED, "invalid_oauth_state"),
     };
-    // Constant-time-ness doesn't matter here the way it does for the HMAC
-    // check above: `state` is high-entropy and known to the legitimate
-    // browser via its own (HttpOnly) cookie, not a secret an attacker is
-    // trying to brute force character-by-character over the network.
+    // Constant-time-ness doesn't matter here the way it does for an HMAC
+    // check: `state` is high-entropy and known to the legitimate browser
+    // via its own (HttpOnly) cookie, not a secret an attacker is trying
+    // to brute force character-by-character over the network.
     if oauth_state.state != returned_state {
-        return error_json(
-            StatusCode::UNAUTHORIZED,
-            serde_json::json!({"error": "invalid_oauth_state"}),
-        );
+        return respond_error(StatusCode::UNAUTHORIZED, "invalid_oauth_state");
     }
 
     let user = match github.exchange_code(code, &oauth_state.verifier).await {
         Ok(user) => user,
         Err(GithubAuthError::InvalidCode) => {
-            return error_json(
-                StatusCode::UNAUTHORIZED,
-                serde_json::json!({"error": "invalid_code"}),
-            );
+            return respond_error(StatusCode::UNAUTHORIZED, "invalid_code");
         }
         Err(GithubAuthError::Unavailable) => {
-            return error_json(
-                StatusCode::SERVICE_UNAVAILABLE,
-                serde_json::json!({"error": "unavailable"}),
-            );
+            return respond_error(StatusCode::SERVICE_UNAVAILABLE, "unavailable");
         }
     };
 
@@ -471,54 +489,64 @@ async fn github_callback(
     // password login (OBI-206) -- see `AuthService::github_login`.
     match auth.github_login(user.id, None, &ctx).await {
         Ok(pair) => {
-            // Success: deliver via the same cookie-only session-family
-            // path `/auth/login` uses (OBI-201 review must-fix #2) -- a
-            // `303` to the app, never a JSON body with a token pair on a
-            // top-level navigation. The SPA calls `/auth/refresh` on load
-            // to mint an access token from the cookie this just set.
-            let mut response =
-                clear_state(Redirect::to(GITHUB_LOGIN_SUCCESS_REDIRECT).into_response());
-            let max_age = (pair.refresh_expires_at - time::OffsetDateTime::now_utc())
+            let max_age = (pair.refresh_expires_at - OffsetDateTime::now_utc())
                 .whole_seconds()
                 .max(0);
-            response.headers_mut().append(
+            let mut response = Redirect::to(GITHUB_LOGIN_REDIRECT).into_response();
+            let response_headers = response.headers_mut();
+            response_headers.append(
                 crate::auth::set_cookie_name(),
                 crate::auth::set_cookie_header(&pair.refresh_token, max_age),
             );
+            set_cookie(response_headers, &clear_cookie(GITHUB_STATE_COOKIE));
+            response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             response
         }
         Err(AuthError::TotpRequired) => {
             // GitHub counts as the password factor only (M-AUTH-7): a T3+
             // uid still needs a TOTP code, which this redirect has no
-            // room to carry. The pending token travels in its own
-            // path-scoped `__Host-` cookie (OBI-201 review must-fix #2),
-            // never the JSON body or a query parameter -- the client
-            // posts it (implicitly, via the cookie) plus a code to
-            // `/auth/github/totp` instead of redoing the OAuth dance
-            // (the authorization code is already spent).
+            // room to carry. The browser gets a short-TTL cookie instead
+            // of a JSON `pending_token` (CTO review, must-fix): the
+            // authorization code is already spent, so the client
+            // exchanges this cookie plus a code via `/auth/github/totp`
+            // rather than redoing the OAuth dance.
             match auth.issue_github_pending(user.id) {
                 Ok(pending_token) => {
-                    let mut response =
-                        clear_state(Redirect::to(GITHUB_TOTP_REDIRECT).into_response());
-                    set_cookie(
-                        response.headers_mut(),
-                        &pending_cookie_header(&pending_token, GITHUB_PENDING_TTL_SECS),
+                    let mut response = Redirect::to(GITHUB_PENDING_REDIRECT).into_response();
+                    let response_headers = response.headers_mut();
+                    response_headers.append(
+                        header::SET_COOKIE,
+                        HeaderValue::from_str(&build_cookie(
+                            GITHUB_PENDING_COOKIE,
+                            &pending_token,
+                            GITHUB_PENDING_TTL_SECS,
+                        ))
+                        .expect("cookie header value is ASCII-safe by construction"),
                     );
+                    set_cookie(response_headers, &clear_cookie(GITHUB_STATE_COOKIE));
+                    response_headers
+                        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
                     response
                 }
                 Err(error) => {
                     let (status, Json(body)) = auth_error_response(error);
-                    error_json(status, serde_json::to_value(body).unwrap())
+                    respond_error(status, body.error)
                 }
             }
         }
         Err(error) => {
             let (status, Json(body)) = auth_error_response(error);
-            error_json(status, serde_json::to_value(body).unwrap())
+            respond_error(status, body.error)
         }
     }
 }
 
+/// `POST /auth/github/totp` (OBI-201): redeems the `__Host-github_pending`
+/// cookie plus a fresh TOTP code. Guarded by the same Origin +
+/// `X-Loom-Auth` CSRF check `/auth/refresh`/`/auth/logout` use (defense
+/// in depth -- it reads one cookie and, on success, sets another). On
+/// success this responds exactly like `/auth/login`: the access token in
+/// the JSON body, the refresh token only as the `__Host-loom_rt` cookie.
 async fn github_totp(
     State(state): State<HttpState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -537,24 +565,28 @@ async fn github_totp(
         )
             .into_response();
     };
-    // One-time use (same discipline as the OAuth-state cookie): cleared
-    // on every response path below, success or failure.
-    let clear_pending = |mut response: axum::response::Response| {
-        let response_headers = response.headers_mut();
-        set_cookie(response_headers, &clear_pending_cookie_header());
-        response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        response
-    };
     let Some(pending_token) = read_cookie(&headers, GITHUB_PENDING_COOKIE) else {
-        return clear_pending(auth_error_response(AuthError::InvalidPendingToken).into_response());
+        return auth_error_response(AuthError::InvalidPendingToken).into_response();
     };
     let ctx = auth_context(&headers, Some(peer));
     match auth
         .github_login_with_pending(&pending_token, Some(&request.totp_code), &ctx)
         .await
     {
-        Ok(pair) => clear_pending(token_response(&pair)),
-        Err(error) => clear_pending(auth_error_response(error).into_response()),
+        Ok(pair) => {
+            let mut response = token_response(&pair);
+            let response_headers = response.headers_mut();
+            set_cookie(response_headers, &clear_cookie(GITHUB_PENDING_COOKIE));
+            response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => {
+            let mut response = auth_error_response(error).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
     }
 }
 
@@ -562,37 +594,20 @@ async fn github_totp(
 /// requires `Secure`, no `Domain` attribute, and `Path=/`, which is what
 /// stops a co-tenant subdomain or a plain-HTTP MITM from ever being able
 /// to set a cookie by this name that our server would accept.
-fn state_cookie_header(value: &str, max_age_secs: i64) -> String {
-    format!(
-        "{GITHUB_STATE_COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}"
-    )
+fn build_cookie(name: &str, value: &str, max_age_secs: i64) -> String {
+    format!("{name}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={max_age_secs}")
 }
 
-fn clear_state_cookie_header() -> String {
-    format!("{GITHUB_STATE_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
+fn clear_cookie(name: &str) -> String {
+    format!("{name}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
 }
 
-/// The GitHub-login TOTP-pending-token cookie (OBI-201 review must-fix
-/// #2): `Path`-scoped to [`GITHUB_PENDING_COOKIE_PATH`], not `/`, so it
-/// is never sent anywhere but the one route that redeems it.
-fn pending_cookie_header(value: &str, max_age_secs: i64) -> String {
-    format!(
-        "{GITHUB_PENDING_COOKIE}={value}; Path={GITHUB_PENDING_COOKIE_PATH}; Secure; HttpOnly; SameSite=Strict; Max-Age={max_age_secs}"
-    )
-}
-
-fn clear_pending_cookie_header() -> String {
-    format!(
-        "{GITHUB_PENDING_COOKIE}=; Path={GITHUB_PENDING_COOKIE_PATH}; Secure; HttpOnly; SameSite=Strict; Max-Age=0"
-    )
-}
-
+/// Append (never replace) a `Set-Cookie` header -- a GitHub-login
+/// response can carry more than one (e.g. clearing the state cookie
+/// while setting the refresh cookie), and browsers treat repeated
+/// `Set-Cookie` headers as independent cookies, not an overwrite.
 fn set_cookie(headers: &mut HeaderMap, value: &str) {
     if let Ok(header_value) = HeaderValue::from_str(value) {
-        // `append`, not `insert`: a response can carry more than one
-        // `Set-Cookie` header (e.g. the success path below clears the
-        // OAuth-state cookie *and* sets the refresh cookie) -- `insert`
-        // would silently replace one with the other.
         headers.append(header::SET_COOKIE, header_value);
     }
 }
@@ -629,359 +644,14 @@ fn percent_encode(value: &str) -> String {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
-
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tokio::sync::mpsc;
     use tower::ServiceExt;
 
-    use crate::auth::tests::{FakeDirectory, FakeGithubProvider, test_service};
-    use crate::auth::{AuthContext, GithubIdentityProvider, GithubLoginConfig};
+    use crate::auth::tests::{FakeDirectory, test_service};
 
     const STAFF_ORIGIN: &str = "https://staff.loom.example";
-    const GITHUB_REDIRECT_URI: &str = "https://staff.loom.example/auth/github/callback";
-
-    async fn app_with_github(github_code: &str, github_id: i64) -> (Router, FakeDirectory) {
-        let directory = FakeDirectory::new();
-        directory.add_staff("samwise", "unused-password", 1);
-        directory.link_github(github_id, "samwise");
-        let service = test_service(directory.clone());
-        let provider: Arc<dyn GithubIdentityProvider> =
-            Arc::new(FakeGithubProvider::new().with_code(github_code, github_id));
-        let login_config = GithubLoginConfig::new(
-            "test-client-id".to_string(),
-            GITHUB_REDIRECT_URI.to_string(),
-        );
-        let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
-        let state = crate::HttpState::new(
-            ws_accept_tx,
-            loom_obs::Readiness::new(),
-            loom_obs::PrometheusMetrics::new_unregistered(),
-        )
-        .with_auth(service)
-        .with_github(provider, login_config)
-        .with_staff_origins(vec![STAFF_ORIGIN.to_string()]);
-        (crate::app(state), directory)
-    }
-
-    /// Like [`app_with_github`], but the linked uid is T3+ with a
-    /// confirmed TOTP secret (returned as base32, so the test can compute
-    /// real codes against it) -- for exercising the `totp_required` /
-    /// pending-token path. The enrolling service is throwaway: it shares
-    /// the same [`FakeDirectory`] (an `Arc<Mutex<..>>` under the hood) as
-    /// the one wired into the returned app, and the deterministic test
-    /// keyset ([`test_service`]) means tokens minted by one are valid
-    /// JwtKeys for the other.
-    async fn app_with_github_t3(github_code: &str, github_id: i64) -> (Router, String) {
-        let directory = FakeDirectory::new();
-        directory.add_staff("elrond", "unused-password", 3);
-        directory.link_github(github_id, "elrond");
-
-        let enroll_service = test_service(directory.clone());
-        let enrollment = enroll_service
-            .totp_enroll("elrond", &AuthContext::default())
-            .await
-            .unwrap();
-        directory.confirm_totp_for_test("elrond");
-
-        let service = test_service(directory.clone());
-        let provider: Arc<dyn GithubIdentityProvider> =
-            Arc::new(FakeGithubProvider::new().with_code(github_code, github_id));
-        let login_config = GithubLoginConfig::new(
-            "test-client-id".to_string(),
-            GITHUB_REDIRECT_URI.to_string(),
-        );
-        let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
-        let state = crate::HttpState::new(
-            ws_accept_tx,
-            loom_obs::Readiness::new(),
-            loom_obs::PrometheusMetrics::new_unregistered(),
-        )
-        .with_auth(service)
-        .with_github(provider, login_config)
-        .with_staff_origins(vec![STAFF_ORIGIN.to_string()]);
-        (crate::app(state), enrollment.secret_base32)
-    }
-
-    fn with_peer(mut request: axum::http::Request<Body>) -> axum::http::Request<Body> {
-        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
-        request.extensions_mut().insert(ConnectInfo(peer));
-        request
-    }
-
-    fn cookie_from(headers: &HeaderMap) -> String {
-        headers
-            .get(header::SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
-    }
-
-    /// Like [`cookie_from`], but scans every `Set-Cookie` header value
-    /// for the one whose name matches `name=` -- needed once a response
-    /// carries more than one (e.g. the GitHub callback clears the
-    /// OAuth-state cookie *and* sets the refresh cookie, or the pending
-    /// cookie, in the same response).
-    /// The full `Set-Cookie` header value whose name matches `name=`
-    /// (not truncated to `name=value` -- for attribute assertions; use
-    /// [`cookie_header_for`] to get a reusable `Cookie` request-header
-    /// value instead). Scans every `Set-Cookie` value, since a response
-    /// can carry more than one (e.g. the GitHub callback clears the
-    /// OAuth-state cookie *and* sets the refresh cookie in the same
-    /// response).
-    fn cookie_named(headers: &HeaderMap, name: &str) -> String {
-        let prefix = format!("{name}=");
-        headers
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .find_map(|value| {
-                let value = value.to_str().ok()?;
-                value.starts_with(&prefix).then(|| value.to_string())
-            })
-            .unwrap_or_else(|| panic!("no Set-Cookie header named {name:?}"))
-    }
-
-    /// [`cookie_named`], truncated to `name=value` -- what a real browser
-    /// would actually send back in a `Cookie` request header (no
-    /// `Path`/`Secure`/etc attributes).
-    fn cookie_header_for(headers: &HeaderMap, name: &str) -> String {
-        cookie_named(headers, name)
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
-    }
-
-    /// Extract one query-string parameter's raw (not percent-decoded --
-    /// every value this module ever puts in a query string is already in
-    /// the unreserved set) value out of a URL.
-    fn query_param(url: &str, key: &str) -> Option<String> {
-        let query = url.split('?').nth(1)?;
-        query.split('&').find_map(|pair| {
-            let (k, v) = pair.split_once('=')?;
-            (k == key).then(|| v.to_string())
-        })
-    }
-
-    /// Acceptance: PKCE S256 challenge + CSRF state in the authorize URL,
-    /// the `__Host-` state cookie with the right attributes, and no
-    /// `scope` parameter (should-fix from the OBI-195/OBI-201 review).
-    #[tokio::test]
-    async fn github_start_redirects_with_pkce_and_sets_the_state_cookie_and_no_scope() {
-        let (app, _directory) = app_with_github("the-code", 7).await;
-        let request = axum::http::Request::builder()
-            .uri("/auth/github/start")
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-
-        let location = response
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(location.contains("code_challenge="));
-        assert!(location.contains("code_challenge_method=S256"));
-        assert!(location.contains("state="));
-        assert!(location.contains("client_id=test-client-id"));
-        assert!(!location.contains("scope="));
-
-        let set_cookie = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(set_cookie.starts_with("__Host-github_oauth_state="));
-        assert!(set_cookie.contains("Secure"));
-        assert!(set_cookie.contains("HttpOnly"));
-        assert!(set_cookie.contains("SameSite=Lax"));
-        assert!(set_cookie.contains("Path=/"));
-    }
-
-    /// A linked, sub-T3 uid's callback succeeds: the refresh cookie is
-    /// set (OBI-198's cookie-only session path, not a JSON token pair),
-    /// the browser is `303`-redirected to the app -- never a JSON body
-    /// with tokens on a top-level navigation (OBI-201 review must-fix) --
-    /// and the response never caches.
-    #[tokio::test]
-    async fn github_callback_success_sets_the_refresh_cookie_and_redirects_to_the_app() {
-        let (app, _directory) = app_with_github("the-code", 7).await;
-
-        let start_request = axum::http::Request::builder()
-            .uri("/auth/github/start")
-            .body(Body::empty())
-            .unwrap();
-        let start_response = app.clone().oneshot(start_request).await.unwrap();
-        let location = start_response
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let state_cookie = cookie_from(start_response.headers());
-        let state_value = query_param(&location, "state").unwrap();
-
-        let callback_request = with_peer(
-            axum::http::Request::builder()
-                .uri(format!(
-                    "/auth/github/callback?code=the-code&state={state_value}"
-                ))
-                .header("cookie", &state_cookie)
-                .body(Body::empty())
-                .unwrap(),
-        );
-        let response = app.oneshot(callback_request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            response.headers().get(header::LOCATION).unwrap(),
-            GITHUB_LOGIN_SUCCESS_REDIRECT
-        );
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-store"
-        );
-        let set_cookie = cookie_named(response.headers(), "__Host-loom_rt");
-        assert!(set_cookie.starts_with("__Host-loom_rt="));
-        assert!(set_cookie.contains("HttpOnly"));
-        assert!(set_cookie.contains("Secure"));
-    }
-
-    /// A `state` that doesn't match the signed cookie's (a forged or
-    /// stale callback) is refused outright, before GitHub's token
-    /// endpoint is ever called.
-    #[tokio::test]
-    async fn github_callback_with_a_mismatched_state_is_refused() {
-        let (app, _directory) = app_with_github("the-code", 7).await;
-
-        let start_request = axum::http::Request::builder()
-            .uri("/auth/github/start")
-            .body(Body::empty())
-            .unwrap();
-        let start_response = app.clone().oneshot(start_request).await.unwrap();
-        let state_cookie = cookie_from(start_response.headers());
-
-        let callback_request = with_peer(
-            axum::http::Request::builder()
-                .uri("/auth/github/callback?code=the-code&state=not-the-right-state")
-                .header("cookie", &state_cookie)
-                .body(Body::empty())
-                .unwrap(),
-        );
-        let response = app.oneshot(callback_request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// A callback with no state cookie at all (missing/expired) is
-    /// refused, not treated as an unauthenticated success.
-    #[tokio::test]
-    async fn github_callback_with_no_state_cookie_is_refused() {
-        let (app, _directory) = app_with_github("the-code", 7).await;
-        let callback_request = with_peer(
-            axum::http::Request::builder()
-                .uri("/auth/github/callback?code=the-code&state=whatever")
-                .body(Body::empty())
-                .unwrap(),
-        );
-        let response = app.oneshot(callback_request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// M-AUTH-7 end to end: a T3+ linked uid's callback stops at
-    /// `totp_required`, redirecting to the TOTP page with the pending
-    /// token in its own path-scoped cookie (OBI-201 review must-fix),
-    /// which `/auth/github/totp` -- CSRF-guarded the same as `/auth/
-    /// refresh` (OBI-201 review must-fix) -- redeems to finish the login.
-    #[tokio::test]
-    async fn github_callback_totp_required_then_github_totp_completes_the_login() {
-        let (app, secret_base32) = app_with_github_t3("the-code", 99).await;
-
-        let start_request = axum::http::Request::builder()
-            .uri("/auth/github/start")
-            .body(Body::empty())
-            .unwrap();
-        let start_response = app.clone().oneshot(start_request).await.unwrap();
-        let location = start_response
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        let state_cookie = cookie_from(start_response.headers());
-        let state_value = query_param(&location, "state").unwrap();
-
-        let callback_request = with_peer(
-            axum::http::Request::builder()
-                .uri(format!(
-                    "/auth/github/callback?code=the-code&state={state_value}"
-                ))
-                .header("cookie", &state_cookie)
-                .body(Body::empty())
-                .unwrap(),
-        );
-        let response = app.clone().oneshot(callback_request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            response.headers().get(header::LOCATION).unwrap(),
-            GITHUB_TOTP_REDIRECT
-        );
-        let pending_cookie = cookie_header_for(response.headers(), "__Host-github_pending");
-        assert!(pending_cookie.starts_with("__Host-github_pending="));
-
-        // Without Origin + X-Loom-Auth, /auth/github/totp refuses outright
-        // (OBI-201 review must-fix: same CSRF guard as /auth/refresh).
-        let code = crate::auth::totp_for_secret(&secret_base32, "elrond")
-            .unwrap()
-            .generate_current()
-            .to_string();
-        let unguarded_request = with_peer(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/auth/github/totp")
-                .header("content-type", "application/json")
-                .header("cookie", &pending_cookie)
-                .body(Body::from(
-                    serde_json::json!({"totp_code": code}).to_string(),
-                ))
-                .unwrap(),
-        );
-        let response = app.clone().oneshot(unguarded_request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-        let totp_request = with_peer(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/auth/github/totp")
-                .header("origin", STAFF_ORIGIN)
-                .header("x-loom-auth", "1")
-                .header("content-type", "application/json")
-                .header("cookie", &pending_cookie)
-                .body(Body::from(
-                    serde_json::json!({"totp_code": code}).to_string(),
-                ))
-                .unwrap(),
-        );
-        let response = app.oneshot(totp_request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-store"
-        );
-        let set_cookie = cookie_named(response.headers(), "__Host-loom_rt");
-        assert!(set_cookie.starts_with("__Host-loom_rt="));
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.get("access_token").is_some());
-    }
 
     async fn app_with_auth() -> (Router, FakeDirectory) {
         let directory = FakeDirectory::new();
@@ -997,6 +667,12 @@ mod tests {
         .with_auth(service)
         .with_staff_origins(vec![STAFF_ORIGIN.to_string()]);
         (crate::app(state), directory)
+    }
+
+    fn with_peer(mut request: axum::http::Request<Body>) -> axum::http::Request<Body> {
+        let peer: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+        request.extensions_mut().insert(ConnectInfo(peer));
+        request
     }
 
     async fn login_and_get_cookie(app: &Router) -> String {
@@ -1225,5 +901,350 @@ mod tests {
                 .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
                 .is_none()
         );
+    }
+
+    // -- OBI-201: GitHub login, cookie-session model --------------------
+
+    /// A fake [`GithubIdentityProvider`] scoped to this test module -- one
+    /// fixed code -> id mapping, no network.
+    struct FakeProvider {
+        code: String,
+        github_id: i64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::auth::GithubIdentityProvider for FakeProvider {
+        async fn exchange_code(
+            &self,
+            code: &str,
+            _code_verifier: &str,
+        ) -> Result<crate::auth::GithubUser, GithubAuthError> {
+            if code == self.code {
+                Ok(crate::auth::GithubUser { id: self.github_id })
+            } else {
+                Err(GithubAuthError::InvalidCode)
+            }
+        }
+    }
+
+    async fn app_with_github(
+        directory: FakeDirectory,
+        github_code: &str,
+        github_id: i64,
+    ) -> Router {
+        let service = test_service(directory);
+        let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
+        let provider = std::sync::Arc::new(FakeProvider {
+            code: github_code.to_string(),
+            github_id,
+        });
+        let login_config = crate::auth::GithubLoginConfig::new(
+            "test-client-id".to_string(),
+            "https://staff.example/cb".to_string(),
+        );
+        let state = crate::HttpState::new(
+            ws_accept_tx,
+            loom_obs::Readiness::new(),
+            loom_obs::PrometheusMetrics::new_unregistered(),
+        )
+        .with_auth(service)
+        .with_github(provider, login_config)
+        .with_staff_origins(vec![STAFF_ORIGIN.to_string()]);
+        crate::app(state)
+    }
+
+    /// Every `Set-Cookie` header value on a response (there can be more
+    /// than one -- see [`set_cookie`]'s doc comment).
+    fn set_cookie_values(headers: &HeaderMap) -> Vec<String> {
+        headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn find_cookie<'a>(values: &'a [String], name: &str) -> Option<&'a str> {
+        values.iter().map(String::as_str).find(|v| {
+            v.split(';')
+                .next()
+                .is_some_and(|first| first.starts_with(&format!("{name}=")))
+        })
+    }
+
+    #[tokio::test]
+    async fn github_start_redirects_with_pkce_and_sets_the_state_cookie_and_no_scope() {
+        let app = app_with_github(FakeDirectory::new(), "unused", 1).await;
+
+        let request = with_peer(
+            axum::http::Request::builder()
+                .uri("/auth/github/start")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("https://github.com/login/oauth/authorize?"));
+        assert!(location.contains("code_challenge_method=S256"));
+        assert!(location.contains("client_id=test-client-id"));
+        assert!(!location.contains("scope="));
+
+        let cookies = set_cookie_values(response.headers());
+        assert!(find_cookie(&cookies, GITHUB_STATE_COOKIE).is_some());
+    }
+
+    #[tokio::test]
+    async fn github_callback_end_to_end_with_a_linked_user_sets_the_session_cookie_and_redirects() {
+        let directory = FakeDirectory::new();
+        directory.add_staff("samwise", "unused-password", 1);
+        directory.link_github(42, "samwise");
+        let app = app_with_github(directory, "good-code", 42).await;
+
+        let start_request = with_peer(
+            axum::http::Request::builder()
+                .uri("/auth/github/start")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let start_response = app.clone().oneshot(start_request).await.unwrap();
+        let location = start_response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let cookies = set_cookie_values(start_response.headers());
+        let state_cookie = find_cookie(&cookies, GITHUB_STATE_COOKIE).unwrap();
+        let state_cookie = state_cookie.split(';').next().unwrap().to_string();
+        let csrf_state = location
+            .split("state=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
+
+        let callback_request = with_peer(
+            axum::http::Request::builder()
+                .uri(format!(
+                    "/auth/github/callback?code=good-code&state={csrf_state}"
+                ))
+                .header(axum::http::header::COOKIE, state_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let callback_response = app.oneshot(callback_request).await.unwrap();
+        assert_eq!(callback_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            callback_response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap(),
+            GITHUB_LOGIN_REDIRECT
+        );
+        let cookies = set_cookie_values(callback_response.headers());
+        let refresh_cookie = find_cookie(&cookies, crate::auth::REFRESH_COOKIE_NAME)
+            .expect("github login sets the session refresh cookie, not a JSON token body");
+        assert!(refresh_cookie.contains("HttpOnly"));
+        assert!(refresh_cookie.contains("Secure"));
+        let cleared_state = find_cookie(&cookies, GITHUB_STATE_COOKIE).unwrap();
+        assert!(cleared_state.contains("Max-Age=0"));
+        assert_eq!(
+            callback_response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .unwrap(),
+            "no-store"
+        );
+
+        let body = callback_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        // Must-fix (PR #78 CTO review): no JSON access/refresh token body
+        // on this response at all -- the body is empty (a redirect).
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn github_callback_with_a_wrong_state_is_refused() {
+        let directory = FakeDirectory::new();
+        directory.add_staff("samwise", "unused-password", 1);
+        directory.link_github(42, "samwise");
+        let app = app_with_github(directory, "good-code", 42).await;
+
+        let start_request = with_peer(
+            axum::http::Request::builder()
+                .uri("/auth/github/start")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let start_response = app.clone().oneshot(start_request).await.unwrap();
+        let cookies = set_cookie_values(start_response.headers());
+        let state_cookie = find_cookie(&cookies, GITHUB_STATE_COOKIE)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let callback_request = with_peer(
+            axum::http::Request::builder()
+                .uri("/auth/github/callback?code=good-code&state=not-the-real-state")
+                .header(axum::http::header::COOKIE, state_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let callback_response = app.oneshot(callback_request).await.unwrap();
+        assert_eq!(callback_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn github_callback_without_the_state_cookie_is_refused() {
+        let directory = FakeDirectory::new();
+        directory.add_staff("samwise", "unused-password", 1);
+        directory.link_github(42, "samwise");
+        let app = app_with_github(directory, "good-code", 42).await;
+
+        let callback_request = with_peer(
+            axum::http::Request::builder()
+                .uri("/auth/github/callback?code=good-code&state=whatever")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let callback_response = app.oneshot(callback_request).await.unwrap();
+        assert_eq!(callback_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Acceptance (OBI-201, M-AUTH-7): a T3 GitHub login without TOTP gets
+    /// redirected with a pending cookie, not a hard failure and not a
+    /// JSON `pending_token` -- `/auth/github/totp` reads that cookie back
+    /// (CSRF-guarded the same as `/auth/refresh`) and, with a correct
+    /// code, completes the session exactly like `/auth/login` would.
+    #[tokio::test]
+    async fn github_callback_for_a_t3_uid_sets_a_pending_cookie_then_github_totp_completes_login() {
+        let directory = FakeDirectory::new();
+        directory.add_staff("gandalf", "unused-password", 3);
+        directory.link_github(99, "gandalf");
+        let app = app_with_github(directory.clone(), "good-code", 99).await;
+
+        let service = test_service(directory.clone());
+        let enrollment = service
+            .totp_enroll("gandalf", &crate::auth::AuthContext::default())
+            .await
+            .unwrap();
+        directory.confirm_totp_for_test("gandalf");
+        let totp = crate::auth::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+
+        let start_request = with_peer(
+            axum::http::Request::builder()
+                .uri("/auth/github/start")
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let start_response = app.clone().oneshot(start_request).await.unwrap();
+        let location = start_response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let cookies = set_cookie_values(start_response.headers());
+        let state_cookie = find_cookie(&cookies, GITHUB_STATE_COOKIE)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let csrf_state = location
+            .split("state=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
+
+        let callback_request = with_peer(
+            axum::http::Request::builder()
+                .uri(format!(
+                    "/auth/github/callback?code=good-code&state={csrf_state}"
+                ))
+                .header(axum::http::header::COOKIE, state_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let callback_response = app.clone().oneshot(callback_request).await.unwrap();
+        assert_eq!(callback_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            callback_response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap(),
+            GITHUB_PENDING_REDIRECT
+        );
+        let cookies = set_cookie_values(callback_response.headers());
+        let pending_cookie = find_cookie(&cookies, GITHUB_PENDING_COOKIE)
+            .expect("totp-required github login sets a pending cookie, not a JSON body token")
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(find_cookie(&cookies, crate::auth::REFRESH_COOKIE_NAME).is_none());
+
+        let fresh_code = totp.generate_current().to_string();
+        let totp_request = with_peer(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/github/totp")
+                .header("origin", STAFF_ORIGIN)
+                .header("x-loom-auth", "1")
+                .header(axum::http::header::COOKIE, pending_cookie)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "totp_code": fresh_code }).to_string(),
+                ))
+                .unwrap(),
+        );
+        let totp_response = app.oneshot(totp_request).await.unwrap();
+        assert_eq!(totp_response.status(), StatusCode::OK);
+        assert_eq!(
+            totp_response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let cookies = set_cookie_values(totp_response.headers());
+        assert!(find_cookie(&cookies, crate::auth::REFRESH_COOKIE_NAME).is_some());
+    }
+
+    /// `/auth/github/totp` is CSRF-guarded like `/auth/refresh`/`/auth/logout`.
+    #[tokio::test]
+    async fn github_totp_without_x_loom_auth_header_is_rejected() {
+        let directory = FakeDirectory::new();
+        directory.add_staff("gandalf", "unused-password", 1);
+        directory.link_github(99, "gandalf");
+        let app = app_with_github(directory, "good-code", 99).await;
+
+        let request = with_peer(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/auth/github/totp")
+                .header("origin", STAFF_ORIGIN)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "totp_code": "000000" }).to_string(),
+                ))
+                .unwrap(),
+        );
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

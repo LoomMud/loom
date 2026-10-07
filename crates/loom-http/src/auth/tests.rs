@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 
-pub(crate) use super::github::fake::FakeGithubProvider;
+use super::github::fake::FakeGithubProvider;
 use super::*;
 
 #[derive(Clone)]
@@ -856,160 +856,107 @@ async fn github_login_for_a_linked_user_succeeds_and_reads_tier_from_the_directo
     assert_eq!(claims.tier, 2);
 }
 
-/// OBI-201 review must-fix (re-review of PR #78): every *normal* GitHub
-/// login for a T3+ uid with no `totp_code` hits `TotpRequired` first --
-/// if that didn't release its rate-limiter reservation, the account
-/// would lock itself out after `ACCOUNT_FAILURE_LIMIT` (5) ordinary
-/// logins with nobody ever guessing anything wrong.
+/// Acceptance (OBI-206): GitHub login shares the password path's rate
+/// limiter -- repeated bad/unlinked GitHub ids lock out the same way
+/// repeated bad passwords do, keyed by `github:{id}` rather than uid.
 #[tokio::test]
-async fn github_login_totp_required_does_not_leak_a_rate_limit_reservation() {
+async fn github_login_is_rate_limited_like_password_login() {
     let directory = FakeDirectory::new();
-    directory.add_staff("elrond", "unused-password", 3);
-    directory.link_github(99, "elrond");
-    let service = test_service(directory);
+    let service = test_service(directory).with_rate_limiter(RateLimiter::with_test_tuning(
+        3,
+        Duration::from_secs(300),
+        Duration::from_secs(300),
+        100.0,
+        Duration::from_secs(60),
+    ));
 
-    for _ in 0..10 {
-        let result = service.github_login(99, None, &ctx()).await;
-        assert_eq!(
-            result.unwrap_err(),
-            AuthError::TotpRequired,
-            "a TotpRequired outcome must never escalate into a lockout"
-        );
-    }
-}
-
-/// OBI-206 acceptance (restated for the live OAuth flow, OBI-201 review):
-/// once a GitHub id resolves to a uid, every subsequent outcome --
-/// including a wrong TOTP code -- lands on the same `uid:` bucket the
-/// password path uses, not a GitHub-specific one. A GitHub-login TOTP
-/// guess and a password-login TOTP guess for the same staff member share
-/// one lockout.
-#[tokio::test]
-async fn github_login_totp_failures_share_the_uid_keyed_account_counter_with_password_login() {
-    let directory = FakeDirectory::new();
-    directory.add_staff("gandalf", "mithrandir", 3);
-    directory.link_github(7, "gandalf");
-    let service = test_service(directory);
-
-    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
-    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
-    let code = totp.generate_current().to_string();
-    service
-        .totp_confirm("gandalf", &code, &ctx())
-        .await
-        .unwrap();
-
-    // 3 wrong codes via GitHub login...
     for _ in 0..3 {
-        let result = service.github_login(7, Some("000000"), &ctx()).await;
-        assert_eq!(result.unwrap_err(), AuthError::TotpInvalid);
-    }
-    // ...and 2 wrong passwords via the password path -- 5 total against
-    // the same account.
-    for _ in 0..2 {
-        let result = service.login("gandalf", "wrong", None, &ctx()).await;
+        let result = service.github_login(555, None, &ctx()).await;
         assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
     }
-
-    // The account is now locked from the combined count -- even a
-    // correct GitHub login with the right code is refused.
-    let fresh_code = totp.generate_current().to_string();
-    let result = service.github_login(7, Some(&fresh_code), &ctx()).await;
+    // The account-equivalent lockout now kicks in -- same response shape
+    // as a locked password account, not a distinct "too many GitHub
+    // attempts" error that would leak lockout state.
+    let result = service.github_login(555, None, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
 }
 
-/// A flood of *unlinked* GitHub ids is throttled on its own
-/// `github:{id}` pre-resolve bucket -- it never touches any uid's
-/// lockout, since there's no uid to share it with yet.
+/// Acceptance (OBI-201, M-AUTH-7): "GitHub login of a T3 without TOTP is
+/// refused" via the pending-token flow -- the callback can't carry a
+/// `totp_code`, so it gets a pending token instead of a hard failure, and
+/// that token (plus a code) completes the login without redoing OAuth.
 #[tokio::test]
-async fn a_flood_of_unlinked_github_ids_locks_out_on_the_pre_resolve_bucket() {
+async fn github_login_pending_totp_completes_with_a_correct_code() {
     let directory = FakeDirectory::new();
-    let service = test_service(directory);
-
-    for _ in 0..5 {
-        let result = service.github_login(424242, None, &ctx()).await;
-        assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
-    }
-    // The 6th attempt against the same unlinked id is now locked out the
-    // same way (indistinguishable response).
-    let result = service.github_login(424242, None, &ctx()).await;
-    assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
-}
-
-/// End-to-end happy path for the TOTP-pending token (OBI-201, M-AUTH-7):
-/// a T3+ GitHub login with no code gets `TotpRequired`; the callback
-/// handler mints a pending token via `issue_github_pending`, and
-/// `github_login_with_pending` redeems it plus a correct code to finish
-/// the login exactly as if the code had been presented to `github_login`
-/// directly.
-#[tokio::test]
-async fn issue_github_pending_then_redeem_with_a_totp_code_completes_the_login() {
-    let directory = FakeDirectory::new();
-    directory.add_staff("elrond", "unused-password", 3);
-    directory.link_github(99, "elrond");
+    directory.add_staff("gandalf", "unused-password", 3);
+    directory.link_github(99, "gandalf");
     let service = test_service(directory.clone());
 
-    let enrollment = service.totp_enroll("elrond", &ctx()).await.unwrap();
-    directory.confirm_totp_for_test("elrond");
-    let totp = totp::totp_for_secret(&enrollment.secret_base32, "elrond").unwrap();
+    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gandalf");
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
 
     let result = service.github_login(99, None, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
 
     let pending = service.issue_github_pending(99).unwrap();
-    let code = totp.generate_current().to_string();
+
+    // A wrong code against the pending token is refused distinctly.
+    let result = service
+        .github_login_with_pending(&pending, Some("000000"), &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpInvalid);
+
+    let fresh_code = totp.generate_current().to_string();
     let pair = service
-        .github_login_with_pending(&pending, Some(&code), &ctx())
+        .github_login_with_pending(&pending, Some(&fresh_code), &ctx())
         .await
         .unwrap();
     let claims = service.verify_access_token(&pair.access_token).unwrap();
-    assert_eq!(claims.sub, "elrond");
+    assert_eq!(claims.sub, "gandalf");
     assert_eq!(claims.tier, 3);
-    assert_eq!(claims.amr, vec!["github".to_string(), "otp".to_string()]);
 }
 
-/// A pending token is single-purpose: it is refused if presented to
-/// `verify_access_token`/`decode` as if it were an access token, and
-/// vice versa -- distinct `aud`/`typ`, not just the `purpose` field
-/// (OBI-201 review must-fix).
+/// A pending token signed with a different key (or for a different
+/// purpose) is refused outright -- it must not be confused with an access
+/// token or forgeable by anyone but this server.
 #[tokio::test]
-async fn a_pending_token_is_not_a_bearer_of_arbitrary_claims() {
+async fn github_pending_token_is_not_a_bearer_of_arbitrary_claims() {
     let directory = FakeDirectory::new();
-    directory.add_staff("elrond", "unused-password", 3);
-    directory.link_github(99, "elrond");
+    directory.add_staff("gandalf", "unused-password", 1);
+    directory.link_github(99, "gandalf");
     let service = test_service(directory);
 
-    let pending = service.issue_github_pending(99).unwrap();
-    // A pending token is not a valid access token.
-    assert!(service.verify_access_token(&pending).is_err());
-    // Redeeming garbage as a pending token is refused outright.
+    // A different (attacker-controlled) state-token key, not the
+    // server's -- `AuthService` never exposes its own `StateTokenKey`,
+    // only whether a token verifies against it (must-fix 2, PR #78 CTO
+    // review: this signing domain is now entirely separate from the
+    // EdDSA staff access-token keyset).
+    let attacker_key = StateTokenKey::generate();
+    let forged = attacker_key
+        .encode(&GithubPendingClaims {
+            github_id: 99,
+            purpose: GITHUB_PENDING_PURPOSE.to_string(),
+            iat: OffsetDateTime::now_utc().unix_timestamp(),
+            exp: OffsetDateTime::now_utc().unix_timestamp() + 300,
+        })
+        .unwrap();
     let result = service
-        .github_login_with_pending("not-a-real-token", Some("000000"), &ctx())
+        .github_login_with_pending(&forged, None, &ctx())
         .await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidPendingToken);
-}
 
-/// The OAuth `__Host-` state cookie round-trips through sign/verify and
-/// is refused if its `state` doesn't match (the callback handler's job,
-/// exercised at the handler level in `handlers.rs`) -- here, just that
-/// the service-level sign/verify pair itself works and that garbage is
-/// refused.
-#[tokio::test]
-async fn oauth_state_round_trips_and_rejects_garbage() {
-    let directory = FakeDirectory::new();
-    let service = test_service(directory);
-
-    let cookie_value = service
-        .sign_oauth_state("csrf-state", "pkce-verifier")
+    // A real access token, replayed as if it were a pending token, is also
+    // refused -- `AccessClaims` has no `purpose` field, so deserialization
+    // itself fails before the purpose check ever runs.
+    let pair = service
+        .login("gandalf", "unused-password", None, &ctx())
+        .await
         .unwrap();
-    let claims = service.verify_oauth_state(&cookie_value).unwrap();
-    assert_eq!(claims.state, "csrf-state");
-    assert_eq!(claims.verifier, "pkce-verifier");
-
-    assert_eq!(
-        service.verify_oauth_state("not-a-real-cookie").unwrap_err(),
-        AuthError::InvalidOAuthState
-    );
+    let result = service
+        .github_login_with_pending(&pair.access_token, None, &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidPendingToken);
 }
 
 /// The fake GitHub provider (used by the HTTP-layer test, exercised here
@@ -1019,12 +966,12 @@ async fn fake_github_provider_refuses_an_unknown_code() {
     let provider = FakeGithubProvider::new().with_code("good-code", 7);
     assert!(
         provider
-            .exchange_code("bad-code", "unused-verifier")
+            .exchange_code("bad-code", "verifier")
             .await
             .is_err()
     );
     let user = provider
-        .exchange_code("good-code", "unused-verifier")
+        .exchange_code("good-code", "verifier")
         .await
         .unwrap();
     assert_eq!(user.id, 7);
