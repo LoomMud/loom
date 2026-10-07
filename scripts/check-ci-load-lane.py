@@ -23,7 +23,20 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      skipped or downgraded: no `needs`, no `if`, no `continue-on-error`, and
      `loadtest-e1-1` still runs `loom-loadtest` with `--players 150` and
      `--fail-on-sla-miss`, with enough `timeout-minutes` that host load can
-     only make the measurement slow, never get the job cancelled.
+     only make the measurement slow, never get the job cancelled; and
+  5. if the workflow has a *workflow-level* `concurrency` block (OBI-313), it
+     cancels superseded `pull_request` runs and nothing else: `group` must be
+     PR-scoped and carry `github.run_id` as the non-PR fallback, and
+     `cancel-in-progress` must be an expression that is true only for
+     `pull_request`. Rule 5 exists because a workflow-level cancel reaches into
+     jobs whose own `cancel-in-progress: false` forbids being cancelled -- rule
+     1 is only as strong as what the block above it is allowed to kill; and
+  6. if that block cancels `pull_request` runs, `on.pull_request.types` is
+     narrowed to the activities that change the commit (`opened`, `synchronize`,
+     `reopened`) -- with `types:` omitted GitHub fires on *every* activity, so
+     labeling a PR would cancel its own running gate -- and the narrowing may
+     not drop `opened` or `synchronize`, which is how a required check gets
+     skipped under cover of "narrowing the trigger".
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -48,7 +61,23 @@ SLA_FLAGS = ["--players 150", "--fail-on-sla-miss"]
 # mid-build and the required check was `cancelled`, which blocks a PR exactly
 # like a miss while saying nothing at all about p99.
 MIN_TIMEOUT = {"loadtest-e1-1": 30, "loadtest-smoke": 20}
+# The `pull_request` activity types that change the commit under test, and the
+# two that a required check cannot afford to lose (OBI-313).
+COMMIT_TYPES = {"opened", "synchronize", "reopened"}
+MUST_RUN_ON = {"opened", "synchronize"}
 DEFAULT = ".github/workflows/ci.yml"
+# Workflow-level concurrency (OBI-313). A constant group name would be a
+# repo-wide mutex -- one PR's push cancelling another PR's in-flight
+# 150-player gate -- and a group without the `github.run_id` fallback puts a
+# `push` to `main` in a shared group, where the next main push (or a re-run of
+# the gate, which is how OBI-311 measures "5 sequential un-retried runs")
+# could cancel it.
+WF_GROUP_PREFIX = "github.workflow"
+WF_RUNID_FALLBACK = "github.run_id"
+WF_PR_SCOPED = ("github.ref", "github.head_ref", "github.event.pull_request.number")
+WF_PR_TEST = re.compile(r"github\.event_name\s*==\s*['\"]pull_request['\"]")
+WF_OTHER_EVENTS = ("push", "pull_request_target", "workflow_dispatch", "workflow_call",
+                   "schedule", "repository_dispatch", "merge_request_event")
 
 
 def job_blocks(text):
@@ -131,9 +160,159 @@ def needs_of(block):
     return [l.strip("- ").strip() for l in child(block, "needs") if l.strip()]
 
 
+def workflow_concurrency(text):
+    """The top-level `concurrency:` mapping as {key: value}; {} when absent.
+
+    Column 0 for the key, indent 2 for its children -- the same indentation
+    reading used for the job blocks, so the check stays dependency-free.
+    """
+    out, seen = {}, False
+    for line in text.splitlines():
+        if not seen:
+            if re.fullmatch(r"concurrency:\s*", line):
+                seen = True
+            continue
+        if re.fullmatch(r"\s*", line) or re.fullmatch(r"\s*#.*", line):
+            continue
+        if re.fullmatch(r"[A-Za-z0-9_-]+:.*", line):
+            break  # next top-level key: the block ended
+        m = re.fullmatch(r"  ([a-zA-Z_-]+):\s*(.+?)\s*", line)
+        if m:
+            out[m.group(1)] = m.group(2).strip("'\"")
+    return out
+
+
+def check_workflow_concurrency(wc):
+    """Rule 5. An absent block is allowed -- that is the pre-OBI-313 state,
+    where nothing can be cancelled at workflow level. Safe, if it leaves stale
+    runs holding lane places. A present block has to be exact."""
+    errors = []
+    if not wc:
+        return errors
+    group = wc.get("group")
+    if group is None:
+        return errors + ["workflow-level `concurrency` block has no `group:`"]
+    g = group.strip()
+    if "${{" not in g or WF_GROUP_PREFIX not in g:
+        errors.append(f"workflow-level concurrency.group is {g!r}: it must be an "
+                      "expression containing `github.workflow`. A constant or shared "
+                      "group name is a repo-wide mutex -- one PR's push would cancel "
+                      "another PR's in-flight 150-player gate.")
+        return errors
+    arms = g.rsplit("||", 1)
+    if len(arms) != 2 or WF_RUNID_FALLBACK not in arms[1]:
+        errors.append(f"workflow-level concurrency.group {g!r} must fall back to "
+                      "`github.run_id` for non-`pull_request` events (`... || "
+                      "github.run_id`): without it a `push` to `main` shares a group "
+                      "with the next main push, and a gate measured on `main` becomes "
+                      "cancellable.")
+    elif not any(tok in arms[0] for tok in WF_PR_SCOPED):
+        errors.append(f"workflow-level concurrency.group {g!r} is not PR-scoped: the "
+                      f"`pull_request` arm must contain one of {list(WF_PR_SCOPED)}, "
+                      "or every PR shares one group and cancels across PRs.")
+
+    cip = wc.get("cancel-in-progress")
+    if cip is None:
+        return errors  # GitHub's default is false: nothing gets cancelled
+    v = cip.strip()
+    if not (v.startswith("${{") and v.endswith("}}")):
+        return errors + [f"workflow-level concurrency.cancel-in-progress is {v!r}: it "
+                         "must be an expression keyed on `github.event_name == "
+                         "'pull_request'`. A literal `true` cancels `push` runs to "
+                         "`main` and any re-run of a gate."]
+    body = v[3:-2].strip()
+    if not WF_PR_TEST.search(body):
+        errors.append(f"workflow-level concurrency.cancel-in-progress {v!r} does not "
+                      "test `github.event_name == 'pull_request'`, so it cannot be "
+                      "shown false for `push` and `workflow_dispatch`.")
+    if "!=" in body:
+        errors.append(f"workflow-level concurrency.cancel-in-progress {v!r} uses `!=`: a "
+                      "negated test is true for at least one non-`pull_request` event, "
+                      "which is exactly the run OBI-313 must never cancel.")
+    if "||" in body:
+        errors.append(f"workflow-level concurrency.cancel-in-progress {v!r} uses `||`, "
+                      "which can only widen cancellation beyond `pull_request`.")
+    stray = sorted({q for q in re.findall(r"['\"]([^'\"]*)['\"]", body)} - {"pull_request"})
+    if stray:
+        errors.append(f"workflow-level concurrency.cancel-in-progress {v!r} mentions "
+                      f"{stray}: only `'pull_request'` may appear, so nothing that is "
+                      "true for `push`/`workflow_dispatch` can be smuggled in.")
+    for ev in WF_OTHER_EVENTS:
+        if re.search(rf"event_name\s*==\s*['\"]{ev}['\"]", body):
+            errors.append(f"workflow-level concurrency.cancel-in-progress {v!r} is true "
+                          f"for `{ev}`: only a superseded `pull_request` run may be "
+                          "cancelled.")
+    return errors
+
+
+def on_pull_request_types(text):
+    """`on.pull_request.types` as a set.
+
+    Empty set = no `types:` key = GitHub fires on *every* activity type;
+    None = `pull_request` is not a trigger of this workflow at all.
+    """
+    lines = text.splitlines()
+    starts = [i for i, l in enumerate(lines) if re.fullmatch(r"(?:^on:|^true:)\s*", l)]
+    if not starts:
+        return None
+    block = []
+    for line in lines[starts[0] + 1:]:
+        if re.fullmatch(r"[A-Za-z0-9_-]+:.*", line):
+            break  # next top-level key
+        block.append(line)
+    idx = [i for i, l in enumerate(block)
+           if re.fullmatch(r"  (?:pull_request|pull_request_target):\s*", l)]
+    if not idx:
+        return None
+    children = []
+    for line in block[idx[0] + 1:]:
+        if re.fullmatch(r"  [A-Za-z0-9_-]+:\s*", line):
+            break  # next event key
+        children.append(line)
+    for line in children:
+        m = re.fullmatch(r"    types:\s*\[?([^\]]*)\]?", line)
+        if m and m.group(1).strip():
+            return {x.strip().strip("'\"") for x in m.group(1).split(",") if x.strip()}
+    return set()
+
+
+def check_supersede_scope(text, wc):
+    """Rule 6. A PR-only workflow-level cancel is only safe on a commit-only
+    trigger: with `types:` omitted GitHub fires `pull_request` for *every*
+    activity, so `labeled` / `assigned` / `edited` / `review_requested` would
+    cancel that PR's own in-flight 150-player gate and take a fresh lane place
+    for a diff that had not changed. A label is not a superseded commit."""
+    cip = (wc.get("cancel-in-progress") or "").strip()
+    if "pull_request" not in cip or cip.lower() == "false":
+        return []  # nothing is cancelled per PR -> nothing to narrow
+    types = on_pull_request_types(text)
+    if types is None:
+        return []  # no PR trigger at all; the cancel arm is inert
+    if not types:
+        return ["the workflow-level block cancels superseded `pull_request` runs, but "
+                "`on.pull_request` has no `types:` -- GitHub then fires on *every* "
+                "activity type, so labeling or re-reviewing a PR would cancel its own "
+                "in-flight `loadtest-e1-1`. Restrict it to "
+                f"{sorted(COMMIT_TYPES)}."]
+    errs = []
+    missing = sorted(MUST_RUN_ON - types)
+    if missing:
+        errs.append(f"`on.pull_request.types` dropped {missing}: a required check has to "
+                    "run on the first commit and on every commit after it, so narrowing "
+                    "the trigger cannot be used to skip the gate")
+    extra = sorted(types - COMMIT_TYPES)
+    if extra:
+        errs.append(f"`on.pull_request.types` still fires on {extra}: those activities "
+                    "change nothing about the commit, and with the workflow-level cancel "
+                    "each one would kill that PR's running gate and take a fresh lane "
+                    f"place. Only {sorted(COMMIT_TYPES)} may appear.")
+    return errs
+
+
 def check_text(text):
     jobs = job_blocks(text)
-    errors = []
+    wc = workflow_concurrency(text)
+    errors = check_workflow_concurrency(wc) + check_supersede_scope(text, wc)
 
     for job in LANE_JOBS:
         if job not in jobs:
@@ -272,6 +451,42 @@ MUTANTS = [
                                     "    runs-on: ubuntu-latest\n"
                                     "    steps:\n      - run: echo hi\n", 1)),
     ("required check renamed away", lambda t: t.replace("  deny:\n", "  deny-optional:\n", 1)),
+    # Workflow-level concurrency (OBI-313). The first six are the shapes the
+    # issue names; the last four re-test the lane *beside* the new block -- the
+    # hazard this block creates is a job that forbids being killed, and the
+    # trigger that could kill it for a label instead of a commit.
+    ("workflow-level cancel-in-progress made literal true",
+     lambda t: _sub(t, "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                    "  cancel-in-progress: true\n")),
+    ("workflow-level cancel-in-progress also true for push",
+     lambda t: _sub(t, "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                    "  cancel-in-progress: ${{ github.event_name == 'pull_request' || "
+                    "github.event_name == 'push' }}\n")),
+    ("workflow-level cancel-in-progress true for a ref instead of the event",
+     lambda t: _sub(t, "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                    "  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}\n")),
+    ("workflow-level group loses the run_id fallback",
+     lambda t: _sub(t, "group: ${{ github.workflow }}",
+                    "  group: ${{ github.workflow }}-${{ github.ref }}\n")),
+    ("workflow-level group made a constant name",
+     lambda t: _sub(t, "group: ${{ github.workflow }}", "  group: loom-ci-supersede\n")),
+    ("workflow-level group not PR-scoped",
+     lambda t: _sub(t, "group: ${{ github.workflow }}",
+                    "  group: ${{ github.workflow }}-${{ github.event_name == "
+                    "'pull_request' && 'all-prs-together' || github.run_id }}\n")),
+    ("required gate's own cancel-in-progress flipped beside the workflow block",
+     lambda t: _sub(t, "cancel-in-progress: false", "      cancel-in-progress: true\n", nth=2)),
+    ("supersede block with the PR trigger left unrestricted",
+     lambda t: _sub(t, "    types: [opened, synchronize, reopened]\n", None)),
+    ("supersede block with label events back in the trigger",
+     lambda t: _sub(t, "types: [opened, synchronize, reopened]",
+                    "    types: [opened, synchronize, reopened, labeled]\n")),
+    ("supersede trigger narrowed until `synchronize` is gone",
+     lambda t: _sub(t, "types: [opened, synchronize, reopened]",
+                    "    types: [opened, reopened]\n")),
+    ("supersede trigger narrowed until `opened` is gone",
+     lambda t: _sub(t, "types: [opened, synchronize, reopened]",
+                    "    types: [synchronize, reopened]\n")),
 ]
 
 
@@ -303,8 +518,11 @@ def main(argv):
         for e in errors:
             print(f"  - {e}")
         return 1
+    wc = workflow_concurrency(Path(path).read_text())
+    supersede = (" and cancels superseded pull_request runs only"
+                 if wc.get("cancel-in-progress") else ", no workflow-level cancel")
     print(f"check-ci-load-lane: {path} keeps the {LANE_GROUP} lane and "
-          f"{'/'.join(LANE_JOBS)} in DAG order")
+          f"{'/'.join(LANE_JOBS)} in DAG order{supersede}")
     return 0
 
 

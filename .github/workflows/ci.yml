@@ -1,10 +1,55 @@
 name: ci
 on:
   pull_request:
+    # Only the activity types that change what is being measured. GitHub runs
+    # `pull_request` workflows for *every* type when this is omitted, so a
+    # label, a reviewer request or a title edit used to start a whole new CI
+    # run and take a fresh lane place for a diff that did not change -- and
+    # with the workflow-level cancel below, it would now also cancel that PR's
+    # in-flight 150-player measurement. `opened` and `synchronize` stay, so a
+    # required check still runs on the first commit and on every commit after
+    # that one; `reopened` stays because a reopened PR has no live run.
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
 permissions:
   contents: read
+
+# ── Which runs may be cancelled, and which may never be (OBI-313) ─────────
+# MAY BE CANCELLED -- a `pull_request` run whose commit is already superseded
+# by a newer push to the same PR. That is the only thing this block cancels.
+# It exists because `loom-ci-load-lane` is a FIFO across runs: a PR with three
+# pushes holds three places in it, and nobody else's required gate moves until
+# they drain. Run 37698132725 (2026-10-07 22:44:59Z) was a *draft* PR whose
+# diff was two README paragraphs and a comment block; it held a lane place for
+# `loadtest-e1-1` -- and, on the branch where OBI-311's CPU-heavy jobs join the
+# lane, for `rust` and the three `fuzz-smoke*` jobs too -- and had to be
+# cancelled by hand 43 s later. Draft state does not suppress `pull_request`
+# runs in this repo, and suppressing them with a job-level `if:` would *skip* a
+# required check, which blocks a PR as hard as a failure. Cancelling a run that
+# is already superseded is the control we have -- which is also why the trigger
+# above is narrowed to the commit-changing activity types: a label is not a
+# superseded commit, and must not be able to kill a running gate.
+#
+# NEVER CANCELLED -- a `push` to `main`, and any measurement already running.
+# For a non-`pull_request` event the group falls back to `github.run_id`, so
+# every main push is its own group and there is nothing for a later run to
+# cancel: OBI-311's "5 sequential un-retried E1.1 runs" stays measurable. The
+# lane jobs keep `cancel-in-progress: false` and `queue: max` so a gate is not
+# killed inside its own run either -- a workflow-level cancel does reach into
+# jobs whose own `cancel-in-progress: false` forbids it, which is why
+# scripts/check-ci-load-lane.py pins both the group and this expression rather
+# than trusting a comment above them.
+#
+# What cancellation costs: the check on the superseded commit ends `cancelled`
+# and the newer commit is measured again. Branch protection evaluates the PR's
+# newest commit, and `strict: true` + `required_linear_history: true` mean a
+# stale SHA never satisfied the branch here anyway, so the merge gate keeps the
+# same shape. That trade is OBI-313's design question for the CTO, not a change
+# to be assumed in YAML.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # ── CI load lane (OBI-308) ─────────────────────────────────────────────────
 # `loadtest-e1-1`, `loadtest-smoke` and `bench` measure wall-clock latency on
@@ -43,7 +88,8 @@ permissions:
 # out of scope for OBI-308 -- see results/README.md "CI load lane".
 #
 # These invariants are enforced by scripts/check-ci-load-lane.py, run in the
-# `hygiene` job below.
+# `hygiene` job below. Which runs may be cancelled *at all* is the workflow-level
+# `concurrency` block above, not anything in the lane.
 jobs:
   rust:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
@@ -208,10 +254,13 @@ jobs:
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" -o "$workdir/gitleaks.tar.gz"
           tar -xzf "$workdir/gitleaks.tar.gz" -C "$workdir" gitleaks
           "$workdir/gitleaks" git --redact --exit-code 1 .
-      - name: CI load lane invariants (OBI-308)
+      - name: CI load lane invariants (OBI-308, workflow-level cancel OBI-313)
         # The latency gates in this workflow are only meaningful on a quiet
         # host. Keep the lane (concurrency group + DAG order + "no required
-        # check may be skipped") from rotting silently.
+        # check may be skipped") from rotting silently, and keep the
+        # workflow-level group cancelling superseded `pull_request` runs only:
+        # a workflow-level cancel reaches into jobs whose own
+        # `cancel-in-progress: false` forbids it.
         run: |
           set -euo pipefail
           scripts/ci-ensure-tools.sh python3:python3-minimal
