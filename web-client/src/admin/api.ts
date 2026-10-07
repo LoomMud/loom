@@ -34,6 +34,41 @@ export interface AdminApiOptions {
  * free" the way a plain `<form>` POST or `<img>` tag can. */
 const STAFF_AUTH_HEADER = "X-Loom-Auth";
 
+/** `navigator.locks` (Web Locks API) resource name `refresh()` holds for
+ * the duration of one round trip (CTO review on PR #121, OBI-297).
+ * `__Host-loom_rt` is a cookie, so it is shared by every tab/window on
+ * this origin -- two tabs duplicated from one another start with the
+ * *same* access token and the *same* `exp`, so their proactive-refresh
+ * timers (`app.ts`'s `scheduleProactiveRefresh`) fire in the same tick,
+ * and both would otherwise present the same refresh cookie. The server
+ * treats a second presentation of an already-rotated refresh token as
+ * theft (`session_rotate`'s reuse-detection branch): it revokes the
+ * *whole* session family and audits `auth.refresh.reuse`, signing every
+ * tab out and logging a false theft event for what was just two tabs
+ * racing. A Web Locks resource name is scoped per-origin (not
+ * per-script, per-tab, or per-process), so it serializes the race across
+ * tabs, not just within one -- the in-tab-only dedup below
+ * (`refreshInFlight`) cannot do that by itself. */
+const REFRESH_LOCK_NAME = "loom-admin-auth-refresh";
+
+/** Minimal shape of the bits of the Web Locks API this module uses --
+ * not every target runtime (Node under `node:test`, in particular) has a
+ * `navigator.locks`, so this is typed narrowly rather than imported from
+ * `lib.dom.d.ts` wholesale, and every call site feature-detects before
+ * using it (`hasWebLocks` below). */
+interface LocksLike {
+  locks: {
+    request<T>(name: string, callback: () => Promise<T>): Promise<T>;
+  };
+}
+
+function hasWebLocks(): boolean {
+  return (
+    typeof navigator !== "undefined" &&
+    (navigator as unknown as Partial<LocksLike>).locks !== undefined
+  );
+}
+
 export class AdminApiError extends Error {
   constructor(
     public readonly status: number,
@@ -170,6 +205,15 @@ export class AdminApi {
     return body as T;
   }
 
+  /** In-tab single-flight: while one `refresh()` round trip is already
+   * in progress, every other caller (a 401 retry, the proactive timer,
+   * another page module) awaits the *same* promise instead of firing a
+   * second `/auth/refresh`. This is the in-tab half of the fix; the
+   * `navigator.locks` call inside `refresh()` is the cross-tab half --
+   * see `REFRESH_LOCK_NAME`'s doc comment. `null` whenever no refresh is
+   * outstanding. */
+  private refreshInFlight: Promise<boolean> | null = null;
+
   /** Silent refresh via the `__Host-loom_rt` HttpOnly cookie (OBI-198,
    * OBI-297): `credentials: "same-origin"` is what makes the browser
    * attach that cookie, and `X-Loom-Auth: 1` plus an allow-listed
@@ -179,27 +223,69 @@ export class AdminApi {
    * response body never contains it either, only a rotated access
    * token. Never throws: any failure (network error, non-2xx, malformed
    * body) resolves to `false` so callers can treat "couldn't silently
-   * refresh" uniformly with "not signed in" and fall back to sign-in. */
+   * refresh" uniformly with "not signed in" and fall back to sign-in.
+   *
+   * Single-flight both within a tab (`refreshInFlight`) and across tabs
+   * (`navigator.locks.request(REFRESH_LOCK_NAME, ...)`, CTO review on PR
+   * #121) -- see `REFRESH_LOCK_NAME`'s doc comment for why the
+   * cross-tab case matters: two tabs with the same cookie racing to
+   * refresh would otherwise trip the server's reuse-detection and
+   * revoke the whole session family out from under every tab. */
   async refresh(): Promise<boolean> {
-    try {
-      const response = await fetch(`${this.options.baseUrl}/auth/refresh`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { [STAFF_AUTH_HEADER]: "1" },
+    if (this.refreshInFlight !== null) {
+      return this.refreshInFlight;
+    }
+    const tokenBeforeRefresh = this.options.getAccessToken();
+
+    const doRefresh = async (): Promise<boolean> => {
+      try {
+        const response = await fetch(`${this.options.baseUrl}/auth/refresh`, {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { [STAFF_AUTH_HEADER]: "1" },
+        });
+        if (!response.ok) {
+          return false;
+        }
+        const text = await response.text();
+        const body = text.length > 0 ? safeJsonParse(text) : null;
+        const accessToken = (body as { access_token?: unknown } | null)?.access_token;
+        if (typeof accessToken !== "string") {
+          return false;
+        }
+        this.options.setAccessToken(accessToken);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const withCrossTabLock = async (): Promise<boolean> => {
+      if (!hasWebLocks()) {
+        return doRefresh();
+      }
+      return (navigator as unknown as LocksLike).locks.request(REFRESH_LOCK_NAME, async () => {
+        // Another tab may have already rotated the cookie (and this
+        // tab's token, via the shared `TokenStore`) while this call
+        // was queued for the lock -- in that case the round trip this
+        // call was about to make would just be the reuse the server
+        // rejects. A changed token means someone else already won;
+        // nothing left for this call to do.
+        if (this.options.getAccessToken() !== tokenBeforeRefresh) {
+          return true;
+        }
+        return doRefresh();
       });
-      if (!response.ok) {
-        return false;
+    };
+
+    const inFlight = withCrossTabLock();
+    this.refreshInFlight = inFlight;
+    try {
+      return await inFlight;
+    } finally {
+      if (this.refreshInFlight === inFlight) {
+        this.refreshInFlight = null;
       }
-      const text = await response.text();
-      const body = text.length > 0 ? safeJsonParse(text) : null;
-      const accessToken = (body as { access_token?: unknown } | null)?.access_token;
-      if (typeof accessToken !== "string") {
-        return false;
-      }
-      this.options.setAccessToken(accessToken);
-      return true;
-    } catch {
-      return false;
     }
   }
 

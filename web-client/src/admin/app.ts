@@ -27,7 +27,18 @@ const PROACTIVE_REFRESH_SKEW_SECS = 60;
  * Stops rescheduling (rather than looping forever) the moment there's no
  * token or refresh fails -- a dead/revoked/logged-out session just lets
  * the next 401 (or the sign-in page) take over. Returns a `stop()` so
- * `mountAdminApp` can tear the timer down if it's ever re-mounted. */
+ * `mountAdminApp` can tear the timer down if it's ever re-mounted.
+ *
+ * `mountAdminApp`'s `route()` calls this on *every* hash change, not
+ * just once at mount -- harmless (it always `stop()`s the previous timer
+ * first, so there's never more than one live), but worth knowing if
+ * you're tracing why this runs more than once per page load. One gap
+ * this doesn't close: after a step-up re-login swaps in a fresh token
+ * (`stepup-modal.ts`), this timer is still counting down to the *old*
+ * token's `exp` until the next hash change reschedules it. Harmless in
+ * practice -- `AdminApi.request`'s refresh-on-401 covers the gap if the
+ * old timer fires too late -- but it means the proactive refresh isn't
+ * always keyed to the token actually in use. */
 function scheduleProactiveRefresh(api: AdminApi, tokens: TokenStore): () => void {
   let timer: ReturnType<typeof setTimeout> | undefined;
 
