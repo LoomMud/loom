@@ -10,7 +10,54 @@ import { renderObjectsPage } from "./pages/objects.js";
 import { renderRolesPage } from "./pages/roles.js";
 import { renderSignInPage } from "./pages/signin.js";
 import { renderWhoPage } from "./pages/who.js";
+import { decodeAccessToken } from "./stepup.js";
 import type { TokenStore } from "./tokenstore.js";
+
+/** How long before an access token's `exp` to fire the proactive silent
+ * refresh (OBI-297) -- comfortably inside the 10-minute access-token
+ * lifetime (D-TM2) so the refresh round-trip has room to finish before
+ * the token staff are mid-request with actually expires. Reactive
+ * refresh-on-401 (`AdminApi.request`) is the backstop if this timer is
+ * ever late (a sleeping laptop, a slow network) or simply didn't fire. */
+const PROACTIVE_REFRESH_SKEW_SECS = 60;
+
+/** Keeps one `setTimeout` alive that fires a silent `/auth/refresh`
+ * shortly before the current access token expires, and reschedules
+ * itself off the *new* token's `exp` after every successful refresh.
+ * Stops rescheduling (rather than looping forever) the moment there's no
+ * token or refresh fails -- a dead/revoked/logged-out session just lets
+ * the next 401 (or the sign-in page) take over. Returns a `stop()` so
+ * `mountAdminApp` can tear the timer down if it's ever re-mounted. */
+function scheduleProactiveRefresh(api: AdminApi, tokens: TokenStore): () => void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const schedule = () => {
+    const token = tokens.get();
+    if (token === null) {
+      return;
+    }
+    const claims = decodeAccessToken(token);
+    if (claims === null) {
+      return;
+    }
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const delayMs = Math.max(0, (claims.exp - PROACTIVE_REFRESH_SKEW_SECS - nowSecs) * 1000);
+    timer = setTimeout(() => {
+      void (async () => {
+        if (await api.refresh()) {
+          schedule();
+        }
+      })();
+    }, delayMs);
+  };
+
+  schedule();
+  return () => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  };
+}
 
 export type AdminPageName = "who" | "objects" | "errors" | "roles" | "audit" | "broadcast";
 
@@ -46,7 +93,9 @@ export function mountAdminApp(root: {
   const api = new AdminApi({
     baseUrl: root.baseUrl,
     getAccessToken: root.tokens.get,
+    setAccessToken: root.tokens.set,
   });
+  let stopProactiveRefresh: (() => void) | undefined;
 
   const renderNav = () => {
     clear(root.nav);
@@ -61,8 +110,12 @@ export function mountAdminApp(root: {
       `Sign out (${root.tokens.username() ?? "?"})`,
     ]);
     signOut.addEventListener("click", () => {
-      root.tokens.clear();
-      route();
+      void (async () => {
+        await api.logout();
+        stopProactiveRefresh?.();
+        root.tokens.clear();
+        route();
+      })();
     });
     root.nav.append(signOut);
   };
@@ -73,6 +126,8 @@ export function mountAdminApp(root: {
       renderSignInPage(root.main, api, root.tokens, route);
       return;
     }
+    stopProactiveRefresh?.();
+    stopProactiveRefresh = scheduleProactiveRefresh(api, root.tokens);
     render(pageFromHash(location.hash));
   };
 

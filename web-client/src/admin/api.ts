@@ -21,7 +21,18 @@ export interface AdminApiOptions {
    * driver on a different port. */
   baseUrl: string;
   getAccessToken: () => string | null;
+  /** Called with the rotated access token after a successful silent
+   * refresh (`./tokenstore.ts`'s `TokenStore.set`, OBI-297) -- this
+   * module never persists a token itself, it only ever hands a fresh one
+   * back to whatever store the embedding page uses. */
+  setAccessToken: (token: string) => void;
 }
+
+/** `/auth/refresh` and `/auth/logout` both require this header (OBI-198,
+ * M-AUTH-6) alongside an allow-listed `Origin` -- it forces a CORS
+ * preflight, so a cross-origin page can never fire either route "for
+ * free" the way a plain `<form>` POST or `<img>` tag can. */
+const STAFF_AUTH_HEADER = "X-Loom-Auth";
 
 export class AdminApiError extends Error {
   constructor(
@@ -106,13 +117,21 @@ export interface BroadcastRequest {
 
 /**
  * Minimal `/auth/login` response shape this module needs (full shape is
- * `loom-http::handlers::TokenPair`, OBI-174) -- just enough to read the
- * fresh access token back out after a step-up re-auth.
- */
+ * `loom-http::handlers::TokenResponse`, OBI-174/OBI-198) -- just enough
+ * to read the fresh access token back out after a step-up re-auth. As of
+ * OBI-198 (PR #77) the server no longer returns a refresh token in this
+ * body at all -- it travels only as the `__Host-loom_rt` HttpOnly
+ * cookie, so there is nothing here for this module (or any other JS) to
+ * read or store. */
 export interface LoginResponse {
   access_token: string;
-  refresh_token: string;
+  access_expires_at: number;
 }
+
+/** `/auth/refresh`'s response shape -- identical to `LoginResponse`, kept
+ * as its own type so a caller reading `RefreshResponse` isn't implying
+ * "this came from a sign-in". */
+export type RefreshResponse = LoginResponse;
 
 export class AdminApi {
   constructor(private readonly options: AdminApiOptions) {}
@@ -121,23 +140,86 @@ export class AdminApi {
     path: string,
     init?: RequestInit,
   ): Promise<T> {
-    const token = this.options.getAccessToken();
-    if (token === null) {
-      throw new NoAccessTokenError();
+    const attempt = async (): Promise<Response> => {
+      const token = this.options.getAccessToken();
+      if (token === null) {
+        throw new NoAccessTokenError();
+      }
+      return fetch(`${this.options.baseUrl}${path}`, {
+        ...init,
+        headers: {
+          ...(init?.headers ?? {}),
+          Authorization: `Bearer ${token}`,
+        },
+      });
+    };
+    let response = await attempt();
+    // Silent refresh-on-401 (OBI-297): a token that was fine when the
+    // page loaded can expire mid-session (access tokens are 10 min,
+    // D-TM2). One retry only -- a second 401 after a successful refresh
+    // means the *new* token was rejected too, which is a real auth
+    // failure, not an expiry race, and should surface to the caller.
+    if (response.status === 401 && (await this.refresh())) {
+      response = await attempt();
     }
-    const response = await fetch(`${this.options.baseUrl}${path}`, {
-      ...init,
-      headers: {
-        ...(init?.headers ?? {}),
-        Authorization: `Bearer ${token}`,
-      },
-    });
     const text = await response.text();
     const body = text.length > 0 ? safeJsonParse(text) : null;
     if (!response.ok) {
       throw new AdminApiError(response.status, body);
     }
     return body as T;
+  }
+
+  /** Silent refresh via the `__Host-loom_rt` HttpOnly cookie (OBI-198,
+   * OBI-297): `credentials: "same-origin"` is what makes the browser
+   * attach that cookie, and `X-Loom-Auth: 1` plus an allow-listed
+   * `Origin` is what the server demands before it will read it
+   * (M-AUTH-6). This module never reads the cookie itself -- it isn't
+   * `HttpOnly`-exempt JS, it just rides along on the request -- and the
+   * response body never contains it either, only a rotated access
+   * token. Never throws: any failure (network error, non-2xx, malformed
+   * body) resolves to `false` so callers can treat "couldn't silently
+   * refresh" uniformly with "not signed in" and fall back to sign-in. */
+  async refresh(): Promise<boolean> {
+    try {
+      const response = await fetch(`${this.options.baseUrl}/auth/refresh`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { [STAFF_AUTH_HEADER]: "1" },
+      });
+      if (!response.ok) {
+        return false;
+      }
+      const text = await response.text();
+      const body = text.length > 0 ? safeJsonParse(text) : null;
+      const accessToken = (body as { access_token?: unknown } | null)?.access_token;
+      if (typeof accessToken !== "string") {
+        return false;
+      }
+      this.options.setAccessToken(accessToken);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Sign-out: tells the server to revoke the session family behind the
+   * `__Host-loom_rt` cookie and clear it (OBI-198's `logout` handler),
+   * same `credentials`/header contract as `refresh`. Best-effort -- a
+   * network failure here must not stop the caller from clearing its own
+   * token store; an unreachable server can't keep a stale cookie
+   * confidential, but failing to clear the *local* token store would
+   * leave the UI looking signed in. */
+  async logout(): Promise<void> {
+    try {
+      await fetch(`${this.options.baseUrl}/auth/logout`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { [STAFF_AUTH_HEADER]: "1" },
+      });
+    } catch {
+      // Best-effort; see doc comment above.
+    }
   }
 
   who(): Promise<WhoEntry[]> {
