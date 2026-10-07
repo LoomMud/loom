@@ -145,11 +145,20 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   `loadtest-e1-1` -> `loadtest-smoke` -> `bench`. The required gate goes
   first and has no `needs:`/`if:` of its own, so nothing upstream can skip
   it; the two non-required gates wait for it instead of competing with it.
+- Each gate carries wall-clock headroom (`timeout-minutes` 30 for E1.1, 20
+  for the smoke run). The lane removes a second *gate* from the host, not
+  this run's own `rust` job or another PR's builds, and a release build
+  starved past the old 15-minute budget does not fail the check -- it gets
+  **cancelled**, which blocks a PR just as hard and leaves no p99 to read
+  (run 37663331238, 2026-10-07 18:01:00Z -> 18:16Z, cancelled mid-build while
+  an intentionally contending probe PR ran eight jobs beside it). Slow is
+  survivable; cancelled is not.
 - `scripts/check-ci-load-lane.py` asserts all of the above (and that the
-  gate still runs 150 players with `--fail-on-sla-miss`, and that no
-  required check became skippable or optional), plus a `--self-test` of 14
-  mutations. Both run in the required `hygiene` job, so the lane cannot rot
-  silently and the comment here cannot drift from the workflow.
+  gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
+  headroom, and that no required check became skippable or optional), plus a
+  `--self-test` of 15 mutations. Both run in the required `hygiene` job, so
+  the lane cannot rot silently and the comment here cannot drift from the
+  workflow.
 
 **What the lane does *not* claim.** GitHub scopes a job-level concurrency
 group per workflow *and job*, so the hard guarantee is "the same gate never
@@ -162,7 +171,11 @@ that is runner capacity, not YAML: the durable fix is a dedicated/ephemeral
 load host, which is a CTO call and explicitly out of scope for OBI-308.
 
 **If you see `loadtest-e1-1` waiting** ("Waiting for job to run" on the
-checks tab): that is the lane working. One E1.1 slot costs ~3.5 min of
+checks tab): that is the lane working, and it has been watched working. On
+2026-10-07 PR #128 (carrying this change) took the lane at 18:01:00Z; the
+probe PR #129's `loadtest-e1-1` sat `pending` from 18:00:58Z and only started
+at 18:20:35Z, ~19.5 minutes later, *after* #128's job left the group -- it was
+never cancelled and never co-scheduled. One E1.1 slot costs ~3.5 min of
 runner wall-clock (build cache warm), so a queue of two PRs clears in well
 under ten. Do not respond to a wait, or to a p99 miss on a run that overlapped
 another, by raising the threshold, dropping the population, marking the check
