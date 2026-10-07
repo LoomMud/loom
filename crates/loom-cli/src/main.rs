@@ -1955,6 +1955,27 @@ async fn serve(
         )
         .unwrap_or_else(|err| panic!("LOOM_JWT_KEY_FILE ({}): {err}", key_file.display()));
         http_state = http_state.with_auth(loom_http::auth::AuthService::new(directory, keys));
+        http_state = http_state.with_staff_origins(staff_origins_from_env());
+
+        // OBI-201 (M-AUTH-7): GitHub login mounts only once auth itself
+        // is mounted *and* every GitHub OAuth app setting is present --
+        // same "absent by default" shape, so an operator who hasn't
+        // provisioned a GitHub OAuth app yet gets no `/auth/github/*`
+        // routes at all rather than ones that 503 forever.
+        if let Some(github_config) = github_oauth_config_from_env() {
+            let login_config = loom_http::auth::GithubLoginConfig::new(
+                github_config.client_id.clone(),
+                github_config.redirect_uri.clone(),
+            );
+            let provider: std::sync::Arc<dyn loom_http::auth::GithubIdentityProvider> =
+                std::sync::Arc::new(loom_http::auth::LiveGithubProvider::new(github_config));
+            http_state = http_state.with_github(provider, login_config);
+        } else {
+            tracing::info!(
+                "GitHub staff login (/auth/github/*) disabled: set LOOM_GITHUB_CLIENT_ID, \
+                 LOOM_GITHUB_CLIENT_SECRET, and LOOM_GITHUB_REDIRECT_URI to enable it"
+            );
+        }
     } else {
         tracing::info!(
             "staff web auth (/auth/*) disabled: set both LOOM_DATABASE_URL (or DATABASE_URL) \
@@ -2200,6 +2221,58 @@ fn jwt_key_file_from_env() -> Option<PathBuf> {
 /// after a redeploy for no operational reason).
 fn jwt_issuer_from_env() -> String {
     std::env::var("LOOM_JWT_ISSUER").unwrap_or_else(|_| "https://build.loommud.com/".to_string())
+}
+
+/// The staff-origin allowlist (OBI-198, M-AUTH-6): exact `Origin` values
+/// (scheme + host + port, comma-separated) that `/auth/refresh` and
+/// `/auth/logout` accept. Unset by default, which refuses both routes
+/// outright -- an operator who wants a browser staff client to be able to
+/// refresh/log out must set this to that client's exact origin(s).
+fn staff_origins_from_env() -> Vec<String> {
+    std::env::var("LOOM_STAFF_ORIGINS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|origin| origin.trim().to_string())
+                .filter(|origin| !origin.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// GitHub OAuth app settings for staff login (OBI-201, M-AUTH-7). All
+/// three (`LOOM_GITHUB_CLIENT_ID`, `LOOM_GITHUB_CLIENT_SECRET`,
+/// `LOOM_GITHUB_REDIRECT_URI`) must be set, non-empty, or
+/// `/auth/github/*` doesn't mount at all -- there is no "GitHub login
+/// with no secret" state. An empty string (e.g. a compose/.env
+/// placeholder someone forgot to fill in) is treated the same as unset,
+/// not as a present-but-blank credential. The redirect URI must parse as
+/// an `https://` URL -- GitHub itself enforces an exact match against
+/// the OAuth app's registered callback, so a malformed value here just
+/// means every callback fails closed, not a security hole, but failing
+/// at startup is a much clearer signal than at the first login attempt.
+fn github_oauth_config_from_env() -> Option<loom_http::auth::GithubOAuthConfig> {
+    let client_id = non_empty_env("LOOM_GITHUB_CLIENT_ID")?;
+    let client_secret = non_empty_env("LOOM_GITHUB_CLIENT_SECRET")?;
+    let redirect_uri = non_empty_env("LOOM_GITHUB_REDIRECT_URI")?;
+    if !redirect_uri.starts_with("https://") {
+        tracing::warn!(
+            "LOOM_GITHUB_REDIRECT_URI does not start with https://; GitHub staff login stays \
+             disabled until it's a valid https URL"
+        );
+        return None;
+    }
+    Some(loom_http::auth::GithubOAuthConfig::new(
+        client_id,
+        client_secret,
+        redirect_uri,
+    ))
+}
+
+/// `std::env::var`, but an empty string reads the same as unset.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 /// The `serve()` world-tick timer (spec r5 N2, OBI-82): every `interval`

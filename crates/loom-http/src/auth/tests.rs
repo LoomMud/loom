@@ -28,7 +28,7 @@ struct FakeStaff {
 #[derive(Default)]
 struct FakeDirectoryInner {
     staff: HashMap<String, FakeStaff>, // keyed by username (== uid in these tests)
-    refresh_tokens: HashMap<String, RefreshRecord>, // keyed by token_hash
+    sessions: HashMap<String, FakeSession>, // keyed by token_hash
     github_links: HashMap<i64, String>,
     audit_events: Vec<AuditEvent>,
     /// How many times [`StaffDirectory::resolve_uid`] has been called
@@ -45,17 +45,28 @@ struct FakeDirectoryInner {
     fail_admin_audit: bool,
 }
 
-#[derive(Default, Clone)]
-struct FakeDirectory {
+#[derive(Clone)]
+struct FakeSession {
+    staff_uid: String,
+    expires_at: OffsetDateTime,
+    revoked_at: Option<OffsetDateTime>,
+    sid: String,
+    amr: Vec<String>,
+    mfa_at: Option<OffsetDateTime>,
+    last_used_at: OffsetDateTime,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct FakeDirectory {
     inner: Arc<Mutex<FakeDirectoryInner>>,
 }
 
 impl FakeDirectory {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    fn add_staff(&self, uid: &str, password: &str, tier: i16) {
+    pub(crate) fn add_staff(&self, uid: &str, password: &str, tier: i16) {
         self.inner.lock().unwrap().staff.insert(
             uid.to_string(),
             FakeStaff {
@@ -87,7 +98,7 @@ impl FakeDirectory {
         self.inner.lock().unwrap().fail_admin_audit = true;
     }
 
-    fn link_github(&self, github_id: i64, uid: &str) {
+    pub(crate) fn link_github(&self, github_id: i64, uid: &str) {
         self.inner
             .lock()
             .unwrap()
@@ -103,7 +114,7 @@ impl FakeDirectory {
     /// login with a real code succeeds must set up "already confirmed"
     /// this way instead of spending the one real code available to it on
     /// confirmation.
-    fn confirm_totp_for_test(&self, uid: &str) {
+    pub(crate) fn confirm_totp_for_test(&self, uid: &str) {
         self.inner
             .lock()
             .unwrap()
@@ -113,16 +124,27 @@ impl FakeDirectory {
             .totp_confirmed = true;
     }
 
-    /// Directly mark a refresh token revoked (simulating an admin/logout
-    /// action taken through some other path). Exercised indirectly by
-    /// every test that calls [`AuthService::logout`]; kept as a direct
-    /// helper too since a future test may want to revoke without going
-    /// through the service.
+    /// Directly mark a session revoked (simulating an admin/logout
+    /// action taken through some other path, or the OBI-198 revoke-all
+    /// trigger -- exercised directly here since the fake directory has
+    /// no triggers).
     #[allow(dead_code)]
     fn revoke_for_test(&self, token_plaintext: &str) {
         let hash = hash_token(token_plaintext);
-        if let Some(record) = self.inner.lock().unwrap().refresh_tokens.get_mut(&hash) {
-            record.revoked_at = Some(now());
+        if let Some(session) = self.inner.lock().unwrap().sessions.get_mut(&hash) {
+            session.revoked_at = Some(now());
+        }
+    }
+
+    /// Simulate the OBI-198 revoke-all-for-uid trigger (tier change, TOTP
+    /// reset, GitHub unlink, staff removal, or password change all end up
+    /// here in Postgres).
+    fn revoke_all_for_uid_for_test(&self, uid: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        for session in inner.sessions.values_mut() {
+            if session.staff_uid == uid {
+                session.revoked_at = Some(now());
+            }
         }
     }
 
@@ -131,10 +153,20 @@ impl FakeDirectory {
         self.inner
             .lock()
             .unwrap()
-            .refresh_tokens
+            .sessions
             .get(&hash)
             .map(|r| r.revoked_at.is_some())
             .unwrap_or(false)
+    }
+
+    /// Back-date a session's `last_used_at` past the idle cutoff, for the
+    /// idle-expiry test -- simulating a session nobody has refreshed in a
+    /// while without sleeping real hours.
+    fn backdate_last_used_for_test(&self, token_plaintext: &str, last_used_at: OffsetDateTime) {
+        let hash = hash_token(token_plaintext);
+        if let Some(session) = self.inner.lock().unwrap().sessions.get_mut(&hash) {
+            session.last_used_at = last_used_at;
+        }
     }
 
     fn audit_events(&self) -> Vec<AuditEvent> {
@@ -246,15 +278,16 @@ impl StaffDirectory for FakeDirectory {
         amr: &[String],
         mfa_at: Option<OffsetDateTime>,
     ) -> Result<(), DirectoryError> {
-        self.inner.lock().unwrap().refresh_tokens.insert(
+        self.inner.lock().unwrap().sessions.insert(
             token_hash.to_string(),
-            RefreshRecord {
+            FakeSession {
                 staff_uid: uid.to_string(),
                 expires_at,
                 revoked_at: None,
                 sid: sid.to_string(),
                 amr: amr.to_vec(),
                 mfa_at,
+                last_used_at: now(),
             },
         );
         Ok(())
@@ -268,57 +301,95 @@ impl StaffDirectory for FakeDirectory {
             .inner
             .lock()
             .unwrap()
-            .refresh_tokens
+            .sessions
             .get(token_hash)
-            .cloned())
-    }
-
-    async fn refresh_token_rotate(
-        &self,
-        token_hash: &str,
-    ) -> Result<RefreshRotation, DirectoryError> {
-        let mut inner = self.inner.lock().unwrap();
-        let Some(record) = inner.refresh_tokens.get_mut(token_hash) else {
-            return Ok(RefreshRotation::NotFound);
-        };
-        if record.revoked_at.is_some() {
-            return Ok(RefreshRotation::Reused {
-                staff_uid: record.staff_uid.clone(),
-            });
-        }
-        if record.expires_at <= now() {
-            return Ok(RefreshRotation::Expired);
-        }
-        record.revoked_at = Some(now());
-        Ok(RefreshRotation::Rotated {
-            staff_uid: record.staff_uid.clone(),
-            sid: record.sid.clone(),
-            amr: record.amr.clone(),
-            mfa_at: record.mfa_at,
-        })
+            .map(|s| RefreshRecord {
+                staff_uid: s.staff_uid.clone(),
+                expires_at: s.expires_at,
+                revoked_at: s.revoked_at,
+                sid: s.sid.clone(),
+                amr: s.amr.clone(),
+                mfa_at: s.mfa_at,
+            }))
     }
 
     async fn refresh_token_revoke(&self, token_hash: &str) -> Result<(), DirectoryError> {
-        if let Some(record) = self
-            .inner
-            .lock()
-            .unwrap()
-            .refresh_tokens
-            .get_mut(token_hash)
-        {
-            record.revoked_at = Some(now());
+        if let Some(session) = self.inner.lock().unwrap().sessions.get_mut(token_hash) {
+            session.revoked_at = Some(now());
         }
         Ok(())
     }
 
     async fn refresh_token_revoke_all(&self, uid: &str) -> Result<(), DirectoryError> {
         let mut inner = self.inner.lock().unwrap();
-        for record in inner.refresh_tokens.values_mut() {
-            if record.staff_uid == uid {
-                record.revoked_at = Some(now());
+        for session in inner.sessions.values_mut() {
+            if session.staff_uid == uid {
+                session.revoked_at = Some(now());
             }
         }
         Ok(())
+    }
+
+    async fn session_revoke_family_by_token(&self, token_hash: &str) -> Result<(), DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(sid) = inner.sessions.get(token_hash).map(|s| s.sid.clone()) else {
+            return Ok(());
+        };
+        for session in inner.sessions.values_mut() {
+            if session.sid == sid {
+                session.revoked_at = Some(now());
+            }
+        }
+        Ok(())
+    }
+
+    async fn session_rotate(
+        &self,
+        old_token_hash: &str,
+        new_token_hash: &str,
+        idle_cutoff: OffsetDateTime,
+    ) -> Result<SessionRotateOutcome, DirectoryError> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(session) = inner.sessions.get(old_token_hash).cloned() else {
+            return Ok(SessionRotateOutcome::Invalid);
+        };
+
+        if session.revoked_at.is_some() {
+            // Reuse: kill the whole family.
+            for other in inner.sessions.values_mut() {
+                if other.sid == session.sid && other.revoked_at.is_none() {
+                    other.revoked_at = Some(now());
+                }
+            }
+            return Ok(SessionRotateOutcome::Reused {
+                staff_uid: session.staff_uid,
+            });
+        }
+
+        if session.expires_at <= now() || session.last_used_at <= idle_cutoff {
+            return Ok(SessionRotateOutcome::Invalid);
+        }
+
+        inner.sessions.get_mut(old_token_hash).unwrap().revoked_at = Some(now());
+        inner.sessions.insert(
+            new_token_hash.to_string(),
+            FakeSession {
+                staff_uid: session.staff_uid.clone(),
+                expires_at: session.expires_at,
+                revoked_at: None,
+                sid: session.sid.clone(),
+                amr: session.amr.clone(),
+                mfa_at: session.mfa_at,
+                last_used_at: now(),
+            },
+        );
+        Ok(SessionRotateOutcome::Rotated {
+            staff_uid: session.staff_uid,
+            sid: session.sid,
+            amr: session.amr,
+            mfa_at: session.mfa_at,
+            expires_at: session.expires_at,
+        })
     }
 
     async fn github_lookup(&self, github_id: i64) -> Result<Option<String>, DirectoryError> {
@@ -412,7 +483,7 @@ impl StaffDirectory for FakeDirectory {
     }
 }
 
-fn test_service(directory: FakeDirectory) -> AuthService {
+pub(crate) fn test_service(directory: FakeDirectory) -> AuthService {
     AuthService::new(
         Arc::new(directory),
         JwtKeys::single(
@@ -607,8 +678,64 @@ async fn expired_refresh_token_is_refused() {
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
 }
 
+/// Acceptance (OBI-198, M-AUTH-5): "idle expiry enforced" -- a session
+/// not rotated within the idle window is refused even though its 14-day
+/// absolute expiry hasn't passed.
+#[tokio::test]
+async fn idle_expired_refresh_token_is_refused() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("frodo", "ringbearer", 1);
+    let service = test_service(directory.clone()).with_idle_ttl(Duration::from_secs(60));
+
+    let pair = service
+        .login("frodo", "ringbearer", None, &ctx())
+        .await
+        .unwrap();
+    directory.backdate_last_used_for_test(
+        &pair.refresh_token,
+        OffsetDateTime::now_utc() - time::Duration::seconds(120),
+    );
+
+    let result = service.refresh(&pair.refresh_token, &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
+}
+
+/// Acceptance (OBI-198, M-AUTH-5): a tier change (or TOTP reset/GitHub
+/// unlink/password change/staff removal -- all funnel into the same
+/// Postgres `staff_sessions_revoke_for_uid` trigger, see
+/// `loom-persist/migrations/0008_staff_sessions.sql`) revokes every
+/// session for the uid, not just one family.
+#[tokio::test]
+async fn revoke_all_for_uid_kills_every_family() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("sam", "gaffer", 1);
+    let service = test_service(directory.clone());
+
+    let pair_a = service.login("sam", "gaffer", None, &ctx()).await.unwrap();
+    let pair_b = service.login("sam", "gaffer", None, &ctx()).await.unwrap();
+
+    directory.revoke_all_for_uid_for_test("sam");
+
+    assert_eq!(
+        service
+            .refresh(&pair_a.refresh_token, &ctx())
+            .await
+            .unwrap_err(),
+        AuthError::InvalidRefreshToken
+    );
+    assert_eq!(
+        service
+            .refresh(&pair_b.refresh_token, &ctx())
+            .await
+            .unwrap_err(),
+        AuthError::InvalidRefreshToken
+    );
+}
+
 /// Acceptance: "revoked ... refresh" refused, and a revoked-token replay
-/// (stolen refresh token scenario) takes down the whole session family.
+/// (stolen refresh token scenario) takes down the whole session family --
+/// but a *different* family for the same uid is untouched (OBI-198:
+/// family-scoped, not uid-wide).
 #[tokio::test]
 async fn revoked_refresh_token_is_refused_and_replay_revokes_the_family() {
     let directory = FakeDirectory::new();
@@ -625,10 +752,16 @@ async fn revoked_refresh_token_is_refused_and_replay_revokes_the_family() {
     let result = service.refresh(&pair.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
 
-    // Rotate a second, legitimate session, then simulate a thief replaying
-    // the *old* rotated-out token -- every outstanding token for the uid
-    // should die, including the legitimate rotated one.
+    // Rotate a second, legitimate session *in a different family* (a
+    // separate login), then simulate a thief replaying the *old*
+    // rotated-out token -- every outstanding token in that token's family
+    // should die, including the legitimately-rotated one, but a wholly
+    // separate family for the same uid survives.
     let pair2 = service
+        .login("merry", "brandybuck", None, &ctx())
+        .await
+        .unwrap();
+    let other_family = service
         .login("merry", "brandybuck", None, &ctx())
         .await
         .unwrap();
@@ -639,6 +772,9 @@ async fn revoked_refresh_token_is_refused_and_replay_revokes_the_family() {
     // The legitimately-rotated token is now dead too.
     let result = service.refresh(&rotated.refresh_token, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidRefreshToken);
+    // A separate family for the same uid is untouched.
+    let unaffected = service.refresh(&other_family.refresh_token, &ctx()).await;
+    assert!(unaffected.is_ok());
 }
 
 /// Acceptance (OBI-203): a refreshed token keeps the login's `sid`,
@@ -703,7 +839,7 @@ async fn unknown_refresh_token_is_refused() {
 async fn github_login_for_an_unlinked_user_is_refused() {
     let directory = FakeDirectory::new();
     let service = test_service(directory);
-    let result = service.github_login(123456, None).await;
+    let result = service.github_login(123456, None, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
 }
 
@@ -714,10 +850,113 @@ async fn github_login_for_a_linked_user_succeeds_and_reads_tier_from_the_directo
     directory.link_github(42, "samwise");
     let service = test_service(directory);
 
-    let pair = service.github_login(42, None).await.unwrap();
+    let pair = service.github_login(42, None, &ctx()).await.unwrap();
     let claims = service.verify_access_token(&pair.access_token).unwrap();
     assert_eq!(claims.sub, "samwise");
     assert_eq!(claims.tier, 2);
+}
+
+/// Acceptance (OBI-206): GitHub login shares the password path's rate
+/// limiter -- repeated bad/unlinked GitHub ids lock out the same way
+/// repeated bad passwords do, keyed by `github:{id}` rather than uid.
+#[tokio::test]
+async fn github_login_is_rate_limited_like_password_login() {
+    let directory = FakeDirectory::new();
+    let service = test_service(directory).with_rate_limiter(RateLimiter::with_test_tuning(
+        3,
+        Duration::from_secs(300),
+        Duration::from_secs(300),
+        100.0,
+        Duration::from_secs(60),
+    ));
+
+    for _ in 0..3 {
+        let result = service.github_login(555, None, &ctx()).await;
+        assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+    }
+    // The account-equivalent lockout now kicks in -- same response shape
+    // as a locked password account, not a distinct "too many GitHub
+    // attempts" error that would leak lockout state.
+    let result = service.github_login(555, None, &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidCredentials);
+}
+
+/// Acceptance (OBI-201, M-AUTH-7): "GitHub login of a T3 without TOTP is
+/// refused" via the pending-token flow -- the callback can't carry a
+/// `totp_code`, so it gets a pending token instead of a hard failure, and
+/// that token (plus a code) completes the login without redoing OAuth.
+#[tokio::test]
+async fn github_login_pending_totp_completes_with_a_correct_code() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "unused-password", 3);
+    directory.link_github(99, "gandalf");
+    let service = test_service(directory.clone());
+
+    let enrollment = service.totp_enroll("gandalf", &ctx()).await.unwrap();
+    directory.confirm_totp_for_test("gandalf");
+    let totp = totp::totp_for_secret(&enrollment.secret_base32, "gandalf").unwrap();
+
+    let result = service.github_login(99, None, &ctx()).await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
+
+    let pending = service.issue_github_pending(99).unwrap();
+
+    // A wrong code against the pending token is refused distinctly.
+    let result = service
+        .github_login_with_pending(&pending, Some("000000"), &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::TotpInvalid);
+
+    let fresh_code = totp.generate_current().to_string();
+    let pair = service
+        .github_login_with_pending(&pending, Some(&fresh_code), &ctx())
+        .await
+        .unwrap();
+    let claims = service.verify_access_token(&pair.access_token).unwrap();
+    assert_eq!(claims.sub, "gandalf");
+    assert_eq!(claims.tier, 3);
+}
+
+/// A pending token signed with a different key (or for a different
+/// purpose) is refused outright -- it must not be confused with an access
+/// token or forgeable by anyone but this server.
+#[tokio::test]
+async fn github_pending_token_is_not_a_bearer_of_arbitrary_claims() {
+    let directory = FakeDirectory::new();
+    directory.add_staff("gandalf", "unused-password", 1);
+    directory.link_github(99, "gandalf");
+    let service = test_service(directory);
+
+    // A different (attacker-controlled) state-token key, not the
+    // server's -- `AuthService` never exposes its own `StateTokenKey`,
+    // only whether a token verifies against it (must-fix 2, PR #78 CTO
+    // review: this signing domain is now entirely separate from the
+    // EdDSA staff access-token keyset).
+    let attacker_key = StateTokenKey::generate();
+    let forged = attacker_key
+        .encode(&GithubPendingClaims {
+            github_id: 99,
+            purpose: GITHUB_PENDING_PURPOSE.to_string(),
+            iat: OffsetDateTime::now_utc().unix_timestamp(),
+            exp: OffsetDateTime::now_utc().unix_timestamp() + 300,
+        })
+        .unwrap();
+    let result = service
+        .github_login_with_pending(&forged, None, &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidPendingToken);
+
+    // A real access token, replayed as if it were a pending token, is also
+    // refused -- `AccessClaims` has no `purpose` field, so deserialization
+    // itself fails before the purpose check ever runs.
+    let pair = service
+        .login("gandalf", "unused-password", None, &ctx())
+        .await
+        .unwrap();
+    let result = service
+        .github_login_with_pending(&pair.access_token, None, &ctx())
+        .await;
+    assert_eq!(result.unwrap_err(), AuthError::InvalidPendingToken);
 }
 
 /// The fake GitHub provider (used by the HTTP-layer test, exercised here
@@ -725,8 +964,16 @@ async fn github_login_for_a_linked_user_succeeds_and_reads_tier_from_the_directo
 #[tokio::test]
 async fn fake_github_provider_refuses_an_unknown_code() {
     let provider = FakeGithubProvider::new().with_code("good-code", 7);
-    assert!(provider.exchange_code("bad-code").await.is_err());
-    let user = provider.exchange_code("good-code").await.unwrap();
+    assert!(
+        provider
+            .exchange_code("bad-code", "verifier")
+            .await
+            .is_err()
+    );
+    let user = provider
+        .exchange_code("good-code", "verifier")
+        .await
+        .unwrap();
     assert_eq!(user.id, 7);
 }
 
@@ -1191,7 +1438,7 @@ async fn github_login_for_t3_without_totp_is_refused() {
     directory.link_github(99, "elrond");
     let service = test_service(directory);
 
-    let result = service.github_login(99, None).await;
+    let result = service.github_login(99, None, &ctx()).await;
     assert_eq!(result.unwrap_err(), AuthError::TotpRequired);
 }
 
@@ -1209,7 +1456,7 @@ async fn github_login_for_t3_with_totp_succeeds() {
     let totp = totp::totp_for_secret(&enrollment.secret_base32, "elrond").unwrap();
 
     let code = totp.generate_current().to_string();
-    let pair = service.github_login(99, Some(&code)).await.unwrap();
+    let pair = service.github_login(99, Some(&code), &ctx()).await.unwrap();
     let claims = service.verify_access_token(&pair.access_token).unwrap();
     assert_eq!(claims.tier, 3);
 }

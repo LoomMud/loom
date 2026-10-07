@@ -55,6 +55,37 @@ pub struct AccessClaims {
     pub mfa_at: Option<i64>,
 }
 
+/// Claims for a short-lived, single-purpose token identifying a GitHub
+/// numeric user id that OAuth already resolved but which still needs a
+/// TOTP code to finish signing in (OBI-201, M-AUTH-7: "GitHub counts as
+/// the password factor only"). Carries `github_id`, not a staff uid --
+/// [`crate::auth::AuthService::github_login`] re-resolves the link fresh
+/// when this is redeemed, the same as the original OAuth callback would
+/// have, rather than trusting a uid baked into an earlier token (a link
+/// could be revoked in between). Deliberately **not** [`AccessClaims`]
+/// with placeholder tier/scopes -- a field-shape collision would let a
+/// pending token decode as (or be confused with) a real access token.
+/// `purpose` is checked on decode as a second guard even though the field
+/// shapes already differ (`AccessClaims` has no `purpose`, this has no
+/// `tier`/`scopes`, so cross-decoding fails on missing fields regardless).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubPendingClaims {
+    pub github_id: i64,
+    pub purpose: String,
+    pub iat: i64,
+    pub exp: i64,
+}
+
+/// The only valid [`GithubPendingClaims::purpose`] value. Checked on
+/// decode, not just set on encode.
+pub const GITHUB_PENDING_PURPOSE: &str = "github_totp_pending";
+
+impl super::statetoken::HasExpiry for GithubPendingClaims {
+    fn expires_at(&self) -> i64 {
+        self.exp
+    }
+}
+
 /// Derive the scope set an access token gets for `tier` (design §9).
 /// Deliberately additive/cumulative -- a higher tier keeps every scope of
 /// every tier below it -- and deliberately conservative: this is a first

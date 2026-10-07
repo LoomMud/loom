@@ -10,13 +10,16 @@
 //!
 //! [`StaffDirectory::auth_status_for`] is the *only* source of truth for a
 //! staff uid's tier. [`AuthService::issue_tokens`] -- the single place
-//! shared by the password, refresh, and GitHub login paths -- is always
-//! fed a status read fresh just beforehand: an access token's
-//! `tier`/`scopes` claims are a snapshot taken at issue time, never a
-//! value the client (or an upstream IdP) can set, and a promotion or
-//! demotion always takes effect at the access token's next refresh,
-//! which can be forced by revoking the caller's refresh tokens (see
-//! [`StaffDirectory::refresh_token_revoke_all`]). A uid with *no* `staff`
+//! shared by the password and GitHub login paths (a refresh goes through
+//! [`AuthService::refresh`]/[`AuthService::mint_access_token`] instead,
+//! since it must carry an existing session family forward rather than
+//! minting a fresh one) -- is always fed a status read fresh just
+//! beforehand: an access token's `tier`/`scopes` claims are a snapshot
+//! taken at issue time, never a value the client (or an upstream IdP) can
+//! set, and a promotion or demotion always takes effect at the access
+//! token's next refresh, which can be forced by revoking the caller's
+//! sessions (see OBI-198's `staff_sessions` revoke triggers, or
+//! [`AuthService::logout`] for a single family). A uid with *no* `staff`
 //! row at all (e.g. removed staff) is refused outright rather than minting
 //! a tier-0 token (OBI-195 review fix 5).
 //!
@@ -40,12 +43,13 @@
 //!
 //! [`AuthService::refresh`] enforces the *same* mandatory-TOTP floor, but
 //! against state rather than a fresh code (OBI-197/OBI-198 follow-up to
-//! OBI-195 review fix 2): a cookie-only refresh cannot carry a TOTP code,
-//! and step-up freshness is `mfa_at`'s job (M-ADM-2), not every refresh's.
-//! A refresh for a T3+ uid is refused if there is no staff row, if TOTP
-//! isn't confirmed, or if the token family's `amr` (fixed at login, never
-//! recomputed by a refresh -- see [`Self::issue_tokens`]) doesn't contain
-//! `"otp"`; any of those refusals revokes the whole family.
+//! OBI-195 review fix 2): the refresh token travels only as an HttpOnly
+//! cookie (OBI-198), which cannot carry a TOTP code, and step-up freshness
+//! is `mfa_at`'s job (M-ADM-2), not every refresh's. A refresh for a T3+
+//! uid is refused if there is no staff row, if TOTP isn't confirmed, or if
+//! the token family's `amr` (fixed at login, never recomputed by a
+//! refresh -- see [`Self::issue_tokens`]) doesn't contain `"otp"`; any of
+//! those refusals revokes the whole family.
 //!
 //! ## GitHub login never creates staff
 //!
@@ -69,20 +73,32 @@
 //! `docs/threat-model-phase2.md` §6.1 (M-AUTH-1, M-AUTH-2, M-AUTH-9).
 
 mod claims;
+mod cookie;
 mod directory;
 mod github;
 pub mod jwt;
 pub mod ratelimit;
+mod statetoken;
 mod totp;
 
-pub use claims::{AccessClaims, scopes_for_tier};
+pub use claims::{AccessClaims, GITHUB_PENDING_PURPOSE, GithubPendingClaims, scopes_for_tier};
+pub use cookie::{
+    REFRESH_COOKIE_NAME, STAFF_AUTH_HEADER, clear_cookie_header, refresh_token_from_cookies,
+    set_cookie_header, set_cookie_name, staff_csrf_guard_passes,
+};
 pub use directory::{
     AdminAuditEntry, AdminDirectoryError, AuditEvent, DirectoryError, RefreshRecord,
-    RefreshRotation, StaffAuthRecord, StaffAuthStatus, StaffDirectory,
+    SessionRotateOutcome, StaffAuthRecord, StaffAuthStatus, StaffDirectory,
 };
-pub use github::{GithubAuthError, GithubIdentityProvider, GithubUser};
+pub use github::{
+    GithubAuthError, GithubIdentityProvider, GithubLoginConfig, GithubOAuthConfig, GithubUser,
+    LiveGithubProvider, OAUTH_STATE_PURPOSE, OAuthStateClaims, PkcePair, generate_pkce,
+    generate_state,
+};
 pub use jwt::{AUDIENCE, JwtKeys, TokenPair};
 pub use ratelimit::{RateLimitDecision, RateLimiter};
+#[cfg(test)]
+pub use statetoken::StateTokenKey;
 pub use totp::{
     TotpEnrollment, generate_totp_secret, totp_for_secret, totp_step_for_code, verify_totp_code,
 };
@@ -117,11 +133,25 @@ impl AuthContext {
 /// Access tokens are short-lived: a promotion/demotion or a TOTP
 /// requirement change is at most this stale before a refresh picks it up.
 pub const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(10 * 60);
-/// Refresh tokens are long-lived but revocable and rotated on every use.
+/// Sessions are long-lived but revocable and rotated on every refresh.
+/// Design §9/D-TM2: 14 days absolute.
 pub const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+/// A session not used (rotated) for this long is treated as expired even
+/// if its absolute `expires_at` has not passed yet (OBI-198, M-AUTH-5:
+/// "24h idle").
+pub const IDLE_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Tiers at or above this one must have a confirmed TOTP secret to obtain a
 /// session (design §9/D-P2.5: "mandatory for T3+").
 pub const MANDATORY_TOTP_TIER: i16 = 3;
+/// A GitHub-login-pending-TOTP token (OBI-201) is a narrow, single-use
+/// credential: it only ever proves "GitHub's authorization-code exchange
+/// already resolved to this numeric github_id", not "this uid is signed
+/// in". Kept short so a leaked one is cheap to wait out.
+pub const GITHUB_PENDING_TTL: Duration = Duration::from_secs(5 * 60);
+/// How long a GitHub OAuth `state`/PKCE-verifier cookie is good for
+/// (OBI-201, M-AUTH-7) -- long enough for a human to authorize on GitHub,
+/// short enough that a captured cookie isn't useful for long.
+pub const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
@@ -156,6 +186,13 @@ pub enum AuthError {
     /// throttle is not account-specific and doesn't leak anything about
     /// a particular username.
     RateLimited,
+    /// The GitHub-login-pending-TOTP token is unknown, expired, malformed,
+    /// or was issued for a different purpose (OBI-201).
+    InvalidPendingToken,
+    /// The OAuth `state` cookie is missing, expired, malformed, signed for
+    /// a different purpose, or doesn't match the `state` GitHub echoed
+    /// back (OBI-201, M-AUTH-7).
+    InvalidOAuthState,
 }
 
 impl std::fmt::Display for AuthError {
@@ -168,6 +205,8 @@ impl std::fmt::Display for AuthError {
             AuthError::InvalidRefreshToken => "invalid refresh token",
             AuthError::DirectoryUnavailable => "directory unavailable",
             AuthError::RateLimited => "rate limited",
+            AuthError::InvalidPendingToken => "invalid pending token",
+            AuthError::InvalidOAuthState => "invalid oauth state",
         };
         f.write_str(s)
     }
@@ -287,7 +326,14 @@ pub struct AuthService {
     keys: JwtKeys,
     access_ttl: Duration,
     refresh_ttl: Duration,
+    idle_ttl: Duration,
     rate_limiter: Arc<RateLimiter>,
+    /// Signs/verifies the GitHub OAuth state cookie and the pending-TOTP
+    /// cookie (OBI-201) -- a signing domain entirely separate from
+    /// `keys` (must-fix 2, PR #78 CTO review): see `statetoken`'s module
+    /// doc for why. Generated fresh per process; never the same key
+    /// across a restart.
+    state_key: statetoken::StateTokenKey,
 }
 
 impl AuthService {
@@ -297,7 +343,9 @@ impl AuthService {
             keys,
             access_ttl: ACCESS_TOKEN_TTL,
             refresh_ttl: REFRESH_TOKEN_TTL,
+            idle_ttl: IDLE_SESSION_TTL,
             rate_limiter: Arc::new(RateLimiter::new()),
+            state_key: statetoken::StateTokenKey::generate(),
         }
     }
 
@@ -307,6 +355,14 @@ impl AuthService {
     pub fn with_ttls(mut self, access_ttl: Duration, refresh_ttl: Duration) -> Self {
         self.access_ttl = access_ttl;
         self.refresh_ttl = refresh_ttl;
+        self
+    }
+
+    /// Shrink the idle-session TTL for a deterministic test (OBI-198,
+    /// M-AUTH-5: "24h idle" is too long to sleep through in a unit test).
+    #[cfg(test)]
+    pub fn with_idle_ttl(mut self, idle_ttl: Duration) -> Self {
+        self.idle_ttl = idle_ttl;
         self
     }
 
@@ -482,9 +538,9 @@ impl AuthService {
         Ok(pair)
     }
 
-    /// GitHub login (design §9): `github_id` is the numeric id the caller
-    /// already obtained by exchanging an OAuth code and calling GitHub's
-    /// `/user` endpoint (see [`GithubIdentityProvider`]) -- this function
+    /// GitHub login (design §9, M-AUTH-7): `github_id` is the numeric id
+    /// the caller already obtained from the real OAuth2 + PKCE exchange
+    /// (see [`GithubIdentityProvider`]/`crate::handlers`) -- this function
     /// never talks to GitHub itself, it only resolves the link. An
     /// unlinked id is always refused; this never creates a staff row.
     ///
@@ -494,18 +550,82 @@ impl AuthService {
     /// for the *link*, not for a second factor on *this* login -- a GitHub
     /// account takeover must not bypass the mandatory-TOTP floor just
     /// because an arch linked it once.
+    ///
+    /// Shares the password path's rate limiter and audit trail (OBI-206:
+    /// GitHub login previously bypassed both, so a compromised GitHub
+    /// account -- or a stolen/forged authorization code -- could brute
+    /// force TOTP codes through repeated callbacks with no lockout and no
+    /// record). The limiter key is `github:{github_id}` rather than a
+    /// uid: the id is known before the link is resolved, so a flood of
+    /// bogus/unlinked ids is throttled too, not just guesses against a
+    /// linked account.
     pub async fn github_login(
         &self,
         github_id: i64,
         totp_code: Option<&str>,
+        ctx: &AuthContext,
     ) -> Result<TokenPair, AuthError> {
-        let uid = self
-            .directory
-            .github_lookup(github_id)
-            .await?
-            .ok_or(AuthError::InvalidCredentials)?;
-        let status = self.require_staff_status(&uid).await?;
-        let totp_verified = self
+        let rate_limit_key = format!("github:{github_id}");
+        match self.rate_limiter.check(&rate_limit_key, ctx.ip) {
+            RateLimitDecision::IpThrottled => {
+                self.audit(
+                    "auth.login.fail",
+                    None,
+                    ctx,
+                    "deny",
+                    Some("ip_rate_limited".to_string()),
+                )
+                .await;
+                return Err(AuthError::RateLimited);
+            }
+            RateLimitDecision::AccountLocked => {
+                self.audit(
+                    "auth.login.fail",
+                    None,
+                    ctx,
+                    "deny",
+                    Some("account_locked".to_string()),
+                )
+                .await;
+                return Err(AuthError::InvalidCredentials);
+            }
+            RateLimitDecision::Allowed => {}
+        }
+
+        let uid = match self.directory.github_lookup(github_id).await {
+            Ok(Some(uid)) => uid,
+            Ok(None) => {
+                self.rate_limiter.record_failure(&rate_limit_key);
+                self.audit(
+                    "auth.login.fail",
+                    None,
+                    ctx,
+                    "deny",
+                    Some("github_unlinked".to_string()),
+                )
+                .await;
+                return Err(AuthError::InvalidCredentials);
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        let status = match self.require_staff_status(&uid).await {
+            Ok(status) => status,
+            Err(err) => {
+                self.rate_limiter.release(&rate_limit_key);
+                self.audit(
+                    "auth.login.fail",
+                    Some(uid.clone()),
+                    ctx,
+                    "deny",
+                    Some(totp_gate_detail(&err).to_string()),
+                )
+                .await;
+                return Err(err);
+            }
+        };
+
+        let totp_verified = match self
             .enforce_totp_gate_with_code(
                 &uid,
                 status.tier,
@@ -513,88 +633,191 @@ impl AuthService {
                 status.totp_confirmed,
                 totp_code,
             )
-            .await?;
+            .await
+        {
+            Ok(verified) => verified,
+            Err(err) => {
+                if err == AuthError::TotpInvalid {
+                    self.rate_limiter.record_failure(&rate_limit_key);
+                } else {
+                    self.rate_limiter.release(&rate_limit_key);
+                }
+                self.audit(
+                    "auth.login.fail",
+                    Some(uid.clone()),
+                    ctx,
+                    "deny",
+                    Some(totp_gate_detail(&err).to_string()),
+                )
+                .await;
+                return Err(err);
+            }
+        };
         let (amr, mfa_at) = if totp_verified {
             (vec!["github".to_string(), "otp".to_string()], Some(now()))
         } else {
             (vec!["github".to_string()], None)
         };
-        self.issue_tokens(&uid, status.tier, generate_sid(), amr, mfa_at)
-            .await
+
+        self.rate_limiter.record_success(&rate_limit_key);
+        let pair = self
+            .issue_tokens(&uid, status.tier, generate_sid(), amr, mfa_at)
+            .await?;
+        self.audit("auth.login.ok", Some(uid.clone()), ctx, "allow", None)
+            .await;
+        Ok(pair)
     }
 
-    /// Rotate a refresh token: the presented token must be unexpired and
-    /// unrevoked, else [`AuthError::InvalidRefreshToken`]. On success the
-    /// old token is revoked and a new (access, refresh) pair is issued in
-    /// the *same session family* -- `sid`/`amr`/`mfa_at` are carried
-    /// forward unchanged from the row the presented token rotated out of
-    /// (OBI-203: `sid` stays the token-family id M-AUTH-5 reuse detection
-    /// and family revocation are keyed off, and `amr`/`mfa_at` still
-    /// describe the *original* login's authentication context, so the
-    /// M-ADM-2 step-up freshness window is measured from the real
-    /// authentication event, never reset by a later refresh) -- while
-    /// `tier`/`scopes` are read fresh from Postgres, never carried over
-    /// from whatever the old access token claimed.
+    /// Mint a short-lived, single-purpose token asserting "GitHub's
+    /// authorization-code exchange already resolved to this numeric
+    /// `github_id`" (OBI-201), for `crate::handlers::github_callback` to
+    /// carry in the pending-TOTP cookie when [`Self::github_login`]
+    /// refuses with [`AuthError::TotpRequired`]: the authorization code is
+    /// single-use and already spent by that point, so the client can't
+    /// just redo the OAuth dance with a `totp_code` attached -- it
+    /// redeems this token instead, via [`Self::github_login_with_pending`].
+    /// Signed with [`Self::state_key`] (`statetoken::StateTokenKey`), not
+    /// the staff access-token keyset (must-fix 2, PR #78 CTO review).
+    pub fn issue_github_pending(&self, github_id: i64) -> Result<String, AuthError> {
+        let issued_at = now();
+        let claims = GithubPendingClaims {
+            github_id,
+            purpose: GITHUB_PENDING_PURPOSE.to_string(),
+            iat: issued_at.unix_timestamp(),
+            exp: (issued_at + GITHUB_PENDING_TTL).unix_timestamp(),
+        };
+        self.state_key
+            .encode(&claims)
+            .map_err(|_| AuthError::DirectoryUnavailable)
+    }
+
+    /// Redeem a [`Self::issue_github_pending`] token plus a TOTP code,
+    /// completing a GitHub login that stopped at the TOTP gate. Resolves
+    /// the link fresh (same as [`Self::github_login`] would), rather than
+    /// trusting a uid baked into the pending token, so a link revoked in
+    /// the interim is honoured.
+    pub async fn github_login_with_pending(
+        &self,
+        pending_token: &str,
+        totp_code: Option<&str>,
+        ctx: &AuthContext,
+    ) -> Result<TokenPair, AuthError> {
+        let claims: GithubPendingClaims = self
+            .state_key
+            .decode(pending_token)
+            .map_err(|_| AuthError::InvalidPendingToken)?;
+        if claims.purpose != GITHUB_PENDING_PURPOSE {
+            return Err(AuthError::InvalidPendingToken);
+        }
+        self.github_login(claims.github_id, totp_code, ctx).await
+    }
+
+    /// Sign an [`OAuthStateClaims`] bundle for the `__Host-` state cookie
+    /// (OBI-201, M-AUTH-7). Used by `crate::handlers::github_start`.
+    pub fn sign_oauth_state(&self, claims: &OAuthStateClaims) -> Result<String, AuthError> {
+        self.state_key
+            .encode(claims)
+            .map_err(|_| AuthError::DirectoryUnavailable)
+    }
+
+    /// Verify and decode the `__Host-` state cookie (OBI-201, M-AUTH-7).
+    /// Refuses an expired cookie, a bad signature, or one signed for a
+    /// different purpose -- used by `crate::handlers::github_callback`
+    /// before it trusts anything in the cookie (the PKCE verifier
+    /// especially).
+    pub fn verify_oauth_state(&self, cookie_value: &str) -> Result<OAuthStateClaims, AuthError> {
+        let claims: OAuthStateClaims = self
+            .state_key
+            .decode(cookie_value)
+            .map_err(|_| AuthError::InvalidOAuthState)?;
+        if claims.purpose != OAUTH_STATE_PURPOSE {
+            return Err(AuthError::InvalidOAuthState);
+        }
+        Ok(claims)
+    }
+
+    /// Rotate a session: the presented refresh token must be unexpired
+    /// (both absolute, 14 days from login, and idle, 24h since last
+    /// rotation) and unrevoked, else [`AuthError::InvalidRefreshToken`].
+    /// On success the old token is revoked and a new (access, refresh)
+    /// pair is issued in the *same session family* -- atomically, via
+    /// [`loom_persist::Persist::session_rotate`] (OBI-198 re-review,
+    /// must-fix 1/2; supersedes the OBI-195 `refresh_token_rotate`
+    /// design, OBI-216) -- with `tier`/`scopes` read fresh from Postgres
+    /// (never carried over from whatever the old access token claimed)
+    /// and `sid`/`amr`/`mfa_at` carried forward unchanged from the
+    /// consumed row, same as `expires_at` (must-fix 1: the absolute cap
+    /// is fixed at login, never extended by a later rotation).
     ///
     /// The mandatory-TOTP floor is enforced here too (OBI-195 review fix
     /// 2), but against *state*, not a fresh code (OBI-197/OBI-198
-    /// follow-up): a cookie-only refresh has nowhere to carry a TOTP code,
-    /// and the family's `amr` already records whether its login completed
-    /// one. A refresh for a tier at or above [`MANDATORY_TOTP_TIER`] is
-    /// refused -- revoking the whole family -- if there is no staff row,
-    /// if TOTP isn't confirmed, or if `amr` doesn't contain `"otp"` (e.g.
-    /// a T2 login later promoted to T3, which never had the chance to
-    /// prove TOTP in the first place).
+    /// follow-up): the refresh token travels only as a cookie (OBI-198),
+    /// which has nowhere to carry a TOTP code, and the family's `amr`
+    /// already records whether its login completed one. A refresh for a
+    /// tier at or above [`MANDATORY_TOTP_TIER`] is refused -- revoking
+    /// the whole family -- if there is no staff row, if TOTP isn't
+    /// confirmed, or if `amr` doesn't contain `"otp"` (e.g. a T2 login
+    /// later promoted to T3, which never had the chance to prove TOTP in
+    /// the first place).
     ///
-    /// The rotation itself is a single atomic `UPDATE ... RETURNING` (see
-    /// [`RefreshRotation`], OBI-195 review fix 1): two concurrent
-    /// presentations of the same bearer token can never both see "not yet
-    /// revoked" and both succeed. A `Reused` outcome -- replay of a
-    /// rotated-out or logged-out token, i.e. a stolen refresh token --
-    /// revokes every other outstanding token for that uid, not just the
-    /// one presented, since by definition one of the two parties holding
-    /// it is not the legitimate session, and is audited as
-    /// `auth.refresh.reuse` (M-AUTH-9).
+    /// Presenting an *already-revoked* token (replay of a rotated-out
+    /// token, i.e. a stolen refresh token) revokes every other
+    /// outstanding token in that token's family (M-AUTH-5), since by
+    /// definition one of the two parties holding it is not the
+    /// legitimate session. That replay is audited as `auth.refresh.reuse`
+    /// (M-AUTH-9).
     pub async fn refresh(
         &self,
         refresh_token: &str,
         ctx: &AuthContext,
     ) -> Result<TokenPair, AuthError> {
-        let token_hash = hash_token(refresh_token);
-        match self.directory.refresh_token_rotate(&token_hash).await? {
-            RefreshRotation::Rotated {
+        let old_hash = hash_token(refresh_token);
+        let new_refresh_token = generate_refresh_token();
+        let new_hash = hash_token(&new_refresh_token);
+        let idle_cutoff = now() - self.idle_ttl;
+
+        match self
+            .directory
+            .session_rotate(&old_hash, &new_hash, idle_cutoff)
+            .await?
+        {
+            SessionRotateOutcome::Rotated {
                 staff_uid,
                 sid,
                 amr,
                 mfa_at,
+                expires_at,
             } => {
-                let status = match self.require_staff_status(&staff_uid).await {
-                    Ok(status) => status,
-                    Err(err) => return Err(err),
-                };
+                let status = self.require_staff_status(&staff_uid).await?;
                 if let Err(err) = self.enforce_totp_gate_for_refresh(status.tier, &amr) {
                     self.directory.refresh_token_revoke_all(&staff_uid).await?;
                     return Err(err);
                 }
-                self.issue_tokens(&staff_uid, status.tier, sid, amr, mfa_at)
-                    .await
+                let (access_token, access_expires_at) =
+                    self.mint_access_token(&staff_uid, status.tier, &sid, &amr, mfa_at)?;
+                Ok(TokenPair {
+                    access_token,
+                    refresh_token: new_refresh_token,
+                    access_expires_at,
+                    refresh_expires_at: expires_at,
+                })
             }
-            RefreshRotation::Reused { staff_uid } => {
-                self.directory.refresh_token_revoke_all(&staff_uid).await?;
+            SessionRotateOutcome::Reused { staff_uid } => {
                 self.audit("auth.refresh.reuse", Some(staff_uid), ctx, "deny", None)
                     .await;
                 Err(AuthError::InvalidRefreshToken)
             }
-            RefreshRotation::Expired | RefreshRotation::NotFound => {
-                Err(AuthError::InvalidRefreshToken)
-            }
+            SessionRotateOutcome::Invalid => Err(AuthError::InvalidRefreshToken),
         }
     }
 
-    /// Revoke a single refresh token (logout).
+    /// Revoke the whole session family the presented refresh token
+    /// belongs to (logout, M-AUTH-5: "logout revokes the family").
     pub async fn logout(&self, refresh_token: &str) -> Result<(), AuthError> {
         let token_hash = hash_token(refresh_token);
-        self.directory.refresh_token_revoke(&token_hash).await?;
+        self.directory
+            .session_revoke_family_by_token(&token_hash)
+            .await?;
         Ok(())
     }
 
@@ -725,13 +948,14 @@ impl AuthService {
 
     /// Issue a fresh (access, refresh) pair for `uid` at `tier` (read
     /// fresh from Postgres by the caller just beforehand -- see
-    /// [`Self::require_staff_status`]). Shared by the password, GitHub,
-    /// and refresh paths so there is exactly one place that turns a tier
-    /// into scopes and mints tokens. `sid` is the token-family id (fresh
-    /// at login via [`generate_sid`]; carried forward unchanged on
-    /// refresh -- see [`Self::refresh`]), and `amr`/`mfa_at` describe
-    /// *the family's original* authentication context (D-TM3: identity,
-    /// never authority).
+    /// [`Self::require_staff_status`]). Shared by the password and GitHub
+    /// login paths (a refresh goes through [`Self::refresh`]/
+    /// [`Self::mint_access_token`] instead, since it must carry an
+    /// existing family's `sid`/`amr`/`mfa_at`/`expires_at` forward rather
+    /// than minting a fresh family here). `sid` is the token-family id
+    /// (fresh via [`generate_sid`]), and `amr`/`mfa_at` describe *this
+    /// login's* authentication context (D-TM3: identity, never
+    /// authority).
     async fn issue_tokens(
         &self,
         uid: &str,
@@ -740,29 +964,11 @@ impl AuthService {
         amr: Vec<String>,
         mfa_at: Option<OffsetDateTime>,
     ) -> Result<TokenPair, AuthError> {
-        let scopes = scopes_for_tier(tier);
-        let issued_at = now();
-        let access_expires_at = issued_at + self.access_ttl;
-        let claims = AccessClaims {
-            sub: uid.to_string(),
-            tier,
-            scopes,
-            iss: self.keys.issuer().to_string(),
-            aud: self.keys.audience().to_string(),
-            iat: issued_at.unix_timestamp(),
-            nbf: issued_at.unix_timestamp(),
-            exp: access_expires_at.unix_timestamp(),
-            sid: sid.clone(),
-            amr: amr.clone(),
-            mfa_at: mfa_at.map(|t| t.unix_timestamp()),
-        };
-        let access_token = self
-            .keys
-            .encode(&claims)
-            .map_err(|_| AuthError::DirectoryUnavailable)?;
+        let (access_token, access_expires_at) =
+            self.mint_access_token(uid, tier, &sid, &amr, mfa_at)?;
 
         let refresh_token = generate_refresh_token();
-        let refresh_expires_at = issued_at + self.refresh_ttl;
+        let refresh_expires_at = now() + self.refresh_ttl;
         self.directory
             .refresh_token_insert(
                 uid,
@@ -780,6 +986,42 @@ impl AuthService {
             access_expires_at,
             refresh_expires_at,
         })
+    }
+
+    /// Sign a fresh access token for `uid`/`tier`, carrying `sid`/`amr`/
+    /// `mfa_at` -- the one place [`Self::issue_tokens`] (fresh login) and
+    /// [`Self::refresh`] (rotation) both go through to turn a tier into
+    /// scopes and mint an access JWT, so claim construction never drifts
+    /// between the two paths.
+    fn mint_access_token(
+        &self,
+        uid: &str,
+        tier: i16,
+        sid: &str,
+        amr: &[String],
+        mfa_at: Option<OffsetDateTime>,
+    ) -> Result<(String, OffsetDateTime), AuthError> {
+        let scopes = scopes_for_tier(tier);
+        let issued_at = now();
+        let access_expires_at = issued_at + self.access_ttl;
+        let claims = AccessClaims {
+            sub: uid.to_string(),
+            tier,
+            scopes,
+            iss: self.keys.issuer().to_string(),
+            aud: self.keys.audience().to_string(),
+            iat: issued_at.unix_timestamp(),
+            nbf: issued_at.unix_timestamp(),
+            exp: access_expires_at.unix_timestamp(),
+            sid: sid.to_string(),
+            amr: amr.to_vec(),
+            mfa_at: mfa_at.map(|t| t.unix_timestamp()),
+        };
+        let access_token = self
+            .keys
+            .encode(&claims)
+            .map_err(|_| AuthError::DirectoryUnavailable)?;
+        Ok((access_token, access_expires_at))
     }
 
     /// The mandatory-TOTP gate for [`Self::login`]/[`Self::github_login`]
@@ -1348,4 +1590,4 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

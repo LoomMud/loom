@@ -973,7 +973,7 @@ mod tests {
 
         use super::*;
         use crate::auth::{
-            AccessClaims, AuditEvent, DirectoryError, JwtKeys, RefreshRecord, RefreshRotation,
+            AccessClaims, AuditEvent, DirectoryError, JwtKeys, RefreshRecord, SessionRotateOutcome,
             StaffAuthRecord, StaffAuthStatus, StaffDirectory,
         };
         use crate::{HttpState, app};
@@ -1038,10 +1038,18 @@ mod tests {
             ) -> Result<Option<RefreshRecord>, DirectoryError> {
                 unimplemented!("not exercised by these tests")
             }
-            async fn refresh_token_rotate(
+            async fn session_revoke_family_by_token(
                 &self,
                 _token_hash: &str,
-            ) -> Result<RefreshRotation, DirectoryError> {
+            ) -> Result<(), DirectoryError> {
+                unimplemented!("not exercised by these tests")
+            }
+            async fn session_rotate(
+                &self,
+                _old_token_hash: &str,
+                _new_token_hash: &str,
+                _idle_cutoff: time::OffsetDateTime,
+            ) -> Result<SessionRotateOutcome, DirectoryError> {
                 unimplemented!("not exercised by these tests")
             }
             async fn refresh_token_revoke(&self, _token_hash: &str) -> Result<(), DirectoryError> {
