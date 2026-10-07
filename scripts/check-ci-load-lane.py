@@ -28,7 +28,11 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      skipped or downgraded: no `needs`, no `if`, no `continue-on-error`, and
      `loadtest-e1-1` still runs `loom-loadtest` with `--players 150` and
      `--fail-on-sla-miss`, with enough `timeout-minutes` that host load can
-     only make the measurement slow, never get the job cancelled.
+     only make the measurement slow, never get the job cancelled;
+  5. the three load gates, and only they, pick their runner through
+     `vars.CI_LOAD_RUNS_ON` with the shared runner as the fallback (OBI-311),
+     so a dedicated load scale set can be switched on and off with one
+     variable and an unset variable changes nothing.
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -68,6 +72,15 @@ SLA_FLAGS = ["--players 150", "--fail-on-sla-miss"]
 # like a miss while saying nothing at all about p99. Lane jobs now queue behind
 # every other heavy job repo-wide, so these are queue-and-run budgets.
 MIN_TIMEOUT = {"loadtest-e1-1": 30, "loadtest-smoke": 20}
+# Runner selection (OBI-311). Fork PRs stay GitHub-hosted; otherwise the
+# load variable, then exactly the shared expression. Never a bare label: a
+# required check pinned to a scale set that is down or absent queues forever.
+SHARED_RUNS_ON = ("vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && "
+                  "fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud'")
+LOAD_RUNS_ON = ("${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || "
+                "vars.CI_LOAD_RUNS_ON && (startsWith(vars.CI_LOAD_RUNS_ON, '[') && "
+                "fromJSON(vars.CI_LOAD_RUNS_ON) || vars.CI_LOAD_RUNS_ON) || "
+                + SHARED_RUNS_ON + " }}")
 DEFAULT = ".github/workflows/ci.yml"
 
 
@@ -185,6 +198,15 @@ def check_text(text):
                 errors.append(f"`{job}` timeout-minutes is {raw!r}, expected >= {want}: "
                               "a host under load must end the gate with a measured "
                               "p99, not a cancellation")
+
+    for job, block in jobs.items():
+        got = scalar(block, "runs-on")
+        if job in LANE_GATES and got != LOAD_RUNS_ON:
+            errors.append(f"`{job}` runs-on must be the CI_LOAD_RUNS_ON expression "
+                          f"with the shared-runner fallback (OBI-311), got {got!r}")
+        if job not in LANE_GATES and got is not None and "CI_LOAD_RUNS_ON" in got:
+            errors.append(f"`{job}` must not use CI_LOAD_RUNS_ON: the load runner is "
+                          "for the latency gates only")
 
     for job, dep in LANE_CHAIN.items():
         if job in jobs:
@@ -304,6 +326,15 @@ MUTANTS = [
                                     "      queue: max\n"
                                     "    runs-on: ubuntu-latest\n"
                                     "    steps:\n      - run: echo hi\n", 1)),
+    ("gate pinned to a bare load label",
+     lambda t: _sub(t, "vars.CI_LOAD_RUNS_ON",
+                    "    runs-on: arc-runner-set-loommud-load\n")),
+    ("gate back on the shared expression only",
+     lambda t: _sub(t, "vars.CI_LOAD_RUNS_ON",
+                    "    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || "
+                    + SHARED_RUNS_ON + " }}\n", nth=2)),
+    ("unrelated job takes the load runner",
+     lambda t: t.replace("  deny:\n", "  deny:\n    runs-on: " + LOAD_RUNS_ON + "\n", 1)),
     ("required check renamed away", lambda t: t.replace("  deny:\n", "  deny-optional:\n", 1)),
 ]
 
