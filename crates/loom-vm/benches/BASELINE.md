@@ -95,7 +95,10 @@ A/B against the PR's base commit, not this file.
 Job `bench` in `.github/workflows/ci.yml` runs on pull requests and calls
 `scripts/bench-gate.sh <PR base sha>`. It is **not a required check** until a
 release cadence exists to re-baseline against; treat a red `bench` job as a
-signal to look, not an automatic block.
+signal to look, not an automatic block. Read the verdict label before acting:
+exit 1 means *this code got slower*, exit 3 means *the gate could not trust
+itself on that host* -- re-run on a quiet runner (OBI-311), do not move the
+threshold.
 
 ### Method (noise-tolerant)
 
@@ -107,27 +110,70 @@ signal to look, not an automatic block.
    and compares them. The stored baseline is therefore a *commit* (the PR
    base); the table above is the human-readable record, kept in sync by hand
    when a PR intentionally moves these numbers.
-2. **Interleaved rounds.** `BENCH_ROUNDS` (default 3) rounds of the full
-   binary, alternating A-B, B-A, … so slow drift in the runner (thermal,
-   neighbours) hits both sides equally. Each round uses `BENCH_ITERS` (default
-   15) samples internally, same as the binary's own median/p95/min.
-3. **Min of medians.** Per workload and side, take the binary's own median
+2. **Symmetric arms, rotated order.** Three arms run per round: `base`,
+   `head`, and `ctrl` -- a second, byte-identical *copy* of the head binary at
+   its own path and inode. Before OBI-312 there were two arms and the order
+   alternated A-B, B-A; now the order rotates through all three slots
+   (`head,ctrl,base` / `ctrl,base,head` / `base,head,ctrl`) so every arm gets
+   each slot exactly once per three rounds, and any effect of "what ran
+   immediately before" (frequency ramp, page-cache state, a neighbour's
+   burst) lands on all arms in turn instead of on one side. All three
+   binaries are staged into one directory under equal-length names
+   (`bin/a1|a2|a3/vm_bench`) and always executed from that same cwd, so
+   neither argv[0] length nor working directory can differ between arms.
+   Each round uses `BENCH_ITERS` (default 15) samples internally, same as the
+   binary's own median/p95/min.
+3. **Min of medians.** Per workload and arm, take the binary's own median
    for each round and keep the minimum across rounds. Interference on a
    shared machine only ever adds time, so the minimum is the best estimate of
    the uncontended cost, and the median within a round already discards
    outliers.
-4. **Threshold.** Fail if `head / base > 1 + BENCH_THRESHOLD` (default 0.15)
-   for any workload present on both sides. Workloads only on one side are
-   reported and skipped (new workloads start gating on the next PR).
-5. **Confirmation pass.** If the first pass fails, run a second pass of the
-   same size and recompute over all rounds; fail only if the regression
-   survives. A real regression survives; a one-off noisy round does not.
+4. **Threshold -- and the control that validates it.** Fail if
+   `head / base > 1 + BENCH_THRESHOLD` (default 0.15) for any workload present
+   on both sides. Workloads only on one side are reported and skipped (new
+   workloads start gating on the next PR). The *same* tolerance is applied to
+   `ctrl / head`: those two binaries are the same bytes, so a miss in either
+   direction means the harness cannot demonstrate that it measures 1.00, and
+   no `head / base` from that run means anything. Such a run exits 3 and is
+   labelled `INVALID harness` -- red, but never blamed on the PR. Equally, if
+   `sha256(base binary) == sha256(head binary)` the diff compiled to identical
+   code, so an out-of-band `head / base` is by definition an artifact and also
+   exits 3.
+5. **Confirmation pass.** If the first pass fails -- regression *or* control
+   miss -- run a second pass of the same size and recompute over all rounds;
+   fail only if the miss survives. A real regression survives; a one-off noisy
+   round does not.
 6. If the base commit has no `vm_bench` example (there is no such commit on
    this tree today), the gate passes with a notice.
+7. **Raw data leaves the job.** Every round's full table is kept under
+   `target/bench-gate/logs/` with `meta.env` (both binary hashes, kernel,
+   nproc, load average, cpufreq governor, cgroup CPU quota,
+   threshold/rounds/iters) and `bench-rounds.csv` (every per-workload,
+   per-round median for all three arms), which the `bench` job uploads as the
+   `bench-rounds-<run id>` artifact. A verdict that is a *minimum over N
+   rounds* has to keep the N, or the next 1.177 gets diagnosed from guesses.
 
 `scripts/bench_compare.py` parses the Markdown tables `vm_bench` itself
-prints (stdlib Python, no external deps) and writes the comparison table to
-the job summary.
+prints (stdlib Python, no external deps), writes the comparison table -- plus
+the per-round medians of anything that moved -- to the job summary, and exits
+`0` pass / `1` regression / `2` usage or missing arm / `3` invalid harness.
+`python3 scripts/bench_compare.py --self-test` checks that classifier on
+synthetic logs, and runs in `hygiene`, so the semantics cannot rot without a
+release build noticing.
+
+### The two arms do *not* differ by build path (OBI-312)
+
+The first hypothesis for PR #131's `priv_control 1.177` was that building the
+same source from `target/bench-gate/base` into `target/bench-gate/target-base`
+versus from the workspace root into `target` produced different binaries --
+longer embedded `file!()`/panic-location strings shifting hot code -- and that
+the fix was `-C remap-path-prefix`. Measured and rejected: that exact pair of
+paths yields binaries with different inodes and the **same sha256** for the
+same commit, because cargo hands rustc paths relative to each package root.
+No remapping is needed. What the gate lacked was a null control: it could not
+tell "the code got slower" from "the runner moved", and it reported the latter
+as the former. The fix is to measure the error bar, and to assert build
+identity instead of assuming either direction.
 
 ### Updating the baseline
 
