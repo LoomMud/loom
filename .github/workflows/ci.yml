@@ -233,6 +233,22 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - run: FUZZ_SECONDS=45 scripts/fuzz-smoke.sh lsp
   web-client:
+    # OBI-308 / OBI-311 PROBE (throwaway branch, not for merge). `web-client` is
+    # a ~1 minute, non-required job that normally starts within a minute of the
+    # run and overlaps `loadtest-e1-1` (control runs: 37674844425 ran its gate
+    # 19:45-19:55 while web-client ran 19:30-19:31; 37674762546 gate 19:37-19:44
+    # with web-client 19:28-19:29). It is deliberately given the *same
+    # concurrency group name* as the load gates while being a *different job id*.
+    # If GitHub scopes a job-level group across the jobs of one workflow, this
+    # job sits `pending` until the gate releases; if it scopes per job id, it
+    # starts immediately like `deny`/`dco`/`fuzz-smoke*` do, and then pulling
+    # `rust` into the lane would buy the gates nothing. `hygiene` is expected to
+    # fail on this branch: the lane guard forbids an unrelated job joining the
+    # group, which is the same invariant under test here.
+    concurrency:
+      group: loom-ci-load-lane
+      cancel-in-progress: false
+      queue: max
     # Minimal TS web client (OBI-39): build + unit tests, and an npm
     # dependency licence gate mirroring `deny.toml`'s OSI allow-list (the
     # client ships zero production dependencies today; `--production`
