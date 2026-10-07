@@ -6,7 +6,7 @@
 mod telnet;
 mod ws;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::Instant;
 
@@ -153,23 +153,91 @@ enum ConnControl {
 /// `Clone`/`PartialEq`/`Eq` (for `Host`/test ergonomics elsewhere) and a
 /// `oneshot::Sender` cannot implement any of those.
 ///
-/// Ordering (reviewed, OBI-227): `reclaim_rx` and `command_rx` are read
-/// from the same unbiased `tokio::select!` as every other event source in
-/// [`run_server_full`], so a `Send`/`Close`/`SetEcho` for a `ConnId` can
-/// still be in flight on `command_rx` when that id's reclaim request is
-/// processed -- harmless (the stale command just finds no entry once the
-/// reclaim removes it, or lands on the connection microseconds before it
-/// stops), but the driver issuing reclaim requests must not assume a
-/// command it just sent landed before the reclaim it sends next. The
-/// copyover driver's actual required order is coarser than per-command
-/// interleaving and is the caller's (not this module's) responsibility to
-/// enforce: quiesce new input to the objects being handed off, drain any
-/// commands already queued for them, reclaim every live connection (in
-/// the order `live_connections()` on the new side will expect, per
-/// [`ConnControl::Reclaim`]'s docs), and only then take the world
-/// snapshot -- reclaiming after the snapshot would hand off a connection
-/// the snapshot never recorded as still bound.
+/// Ordering (reviewed, OBI-227; enforced by `run_server_full` as of
+/// OBI-304): `reclaim_rx` and `command_rx` are read from the same unbiased
+/// `tokio::select!`, so a `Send`/`Close`/`SetEcho` for a `ConnId` can still
+/// be in flight on `command_rx` when that id's reclaim request is picked
+/// up. As of OBI-304 that no longer costs the world any output: the
+/// reclaim arm first applies every command `command_rx` has already
+/// accepted ([`drain_commands_before_reclaim`]) before it removes the
+/// connection's entry, and any command that arrives in the window between
+/// the reclaim and the matching `adopt` is buffered for the session
+/// ([`HandoffOutbox`]) and replayed, in order, onto the re-adopted
+/// connection. Neither side of that has to be quiesced first to keep its
+/// already-emitted output.
+///
+/// What this does *not* buy: it is not a general cross-channel ordering
+/// guarantee. A command enqueued after the reclaim request is delivered
+/// after the session comes back, not before it leaves -- which is the only
+/// reading that is even meaningful once the socket has moved to another
+/// process. The copyover driver's required order for a *consistent world*
+/// is still the caller's (not this module's) responsibility to enforce:
+/// quiesce new input to the objects being handed off, reclaim every live
+/// connection (in the order `live_connections()` on the new side will
+/// expect, per [`ConnControl::Reclaim`]'s docs), and only then take the
+/// world snapshot -- reclaiming after the snapshot would hand off a
+/// connection the snapshot never recorded as still bound.
 pub type ReclaimRequest = (ConnId, oneshot::Sender<Option<TcpStream>>);
+
+/// Output the world queued for a session while its socket was out of the
+/// process for a copyover round trip (OBI-304), keyed by the `ConnId` the
+/// id will come back under.
+///
+/// A `reclaim` removes the connection's `ConnEntry` immediately (so no
+/// further command is routed at it in this process) and hands the fd to
+/// the caller; a later `adopt` re-keys a *fresh* `run_connection` task
+/// under the same id. Anything the world emitted in between had no owner
+/// and used to be dropped on the floor -- design §7.5 promises a copyover
+/// loses no output, and `loom serve`'s same-process rehearsal round trip
+/// does not (and cannot) freeze the world for the duration, so a
+/// heartbeat/`call_out` reply, or the tail of an intro burst that landed
+/// after the reclaim was applied, silently vanished.
+type HandoffOutbox = HashMap<ConnId, VecDeque<ConnControl>>;
+
+/// Per-session bound on [`HandoffOutbox`] (OBI-304): a handed-off session
+/// gets buffered no more output than a live one would (`NetConfig::
+/// output_queue_depth`), which is also exactly what fits back into the
+/// adopted connection's control channel in one pass -- see the `adopt_rx`
+/// arm of [`run_server_full`]. Beyond the bound the newest command is
+/// dropped with a `warn!` + counter, i.e. the old behaviour, but loudly.
+///
+/// A no-op unless `conn` is a session this loop actually accepted a
+/// reclaim for.
+fn park_for_handoff(
+    conn: ConnId,
+    control: ConnControl,
+    handoff: &mut HandoffOutbox,
+    queue_depth: usize,
+) {
+    // Only ids with a marker (i.e. a reclaim this loop actually accepted)
+    // get an outbox: a command for a connection that never existed, or
+    // one that disconnected normally, stays the silent no-op it has
+    // always been.
+    let Some(queue) = handoff.get_mut(&conn) else {
+        return;
+    };
+    if queue.len() >= queue_depth {
+        warn!(
+            conn,
+            queue_depth,
+            "dropping output queued for a connection mid-copyover-handoff: handoff outbox full \
+             (the socket was never re-adopted, or the world outran the handoff)"
+        );
+        metrics::counter!("loom_net_handoff_outbox_dropped_total").increment(1);
+        return;
+    }
+    queue.push_back(control);
+    metrics::counter!("loom_net_handoff_outbox_parked_total").increment(1);
+}
+
+/// How many already-queued [`NetCommand`]s [`run_server_full`] applies
+/// before it goes back to the fair `select!` when a reclaim arrives
+/// (OBI-304). `COMMANDS_PER_RECLAIM_DRAIN` is a *budget*, not the
+/// guarantee: whatever exceeds it is still not lost, it just lands in the
+/// session's [`HandoffOutbox`] instead of its socket. The number exists so
+/// one flood of output for unrelated connections can't delay every other
+/// reclaim/adopt in the loop indefinitely.
+const COMMANDS_PER_RECLAIM_DRAIN: usize = 256;
 
 #[derive(Debug)]
 struct ConnEntry {
@@ -282,6 +350,7 @@ pub async fn run_server_full(
 ) -> io::Result<()> {
     let mut next_conn_id: ConnId = 1;
     let mut conns: HashMap<ConnId, ConnEntry> = HashMap::new();
+    let mut handoff: HandoffOutbox = HandoffOutbox::new();
     let (closed_tx, mut closed_rx) = mpsc::channel::<ConnId>(256);
 
     loop {
@@ -302,6 +371,24 @@ pub async fn run_server_full(
                 // the connection is, from this process's point of view,
                 // already gone to its new owner, even though the task
                 // itself is still finishing its reunite-and-reply.
+                //
+                // OBI-304: first apply whatever `command_rx` has already
+                // accepted. `command_rx` and `reclaim_rx` are two different
+                // channels read by one unbiased `select!`, so without this
+                // the loop could remove the entry while the session's own
+                // `NetCommand::Send`s were still queued behind the reclaim
+                // request -- the command arm would then find no entry and
+                // drop the world's already-emitted output (the OBI-292
+                // flake: master `logon()`'s "welcome, then room
+                // description" burst split across exactly this boundary).
+                // Ordering is guaranteed in one direction only: every
+                // command the world enqueued *before* the reclaim request
+                // it is handing off for is visible here (the caller's
+                // happens-before edge -- the world snapshot reply -- runs
+                // through the world thread that produced those commands),
+                // so this drain really does flush them to the socket before
+                // its fd leaves.
+                drain_commands_before_reclaim(&mut command_rx, &mut conns, &mut handoff, &event_tx, config.output_queue_depth).await;
                 match conns.remove(&conn) {
                     Some(entry) => {
                         // `try_send` would leave a live connection stranded
@@ -325,6 +412,11 @@ pub async fn run_server_full(
                                 let _ = reply_tx.send(None);
                             }
                         });
+                        // OBI-304: mark the id as "out of the process for a
+                        // handoff" so anything the world emits for it before
+                        // the readopt is buffered (see [`HandoffOutbox`])
+                        // instead of dropped.
+                        handoff.entry(conn).or_default();
                     }
                     None => {
                         debug!(conn, "reclaim requested for an unknown/already-gone connection");
@@ -367,6 +459,35 @@ pub async fn run_server_full(
                 // exist.
 
                 let (tx, rx) = mpsc::channel(config.output_queue_depth);
+                // OBI-304: replay whatever the world queued for this
+                // session while its fd was out, *before* the entry becomes
+                // visible to `command_rx`. Pushing into a channel no one
+                // else holds a sender for yet keeps the parked output
+                // strictly ahead of any new command for this id, and the
+                // fresh task writes the negotiation preamble before it ever
+                // polls `control_rx`, so the player sees preamble -> output
+                // they had already been "sent".
+                let mut parked = handoff.remove(&conn_id).unwrap_or_default();
+                while let Some(control) = parked.pop_front() {
+                    if let Err(mpsc::error::TrySendError::Full(control)) = tx.try_send(control) {
+                        // Cannot happen while the per-session bound in
+                        // [`park_for_handoff`] equals `output_queue_depth`,
+                        // but never lose it (and never block this loop):
+                        // hand the remainder to a task that awaits room.
+                        let mut remainder = VecDeque::with_capacity(parked.len() + 1);
+                        remainder.push_back(control);
+                        remainder.append(&mut parked);
+                        let replay_tx = tx.clone();
+                        tokio::spawn(async move {
+                            for control in remainder {
+                                if replay_tx.send(control).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                        break;
+                    }
+                }
                 let conn_event_tx = event_tx.clone();
                 let conn_closed_tx = closed_tx.clone();
                 let conn_config = config.clone();
@@ -396,79 +517,7 @@ pub async fn run_server_full(
                 conns.insert(conn_id, ConnEntry { tx, task });
             }
             Some(cmd) = command_rx.recv() => {
-                match cmd {
-                    NetCommand::Send(conn, text) => {
-                        let Some(entry) = conns.get(&conn) else {
-                            continue;
-                        };
-
-                        match entry.tx.try_send(ConnControl::Send(text)) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                warn!(conn, "disconnecting slow client: output queue full");
-                                if let Some(entry) = conns.remove(&conn) {
-                                    entry.task.abort();
-                                }
-                                let _ = event_tx.send(NetEvent::Disconnected(conn)).await;
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                conns.remove(&conn);
-                            }
-                        }
-                    }
-                    NetCommand::Close(conn) => {
-                        if let Some(entry) = conns.remove(&conn) {
-                            match entry.tx.try_send(ConnControl::Close) {
-                                Ok(()) => {}
-                                Err(_) => {
-                                    entry.task.abort();
-                                    let _ = event_tx.send(NetEvent::Disconnected(conn)).await;
-                                }
-                            }
-                        }
-                    }
-                    NetCommand::SendGmcp(conn, package_message, payload) => {
-                        let Some(entry) = conns.get(&conn) else {
-                            continue;
-                        };
-
-                        match entry
-                            .tx
-                            .try_send(ConnControl::SendGmcp(package_message, payload))
-                        {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                warn!(conn, "disconnecting slow client: output queue full");
-                                if let Some(entry) = conns.remove(&conn) {
-                                    entry.task.abort();
-                                }
-                                let _ = event_tx.send(NetEvent::Disconnected(conn)).await;
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                conns.remove(&conn);
-                            }
-                        }
-                    }
-                    NetCommand::SetEcho(conn, enabled) => {
-                        let Some(entry) = conns.get(&conn) else {
-                            continue;
-                        };
-
-                        match entry.tx.try_send(ConnControl::SetEcho(enabled)) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                warn!(conn, "disconnecting slow client: output queue full");
-                                if let Some(entry) = conns.remove(&conn) {
-                                    entry.task.abort();
-                                }
-                                let _ = event_tx.send(NetEvent::Disconnected(conn)).await;
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                conns.remove(&conn);
-                            }
-                        }
-                    }
-                }
+                apply_command(cmd, &mut conns, &mut handoff, &event_tx, config.output_queue_depth).await;
             }
             accepted = listener.accept() => {
                 let (stream, peer_addr) = accepted?;
@@ -504,8 +553,134 @@ pub async fn run_server_full(
         entry.task.abort();
         let _ = event_tx.send(NetEvent::Disconnected(conn)).await;
     }
+    if !handoff.is_empty() {
+        // OBI-304: a session whose fd left this process and never came back
+        // has buffered output with nowhere to go (a real copyover's old
+        // process exits here; the new one gets the world's own state from
+        // the snapshot). Loud, not silent.
+        warn!(
+            sessions = handoff.len(),
+            "net server shutting down with output still buffered for connections mid-copyover-handoff"
+        );
+    }
 
     Ok(())
+}
+
+/// Route one [`NetCommand`] to the live connection it is keyed by, with
+/// exactly the behaviour every arm of the old inline `command_rx` match had
+/// (send, GMCP, echo toggle, close; slow-client disconnect when a
+/// connection's control queue is full), plus one new case (OBI-304): a
+/// command for an id that is currently *out of the process for a copyover
+/// handoff* is buffered for it instead of dropped. Factored out of
+/// [`run_server_full`] so the reclaim path can replay the same logic over
+/// [`drain_commands_before_reclaim`].
+async fn apply_command(
+    cmd: NetCommand,
+    conns: &mut HashMap<ConnId, ConnEntry>,
+    handoff: &mut HandoffOutbox,
+    event_tx: &mpsc::Sender<NetEvent>,
+    queue_depth: usize,
+) {
+    match cmd {
+        NetCommand::Send(conn, text) => {
+            route_or_park(
+                conn,
+                ConnControl::Send(text),
+                conns,
+                handoff,
+                event_tx,
+                queue_depth,
+            )
+            .await;
+        }
+        NetCommand::SendGmcp(conn, package_message, payload) => {
+            route_or_park(
+                conn,
+                ConnControl::SendGmcp(package_message, payload),
+                conns,
+                handoff,
+                event_tx,
+                queue_depth,
+            )
+            .await;
+        }
+        NetCommand::SetEcho(conn, enabled) => {
+            route_or_park(
+                conn,
+                ConnControl::SetEcho(enabled),
+                conns,
+                handoff,
+                event_tx,
+                queue_depth,
+            )
+            .await;
+        }
+        NetCommand::Close(conn) => match conns.remove(&conn) {
+            Some(entry) => match entry.tx.try_send(ConnControl::Close) {
+                Ok(()) => {}
+                Err(_) => {
+                    entry.task.abort();
+                    let _ = event_tx.send(NetEvent::Disconnected(conn)).await;
+                }
+            },
+            // OBI-304: the world asked to close a session whose fd is out
+            // for a handoff. Re-adopting first, then closing, is the only
+            // reading that keeps `net_dead()` running exactly once.
+            None => park_for_handoff(conn, ConnControl::Close, handoff, queue_depth),
+        },
+    }
+}
+
+/// The `Send`/`SendGmcp`/`SetEcho` half of [`apply_command`]: these three
+/// share one behaviour (queue it, or drop the client when its queue is
+/// full), so they share one function rather than three copies of the same
+/// match.
+async fn route_or_park(
+    conn: ConnId,
+    control: ConnControl,
+    conns: &mut HashMap<ConnId, ConnEntry>,
+    handoff: &mut HandoffOutbox,
+    event_tx: &mpsc::Sender<NetEvent>,
+    queue_depth: usize,
+) {
+    if let Some(entry) = conns.get(&conn) {
+        match entry.tx.try_send(control) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(conn, "disconnecting slow client: output queue full");
+                if let Some(entry) = conns.remove(&conn) {
+                    entry.task.abort();
+                }
+                let _ = event_tx.send(NetEvent::Disconnected(conn)).await;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                conns.remove(&conn);
+            }
+        }
+    } else {
+        park_for_handoff(conn, control, handoff, queue_depth);
+    }
+}
+
+/// OBI-304: apply every [`NetCommand`] `command_rx` has already accepted
+/// before a reclaim is allowed to remove a connection's entry, so output
+/// the world emitted *before* asking for the fd back is written to that fd
+/// while it is still here. Bounded by `COMMANDS_PER_RECLAIM_DRAIN`; excess
+/// is not lost, it just goes through [`park_for_handoff`] instead.
+async fn drain_commands_before_reclaim(
+    command_rx: &mut mpsc::Receiver<NetCommand>,
+    conns: &mut HashMap<ConnId, ConnEntry>,
+    handoff: &mut HandoffOutbox,
+    event_tx: &mpsc::Sender<NetEvent>,
+    queue_depth: usize,
+) {
+    for _ in 0..COMMANDS_PER_RECLAIM_DRAIN {
+        let Ok(cmd) = command_rx.try_recv() else {
+            break;
+        };
+        apply_command(cmd, conns, handoff, event_tx, queue_depth).await;
+    }
 }
 
 async fn run_connection(
@@ -2293,5 +2468,206 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         server.await.unwrap().unwrap();
+    }
+
+    /// OBI-304, window 1: output the world had **already queued** for a
+    /// session must reach the socket *before* the reclaim hands the fd
+    /// back, not be dropped because `run_server_full`'s unbiased select
+    /// happened to poll `reclaim_rx` before `command_rx`.
+    ///
+    /// This is the exact shape of the OBI-292/OBI-304 flake: master
+    /// `logon()` sends `Welcome to Loom!` and then the room description
+    /// as two separate `NetCommand::Send`s, and a copyover request that
+    /// lands in between used to tear the session's `ConnEntry` out of
+    /// `conns` while the second one was still sitting in `command_rx` --
+    /// the command arm then found no entry and silently dropped the
+    /// player's room description. Design §7.5 promises no lost output, so
+    /// this asserts the guarantee directly, without a supervisor or a
+    /// real world in the loop.
+    ///
+    /// 32 queued lines (not 1) because the race is a `tokio::select!`
+    /// coin-flip per iteration -- `command_rx` and `reclaim_rx` are both
+    /// ready, so whichever wins decides the split point of the burst.
+    /// Every line the reclaim wins past used to be dropped outright; in
+    /// 3/3 pre-fix runs of this test the reclaim won the very first flip
+    /// and *all 32* lines were lost ("socket went quiet after [], wanted
+    /// 32 lines"), which is what the OBI-292 bot saw as a mid-intro
+    /// hang: the welcome made it, the room description did not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reclaim_flushes_output_already_queued_for_the_session() {
+        const QUEUED_LINES: usize = 32;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_ws_tx, ws_rx) = mpsc::channel(1);
+        let (_adopt_tx, adopt_rx) = mpsc::channel(4);
+        let (reclaim_tx, reclaim_rx) = mpsc::channel(4);
+
+        let server = tokio::spawn(run_server_full(
+            listener,
+            config,
+            event_tx,
+            cmd_rx,
+            shutdown_rx,
+            ws_rx,
+            adopt_rx,
+            reclaim_rx,
+        ));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let conn = loop {
+            match event_rx.recv().await.expect("event channel closed") {
+                NetEvent::Connected(id) => break id,
+                _ => continue,
+            }
+        };
+        drain_preamble(&mut client).await;
+
+        // Everything the world emitted before it asked for the fd back --
+        // the `logon()`-style "welcome, then room description" burst. The
+        // client is deliberately *not* read in between, so all of it is
+        // still in flight (in `command_rx`, or in the per-connection
+        // control queue, or in the kernel send buffer) when the reclaim
+        // is issued.
+        for idx in 0..QUEUED_LINES {
+            cmd_tx
+                .send(NetCommand::Send(conn, format!("queued-{idx}\n")))
+                .await
+                .unwrap();
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reclaim_tx.send((conn, reply_tx)).await.unwrap();
+        let reclaimed = reply_rx
+            .await
+            .expect("reclaim reply channel dropped")
+            .expect("reclaim should succeed for a live connection");
+
+        // Read *before* anything is re-adopted: the queued output was
+        // written to the socket, so it must already be there -- the fd
+        // hand-off carries the kernel send buffer with it.
+        let got = read_lines(&mut client, QUEUED_LINES).await;
+        let expected: Vec<String> = (0..QUEUED_LINES)
+            .map(|idx| format!("queued-{idx}\r\n"))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "a reclaim must not drop output already queued for the session"
+        );
+
+        // And the round trip really is a round trip: the fd still works.
+        drop(reclaimed);
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    /// OBI-304, window 2: output enqueued for a session *between* the
+    /// reclaim and the readopt (the world is not frozen during
+    /// `loom serve`'s rehearsal round trip, and in a real copyover the
+    /// pause between "fd gone" and "fd back" is exactly where a
+    /// `call_out`/heartbeat reply can land) must be buffered and
+    /// delivered once the connection is adopted -- not dropped because
+    /// the id had no `ConnEntry` for a few milliseconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readopt_delivers_output_queued_during_the_handoff_window() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_ws_tx, ws_rx) = mpsc::channel(1);
+        let (adopt_tx, adopt_rx) = mpsc::channel(4);
+        let (reclaim_tx, reclaim_rx) = mpsc::channel(4);
+
+        let server = tokio::spawn(run_server_full(
+            listener,
+            config,
+            event_tx,
+            cmd_rx,
+            shutdown_rx,
+            ws_rx,
+            adopt_rx,
+            reclaim_rx,
+        ));
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let conn = loop {
+            match event_rx.recv().await.expect("event channel closed") {
+                NetEvent::Connected(id) => break id,
+                _ => continue,
+            }
+        };
+        drain_preamble(&mut client).await;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reclaim_tx.send((conn, reply_tx)).await.unwrap();
+        let reclaimed = reply_rx
+            .await
+            .expect("reclaim reply channel dropped")
+            .expect("reclaim should succeed for a live connection");
+
+        // The handoff window: the world is still running and emits for
+        // this session. `conns` no longer has an entry for `conn`, so
+        // before OBI-304 both of these were silently dropped.
+        cmd_tx
+            .send(NetCommand::Send(conn, "during-handoff-1\n".to_string()))
+            .await
+            .unwrap();
+        cmd_tx
+            .send(NetCommand::Send(conn, "during-handoff-2\n".to_string()))
+            .await
+            .unwrap();
+        // Give `run_server_full` a chance to actually process both (it
+        // would drop them here rather than later, so this makes the test
+        // fail for the right reason instead of passing by luck).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        adopt_tx.send((conn, reclaimed)).await.unwrap();
+
+        // A re-adopted connection always starts with a fresh negotiation
+        // preamble (the codec state reset documented since OBI-227), then
+        // whatever was parked for it, in order.
+        drain_preamble(&mut client).await;
+        let got = read_lines(&mut client, 2).await;
+        assert_eq!(
+            got,
+            vec!["during-handoff-1\r\n", "during-handoff-2\r\n"],
+            "output queued between reclaim and adopt must be replayed on adoption"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    /// Read exactly `want` `\n`-terminated lines from `client`, failing
+    /// (not hanging) if the socket goes quiet first.
+    async fn read_lines(client: &mut TcpStream, want: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut pending = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while out.len() < want {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("timed out after {out:?}, wanted {want} lines");
+            }
+            let mut buf = [0_u8; 512];
+            let n = tokio::time::timeout_at(deadline, client.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("read_lines: socket went quiet after {out:?}, wanted {want} lines")
+                })
+                .expect("client socket read failed");
+            pending.extend_from_slice(&buf[..n]);
+            while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = pending.drain(..=pos).collect();
+                out.push(String::from_utf8_lossy(&line).into_owned());
+            }
+        }
+        out
     }
 }
