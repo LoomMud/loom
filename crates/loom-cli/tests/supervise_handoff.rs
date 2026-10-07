@@ -10,40 +10,56 @@
 //! hand-off were broken (wrong fd order, child never got the fds, ...)
 //! the connect would simply time out, since only `supervise` binds
 //! anything in this mode.
+//!
+//! ## Startup is a readiness barrier, not a sleep (OBI-292)
+//!
+//! Every test here starts with [`spawn_until_serving`], which does not
+//! return until the server has *proven* it is serving: the 12-byte telnet
+//! negotiation preamble has actually arrived, on a connection the test
+//! then holds open. Two CI failure signatures this file used to have came
+//! from not doing that.
+//!
+//! * `read telnet negotiation preamble: Connection reset by peer (os
+//!   error 104)` -- the test connected while the supervisor was still
+//!   alive, the supervisor then exited for a startup-only reason (a lost
+//!   `bind` race -- see [`TEST_PORT_BAND_START`]), which closed the
+//!   listener and reset the test's still-queued connection. Nothing in
+//!   the CI log explained it because the supervisor's own output was
+//!   piped away and thrown out.
+//! * `stream did not contain valid UTF-8 (os error 526)` -- a raw telnet
+//!   IAC byte landing inside a `read_line` (see [`read_until_contains`]).
+//!
+//! Neither is a property any test here claims to assert, so both are
+//! handled where they belong: at startup. A supervisor that dies *after*
+//! [`spawn_until_serving`] returns still fails its test exactly as
+//! before -- that is the actual subject of OBI-184/OBI-225/OBI-251.
+//!
+//! Capturing that output is what surfaced a third race, in the
+//! version-watch tests: `supervise` seeds its desired-version baseline
+//! from the *running* build (deliberately, CTO review on OBI-256), so a
+//! file already holding `v1.0.0` looked like a change on the watcher's
+//! very first tick, and the resulting unsolicited copyover request ran a
+//! reclaim/readopt round trip over a connection the test was still
+//! introducing. [`Supervisor::start`] now declares `LOOM_RUNNING_VERSION`
+//! to match the file each test seeds, so a test gets exactly the one
+//! version change it asks for.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[test]
 fn supervise_hands_off_listening_sockets_to_a_standby_child() {
     let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
-    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
-
-    // `loom supervise` binds, then spawns the standby and blocks on its
-    // ready signal before handing off -- give that its own generous
-    // retry budget (compiling `tworoom` plus process spawn overhead) on
-    // top of the usual connect retry.
-    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-
-    // Just the telnet option-negotiation preamble (OBI-26: `DO NAWS`, `DO
-    // TTYPE`, `WILL GMCP`, `WILL MSSP` -- 12 bytes) is enough: proves the
-    // standby child's `World`/`loom-net` stack is really the one serving
-    // this connection, not a hung/empty accept.
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble from the handed-off socket");
+    // The call itself is the assertion: `loom supervise` binds, spawns the
+    // standby and blocks on its ready signal before handing off, and
+    // `spawn_until_serving` does not return until the child's own
+    // `World`/`loom-net` stack -- not a hung/empty accept -- has written
+    // the negotiation preamble on a connection held open here.
+    let (mut supervisor, _telnet_bind, _stream) = spawn_until_serving(&mudlib);
 
     supervisor.assert_alive();
 }
@@ -61,21 +77,7 @@ fn supervise_hands_off_listening_sockets_to_a_standby_child() {
 #[test]
 fn sigterm_to_the_supervisor_is_forwarded_to_the_child_and_both_exit() {
     let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
-    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
-
-    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before sending SIGTERM");
+    let (mut supervisor, telnet_bind, _stream) = spawn_until_serving(&mudlib);
 
     loom_supervise::signal::send_sigterm(supervisor.child.id())
         .expect("send SIGTERM to the supervisor process");
@@ -125,21 +127,7 @@ fn sigterm_to_the_supervisor_is_forwarded_to_the_child_and_both_exit() {
 #[test]
 fn sigkill_the_supervisor_still_terminates_the_child_via_pdeathsig() {
     let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
-    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
-
-    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before SIGKILLing the supervisor");
+    let (mut supervisor, telnet_bind, _stream) = spawn_until_serving(&mudlib);
 
     // `Child::kill()` is `SIGKILL`, not `SIGTERM` -- the supervisor gets
     // no chance to run any of its own forwarding code.
@@ -184,21 +172,7 @@ fn sigkill_the_supervisor_still_terminates_the_child_via_pdeathsig() {
 #[test]
 fn standby_child_crash_is_respawned_against_the_same_listener() {
     let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
-    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
-
-    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before crashing the child");
+    let (mut supervisor, telnet_bind, mut stream) = spawn_until_serving(&mudlib);
 
     let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
         .expect("did not find the standby child's pid under /proc");
@@ -222,12 +196,14 @@ fn standby_child_crash_is_respawned_against_the_same_listener() {
     // sequence's own 1s backoff plus a fresh mudlib compile, not just a
     // single already-warm child's response time (CTO review, OBI-253).
     let mut reconnected = connect_with_retry(&telnet_bind, Duration::from_secs(15));
-    reconnected
-        .set_read_timeout(Some(Duration::from_secs(15)))
-        .unwrap();
-    reconnected
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble from the respawned child");
+    let mut respawned_preamble = [0_u8; TELNET_PREAMBLE_LEN];
+    fill_before_deadline(
+        &mut reconnected,
+        &mut respawned_preamble,
+        Instant::now() + Duration::from_secs(15),
+        &mut supervisor,
+    )
+    .expect("read telnet negotiation preamble from the respawned child");
 
     supervisor.assert_alive();
 }
@@ -244,21 +220,7 @@ fn standby_child_crash_is_respawned_against_the_same_listener() {
 #[test]
 fn sigterm_during_crash_backoff_stops_the_supervisor_without_a_further_respawn() {
     let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
-    let mut supervisor = Supervisor::spawn(&mudlib, &telnet_bind, &http_bind);
-
-    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before crashing the child");
+    let (mut supervisor, telnet_bind, _stream) = spawn_until_serving(&mudlib);
 
     let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
         .expect("did not find the standby child's pid under /proc");
@@ -386,46 +348,23 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
 #[test]
 fn version_file_change_is_detected_and_logged() {
     let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
     let version_dir = scratch("version-watch");
     let version_file = version_dir.join("desired-version");
-    std::fs::write(&version_file, "v1.0.0\n").expect("write initial desired-version");
+    // Must match `DESIRED_VERSION_INITIAL` (what `Supervisor::start`
+    // declares as this supervisor's own running version), so booting is
+    // not itself a "change".
+    std::fs::write(&version_file, format!("{DESIRED_VERSION_INITIAL}\n"))
+        .expect("write initial desired-version");
 
-    let (mut supervisor, stdout) =
-        Supervisor::spawn_with_version_file(&mudlib, &telnet_bind, &http_bind, &version_file);
-
-    // Confirm the standby child is really up before touching the
-    // version file, so a later failure can't be "it never booted" in
-    // disguise.
-    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before changing the version file");
-
-    // A background thread drains stdout into a channel, since reading
-    // it directly on this thread would block waiting for more output
-    // right when the test needs to also act (write the file) and poll
-    // (read lines with an overall timeout).
-    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
-            if line_tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    // Confirms the standby child is really up and serving before the
+    // version file is touched, so a later failure can't be "it never
+    // booted" in disguise. `line_rx` streams the supervisor's own stdout:
+    // reading it directly on this thread would block waiting for more
+    // output right when the test needs to also act (write the file) and
+    // poll (read lines with an overall timeout), which is why it is
+    // drained on a dedicated thread (`drain_pipe`).
+    let (mut supervisor, _telnet_bind, _stream, line_rx) =
+        spawn_until_serving_with_version_file(&mudlib, &version_file);
 
     std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
 
@@ -471,39 +410,16 @@ fn version_file_change_is_detected_and_logged() {
 #[test]
 fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
     let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
     let version_dir = scratch("version-watch-control");
     let version_file = version_dir.join("desired-version");
-    std::fs::write(&version_file, "v1.0.0\n").expect("write initial desired-version");
+    // Must match `DESIRED_VERSION_INITIAL` (what `Supervisor::start`
+    // declares as this supervisor's own running version), so booting is
+    // not itself a "change".
+    std::fs::write(&version_file, format!("{DESIRED_VERSION_INITIAL}\n"))
+        .expect("write initial desired-version");
 
-    let (mut supervisor, stdout) =
-        Supervisor::spawn_with_version_file(&mudlib, &telnet_bind, &http_bind, &version_file);
-
-    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before changing the version file");
-
-    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
-            if line_tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    let (mut supervisor, _telnet_bind, mut stream, line_rx) =
+        spawn_until_serving_with_version_file(&mudlib, &version_file);
 
     std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
 
@@ -607,26 +523,16 @@ fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
 #[test]
 fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
     let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
     let version_dir = scratch("version-watch-reclaim");
     let version_file = version_dir.join("desired-version");
-    std::fs::write(&version_file, "v1.0.0\n").expect("write initial desired-version");
+    // Must match `DESIRED_VERSION_INITIAL` (what `Supervisor::start`
+    // declares as this supervisor's own running version), so booting is
+    // not itself a "change".
+    std::fs::write(&version_file, format!("{DESIRED_VERSION_INITIAL}\n"))
+        .expect("write initial desired-version");
 
-    let (mut supervisor, stdout) =
-        Supervisor::spawn_with_version_file(&mudlib, &telnet_bind, &http_bind, &version_file);
-
-    let mut stream = connect_with_retry(&telnet_bind, Duration::from_secs(10));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before changing the version file");
+    let (mut supervisor, _telnet_bind, stream, line_rx) =
+        spawn_until_serving_with_version_file(&mudlib, &version_file);
     let mut reader = std::io::BufReader::new(stream);
 
     // CTO review (OBI-266/B2): the real regression this test must be
@@ -645,19 +551,6 @@ fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
         moved.contains("The Yard"),
         "expected 'go north' to move into the yard, got:\n{moved}"
     );
-
-    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
-            if line_tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
 
     std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
 
@@ -729,12 +622,214 @@ fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
     supervisor.assert_alive();
 }
 
+/// Drains one pipe of the supervisor's output into its [`Supervisor::log`]
+/// (and, for the version-watch spawns, a channel of the same lines) on a
+/// dedicated thread. Keeps the last [`SUPERVISOR_LOG_KEEP_LINES`] lines so
+/// a long-running server can't grow the buffer without bound.
+///
+/// The drain never stops early -- not even when the channel's receiver is
+/// gone -- because a full pipe buffer would block the supervisor itself
+/// writing to its own stdout.
+fn drain_pipe<R: Read + Send + 'static>(
+    pipe: R,
+    log: Arc<Mutex<Vec<String>>>,
+    lines: Option<std::sync::mpsc::Sender<String>>,
+) {
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+            {
+                let mut buf = log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if buf.len() >= SUPERVISOR_LOG_KEEP_LINES {
+                    buf.remove(0);
+                }
+                buf.push(line.clone());
+            }
+            if let Some(sender) = &lines {
+                let _ = sender.send(line);
+            }
+        }
+    });
+}
+
+/// Spawns `loom supervise` on freshly reserved ports and does not return
+/// until the standby child has proven it is really serving: the caller
+/// gets back a live connection on which the telnet negotiation preamble
+/// has already been read (see [`TELNET_PREAMBLE_LEN`]).
+///
+/// OBI-292: a supervisor that dies or goes quiet *before* ever serving is
+/// a startup problem, not a result -- it gets torn down and a fresh one is
+/// started on fresh ports, up to [`MAX_STARTUP_ATTEMPTS`] times. Every
+/// failed attempt's own output is carried into the panic message, so the
+/// reason (`failed to bind ...`, `waiting for standby ready signal: ...`)
+/// is in the CI log instead of thrown away.
+fn spawn_until_serving(mudlib: &Path) -> (Supervisor, String, TcpStream) {
+    let (supervisor, telnet_bind, stream, _lines) = spawn_until_serving_inner(mudlib, None);
+    (supervisor, telnet_bind, stream)
+}
+
+/// [`spawn_until_serving`] for the version-watch tests: also returns the
+/// live stream of the supervisor's stdout lines.
+fn spawn_until_serving_with_version_file(
+    mudlib: &Path,
+    version_file: &Path,
+) -> (
+    Supervisor,
+    String,
+    TcpStream,
+    std::sync::mpsc::Receiver<String>,
+) {
+    let (supervisor, telnet_bind, stream, lines) =
+        spawn_until_serving_inner(mudlib, Some(version_file));
+    (
+        supervisor,
+        telnet_bind,
+        stream,
+        lines.expect("a version-file spawn always builds a line receiver"),
+    )
+}
+
+fn spawn_until_serving_inner(
+    mudlib: &Path,
+    version_file: Option<&Path>,
+) -> (
+    Supervisor,
+    String,
+    TcpStream,
+    Option<std::sync::mpsc::Receiver<String>>,
+) {
+    let mut attempts = Vec::new();
+    for attempt in 1..=MAX_STARTUP_ATTEMPTS {
+        let telnet_bind = bind_string(reserve_local_port());
+        let http_bind = bind_string(reserve_local_port());
+        let (mut supervisor, lines) =
+            Supervisor::start(mudlib, &telnet_bind, &http_bind, version_file);
+        match wait_until_serving(&mut supervisor, &telnet_bind) {
+            Ok(stream) => return (supervisor, telnet_bind, stream, lines),
+            Err(reason) => {
+                let log = supervisor.captured_log();
+                // `Drop` kills whatever is still running and releases both
+                // ports before the next attempt binds new ones.
+                drop(supervisor);
+                attempts.push(format!(
+                    "attempt {attempt}/{MAX_STARTUP_ATTEMPTS} on {telnet_bind}: {reason}\n\
+                     --- supervisor output ---\n{log}"
+                ));
+            }
+        }
+    }
+    panic!(
+        "`loom supervise` never served through {MAX_STARTUP_ATTEMPTS} startup attempts:\n{}",
+        attempts.join("\n===\n")
+    );
+}
+
+/// Connects to `telnet_bind` and holds that one connection open until the
+/// server has written the whole negotiation preamble, reporting the reason
+/// it gave up rather than panicking so [`spawn_until_serving_inner`] can
+/// decide whether to retry.
+fn wait_until_serving(supervisor: &mut Supervisor, telnet_bind: &str) -> Result<TcpStream, String> {
+    let deadline = Instant::now() + READY_BUDGET;
+    // Exactly one connection for the whole attempt. Connecting *again*
+    // would queue a second entry on the listener's backlog, and the child
+    // accepts the oldest entry first -- so a reconnect loop can hand the
+    // preamble to a socket the test already dropped and then time out on
+    // the one it kept.
+    let mut stream = loop {
+        match TcpStream::connect(telnet_bind) {
+            Ok(stream) => break stream,
+            Err(err) => {
+                if let Some(status) = supervisor.exited() {
+                    return Err(format!(
+                        "supervisor exited (status {status}) without ever listening on {telnet_bind}: {err}"
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("never listened on {telnet_bind}: {err}"));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    let mut preamble = [0_u8; TELNET_PREAMBLE_LEN];
+    fill_before_deadline(&mut stream, &mut preamble, deadline, supervisor)?;
+    // `fill_before_deadline` polls with a short read timeout; hand the
+    // caller back the 2s the tests used to get from their own preamble
+    // read, so nothing downstream changes shape.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| err.to_string())?;
+    Ok(stream)
+}
+
+/// Reads until `buf` is full, or reports why it stopped. Each individual
+/// read is short (`POLL_READ_TIMEOUT`) so a supervisor that dies partway
+/// through the handshake -- closing the listener it dup'd to the child,
+/// which resets this connection -- is reported in milliseconds rather
+/// than at the deadline; the process is polled for exactly that between
+/// reads.
+fn fill_before_deadline(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+    supervisor: &mut Supervisor,
+) -> Result<(), String> {
+    const POLL_READ_TIMEOUT: Duration = Duration::from_millis(250);
+    stream
+        .set_read_timeout(Some(POLL_READ_TIMEOUT))
+        .map_err(|err| err.to_string())?;
+    let mut received = 0;
+    while received < buf.len() {
+        match stream.read(&mut buf[received..]) {
+            Ok(0) => {
+                return Err(format!(
+                    "server closed the connection after {received} of {} bytes",
+                    buf.len()
+                ));
+            }
+            Ok(n) => received += n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // A supervisor that dies mid-handshake closes the listener
+                // it dup'd to the child, which *resets* this connection --
+                // poll for that here rather than waiting out the deadline
+                // so a retry can start immediately.
+                if let Some(status) = supervisor.exited() {
+                    return Err(format!(
+                        "supervisor exited (status {status}) after the test connected but before serving \
+                         -- closing the listener is what resets this connection"
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "nothing more after the startup deadline (got {received} of {} bytes)",
+                        buf.len()
+                    ));
+                }
+            }
+            Err(err) => return Err(format!("read failed after {received} bytes: {err}")),
+        }
+    }
+    Ok(())
+}
+
 /// `BufReader<TcpStream>`-based line read with a needle, tolerating
 /// `\r\n`/`\n` and any leading binary noise (e.g. a fresh telnet
 /// negotiation preamble after a reclaim/readopt round trip resets codec
 /// state) ahead of real text -- same pattern as `net_tick.rs`'s own
 /// helper of the same name, duplicated here rather than shared across
 /// test binaries (each integration test file is its own crate).
+///
+/// OBI-292: reads bytes, not `String`s. A telnet stream is *not* text --
+/// an IAC sequence landing inside one `\n`-terminated chunk used to make
+/// `read_line` fail with `stream did not contain valid UTF-8 (os error
+/// 526)` and take the test down for a non-ASCII byte it was never meant
+/// to assert on. Lossy decoding keeps the transcript usable for substring
+/// matching, which is all any caller here does with it.
 fn read_until_contains(
     reader: &mut std::io::BufReader<TcpStream>,
     needle: &str,
@@ -747,13 +842,17 @@ fn read_until_contains(
         if Instant::now() > deadline {
             panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
         }
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
+        let mut line = Vec::new();
+        match reader.read_until(b'\n', &mut line) {
             Ok(0) => panic!(
                 "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
             ),
             Ok(_) => {
-                transcript.push_str(&line.replace("\r\n", "\n"));
+                transcript.push_str(
+                    &String::from_utf8_lossy(&line)
+                        .to_string()
+                        .replace("\r\n", "\n"),
+                );
                 if transcript.contains(needle) {
                     return transcript;
                 }
@@ -805,94 +904,257 @@ fn strip_ansi(line: &str) -> String {
     out
 }
 
+/// Start of the port band these tests allocate listener ports from.
+///
+/// OBI-292: this used to be `bind("127.0.0.1:0")` and read back whatever
+/// port the kernel picked -- a port from the *ephemeral* range
+/// (`/proc/sys/net/ipv4/ip_local_port_range`, 32768-60999 on the CI
+/// runners) which was released the instant the probe handle was dropped.
+/// Between that release and `loom supervise` actually binding it, anything
+/// else allocating an ephemeral port can win it -- including another
+/// thread in this same test binary making one of the many outbound
+/// `TcpStream::connect` calls these tests do, each of which takes its
+/// source port from that same range and holds it in `TIME_WAIT` for a
+/// minute afterwards. The supervisor then exits on `failed to bind ...:
+/// Address already in use`, and the test sees either `failed to connect
+/// ... before timeout` or (if it had already connected into the listener's
+/// backlog) a reset. Reproduced locally at roughly one supervisor startup
+/// in thirty with the box oversubscribed, with exactly the CI signature.
+///
+/// Allocating from a fixed band *below* the ephemeral range takes the
+/// kernel's auto-allocation -- and so every outbound connection in the job
+/// -- out of the contest entirely. The probe bind in
+/// [`reserve_local_port`] still confirms the port is free before handing
+/// it over, and skips forward if it is not.
+const TEST_PORT_BAND_START: u16 = 20_000;
+/// Width of [`TEST_PORT_BAND_START`]'s band -- comfortably more than the
+/// handful of ports one run of this binary needs (two per test, per
+/// startup attempt).
+const TEST_PORT_BAND_WIDTH: u16 = 4_000;
+
+/// Allocates the next free port in [`TEST_PORT_BAND_START`]'s band.
+///
+/// The cursor is process-global and atomic, so concurrent tests in this
+/// binary can never be handed the same port twice; the band is entered at
+/// a pid-dependent offset so separate invocations of this binary (a CI
+/// re-run, another test binary's servers) don't all reach for the same
+/// port first.
 fn reserve_local_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("read local addr").port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static CURSOR: AtomicU16 = AtomicU16::new(0);
+    let salt = std::process::id() as u16 % TEST_PORT_BAND_WIDTH;
+    for _step in 0..TEST_PORT_BAND_WIDTH {
+        let index = (salt + CURSOR.fetch_add(1, Ordering::Relaxed)) % TEST_PORT_BAND_WIDTH;
+        let port = TEST_PORT_BAND_START + index;
+        // Probe bind, held for the length of this `if` only. Nothing the
+        // kernel auto-allocates can now take this port, and no other test
+        // in this process will ask for it again (the cursor already moved
+        // past it). The window that remains -- an unrelated process on the
+        // host binding this exact port -- is not one a test can close, so
+        // startup is additionally retried (`MAX_STARTUP_ATTEMPTS`).
+        let probe = std::net::TcpListener::bind(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        )));
+        if probe.is_ok() {
+            return port;
+        }
+    }
+    panic!(
+        "no free port in the test band {TEST_PORT_BAND_START}..{}",
+        TEST_PORT_BAND_START + TEST_PORT_BAND_WIDTH
+    );
 }
+
+fn bind_string(port: u16) -> String {
+    format!("127.0.0.1:{port}")
+}
+
+/// How many bytes `loom serve` writes before a client has said anything:
+/// the telnet option-negotiation preamble (OBI-26: `DO NAWS`, `DO TTYPE`,
+/// `WILL GMCP`, `WILL MSSP` -- 12 bytes). Receiving it is the cheapest
+/// proof that the standby child booted, adopted the listening sockets the
+/// supervisor bound, and is really serving *this* connection -- if the
+/// hand-off were broken (wrong fd order, child never got the fds) the
+/// preamble never arrives.
+const TELNET_PREAMBLE_LEN: usize = 12;
+
+/// How long one startup attempt may take before it is written off. This
+/// bounds the *whole* attempt -- bind, spawn the standby, compile the
+/// mudlib in debug, first bytes on the wire -- so it is a liveness check
+/// on the server rather than a fixed sleep; eight tests' worth of servers
+/// share one 4-core runner in CI.
+const READY_BUDGET: Duration = Duration::from_secs(30);
+
+/// How many times [`spawn_until_serving`] will tear down a supervisor that
+/// died or went quiet before it ever served, and start a fresh one on
+/// fresh ports.
+const MAX_STARTUP_ATTEMPTS: usize = 3;
+
+/// How many lines of a supervisor's own output to keep for post-mortem.
+const SUPERVISOR_LOG_KEEP_LINES: usize = 400;
+
+/// The version string the version-watch tests start their
+/// desired-version file at (and which [`Supervisor::start`] tells the
+/// supervisor is its own running version, so only the *change* each test
+/// writes is a change -- see the comment at that env var's use site).
+const DESIRED_VERSION_INITIAL: &str = "v1.0.0";
 
 struct Supervisor {
     child: Child,
+    /// The supervisor's stdout+stderr, kept so a failure can say *why*.
+    /// OBI-292: both used to be `Stdio::null()`, which is why every CI
+    /// failure in this file was undiagnosable from its log -- the one line
+    /// that named the cause (`supervise: failed to bind ...: Address
+    /// already in use`) was thrown away.
+    log: Arc<Mutex<Vec<String>>>,
 }
 
 impl Supervisor {
-    fn spawn(mudlib: &Path, telnet_bind: &str, http_bind: &str) -> Self {
-        let loom_bin = std::env::var("CARGO_BIN_EXE_loom-cli")
-            .or_else(|_| std::env::var("CARGO_BIN_EXE_loom_cli"))
-            .expect("cargo binary path for loom-cli");
-
-        let child = Command::new(loom_bin)
-            .arg("supervise")
-            .arg("--mudlib")
-            .arg(mudlib)
-            .env("LOOM_TELNET_ADDR", telnet_bind)
-            .env("LOOM_HTTP_ADDR", http_bind)
-            .env_remove("DATABASE_URL")
-            .env_remove("LOOM_SMOKE_DATABASE_URL")
-            .env("RUST_LOG", "")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn loom supervise");
-
-        Self { child }
-    }
-
-    /// Like [`Self::spawn`], but with `LOOM_DESIRED_VERSION_FILE` set
-    /// and `stdout` piped (not discarded) with logging turned up to
-    /// `info` -- needed by the version-watch test, which has nothing
-    /// else observable to assert on (OBI-184's version-watching slice
-    /// is detection-only: a log line is the only externally visible
-    /// effect of a detected change today). `tracing_subscriber::fmt`'s
+    /// Spawns the real `loom` binary in `supervise` mode on the two given
+    /// binds. `version_file: None` runs the plain supervisor; `Some(_)`
+    /// additionally sets `LOOM_DESIRED_VERSION_FILE` and turns logging up
+    /// to `info`, because the version-watch tests have nothing else
+    /// observable to assert on (OBI-184's version-watching slice was
+    /// detection-only for a long time: a log line was the only externally
+    /// visible effect of a detected change). `tracing_subscriber::fmt`'s
     /// default `MakeWriter` is `io::stdout`, not `io::stderr` -- despite
-    /// every other test in this file discarding both, so this is the
-    /// first one where the distinction actually matters. Returns the
-    /// piped stdout handle alongside the `Supervisor` so the caller can
-    /// read it.
-    fn spawn_with_version_file(
+    /// every other test in this file discarding both, so that is the first
+    /// place the distinction actually mattered.
+    ///
+    /// Both shapes pipe stdout *and* stderr into [`Supervisor::log`] --
+    /// nothing discards the server's output any more -- and the
+    /// version-file shape additionally streams stdout's lines to the
+    /// caller as a `Receiver<String>` (ANSI codes still in them: callers
+    /// `strip_ansi`), rather than handing back the raw pipe, which the log
+    /// drain now owns. Tests should not call this directly: use
+    /// [`spawn_until_serving`], which is the same thing plus the readiness
+    /// barrier.
+    fn start(
         mudlib: &Path,
         telnet_bind: &str,
         http_bind: &str,
-        version_file: &Path,
-    ) -> (Self, std::process::ChildStdout) {
+        version_file: Option<&Path>,
+    ) -> (Self, Option<std::sync::mpsc::Receiver<String>>) {
         let loom_bin = std::env::var("CARGO_BIN_EXE_loom-cli")
             .or_else(|_| std::env::var("CARGO_BIN_EXE_loom_cli"))
             .expect("cargo binary path for loom-cli");
 
-        let mut child = Command::new(loom_bin)
-            .arg("supervise")
+        let mut cmd = Command::new(loom_bin);
+        cmd.arg("supervise")
             .arg("--mudlib")
             .arg(mudlib)
             .env("LOOM_TELNET_ADDR", telnet_bind)
             .env("LOOM_HTTP_ADDR", http_bind)
-            .env("LOOM_DESIRED_VERSION_FILE", version_file)
-            // CTO review (OBI-256 nit): overridable rather than a fixed
-            // 5s production default, so this test has real slack
-            // against its own timeout instead of racing CI's timing
-            // margin at the production cadence.
-            .env("LOOM_VERSION_POLL_INTERVAL_MS", "200")
             .env_remove("DATABASE_URL")
-            .env_remove("LOOM_SMOKE_DATABASE_URL")
-            .env("RUST_LOG", "loom_cli=info")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn loom supervise");
+            .env_remove("LOOM_SMOKE_DATABASE_URL");
 
-        let stdout = child.stdout.take().expect("piped stdout");
-        (Self { child }, stdout)
+        // The version-watch tests assert on log *lines* as they arrive,
+        // so their stdout is streamed to a channel as well as logged;
+        // a plain spawn only needs the log.
+        let (line_tx, line_rx) = match version_file {
+            None => {
+                cmd.env("RUST_LOG", "");
+                (None, None)
+            }
+            Some(path) => {
+                cmd.env("LOOM_DESIRED_VERSION_FILE", path)
+                    // OBI-292: declare this supervisor's own running
+                    // version as the same string every version-watch test
+                    // seeds its desired-version file with. Without it the
+                    // baseline is the crate version (0.0.1, from
+                    // `running_version_from_env`), so the file's *initial*
+                    // content already differs from it and the very first
+                    // poll -- `tokio::time::interval`'s tick 0 fires
+                    // immediately, so as soon as the child is up --
+                    // reports a change nobody made and triggers a
+                    // reclaim/readopt round trip on a connection the test
+                    // is still introducing. That is `supervise`'s
+                    // documented behaviour (CTO review, OBI-256: seed from
+                    // the running build's own identity, deliberately), it
+                    // is simply not what these tests are trying to
+                    // exercise: they want exactly one change, the one they
+                    // write.
+                    .env("LOOM_RUNNING_VERSION", DESIRED_VERSION_INITIAL)
+                    // CTO review (OBI-256 nit): overridable rather than a
+                    // fixed 5s production default, so the version tests
+                    // have real slack against their own timeouts instead
+                    // of racing CI's timing margin at the production
+                    // cadence.
+                    .env("LOOM_VERSION_POLL_INTERVAL_MS", "200")
+                    .env("RUST_LOG", "loom_cli=info");
+                let (tx, rx) = std::sync::mpsc::channel::<String>();
+                (Some(tx), Some(rx))
+            }
+        };
+
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn loom supervise");
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        drain_pipe(
+            child.stdout.take().expect("piped stdout"),
+            Arc::clone(&log),
+            line_tx,
+        );
+        drain_pipe(
+            child.stderr.take().expect("piped stderr"),
+            Arc::clone(&log),
+            None,
+        );
+
+        (Self { child, log }, line_rx)
     }
 
+    /// Fails the test if the supervisor process has already exited -- the
+    /// standing invariant every test here re-checks at the end, since
+    /// giving up on a child that keeps crashing is a supervisor bug, not
+    /// a passing test.
     fn assert_alive(&mut self) {
         if let Some(status) = self.child.try_wait().expect("poll supervisor process") {
             panic!("loom supervise exited early with status {status}");
         }
     }
+
+    /// The supervisor's exit status if it has already exited -- unlike
+    /// [`Self::assert_alive`], safe to ask while a startup attempt is
+    /// still in flight, which is what makes a dead-on-arrival supervisor
+    /// reportable in milliseconds instead of at the readiness deadline.
+    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
+    fn captured_log(&self) -> String {
+        let lines = self
+            .log
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Stripped on the way out so the post-mortem is readable rather
+        // than a wall of colour codes.
+        lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 impl Drop for Supervisor {
     fn drop(&mut self) {
+        // OBI-292: a panicking test used to leave behind nothing but the
+        // panic's own message. Print what the server said instead --
+        // captured output only surfaces (to `cargo test`'s failure
+        // report) when the test actually fails, so this is free on the
+        // green path.
+        if std::thread::panicking() {
+            eprintln!(
+                "`loom supervise` (pid {}) output before this test failed:\n{}",
+                self.child.id(),
+                self.captured_log()
+            );
+        }
         // `loom supervise` forwards SIGTERM/SIGINT to its standby child
         // (OBI-184/OBI-225) and exits once the child does -- but a test
         // that panicked before reaching that point, or one that doesn't
@@ -940,4 +1202,33 @@ fn copy_dir(src: &Path, dst: &Path) {
             std::fs::copy(entry.path(), &dst_path).expect("copy fixture file");
         }
     }
+}
+
+/// OBI-292 regression guard for the port allocator itself: the ports a
+/// test hands to `loom supervise` must come from the non-ephemeral band
+/// (so the kernel can never hand one of them to an outbound connection)
+/// and must be distinct within a process (so two tests in the same
+/// `cargo test` run can't be told the same port). The old implementation
+/// was `TcpListener::bind("127.0.0.1:0")` + drop, which satisfies neither
+/// invariant and is what made CI's `EADDRINUSE` startup failures possible.
+#[test]
+fn reserved_test_ports_stay_in_the_non_ephemeral_band() {
+    const SAMPLE: usize = 64;
+    let ports: Vec<u16> = (0..SAMPLE).map(|_| reserve_local_port()).collect();
+    for port in &ports {
+        assert!(
+            *port >= TEST_PORT_BAND_START && *port < TEST_PORT_BAND_START + TEST_PORT_BAND_WIDTH,
+            "port {port} is outside the test band"
+        );
+        assert!(
+            *port < 32_768,
+            "port {port} sits in the Linux ephemeral range"
+        );
+    }
+    let unique: std::collections::HashSet<u16> = ports.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        ports.len(),
+        "reserve_local_port handed out the same port twice"
+    );
 }
