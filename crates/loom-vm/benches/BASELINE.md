@@ -148,7 +148,10 @@ threshold.
 7. **Raw data leaves the job.** Every round's full table is kept under
    `target/bench-gate/logs/` with `meta.env` (both binary hashes, kernel,
    nproc, load average, cpufreq governor, cgroup CPU quota,
-   threshold/rounds/iters) and `bench-rounds.csv` (every per-workload,
+   threshold/rounds/iters -- `cgroup_cpu_max` is cgroup v2 `cpu.max`, so
+   `<quota> <period>`, and `max 100000` means the container is *not*
+   CPU-capped, which is when `nproc` is the core count you get) and
+   `bench-rounds.csv` (every per-workload,
    per-round median for all three arms), which the `bench` job uploads as the
    `bench-rounds-<run id>` artifact. A verdict that is a *minimum over N
    rounds* has to keep the N, or the next 1.177 gets diagnosed from guesses.
