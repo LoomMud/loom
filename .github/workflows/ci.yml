@@ -63,11 +63,9 @@ permissions:
 # The counter-evidence is that contention is not free either -- `rust` took 6
 # min on a quiet host, 10 min beside three fuzz jobs, and 35+ min with three
 # runs piled on, and `fuzz-smoke-bytecode` once hit its 15-minute budget inside
-# the cache-restore step without ever running its payload (OBI-308 notes). If
-# the added CI latency is unacceptable, the fix is capacity, not YAML: pin the
-# gates to a dedicated load-runner label and take `rust`/`fuzz` back out. That
-# is OBI-311's remaining decision (CTO).
-#
+# the cache-restore step without ever running its payload (OBI-308 notes). The
+# answer to that cost is capacity, not a weaker gate, and OBI-311 has decided
+# it: a dedicated load-runner label (CTO decision, 2026-10-07).
 #
 # Dedicated load runner (OBI-311): the three latency gates pick their runner from
 # `vars.CI_LOAD_RUNS_ON` (same plain-text / JSON-array rules as CI_RUNS_ON)
