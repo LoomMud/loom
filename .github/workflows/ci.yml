@@ -57,7 +57,7 @@ permissions:
 #
 # MAY BE CANCELLED -- a `pull_request` run whose commit is already superseded
 # by a newer push to the same PR. That is the only thing this block cancels.
-# It exists because `loom-ci-load-lane` is a FIFO across runs: a PR with three
+# It exists because `loom-ci-load-lane` is a queue across runs: a PR with three
 # pushes holds three places in it, and nobody else's required gate moves until
 # they drain. Run 37698132725 (2026-10-07 22:44:59Z) was a *draft* PR whose
 # diff was two README paragraphs and a comment block; it held a lane place for
@@ -110,9 +110,13 @@ concurrency:
 # So the load gates share the job-level concurrency group `loom-ci-load-lane`,
 # with:
 #   cancel-in-progress: false -- never kill a measurement already running; and
-#   queue: max               -- pending runs wait in FIFO instead of the
-#                               default `single`, where a third run cancels the
-#                               pending one. A *cancelled* required check
+#   queue: max               -- pending jobs all wait (one runs at a time)
+#                               instead of the default `single`, where a third
+#                               run cancels the pending one. Order among the
+#                               waiting jobs is NOT guaranteed: observed
+#                               roughly FIFO by queue-entry time, but nothing
+#                               may depend on fairness or on main going
+#                               first. A *cancelled* required check
 #                               blocks a PR exactly like a failed one, so
 #                               queueing is part of "don't weaken the gate".
 # They are also chained with `needs` -- loadtest-e1-1 -> loadtest-smoke ->
@@ -213,6 +217,20 @@ concurrency:
 # check blocks a PR exactly like a failed one -- see the draft-PR note above).
 # On the skip path the job writes a summary saying the green is "not
 # applicable", not "measured", which is the whole point of keeping the check.
+#
+# Dedicated load runner (OBI-311): the three latency gates pick their runner from
+# `vars.CI_LOAD_RUNS_ON` (same plain-text / JSON-array rules as CI_RUNS_ON)
+# and fall back to exactly the shared runner when it is unset, so this
+# expression changes nothing until a load scale set exists. Pointing it at a
+# node-pinned set (`arc-runner-set-loommud-load`) is what actually quiets the
+# host: no concurrency group can keep warp/loom-gitops jobs or another PR's
+# builds off a shared node. If the load set is down, unset the variable and
+# the gates run (noisily) on the shared set again -- never pin the label here.
+# Once the gates run there, `rust`/`fuzz-smoke*` can leave the lane again:
+# they only joined it to keep the shared node quiet for the gates.
+# Until then the OBI-325 escape frees only the three gates: a docs-only PR's
+# `rust`/`fuzz-smoke*` still wait for a lane place, because they load the
+# shared host whatever the diff is.
 #
 # These invariants are enforced by scripts/check-ci-load-lane.py, run in the
 # `hygiene` job below -- rule 8 there pins the escape hatch, both copies of it,
@@ -333,7 +351,7 @@ jobs:
       group: ${{ needs.loadtest-smoke.outputs.runtime != 'false' && 'loom-ci-load-lane' || format('loom-ci-load-lane-not-required-{0}', github.run_id) }}
       cancel-in-progress: false
       queue: max
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_LOAD_RUNS_ON && (startsWith(vars.CI_LOAD_RUNS_ON, '[') && fromJSON(vars.CI_LOAD_RUNS_ON) || vars.CI_LOAD_RUNS_ON) || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     # ~2m02s for the gate step on the lane host (run 37702660820, 23:48:46 ->
     # 23:50:48: two builds + 3 rounds x 3 arms), i.e. ~5 min of job wall time
     # with checkout and the toolchain. That host is not the "2-vCPU runner" the
@@ -690,7 +708,7 @@ jobs:
       group: ${{ needs.loadtest-e1-1.outputs.runtime != 'false' && 'loom-ci-load-lane' || format('loom-ci-load-lane-not-required-{0}', github.run_id) }}
       cancel-in-progress: false
       queue: max
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_LOAD_RUNS_ON && (startsWith(vars.CI_LOAD_RUNS_ON, '[') && fromJSON(vars.CI_LOAD_RUNS_ON) || vars.CI_LOAD_RUNS_ON) || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     timeout-minutes: 20
     continue-on-error: true
     steps:
@@ -849,7 +867,7 @@ jobs:
       group: ${{ needs.classify.outputs.runtime != 'false' && 'loom-ci-load-lane' || format('loom-ci-load-lane-not-required-{0}', github.run_id) }}
       cancel-in-progress: false
       queue: max
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_LOAD_RUNS_ON && (startsWith(vars.CI_LOAD_RUNS_ON, '[') && fromJSON(vars.CI_LOAD_RUNS_ON) || vars.CI_LOAD_RUNS_ON) || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     # 30, not 15: the lane keeps a second *gate* off the host, but the same
     # run's `rust` job and another PR's build still share it, and a starved
     # release build then blows the budget. When that happened on this PR's

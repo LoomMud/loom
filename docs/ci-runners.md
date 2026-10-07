@@ -75,3 +75,37 @@ The scale set must run in `containerMode: dind` (or `kubernetes` with the
 container hooks) because of the `postgres` service container, the Docker
 container actions and `docker buildx`. See OBI-113 for the trial results and
 the helm values the cluster needs.
+
+## Load runner (`CI_LOAD_RUNS_ON`, OBI-311)
+
+The three latency jobs (`loadtest-e1-1`, the required 150-player
+p99 < 50 ms gate, plus `loadtest-smoke` and `bench`) choose their runner
+from a separate variable, using the same plain-text / JSON-array rules as
+`CI_RUNS_ON`:
+
+```yaml
+runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_LOAD_RUNS_ON && (...) || vars.CI_RUNS_ON && (...) || 'arc-runner-set-loommud' }}
+```
+
+| `CI_LOAD_RUNS_ON` value          | Result for the three latency jobs                     |
+|----------------------------------|--------------------------------------------------------|
+| unset / empty                    | same runner as every other job (the default above)     |
+| `arc-runner-set-loommud-load`    | the dedicated load scale set                           |
+
+Why it exists: a p99 measured with other work on the same node means
+nothing. The `loom-ci-load-lane` concurrency group (see `ci.yml`) stops two
+gates from running together. It cannot keep this run's `rust` job, another
+PR's builds, or `warp`/`loom-gitops` CI (which share
+`arc-runner-set-loommud`) off the node. A dedicated scale set can.
+
+The load scale set is only useful if it has a **node of its own**. Use the
+same image and `containerMode: dind` as the shared set, `minRunners: 0`,
+`maxRunners: 1`, and pin it with a `nodeSelector` plus a toleration for a
+taint (e.g. `loom.ci/load=true:NoSchedule`) that the shared set does not
+tolerate. A second label whose pods land on the shared node buys nothing.
+
+**If the load set is down**, unset `CI_LOAD_RUNS_ON`. The gates fall back
+to the shared set, which is noisy but keeps running, instead of queueing
+forever. `scripts/check-ci-load-lane.py` refuses a bare label in
+`runs-on` for these jobs for exactly this reason. It also refuses
+`CI_LOAD_RUNS_ON` on any other job.

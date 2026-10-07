@@ -321,7 +321,8 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   a workflow* (measured, see below), so at most one heavy thing runs repo-wide
   at a time and a second PR's gate **queues** instead of racing.
 - `cancel-in-progress: false` -- a measurement already running is never
-  killed. `queue: max` -- pending runs wait in FIFO instead of the default
+  killed. `queue: max` -- pending runs all wait (one at a time; the order is
+  not guaranteed, observed roughly FIFO) instead of the default
   `single`, where the third run cancels the pending one. A *cancelled*
   required check blocks a PR exactly like a failed one, so queueing (not
   replacing) is part of not weakening the gate.
@@ -350,7 +351,7 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
   headroom, that no required check became skippable or optional, and that the
   workflow-level block can only ever cancel a superseded `pull_request` run),
-  plus a `--self-test` of 68 mutations (69 cases, among them the gate losing its
+  plus a `--self-test` of 73 mutations (74 cases, among them the gate losing its
   `if: ${{ !cancelled() }}`, the three verdict-isolation beats #154 added, a
   `${{ }}` written inside a `run:` block, and the mudlib checkout going floating,
   unverified or unstamped). Both run in the required `hygiene` job, with the
@@ -472,7 +473,7 @@ so a missing or unreadable verdict means "take the lane and measure". Rule 8 of
 `scripts/check-ci-load-lane.py` pins the whole shape -- the expression, its
 run-scoped arm, the classifier's inability to be skipped or to fail the job, and
 a step guard beside every measurement -- because each of those has a fail-open
-mutation: 68 of them now, all run in `hygiene`.
+mutation: 73 of them now, all run in `hygiene`.
 
 Putting `.github/**` on the irrelevant list is only safe because of rule 9: the
 workflow may not install a `toolchain:` that `rust-toolchain.toml` does not
@@ -615,7 +616,7 @@ the same class -- its `queue:` complaints are a schema lag behind the lane's own
 ### Which runs may be cancelled, and which may never be (OBI-313)
 
 Queueing is not the only way the lane gets stuck. Because
-`loom-ci-load-lane` is a FIFO **across runs**, one PR that takes three pushes
+`loom-ci-load-lane` is a queue **across runs**, one PR that takes three pushes
 holds three places in it until they drain -- including the two pushes nobody
 meant to measure. Run 37698132725 (2026-10-07 22:44:59Z) was a *draft* PR whose
 diff was two README paragraphs and a comment block: it opened a full CI run,

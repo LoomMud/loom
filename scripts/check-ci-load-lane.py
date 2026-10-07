@@ -13,10 +13,10 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
   1. each load job is in the `loom-ci-load-lane` job-level concurrency group,
      with `cancel-in-progress: false` (never kill a running measurement) and
      `queue: max` (a *cancelled* required check blocks a PR as hard as a
-     failed one, so waiting runs must queue in FIFO, not replace each other);
-     or, for the three gates only, is in an OBI-325 escape group, which rule 8
-     pins to exactly the shape that still puts every runtime-relevant run in
-     the lane;
+     failed one, so waiting runs must all queue, not replace each other --
+     one at a time, order not guaranteed); or, for the three gates only, is in
+     an OBI-325 escape group, which rule 8 pins to exactly the shape that still
+     puts every runtime-relevant run in the lane;
   2. the CPU-heavy build/fuzz jobs (`rust`, `fuzz-smoke*`) share that same
      group name unconditionally (they load the host whatever the diff is),
      because a job-level group is keyed by NAME across the jobs of a workflow --
@@ -112,7 +112,11 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      first night and stays red, because merged history contains commits whose
      sign-off names the agent who wrote them rather than the author (run
      37752599276). A permanently red backstop is not a backstop; it is a
-     notification nobody reads.
+     notification nobody reads; and
+ 14. the three load gates, and only they, pick their runner through
+     `vars.CI_LOAD_RUNS_ON` with the shared runner as the fallback (OBI-311),
+     so a dedicated load scale set can be switched on and off with one
+     variable and an unset variable changes nothing.
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -178,6 +182,15 @@ MIN_TIMEOUT = {"loadtest-e1-1": 30, "loadtest-smoke": 20}
 # two that a required check cannot afford to lose (OBI-313).
 COMMIT_TYPES = {"opened", "synchronize", "reopened"}
 MUST_RUN_ON = {"opened", "synchronize"}
+# Runner selection (OBI-311). Fork PRs stay GitHub-hosted; otherwise the
+# load variable, then exactly the shared expression. Never a bare label: a
+# required check pinned to a scale set that is down or absent queues forever.
+SHARED_RUNS_ON = ("vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && "
+                  "fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud'")
+LOAD_RUNS_ON = ("${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || "
+                "vars.CI_LOAD_RUNS_ON && (startsWith(vars.CI_LOAD_RUNS_ON, '[') && "
+                "fromJSON(vars.CI_LOAD_RUNS_ON) || vars.CI_LOAD_RUNS_ON) || "
+                + SHARED_RUNS_ON + " }}")
 DEFAULT = ".github/workflows/ci.yml"
 # Workflow-level concurrency (OBI-313). A constant group name would be a
 # repo-wide mutex -- one PR's push cancelling another PR's in-flight
@@ -1008,6 +1021,15 @@ def check_text(text, root="."):
                               "a host under load must end the gate with a measured "
                               "p99, not a cancellation")
 
+    for job, block in jobs.items():
+        got = scalar(block, "runs-on")
+        if job in LANE_GATES and got != LOAD_RUNS_ON:
+            errors.append(f"`{job}` runs-on must be the CI_LOAD_RUNS_ON expression "
+                          f"with the shared-runner fallback (OBI-311), got {got!r}")
+        if job not in LANE_GATES and got is not None and "CI_LOAD_RUNS_ON" in got:
+            errors.append(f"`{job}` must not use CI_LOAD_RUNS_ON: the load runner is "
+                          "for the latency gates only")
+
     for job, dep in LANE_CHAIN.items():
         if job in jobs:
             deps = needs_of(jobs[job])
@@ -1253,6 +1275,15 @@ MUTANTS = [
                                     "      queue: max\n"
                                     "    runs-on: ubuntu-latest\n"
                                     "    steps:\n      - run: echo hi\n", 1)),
+    ("gate pinned to a bare load label",
+     lambda t: _sub(t, "vars.CI_LOAD_RUNS_ON",
+                    "    runs-on: arc-runner-set-loommud-load\n")),
+    ("gate back on the shared expression only",
+     lambda t: _sub(t, "vars.CI_LOAD_RUNS_ON",
+                    "    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || "
+                    + SHARED_RUNS_ON + " }}\n", nth=2)),
+    ("unrelated job takes the load runner",
+     lambda t: t.replace("  deny:\n", "  deny:\n    runs-on: " + LOAD_RUNS_ON + "\n", 1)),
     ("required check renamed away", lambda t: t.replace("  deny:\n", "  deny-optional:\n", 1)),
     # Workflow-level concurrency (OBI-313). The first six are the shapes the
     # issue names; the last four re-test the lane *beside* the new block -- the
