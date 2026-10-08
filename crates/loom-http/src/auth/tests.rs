@@ -1850,3 +1850,53 @@ fn is_or_might_be_secure_normalizes_and_fails_closed() {
         "multiple .. segments must still fail closed"
     );
 }
+
+/// OBI-319 second review, point 2 (D-TM4 HMAC domain separation): a
+/// token in the *exact* ws-ticket claim shape, but signed with the
+/// OAuth-state/pending-TOTP key, must not redeem as a `/lsp` ticket --
+/// and neither must a real access token or an OAuth state cookie. Only
+/// the ws-ticket issuer's own key is accepted.
+#[test]
+fn ws_ticket_redemption_rejects_tokens_from_every_other_signing_domain() {
+    let service = test_service(FakeDirectory::new());
+    let exp = OffsetDateTime::now_utc().unix_timestamp() + 30;
+    let ticket_shaped = serde_json::json!({
+        "sub": "alice",
+        "sid": "sid-1",
+        "nonce": "n",
+        "exp": exp,
+    });
+
+    // Same claims, OAuth-state/pending-TOTP HMAC key.
+    let state_signed = service.state_key.encode(&ticket_shaped).unwrap();
+    assert!(matches!(
+        service.redeem_ws_ticket(&state_signed),
+        Err(AuthError::InvalidWsTicket)
+    ));
+
+    // An EdDSA access token for the same sub/sid.
+    let access = service.sign_for_test(&AccessClaims {
+        sub: "alice".to_string(),
+        tier: 1,
+        scopes: vec!["builder".to_string()],
+        iss: "https://build.loommud.com/".to_string(),
+        aud: jwt::AUDIENCE.to_string(),
+        iat: exp - 30,
+        nbf: exp - 30,
+        exp,
+        sid: "sid-1".to_string(),
+        amr: vec!["pwd".to_string()],
+        mfa_at: None,
+    });
+    assert!(matches!(
+        service.redeem_ws_ticket(&access),
+        Err(AuthError::InvalidWsTicket)
+    ));
+
+    // And the converse: a genuine ws ticket is not an access token.
+    let real_ticket = service
+        .issue_ws_ticket(&service.verify_access_token(&access).unwrap())
+        .unwrap();
+    assert!(service.verify_access_token(&real_ticket).is_err());
+    assert!(service.verify_oauth_state(&real_ticket).is_err());
+}

@@ -856,6 +856,59 @@ mod tests {
             .unwrap();
     }
 
+    /// Send `{"auth": ticket}` then an `initialize`, and assert the server
+    /// closes without ever answering it -- i.e. no LSP server was started
+    /// for this socket (OBI-319 second review, point 4).
+    async fn assert_refused_without_an_lsp_reply(addr: std::net::SocketAddr, ticket: &str) {
+        let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
+            .await
+            .unwrap();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({ "auth": ticket }).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        // The server may already have closed; a failed send is fine.
+        let _ = ws
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::json!({
+                    "id": 1,
+                    "method": "initialize",
+                    "params": { "capabilities": {} },
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        let next = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
+        match next {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
+            | Ok(None)
+            | Ok(Some(Err(_))) => {}
+            other => panic!("expected the session to be refused with no LSP reply, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_invalid_ticket_is_refused_before_any_lsp_server_starts() {
+        let (addr, _auth, directory) = spawn_lsp_server(None).await;
+        directory.seed_live_session_for_test("frodo", "sid-1");
+        assert_refused_without_an_lsp_reply(addr, "not-a-ticket").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ticket_for_an_already_revoked_session_family_is_refused_at_connect() {
+        // OBI-319 second review, point 3: revocation is checked at connect,
+        // not only by the periodic recheck. The ticket itself is valid and
+        // unused; only the token family behind it is gone.
+        let (addr, auth, directory) = spawn_lsp_server(None).await;
+        directory.seed_live_session_for_test("frodo", "sid-1");
+        let claims = claims_for("frodo", &keys(), "sid-1");
+        let ticket = auth.issue_ws_ticket(&claims).unwrap();
+        directory.revoke_session_family_for_test("sid-1");
+        assert_refused_without_an_lsp_reply(addr, &ticket).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_valid_ticket_bridges_a_real_initialize_round_trip() {
         let (addr, auth, directory) = spawn_lsp_server(None).await;

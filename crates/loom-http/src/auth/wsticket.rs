@@ -157,6 +157,35 @@ mod tests {
     }
 
     #[test]
+    fn issued_tickets_expire_after_thirty_seconds() {
+        // D-TM4 "valid for 30 s" (OBI-319 second-review point 1): pin the
+        // TTL the issuer actually stamps, not just the generic expiry check.
+        let issuer = WsTicketIssuer::new();
+        let before = OffsetDateTime::now_utc().unix_timestamp();
+        let ticket = issuer.issue("alice", "sid-1").unwrap();
+        let after = OffsetDateTime::now_utc().unix_timestamp();
+        let claims: WsTicketClaims = issuer.key.decode(&ticket).unwrap();
+        assert!(claims.exp >= before + TICKET_TTL_SECS && claims.exp <= after + TICKET_TTL_SECS);
+        assert_eq!(TICKET_TTL_SECS, 30);
+    }
+
+    #[test]
+    fn an_expired_ticket_is_rejected_even_on_first_use() {
+        // Signed by the right key, never redeemed, but past `exp`: refused.
+        let issuer = WsTicketIssuer::new();
+        let expired = issuer
+            .key
+            .encode(&WsTicketClaims {
+                sub: "alice".to_string(),
+                sid: "sid-1".to_string(),
+                nonce: "n".to_string(),
+                exp: OffsetDateTime::now_utc().unix_timestamp() - 1,
+            })
+            .unwrap();
+        assert_eq!(issuer.redeem(&expired), Err(WsTicketError::Invalid));
+    }
+
+    #[test]
     fn a_malformed_ticket_is_rejected() {
         let issuer = WsTicketIssuer::new();
         assert_eq!(issuer.redeem("garbage"), Err(WsTicketError::Invalid));
