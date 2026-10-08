@@ -110,7 +110,7 @@ function mountBootFailure(message: string): void {
       el("h2", {}, ["The IDE failed to start"]),
       el("p", {}, [message]),
       el("p", { class: "ide-note" }, [
-        "This page loads Monaco from /vendor/monaco/vs on this origin. A 404 there means the web root was built without `npm run vendor`.",
+        "This page loads Monaco from the version-stamped `vendor/monaco` tree on this origin. A 404 there means the web root was built without `npm run vendor`.",
       ]),
     ]),
   );

@@ -363,6 +363,10 @@ jobs:
       # M-IDE-1 for documents served outside the Rust `ServeDir` wiring, so a
       # broken scanner has to fail loudly instead of passing vacuously.
       - run: node --test ../scripts/check-static-csp.test.mjs
+      # ...and the same reasoning for the cache-key gate (OBI-338): the
+      # version stamp that makes `immutable` safe is only enforced by this
+      # script, so its own logic is tested before it is trusted to fail a build.
+      - run: node --test ../scripts/vendor-monaco.test.mjs
       - run: npm run check-licenses
       # `--audit-level=high`, but *not* `--omit=dev`: CI installs devDeps and
       # audits them, which is how PR #141's first run caught a HIGH chain
