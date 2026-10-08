@@ -398,11 +398,19 @@ unpinned `warp` checkout that supplies the measured mix, not this rule -- that i
 OBI-326, and the corrected premise raises its priority: the mix E1.1 measures is
 not compiled in, not pinned, and not in this repo.
 
-One thing the classifier cannot see: the `warp` mudlib E1.1 serves is checked
-out of `LoomMud/warp`, unpinned, inside the job. A warp-side change can move
-the p99 while every loom PR skips the lane. That is a property of the existing
-un-pinned checkout, not of the skip decision -- pinning warp (or measuring it
-as an input) is OBI-326.
+One thing the classifier could not see, until OBI-326: the `warp` mudlib E1.1
+serves lives in a *second* repository, checked out inside the job. While that
+checkout floated on warp's default branch, a warp-side change could move the p99
+with no loom diff to attach it to -- and after the skip landed, a run that never
+took the lane could be blamed on the next source PR. So the mudlib is now an
+input the repository names: `mudlib/warp.lock` carries `repository=LoomMud/warp`
+and a full 40-character `rev`, each load job's `warp-pin` step reads it and
+checks out exactly that commit, the job re-reads the file to verify what landed
+on disk, and `loom-loadtest --note` stamps `LoomMud/warp@<sha>` into the report.
+There is no fallback: a missing or branch-named pin fails the gate rather than
+serving whatever `main` points at today. The numbers above, recorded before the
+pin, stay attributed to warp `618b90c` by hand -- which is the archaeology this
+file exists to stop requiring.
 
 A cheap `classify` job answers it, and the three lane jobs read the verdict
 twice: through a conditional `concurrency.group` (runtime-relevant, or
@@ -444,6 +452,19 @@ a resolver's behaviour off a text file and can fail *open*; one wasted slot is t
 cheaper mistake. And `mudlib/**` counts as relevant even though nothing there
 reaches `loom serve --mudlib warp` today. The general shape: where a rule could
 be made cheaper by reading something dynamic, the cheap-but-structural rule wins.
+
+Rule 9 (OBI-326) closes the same gap for the world under test. It reads
+`mudlib/warp.lock` and refuses a workflow that serves a mudlib from anything
+other than that rev: every external `actions/checkout` must take both its
+`repository` and its `ref` from the `warp-pin` step, that step must be guarded
+by the same lane test as the steps beside it and must validate the rev as a
+commit SHA, the job must re-read the pin to verify what it checked out, the
+report must carry the `--note`, and the classifier must count `mudlib/warp.lock`
+runtime-relevant -- so a bump takes a lane place instead of moving the goalpost
+under a queue of skips. The last of those is the one that needs a second look:
+an unlisted path already falls closed to "relevant", so what the explicit rule
+buys is a reason a reviewer can read and a property a guard can test, not the
+behaviour itself.
 
 **First live skip (PR #144, run 37736253093, 2026-10-08).** The PR that
 introduces this decides its own diff irrelevant, and the numbers are what the

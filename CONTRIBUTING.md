@@ -104,6 +104,15 @@ follow:
   requires every `toolchain:` the workflow installs to equal the channel in
   `rust-toolchain.toml`. Bump the compiler there, where the change is measured;
   a bump in `ci.yml` alone fails a required check.
+- **The mudlib the gate serves is pinned in this repo, not in the workflow.**
+  E1.1 serves `LoomMud/warp`, a second repository, so the commit it measures is
+  named in `mudlib/warp.lock` (`repository=` plus a full 40-character `rev=`)
+  and read from there by each load job (OBI-326). Rule 9 of
+  `scripts/check-ci-load-lane.py` fails a workflow that serves a mudlib from an
+  unpinned checkout, and `mudlib/warp.lock` is runtime-relevant, so bumping the
+  world takes a lane place and gets measured. Move the rev only to a warp commit
+  that is reachable from warp's default branch, and name the warp PR it came from
+  -- the reports in `results/` are compared against it.
 
 So `loadtest-e1-1` can be green in two different ways, and the job says which
 one you got in its step summary: **measured** (p99 against the 50 ms budget) or
