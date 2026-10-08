@@ -801,7 +801,7 @@ mod tests {
             login_latency: None,
             e1_1_pass: true,
             notes: vec![
-                "mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in mudlib/warp.lock)"
+                "mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in warp.ref)"
                     .to_string(),
             ],
             server_metrics: None,

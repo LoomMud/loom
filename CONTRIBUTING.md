@@ -106,13 +106,18 @@ follow:
   a bump in `ci.yml` alone fails a required check.
 - **The mudlib the gate serves is pinned in this repo, not in the workflow.**
   E1.1 serves `LoomMud/warp`, a second repository, so the commit it measures is
-  named in `mudlib/warp.lock` (`repository=` plus a full 40-character `rev=`)
-  and read from there by each load job (OBI-326). Rule 9 of
-  `scripts/check-ci-load-lane.py` fails a workflow that serves a mudlib from an
-  unpinned checkout, and `mudlib/warp.lock` is runtime-relevant, so bumping the
-  world takes a lane place and gets measured. Move the rev only to a warp commit
-  that is reachable from warp's default branch, and name the warp PR it came from
-  -- the reports in `results/` are compared against it.
+  named in `warp.ref` at the repo root -- one line, a full 40-character SHA -- and
+  read from there by each load job (OBI-326). The repository name stays in the
+  workflow as that one literal, and rule 9 asserts it, so retargeting the load
+  jobs at a fork fails `hygiene` even though `.github/**` is on the skip list.
+  Rule 9 also fails a workflow that serves a mudlib from an unpinned or
+  unverified checkout, and `warp.ref` is runtime-relevant, so bumping the world
+  takes a lane place and gets measured. Move the rev only to a warp commit that
+  is reachable from warp's default branch, name the warp PR it came from, and
+  attach the load run: the world under test carries the session *mix* too
+  (`warp/loadbot/mix.tsv`), so a bump is a change to the measurement, not a
+  checkout detail. `results/README.md` says which SHA the numbers above were
+  taken against.
 
 So `loadtest-e1-1` can be green in two different ways, and the job says which
 one you got in its step summary: **measured** (p99 against the 50 ms budget) or
@@ -130,6 +135,18 @@ If you think a diff was wrongly called irrelevant -- a change that should have
 been measured -- say so on the PR and fix the *rule* in
 `scripts/load-lane-classify.py` (its `--self-test` table is the test), not the
 threshold, the population, or the check itself: `hygiene` fails those.
+
+**When a run has to be measured, make it one of the two that always are.**
+Since OBI-325 a PR can be green without a p99 in it, so a number that must exist
+-- for a release SHA, or to bisect a drift -- comes from `gh workflow run ci.yml
+--ref <sha>` or from the nightly `on.schedule` run, never from hoping a diff
+takes the lane. Both are outside the `pull_request`-scoped concurrency group: a
+schedule or dispatch run gets a run-scoped group and is never cancelled (rule 5),
+and rule 10 fails the workflow if either trigger is deleted -- they live in
+`.github/**`, which the lane counts irrelevant, so a backstop with no guard in
+`hygiene` is a comment. Either way the report names the world it served: the
+`## Notes` block carries `mudlib LoomMud/warp@<sha>`, and the job summary prints
+the same line next to the verdict.
 
 Two things this does **not** change:
 

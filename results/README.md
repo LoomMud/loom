@@ -9,8 +9,8 @@ one Markdown per run, named `<date>-<players>-players[-<label>].{json,md}`.
 
 Reference host: Intel Core i7-9750H @ 2.60GHz (12 logical CPUs), 32 GiB RAM,
 Linux. `loom serve --mudlib warp` (a local `warp` checkout at whatever its `HEAD`
-was that day -- nothing recorded it, which is the gap `mudlib/warp.lock` closes;
-*Report provenance* below attributes it to warp `618b90c`), `loom-loadtest` on
+was that day -- nothing recorded it, which is the gap `warp.ref` closes; *Report
+provenance* below attributes it to warp `618b90c`), `loom-loadtest` on
 the same host (so this includes no network latency beyond loopback -- see
 "Limitations" below).
 
@@ -404,13 +404,16 @@ One thing the classifier could not see, until OBI-326: the `warp` mudlib E1.1
 serves lives in a *second* repository, checked out inside the job. While that
 checkout floated on warp's default branch, a warp-side change could move the p99
 with no loom diff to attach it to -- and after the skip landed, a run that never
-took the lane could be blamed on the next source PR. So the mudlib is now an
-input the repository names: `mudlib/warp.lock` carries `repository=LoomMud/warp`
-and a full 40-character `rev`, each load job's `warp-pin` step reads it and
-checks out exactly that commit, the job re-reads the file to verify what landed
-on disk, and `loom-loadtest --note` stamps `LoomMud/warp@<sha>` into the report.
-There is no fallback: a missing or branch-named pin fails the gate rather than
-serving whatever `main` points at today. The numbers above, recorded before the
+took the lane could be blamed on the next source PR. It also moved the *session
+mix*, because E1.1 replays `--mix warp/loadbot/mix.tsv` out of that same
+checkout, and the `include_str!` of `tests/fixtures/mix.tsv` is `#[cfg(test)]`-only.
+So the mudlib is now an input the repository names: `warp.ref` at the repo root
+holds one line, a full 40-character commit SHA, each load job's `warp-pin` step
+reads it and checks out exactly that commit of `LoomMud/warp`, the job re-reads
+the file to verify what landed on disk, and `loom-loadtest --note` stamps
+`LoomMud/warp@<sha>` into the report. There is no fallback: a missing,
+comment-only or branch-named pin fails the gate rather than serving whatever
+warp's default branch points at today. The numbers above, recorded before the
 pin, stay attributed to warp `618b90c` by hand -- which is the archaeology this
 file exists to stop requiring.
 
@@ -456,17 +459,36 @@ reaches `loom serve --mudlib warp` today. The general shape: where a rule could
 be made cheaper by reading something dynamic, the cheap-but-structural rule wins.
 
 Rule 9 (OBI-326) closes the same gap for the world under test. It reads
-`mudlib/warp.lock` and refuses a workflow that serves a mudlib from anything
-other than that rev: every external `actions/checkout` must take both its
-`repository` and its `ref` from the `warp-pin` step, that step must be guarded
-by the same lane test as the steps beside it and must validate the rev as a
-commit SHA, the job must re-read the pin to verify what it checked out, the
-report must carry the `--note`, and the classifier must count `mudlib/warp.lock`
-runtime-relevant -- so a bump takes a lane place instead of moving the goalpost
-under a queue of skips. The last of those is the one that needs a second look:
-an unlisted path already falls closed to "relevant", so what the explicit rule
-buys is a reason a reviewer can read and a property a guard can test, not the
-behaviour itself.
+`warp.ref` and refuses a workflow that serves a mudlib from anything other than
+that rev: every external `actions/checkout` must take its `ref` from the
+`warp-pin` step and its `repository` from the one name this repo measures
+against (`LoomMud/warp`), that step must be guarded by the same lane test as the
+steps beside it and must validate the rev as a commit SHA, the job must re-read
+the pin to verify what it checked out, the report must carry the `--note`, and
+the classifier must count `warp.ref` runtime-relevant -- so a bump takes a lane
+place instead of moving the goalpost under a queue of skips. The last of those is
+the one that needs a second look: an unlisted path already falls closed to
+"relevant", so what the explicit rule buys is a reason a reviewer can read and a
+property a guard can test, not the behaviour itself.
+
+The rev comes from the file and the repository name does not, and that asymmetry
+is deliberate. A name is stable -- and `hygiene` runs rule 9 on *every* PR
+whatever `classify` decides, so retargeting the load jobs at a fork fails a
+required check even though `.github/**` is on the skip list. A rev is not stable:
+it is the thing warp moves, so it may only ever be read from a file this repo
+owns and the classifier counts.
+
+**Rule 10: the drift backstop (OBI-326).** Pinning the world does not make it
+stop moving -- `warp.ref` bumps land on warp's schedule, and a run of
+runtime-irrelevant loom diffs can leave `main` unmeasured for weeks. So `ci.yml`
+also carries `on.schedule` (a nightly run) and `on.workflow_dispatch`. Neither
+event carries a commit range, which is precisely why they measure: the
+classifier's fail-closed rule (an unreadable or absent range is never evidence
+that nothing changed) makes them take the lane. The release policy follows: **a
+release SHA needs a measured, green `loadtest-e1-1`, taken from the nightly run
+or by dispatch** -- not a green that means "not applicable". Rule 10 asserts both
+triggers stay in the workflow, for the same reason rule 8 asserts the toolchain:
+they live on the skip list.
 
 **First live skip (PR #144, run 37736253093, 2026-10-08).** The PR that
 introduces this decides its own diff irrelevant, and the numbers are what the
@@ -608,6 +630,38 @@ into jobs whose own `cancel-in-progress: false` forbids being cancelled.
 Eleven mutants prove both bite, including flipping the required gate's own
 `cancel-in-progress` to `true` beside the new block and putting `labeled` back
 in the trigger.
+
+## Report provenance
+
+A number in this directory is only usable if a reader can name the world it was
+measured against. Four things belong with every committed report:
+
+| Input | Where it comes from |
+|---|---|
+| loom commit | the run's `github.sha` / `git rev-parse --short HEAD` |
+| **warp commit** | `warp.ref` at the repo root -- one line, one 40-char SHA |
+| session mix | `warp/loadbot/mix.tsv`, replayed by the load bot |
+| host + build profile | the reference host table above, release build |
+
+The warp commit is the one an agent cannot see from this repo's history, so it is
+the one that silently moved: every 150-player number above was taken against
+whatever `LoomMud/warp`'s default branch pointed at that day. The Phase 1
+numbers are attributed to warp `618b90c` by hand, from the host's working copy --
+archaeology that `warp.ref` + `--note` makes unnecessary from here on. `warp.ref`
+currently names `1b0cd394d4cd41586e1a2d5fd449786b75c96976`, which is the tip the
+gate was measured green against; bump it only with a load run attached to the PR.
+
+What is *not* yet automated: the `## Notes` block that `--note` writes into the
+report lands in the downloaded artifact and in the job summary, but copying it
+into the header of a committed `results/ci-e1-1.md` is still a human step. That
+promotion is OBI-326's follow-up.
+
+The release policy that goes with it: a release SHA needs a **measured** green
+`loadtest-e1-1` -- one from the nightly `on.schedule` run, or one started by
+`on.workflow_dispatch`. Since OBI-325 a PR can be green while having no p99 in it
+at all, so "the check is green on the release commit" is not sufficient evidence;
+the run has to be one that took the lane. Both triggers are asserted by rule 10
+because they live in a path the lane itself counts irrelevant.
 
 ## Limitations
 

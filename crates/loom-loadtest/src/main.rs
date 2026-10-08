@@ -563,7 +563,7 @@ mod tests {
     fn note_flag_is_repeatable_and_keeps_order() {
         let a = parse(&[
             "--note",
-            "mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in mudlib/warp.lock)",
+            "mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in warp.ref)",
             "--players",
             "150",
             "--note",
