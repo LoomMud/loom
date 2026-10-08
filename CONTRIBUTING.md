@@ -103,3 +103,16 @@ If you think a diff was wrongly called irrelevant -- a change that should have
 been measured -- say so on the PR and fix the *rule* in
 `scripts/load-lane-classify.py` (its `--self-test` table is the test), not the
 threshold, the population, or the check itself: `hygiene` fails those.
+
+Two things this does **not** change:
+
+- **A skip is not a cure for a contended measurement.** The lane has never
+  shielded a gate from its own run's `rust` and `fuzz-smoke*` jobs, and the
+  board's root cause for the PR #124 miss was exactly that. If a measured gate
+  misses while `rust` is still running in the same run, that is OBI-311 (a quiet
+  runner via `CI_LOAD_RUNS_ON`), not a driver regression -- do not chase it as
+  one, and do not re-run it into a quiet window by hand.
+- **`ci.yml` and `scripts/check-ci-load-lane.py` are shared real estate.** OBI-311
+  (PR #131) and OBI-325 (PR #144) both edit them plus `results/README.md`, so
+  expect a textual rebase for whoever lands second; the shapes do not conflict
+  (a configurable `runs-on:` versus a new job and rules 7-8).

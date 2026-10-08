@@ -409,17 +409,35 @@ never entered the lane.
 
 **First live skip (PR #144, run 37736253093, 2026-10-08).** The PR that
 introduces this decides its own diff irrelevant, and the numbers are what the
-case study was about: `classify` 97 s end to end (3 s for the decision step
-itself, the rest is runner start and a full checkout), `loadtest-e1-1` 27 s with
+case study was about: `classify` 7 s end to end, `loadtest-e1-1` **12 s** with
 `run loom serve + E1.1 load test (150 players)`, the release build, the warp
-checkout and the artifact upload all reported *skipped*, and
-`loadtest-smoke` 20 s / `bench` 8 s behind it. The four-job lane chain finished
-in 3m20s (06:13:17Z -> 06:16:37Z) inside a lane that was in use by nothing; no
-`::warning::` annotation appeared, so the classifier answered rather than
-defaulting. `hygiene` ran both checkers and both self-tests against the new
-workflow in the same job, which is the proof that the escape is still shaped
-correctly -- the measurement path is unchanged code and was not exercised by
-this run, so the next runtime-relevant PR is the check that it still measures.
+checkout, the toolchain install and the artifact upload all reported *skipped:*
+`loadtest-smoke` 8 s and `bench` 7 s behind it. The whole required chain went
+from a 35-60 minute lane wait to about 90 seconds of nothing, and the only
+classifier verdict that ever produced a warning was the local drill where
+`python3` was missing.
+
+**What OBI-325 does *not* fix, and what it does.** This is a throughput change,
+not a measurement-integrity change. The board's own root-cause note on PR #124
+is that a gate miss there came from *the same run's* `rust` job
+(`cargo clippy --workspace --all-targets`, still going 35 minutes into the
+measurement window) while the lane had given the gate the host to itself -- so a
+path filter cannot fix that mechanism, and nobody should read this section as if
+it did. The mechanism fix is a quiet runner (`CI_LOAD_RUNS_ON`, PR #131 /
+OBI-311) or serialising `rust`/`fuzz` against the gate inside a run.
+
+What it does change, besides the queue, is *who may be the neighbour*. Everything
+in the lane builds the release binary, and a second release build beside a
+measuring run is exactly what turned 46.91 ms into 593 ms in the table above
+(37658696127 against 37658252388). An irrelevant run that skips no longer starts
+that build, so it stops being a disturber as well as a queue place -- but the
+same-run `rust` and `fuzz-smoke*` jobs still overlap an E1.1 measurement that
+*does* take the lane, and `release-image.yml` stays outside all of it.
+
+Both changes edit the same three files as PR #131 (`.github/workflows/ci.yml`,
+`scripts/check-ci-load-lane.py`, `results/README.md`), so whichever lands second
+rebases; the overlap is textual, not semantic (#131 swaps the lane jobs'
+`runs-on:` for a configurable runner set, this adds a job and rules 7-8).
 
 **What a green `loadtest-e1-1` means now.** Two different greens. On a
 runtime-relevant diff it is the 150-player measurement, unchanged. On a
