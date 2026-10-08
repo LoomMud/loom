@@ -25,6 +25,7 @@ import {
   type ReadFile,
 } from "./files-api.js";
 import type { EditorMarker, EditorPort } from "./editor-port.js";
+import type { LspHooks } from "./lsp-bridge.js";
 import { FileTree, baseName, type TreeRow } from "./tree.js";
 import { diagnosticsFor, formatDiagnostic, hasErrors, parseDiagnostics, TRUNCATION_NOTE, type ParsedDiagnostic } from "./compile.js";
 import { sanitizeLinkUrl, vfsPathOf } from "./links.js";
@@ -60,6 +61,12 @@ export interface IdeOptions {
    * in uid may read; the server, not the client, decides what that is
    * (M-FS-2/M-FS-3). */
   root?: string;
+  /** The live analyser (`./lsp-bridge.ts`), when the page has one. Absent
+   * is a normal configuration, not an error: a page served over an origin
+   * that cannot hold a WebSocket (`./lsp-transport.ts`) has no `/lsp`, and
+   * the save-compile path in this controller is the analysis that still
+   * works. */
+  lsp?: LspHooks;
 }
 
 /** What the controller is doing, for the status line. A single label
@@ -95,10 +102,18 @@ export class LoomIde {
         void this.save();
       }),
       this.options.editor.onChangeContent(() => {
-        if (this.open !== null && this.options.editor.currentText() !== this.open.diskText) {
+        const text = this.options.editor.currentText();
+        if (this.open !== null && text !== this.open.diskText) {
           this.setState("dirty");
         } else if (this.state === "dirty") {
           this.setState("saved");
+        }
+        // The analyser sees the same edit the dirty flag does. It is the
+        // buffer's *current* text either way -- handing it a different string
+        // would mean the diagnostics on screen describe text the builder is
+        // not looking at.
+        if (this.open !== null) {
+          this.options.lsp?.documentChanged(this.open.path, text);
         }
       }),
     );
@@ -113,6 +128,12 @@ export class LoomIde {
     for (const dispose of this.disposers) {
       dispose();
     }
+    // Before the editor goes away: `didClose` is a message that has to reach
+    // the server while the session it belongs to still exists.
+    if (this.open !== null) {
+      this.options.lsp?.documentClosed(this.open.path);
+    }
+    this.options.lsp?.dispose();
     this.options.editor.dispose();
   }
 
@@ -200,16 +221,29 @@ export class LoomIde {
     return true;
   }
 
-  /** For tests and the initial mount: adopt a read file as the buffer. */
+  /**
+   * Adopt a read file as the buffer. For the initial mount, the tree's
+   * click, and the tests alike.
+   *
+   * The two marker owners are cleared in the order their sources think: the
+   * save path's own (`loom-ide`, immediately, because the file on disk is now
+   * this text and the previous compile said nothing about it), then the
+   * analyser's, as part of handing it the buffer (`./lsp-bridge.ts`).
+   */
   setOpenDocument(file: ReadFile): void {
+    const previous = this.open;
     this.open = { path: file.path, etag: file.etag, diskText: file.text };
     this.options.editor.openText(file.path, file.text);
     this.options.editor.setMarkers([]);
+    if (previous !== null && previous.path !== file.path) {
+      this.options.lsp?.documentClosed(previous.path);
+    }
     this.lastDiagnostics = [];
     this.options.dom.saveButton.disabled = false;
     this.options.dom.pathLabel.textContent = file.path;
     this.renderDiagnostics([]);
     this.setStatus(`Opened ${file.path}`);
+    this.options.lsp?.documentOpened(file.path, file.text);
     this.options.editor.focus();
   }
 
