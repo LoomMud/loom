@@ -19,9 +19,10 @@ permissions:
 # The rule, as accepted by the CTO on 2026-10-08: no required check on a
 # MERGEABLE CANDIDATE may be cancelled. A mergeable candidate is the commit
 # branch protection actually evaluates -- for a pull request, its newest
-# commit, because `strict: true` + `required_linear_history: true` mean a stale
-# SHA never satisfies the branch anyway. A superseded PR SHA is therefore not a
-# mergeable candidate, so cancelling it is permitted; everything else is not.
+# commit, because `strict: true` ("require branches to be up to date before
+# merging") means a stale SHA never satisfies the branch anyway. A superseded
+# PR SHA is therefore not a mergeable candidate, so cancelling it is permitted;
+# everything else is not.
 #
 # MAY BE CANCELLED -- a `pull_request` run whose commit is already superseded
 # by a newer push to the same PR. That is the only thing this block cancels.
@@ -82,9 +83,13 @@ concurrency:
 #                               queueing is part of "don't weaken the gate".
 # They are also chained with `needs` -- loadtest-e1-1 -> loadtest-smoke ->
 # bench -- so the three never overlap inside one run either. The required gate
-# goes first in the chain: nothing may `needs:` it, skip it, or make it
-# optional. `rust`/`deny`/`dco`/`hygiene` (the other required checks) stay
-# outside the lane and unscheduled so they can never be skipped by a lane job.
+# goes first in the chain: nothing may skip it or make it optional, and the one
+# permitted `needs:` on it is `classify`, the OBI-325 job below that decides
+# whether this diff has to be measured at all -- permitted because rule 7 of
+# scripts/check-ci-load-lane.py proves `classify` cannot be skipped and cannot
+# fail-open, and it has no `if:` of its own. `rust`/`deny`/`dco`/`hygiene` (the
+# other required checks) stay outside the lane and unscheduled so they can never
+# be skipped by a lane job.
 # Each gate also carries wall-clock headroom (`timeout-minutes` 30 / 20): the
 # lane stops a second *gate* from racing, not this run's own `rust` job or
 # another PR's builds, and a release build starved past the old 15-minute
@@ -98,9 +103,55 @@ concurrency:
 # it properly is runner capacity (ephemeral/dedicated load hosts), deliberately
 # out of scope for OBI-308 -- see results/README.md "CI load lane".
 #
+#
+# ── Who has to wait at all (OBI-325) ──────────────────────────────────────────
+# A lane place is only worth waiting for if the run can change what the lane
+# measures. `loadtest-e1-1` builds `cargo build --release -p loom-cli
+# -p loom-loadtest` from the checkout and drives `loom serve --mudlib warp` over
+# telnet, so the inputs are the two binaries' source, their manifests and
+# feature sets, the lockfile, the toolchain, `.cargo/` config, and the mudlib.
+# The `classify` job below decides that with `scripts/load-lane-classify.py` --
+# an *irrelevance allow-list with a fail-closed default*, because a path nobody
+# thought of costs one lane run while the opposite mistake costs an unmeasured
+# regression -- and the three lane jobs read its verdict twice:
+#
+#   * `concurrency.group` -- runtime-relevant (or undecided) takes
+#     `loom-ci-load-lane`; runtime-irrelevant takes a `github.run_id`-scoped
+#     group, which no other run is in, so a docs or test PR cannot be queued
+#     behind somebody else's 150-player measurement;
+#   * the measurement steps' `if:` -- the same test, so an escaped group also
+#     means nothing runs on the host: the job is checkout + summary.
+#
+# Two edges of that table are easy to get backwards, so they are cases in the
+# classifier's own --self-test: `crates/*/tests/fixtures/**` is compiled into
+# the load bot by include_str!, which makes a path under tests/ part of the
+# measured binary; and bench workloads and harness files are relevant because
+# `bench` measures them inside this same lane, and skipping would silently
+# retire the only bench regression gate. What the classifier cannot see is the
+# mudlib the gate serves: `warp` is checked out of LoomMud/warp, unpinned,
+# inside the job -- a warp-side change can move p99 while every loom PR skips.
+# That is a property of the un-pinned checkout, not of the decision; pinning
+# warp (or treating it as an input) is the OBI-325 follow-up.
+#
+# `.github/**` itself is on the irrelevant list, and that is only honest because
+# of rule 8 of scripts/check-ci-load-lane.py: no job may install a `toolchain:`
+# that rust-toolchain.toml does not declare. The compiler is an input the lane
+# measures, so it gets exactly one place to change -- a file the classifier
+# counts as runtime-relevant -- and a workflow-only bump fails `hygiene` (a
+# required check) instead of quietly redefining what every later run builds.
+#
+# Both are keyed on `!= 'false'` and not on `== 'true'`: an empty or unreadable
+# classifier output then means "take the lane and measure", never "skip". That
+# is what keeps the required gate fail-closed while the check still reports a
+# real conclusion (the job is never `if:`-ed away, and a *skipped* required
+# check blocks a PR exactly like a failed one -- see the draft-PR note above).
+# On the skip path the job writes a summary saying the green is "not
+# applicable", not "measured", which is the whole point of keeping the check.
+#
 # These invariants are enforced by scripts/check-ci-load-lane.py, run in the
-# `hygiene` job below. Which runs may be cancelled *at all* is the workflow-level
-# `concurrency` block above, not anything in the lane.
+# `hygiene` job below -- rule 7 there pins the escape hatch, both copies of it,
+# and the fail-closed comparison. Which runs may be cancelled *at all* is the
+# workflow-level `concurrency` block above, not anything in the lane.
 jobs:
   rust:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
@@ -181,10 +232,17 @@ jobs:
     # byte-identical copy of the head binary -- and exits 3 (`INVALID
     # harness`) when that control fails to measure 1.00. Threshold, rounds,
     # iterations and the workload list are unchanged.
+    #
+    # OBI-325: it asks `loadtest-smoke` for the lane verdict rather than
+    # recomputing one, so the three lane jobs cannot disagree about whether a
+    # run occupies the lane.
     needs: loadtest-smoke
     if: github.event_name == 'pull_request' && success()
+    outputs:
+      runtime: ${{ needs.loadtest-smoke.outputs.runtime }}
+      reason: ${{ needs.loadtest-smoke.outputs.reason }}
     concurrency:
-      group: loom-ci-load-lane
+      group: ${{ needs.loadtest-smoke.outputs.runtime != 'false' && 'loom-ci-load-lane' || format('loom-ci-load-lane-not-required-{0}', github.run_id) }}
       cancel-in-progress: false
       queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
@@ -204,15 +262,19 @@ jobs:
         with:
           fetch-depth: 0
       - run: scripts/ci-ensure-tools.sh cc:build-essential python3:python3-minimal
+        if: needs.loadtest-smoke.outputs.runtime != 'false'
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-27)
+        if: needs.loadtest-smoke.outputs.runtime != 'false'
         with:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.loadtest-smoke.outputs.runtime != 'false'
       - run: scripts/bench-gate.sh "${{ github.event.pull_request.base.sha }}"
+        if: needs.loadtest-smoke.outputs.runtime != 'false'
       - name: Upload raw round data
         # The verdict is a min-of-medians; OBI-312 could not be diagnosed from
         # CI because the per-round numbers were thrown away. Keep them.
-        if: always()
+        if: always() && needs.loadtest-smoke.outputs.runtime != 'false'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-rounds-${{ github.run_id }}
@@ -265,7 +327,7 @@ jobs:
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" -o "$workdir/gitleaks.tar.gz"
           tar -xzf "$workdir/gitleaks.tar.gz" -C "$workdir" gitleaks
           "$workdir/gitleaks" git --redact --exit-code 1 .
-      - name: CI load lane invariants (OBI-308, workflow-level cancel OBI-313)
+      - name: CI load lane invariants (OBI-308, workflow-level cancel OBI-313, lane escape OBI-325)
         # The latency gates in this workflow are only meaningful on a quiet
         # host. Keep the lane (concurrency group + DAG order + "no required
         # check may be skipped") from rotting silently, and keep the
@@ -277,6 +339,18 @@ jobs:
           scripts/ci-ensure-tools.sh python3:python3-minimal
           python3 scripts/check-ci-load-lane.py .github/workflows/ci.yml
           python3 scripts/check-ci-load-lane.py --self-test .github/workflows/ci.yml
+      - name: load-lane classifier self-test (OBI-325)
+        # *Which* diffs may skip the lane is a policy decision about what the
+        # gate measures, so it lives in a table -- and the table is tested here,
+        # not in the lane, where a wrong answer costs 40 minutes to notice. The
+        # cases are the real diffs from the case studies plus the overlaps that
+        # are easy to get backwards (`tests/fixtures/**` is compiled in by
+        # include_str!), and every unrecognised or unreadable diff must come out
+        # runtime-relevant.
+        run: |
+          set -euo pipefail
+          scripts/ci-ensure-tools.sh python3:python3-minimal
+          python3 scripts/load-lane-classify.py --self-test
       - name: bench gate comparator self-test (OBI-312)
         # The `bench` job's exit code decides whether a red gate means "this
         # code got slower" (1) or "the harness cannot measure 1.00" (3). That
@@ -372,6 +446,82 @@ jobs:
       # so it belongs in the gate; `npm run audit` spells `--include=dev` out
       # so no runner's config can narrow it silently.
       - run: npm run audit
+  classify:
+    # OBI-325: decide whether this change can move the numbers the load lane
+    # measures *before* any job takes a place in that lane.
+    #
+    # Why it has to be a separate job: GitHub resolves a job-level
+    # `concurrency.group` when the job is scheduled, so the answer has to exist
+    # before `loadtest-e1-1` asks for the lane -- a step inside that job is
+    # already 35-60 minutes of queue too late. `needs` is an allowed context for
+    # `jobs.<job_id>.concurrency`, which is what makes this shape possible.
+    #
+    # This job is not a required check and must never be able to *skip* one, so
+    # it is built to fail toward the lane instead: it has no `needs:`/`if:` of
+    # its own, the classifier writes exactly one `runtime=` line and exits 0 on
+    # every path, and if anything at all goes wrong (no diff range, no python,
+    # a crash) the fallback value written here is `true` -- "take the lane and
+    # measure". A classifier that cannot decide delays merges; it does not
+    # silently wave a regression through.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
+    timeout-minutes: 10
+    outputs:
+      runtime: ${{ steps.decide.outputs.runtime }}
+      reason: ${{ steps.decide.outputs.reason }}
+      files: ${{ steps.decide.outputs.files }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The classifier diffs `base...head`, so it needs both ends and their
+          # merge base. `hygiene` and `dco` already pay for a full clone; this
+          # is the same cost, not a new one.
+          fetch-depth: 0
+      - run: scripts/ci-ensure-tools.sh python3:python3-minimal
+        # Tolerated on purpose: a runner that cannot apt-install python3 must not
+        # fail this job, because a failed `classify` *skips* the required gate --
+        # which blocks every PR in the queue. The fallback below takes the lane.
+        continue-on-error: true
+      - name: classify the diff
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          verdict="$RUNNER_TEMP/load-lane.out"
+          : > "$verdict"
+          # One invocation, one verdict file: `runtime=` may be written at most
+          # once, so the fallback below can never sit beside a real answer.
+          args=(--reason "$EVENT carries no readable commit range")
+          if [ "$EVENT" = pull_request ]; then
+            # Three-dot on purpose: this PR's own files, not whatever `main` moved
+            # by while the gate was queued. Two-dot would let someone else's `src/`
+            # change make a docs PR runtime-relevant.
+            args=(--range "$PR_BASE...$PR_HEAD")
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+              && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            args=(--range "$BEFORE...$AFTER")
+          fi
+          python3 scripts/load-lane-classify.py "${args[@]}" \
+            --output-file "$verdict" --summary || true
+          if ! grep -q '^runtime=' "$verdict" 2>/dev/null; then
+            echo 'runtime=true' >> "$verdict"
+            echo 'reason=the classifier could not answer (fail closed: take the lane)' >> "$verdict"
+            echo "::warning::load-lane classifier produced no verdict; taking the lane"
+          fi
+          cat "$verdict" >> "$GITHUB_OUTPUT" 2>/dev/null || true
+          cat "$verdict" || true
+          # This job must never fail on the classification itself: a failed
+          # `classify` *skips* `loadtest-e1-1`, and a skipped required check
+          # blocks the PR as hard as a failed one -- with `strict: true` it
+          # blocks every PR behind it too. Missing verdicts already mean "take
+          # the lane" above, which is the safe direction; the warning is what
+          # makes the delay visible instead of silent.
+          exit 0
+
   loadtest-smoke:
     # R4 load-bot smoke (OBI-40): 20 simulated players, 60s, against a real
     # `loom serve` on this checkout's fixture mudlib driven by Warp's
@@ -382,9 +532,17 @@ jobs:
     #
     # Load-lane member (OBI-308): runs after `loadtest-e1-1` in the same group,
     # so it neither contends with the required gate nor with `bench`.
+    #
+    # OBI-325: it inherits the required gate's lane verdict and republishes it,
+    # so `bench` (which needs *this* job) reads the same decision the lane was
+    # entered on -- and a runtime-irrelevant run leaves the group immediately
+    # instead of queueing behind another PR's measurement.
     needs: loadtest-e1-1
+    outputs:
+      runtime: ${{ needs.loadtest-e1-1.outputs.runtime }}
+      reason: ${{ needs.loadtest-e1-1.outputs.reason }}
     concurrency:
-      group: loom-ci-load-lane
+      group: ${{ needs.loadtest-e1-1.outputs.runtime != 'false' && 'loom-ci-load-lane' || format('loom-ci-load-lane-not-required-{0}', github.run_id) }}
       cancel-in-progress: false
       queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
@@ -393,16 +551,22 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - run: scripts/ci-ensure-tools.sh cc:build-essential python3:python3-minimal
+        if: needs.loadtest-e1-1.outputs.runtime != 'false'
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-27)
+        if: needs.loadtest-e1-1.outputs.runtime != 'false'
         with:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.loadtest-e1-1.outputs.runtime != 'false'
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: needs.loadtest-e1-1.outputs.runtime != 'false'
         with:
           repository: LoomMud/warp
           path: warp
       - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
+        if: needs.loadtest-e1-1.outputs.runtime != 'false'
       - name: run loom serve + loadtest smoke
+        if: needs.loadtest-e1-1.outputs.runtime != 'false'
         env:
           # OBI-344: the same visibility as the gate. The serve log used to be
           # captured at the default level, which prints nothing, so a smoke
@@ -436,7 +600,7 @@ jobs:
           cat /tmp/loom-serve.log
           cp /tmp/loom-serve.log results/loom-serve-smoke.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
+        if: always() && needs.loadtest-e1-1.outputs.runtime != 'false'
         with:
           name: loadtest-smoke-report
           path: |
@@ -452,10 +616,25 @@ jobs:
     #
     # Load-lane holder (OBI-308): the p99 number is meaningless if anything
     # else is on the host, so this job takes the `loom-ci-load-lane` group
-    # alone-across-runs (queueing, never cancelling) and has no `needs:`/`if:`
-    # of its own -- it is a required check and must never be skipped.
+    # alone-across-runs (queueing, never cancelling). It has no `if:` of its
+    # own -- it is a required check and must never be *skipped*, which would
+    # block a PR exactly as hard as a failure.
+    #
+    # OBI-325: it does have one `needs:`, and that is the whole change. A
+    # required check may not be skippable, but it can be *cheap when there is
+    # nothing to measure*: `classify` decides, and a runtime-irrelevant diff
+    # takes a run-scoped group instead of a lane place and runs no measurement
+    # step. The comparison is `!= 'false'`, never `== 'true'`, so an unreadable
+    # verdict means "queue and measure"; and the gate is the one that publishes
+    # the verdict (`outputs.runtime`) for `loadtest-smoke` and `bench` to
+    # inherit, so the three jobs always agree about whether this run holds the
+    # lane. Rule 7 of scripts/check-ci-load-lane.py pins both halves of that.
+    needs: classify
+    outputs:
+      runtime: ${{ needs.classify.outputs.runtime }}
+      reason: ${{ needs.classify.outputs.reason }}
     concurrency:
-      group: loom-ci-load-lane
+      group: ${{ needs.classify.outputs.runtime != 'false' && 'loom-ci-load-lane' || format('loom-ci-load-lane-not-required-{0}', github.run_id) }}
       cancel-in-progress: false
       queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
@@ -469,16 +648,49 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # Always runs, on both paths: a green check that measured nothing has to
+      # say so in the run, not in a comment three weeks later (OBI-325).
+      - name: load-lane decision
+        env:
+          RUNTIME: ${{ needs.classify.outputs.runtime }}
+          REASON: ${{ needs.classify.outputs.reason }}
+        run: |
+          set -uo pipefail
+          if [ "$RUNTIME" = false ]; then
+            {
+              echo '### `loadtest-e1-1`: load lane not required'
+              echo
+              echo 'Nothing in this diff can change what the E1.1 gate measures, so this'
+              echo 'run took no `loom-ci-load-lane` place and made **no measurement**: no'
+              echo 'release build, no 150 players, no p99. This check is green because it'
+              echo 'is not applicable, not because a latency budget passed.'
+              echo
+              echo "Rule: \`$REASON\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "loadtest-e1-1: skipped the load lane ($REASON)"
+          else
+            {
+              echo '### `loadtest-e1-1`: measuring in the load lane'
+              echo
+              echo "Rule: \`$REASON\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "loadtest-e1-1: runtime-relevant ($REASON) -> 150 players, p99 < 50 ms"
+          fi
       - run: scripts/ci-ensure-tools.sh cc:build-essential python3:python3-minimal
+        if: needs.classify.outputs.runtime != 'false'
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-27)
+        if: needs.classify.outputs.runtime != 'false'
         with:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: needs.classify.outputs.runtime != 'false'
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: needs.classify.outputs.runtime != 'false'
         with:
           repository: LoomMud/warp
           path: warp
       - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
+        if: needs.classify.outputs.runtime != 'false'
       - name: capture runner context
         # OBI-344: E1.1 measures wall-clock latency on a *shared* self-hosted
         # runner set, and the lane only guarantees one gate at a time -- the
@@ -486,6 +698,11 @@ jobs:
         # interpretable next to what the host was doing, so record it. Read-
         # only probes, no load added; every one degrades to `n/a` rather than
         # failing the gate.
+        #
+        # OBI-325: gated like every other step that touches the host. On the
+        # runtime-irrelevant path the job takes no lane place and reads
+        # nothing about it.
+        if: needs.classify.outputs.runtime != 'false'
         run: |
           set -uo pipefail
           mkdir -p results
@@ -503,6 +720,8 @@ jobs:
           } > results/runner-context-before.txt 2>&1
           cat results/runner-context-before.txt
       - name: run loom serve + E1.1 load test (150 players)
+        # OBI-325: the guard every host-touching step in this job carries.
+        if: needs.classify.outputs.runtime != 'false'
         env:
           # OBI-344: the gate went red on an intermittent p99 tail with no
           # server-side visibility at all -- the serve log was captured at the
@@ -620,7 +839,7 @@ jobs:
           fi
           exit $status
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
+        if: always() && needs.classify.outputs.runtime != 'false'
         with:
           name: loadtest-e1-1-report
           path: |
