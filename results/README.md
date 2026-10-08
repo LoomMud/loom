@@ -309,9 +309,11 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   required check blocks a PR exactly like a failed one, so queueing (not
   replacing) is part of not weakening the gate.
 - The jobs are also chained with `needs` inside a run:
-  `loadtest-e1-1` -> `loadtest-smoke` -> `bench`. The required gate goes
-  first and has no `needs:`/`if:` of its own, so nothing upstream can skip
-  it; the two non-required gates wait for it instead of competing with it.
+  `classify` -> `loadtest-e1-1` -> `loadtest-smoke` -> `bench`. The required
+  gate has exactly one `needs:` -- `classify`, the job that decides whether this
+  diff has to be measured at all (OBI-325, below) -- and no `if:` of its own,
+  so nothing upstream can skip it; the two non-required gates wait for it
+  instead of competing with it.
 - Each gate carries wall-clock headroom (`timeout-minutes` 30 for E1.1, 20
   for the smoke run). The lane removes a second *gate* from the host, not
   this run's own `rust` job or another PR's builds, and a release build
@@ -329,9 +331,10 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
   headroom, that no required check became skippable or optional, and that the
   workflow-level block can only ever cancel a superseded `pull_request` run),
-  plus a `--self-test` of 26 mutations. Both run in the required `hygiene`
-  job, so the lane cannot rot silently and the comment here cannot drift from
-  the workflow.
+  plus a `--self-test` of 44 mutations. Both run in the required `hygiene`
+  job, with the classifier's own path table (`scripts/load-lane-classify.py
+  --self-test`, 30 cases), so the lane cannot rot silently and the comment here
+  cannot drift from the workflow.
 
 **What the lane does *not* claim.** GitHub scopes a job-level concurrency
 group per workflow *and job*, so the hard guarantee is "the same gate never
@@ -355,6 +358,65 @@ another, by raising the threshold, dropping the population, marking the check
 optional, or re-running it into a quiet window by hand -- `hygiene` fails
 those changes.
 
+### Who has to wait for the lane at all (OBI-325)
+
+Serialising the lane made the numbers honest and made *every merge* wait for
+one. With `strict: true` a queued gate is invalidated each time `main` moves, so
+the queue is not a cost you pay once, it is a cost you pay until you win. PR
+#124 is the case study: rebased four times in about five hours (`b3a9998` 02:09,
+`7db7279` 02:28, `db18202` 03:30), each push re-queued `loadtest-e1-1` for
+35-60 minutes, and when the gate finally went green on `db18202` (run
+37723058077, ~04:50Z) `main` had advanced to `7bb86ce` (PR #122) and the PR
+flipped back to `BEHIND`. What all that waiting measured was a commit whose
+diff from its base was one file, `crates/loom-cli/tests/supervise_handoff.rs`
+-- a test file the release build does not even compile.
+
+So the gate now asks a narrower question first, in
+`scripts/load-lane-classify.py`: **could this diff change what E1.1 measures at
+all?** E1.1 builds `cargo build --release -p loom-cli -p loom-loadtest` from the
+checkout and drives `loom serve --mudlib warp` over telnet, so the inputs are
+the two crates' source, their manifests and features, `Cargo.lock`,
+`rust-toolchain.toml`, `.cargo/` config, `build.rs`, `mudlib/` content (kept
+relevant even though today it is only a Docker mount point -- being unsure
+costs a lane run, it never hides a regression), a `tests/fixtures/**` that
+`include_str!` compiles into the load bot, and the bench workloads and harness
+that `bench` measures in the same lane.
+
+One thing the classifier cannot see: the `warp` mudlib E1.1 serves is checked
+out of `LoomMud/warp`, unpinned, inside the job. A warp-side change can move
+the p99 while every loom PR skips the lane. That is a property of the existing
+un-pinned checkout, not of the skip decision -- pinning warp (or measuring it
+as an input) is the follow-up, and it is listed on OBI-325.
+
+A cheap `classify` job answers it, and the three lane jobs read the verdict
+twice: through a conditional `concurrency.group` (runtime-relevant, or
+undecided, takes `loom-ci-load-lane`; irrelevant takes a `github.run_id`-scoped
+group no other run is in) and through the same test on every step that could put
+load on the host. Both halves are keyed on `!= 'false'` and never `== 'true'`,
+so a missing or unreadable verdict means "take the lane and measure". Rule 7 of
+`scripts/check-ci-load-lane.py` pins the whole shape -- the expression, its
+run-scoped arm, the classifier's inability to be skipped or to fail the job, and
+a step guard beside every measurement -- because each of those has a fail-open
+mutation: 44 of them now, all run in `hygiene`.
+
+Putting `.github/**` on the irrelevant list is only safe because of rule 8: the
+workflow may not install a `toolchain:` that `rust-toolchain.toml` does not
+declare. The compiler is an input the lane measures, so it may have exactly one
+place where it is pinned -- and that file is runtime-relevant, which means a
+toolchain bump is measured instead of skipped. Before rule 8, bumping the
+version in `ci.yml` alone would have changed what every later run builds and
+never entered the lane.
+
+**What a green `loadtest-e1-1` means now.** Two different greens. On a
+runtime-relevant diff it is the 150-player measurement, unchanged. On a
+runtime-irrelevant one it means "not applicable": no release build, no players,
+no p99, and the job writes a step summary saying so and naming the rule that
+decided it. The check is never `if:`-ed away and never skipped -- a skipped
+required check blocks the PR like a failure, which is the trap this whole
+exercise had to walk around. If a p99 regression is ever found on a commit that
+skipped, the classifier was wrong: fix the rule (`--self-test` is the test),
+not the threshold, the population, or the check.
+
 ### Which runs may be cancelled, and which may never be (OBI-313)
 
 Queueing is not the only way the lane gets stuck. Because
@@ -373,10 +435,10 @@ the policy is written down rather than inferred from YAML.
 **The rule, accepted by the CTO on 2026-10-08: no required check on a
 *mergeable candidate* may be cancelled.** A mergeable candidate is the commit
 branch protection actually evaluates. For a pull request that is its newest
-commit, because `strict: true` + `required_linear_history: true` mean a stale
-SHA never satisfies the branch; for `main` every push is a mergeable candidate,
-and so is any run already in flight. A superseded PR SHA is therefore the only
-measurement the block is allowed to throw away.
+commit, because `strict: true` means a stale SHA never satisfies the branch;
+for `main` every push is a mergeable candidate, and so is any run already in
+flight. A superseded PR SHA is therefore the only measurement the block is
+allowed to throw away.
 
 | Run | Cancellation | Why |
 |---|---|---|

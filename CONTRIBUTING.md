@@ -55,3 +55,51 @@ Applied from the first commit (spec v2 §4.4):
 - Keep the interim shared bare repo read-only as a migration mirror.
 - For CLI operations, use the short-lived command env pattern without persisting credentials:
   `GH_TOKEN="$GITHUB_TOKEN" gh <command>`
+
+### Getting merged: the required checks and the load lane
+
+`main` requires five checks -- `rust`, `deny`, `dco`, `hygiene`,
+`loadtest-e1-1` -- and branch protection runs with `strict: true` ("require
+branches to be up to date before merging"), so a PR merges only when those are
+green on a commit that already contains the current `main`.
+
+`loadtest-e1-1` is the 150-player latency gate. It runs alone in one FIFO
+`loom-ci-load-lane` shared by every open PR, so it spends most of its time
+*waiting* rather than measuring (~90 s of measurement, tens of minutes of
+queue). And because `strict: true` invalidates the gate every time `main`
+moves, a rebase restarts that wait: PR #124 was rebased four times in five hours
+and was still `BEHIND` when its gate finally went green (OBI-325). Two rules
+follow:
+
+- **Do not rebase or force-push while `loadtest-e1-1` is queued or running.**
+  It discards the place in line and takes a new one at the back. Rebase once,
+  immediately before you merge, and let the gate run on that commit.
+  (`scripts/check-ci-load-lane.py` keeps a stale SHA from *holding* a lane place
+  for somebody else; that protects the lane, it does not speed up your merge.)
+- **A diff that cannot change what the gate measures does not wait for it at
+  all.** A cheap `classify` job decides, from `scripts/load-lane-classify.py`,
+  whether your changed paths can reach the binaries E1.1 builds or the bench
+  workloads `bench` measures in the same lane. Docs, tests, CI config, scripts,
+  `ops/`, the web client and committed reports get green in seconds and never
+  enter the group. Anything under `crates/*/src/**`, any `Cargo.toml` or
+  `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `build.rs`, `mudlib/`, a
+  `tests/fixtures/**` that is compiled in with `include_str!`, or a bench
+  workload/harness file takes the lane and is measured. Unknown paths take the
+  lane too: the list is an *irrelevance allow-list*, and being unsure costs a
+  lane run rather than hiding a regression.
+- **CI does not get to pick its own compiler.** `.github/**` counts as
+  irrelevant, so `scripts/check-ci-load-lane.py` (rule 8, run by `hygiene`) also
+  requires every `toolchain:` the workflow installs to equal the channel in
+  `rust-toolchain.toml`. Bump the compiler there, where the change is measured;
+  a bump in `ci.yml` alone fails a required check.
+
+So `loadtest-e1-1` can be green in two different ways, and the job says which
+one you got in its step summary: **measured** (p99 against the 50 ms budget) or
+**not applicable** (nothing was built, no players were connected, and the rule
+that decided it is named). The check is never skipped or made optional -- a
+skipped required check blocks a PR exactly like a failure.
+
+If you think a diff was wrongly called irrelevant -- a change that should have
+been measured -- say so on the PR and fix the *rule* in
+`scripts/load-lane-classify.py` (its `--self-test` table is the test), not the
+threshold, the population, or the check itself: `hygiene` fails those.
