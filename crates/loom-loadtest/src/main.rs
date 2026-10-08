@@ -69,10 +69,18 @@ struct Args {
     /// A bot pause that overslept by at least this much marks the loadtest
     /// process itself as starved in that window (OBI-344).
     bot_lag_threshold_ms: f64,
+    /// Provenance lines the caller wants carried into the report (OBI-326).
+    /// The CI load lane uses this to stamp the mudlib a number was measured
+    /// against; a report that cannot name its inputs cannot be compared.
+    notes: Vec<String>,
 }
 
 impl Args {
     fn parse() -> Result<Self, String> {
+        Self::parse_from(std::env::args().skip(1))
+    }
+
+    fn parse_from(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut addr = "127.0.0.1:4000".to_string();
         let mut mix_path = None;
         let mut players = 150_usize;
@@ -93,7 +101,7 @@ impl Args {
         let mut timeline_bucket_ms = 5_000_u64;
         let mut bot_lag_threshold_ms = 50.0_f64;
 
-        let mut args = std::env::args().skip(1);
+        let mut notes: Vec<String> = Vec::new();
         while let Some(a) = args.next() {
             macro_rules! val {
                 () => {
@@ -141,6 +149,7 @@ impl Args {
                     bot_lag_threshold_ms =
                         val!().parse().map_err(|_| "bad --bot-lag-threshold-ms")?
                 }
+                "--note" => notes.push(val!()),
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -171,6 +180,7 @@ impl Args {
             metrics_scrape_ms,
             timeline_bucket_ms,
             bot_lag_threshold_ms,
+            notes,
         })
     }
 }
@@ -198,7 +208,8 @@ fn print_help() {
          \x20 --metrics-url <url>           Scrape this loom-http /metrics URL into the report (OBI-177)\n\
          \x20 --metrics-scrape-ms 1000      Also scrape it *during* the run, this often, for tail attribution (OBI-344). 0 = end-of-run only\n\
          \x20 --timeline-bucket-ms 5000     Bucket width of the latency timeline\n\
-         \x20 --bot-lag-threshold-ms 50     Oversleep that counts as loadtest-process starvation\n"
+         \x20 --bot-lag-threshold-ms 50     Oversleep that counts as loadtest-process starvation\n\
+         \x20 --note <text>                 Carry this provenance line into the report, repeatable (OBI-326: the CI lane stamps the pinned mudlib)\n"
     );
 }
 
@@ -364,7 +375,9 @@ async fn run(args: Args) -> Result<(), String> {
         .map(|r| r.p99_ms < args.sla_p99_ms)
         .unwrap_or(false);
 
-    let mut notes = Vec::new();
+    // Caller-supplied provenance first: a reader should see which mudlib and
+    // which build produced these numbers before it sees the run's own warnings.
+    let mut notes = args.notes.clone();
     if login_failures > 0 {
         notes.push(format!("{login_failures} bot(s) failed to log in"));
     }
@@ -526,4 +539,53 @@ async fn run(args: Args) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+
+    fn parse(extra: &[&str]) -> Args {
+        let mut argv = vec!["--mix", "warp/loadbot/mix.tsv"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv.iter().map(|s| s.to_string())).expect("args should parse")
+    }
+
+    #[test]
+    fn notes_default_to_empty() {
+        assert!(parse(&[]).notes.is_empty());
+    }
+
+    /// OBI-326: the load lane stamps every report with the mudlib it served,
+    /// and it does that with repeated `--note` flags. Order is the caller's
+    /// order -- the report is the record, so the parser must not shuffle it.
+    #[test]
+    fn note_flag_is_repeatable_and_keeps_order() {
+        let a = parse(&[
+            "--note",
+            "mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in mudlib/warp.lock)",
+            "--players",
+            "150",
+            "--note",
+            "loom 7bb86ce",
+        ]);
+        assert_eq!(a.notes.len(), 2);
+        assert!(a.notes[0].starts_with("mudlib LoomMud/warp@1b0cd394"));
+        assert_eq!(a.notes[1], "loom 7bb86ce");
+        assert_eq!(a.players, 150);
+    }
+
+    #[test]
+    fn note_without_a_value_is_an_error() {
+        let parsed = Args::parse_from(
+            ["--mix", "warp/loadbot/mix.tsv", "--note"]
+                .iter()
+                .map(|s| s.to_string()),
+        );
+        let err = match parsed {
+            Ok(_) => panic!("--note with no value must not parse"),
+            Err(e) => e,
+        };
+        assert!(err.contains("--note"), "unexpected error text: {err}");
+    }
 }

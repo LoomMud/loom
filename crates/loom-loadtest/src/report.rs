@@ -779,4 +779,40 @@ mod tests {
         );
         assert!(md.contains("2.0 - 3.0"), "{md}");
     }
+
+    /// OBI-326: a number has to name its inputs. The load lane passes the pinned
+    /// mudlib as a note, and the committed Markdown report is where a reader (or
+    /// a later bisect) finds out which `warp` commit produced the p99.
+    #[test]
+    fn markdown_carries_the_mudlib_provenance_note() {
+        let mut s = Samples::default();
+        s.push(Duration::from_millis(9));
+        let report = RunReport {
+            players: 150,
+            slow_reader_fraction: 0.1,
+            requested_duration_secs: 90,
+            actual_duration_secs: 90.1,
+            login_failures: 0,
+            disconnects: 0,
+            commands_sent: 1,
+            sla_p99_ms: 50.0,
+            command_latency: LatencyReport::from_samples(&s),
+            slow_reader_command_latency: None,
+            login_latency: None,
+            e1_1_pass: true,
+            notes: vec![
+                "mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in mudlib/warp.lock)"
+                    .to_string(),
+            ],
+            server_metrics: None,
+        };
+        let md = report.to_markdown();
+        assert!(md.contains("## Notes"), "no notes section in:\n{md}");
+        assert!(
+            md.contains("warp@1b0cd394"),
+            "provenance note missing:\n{md}"
+        );
+        let json = serde_json::to_string(&report).expect("report serializes");
+        assert!(json.contains("1b0cd394"), "note missing from json: {json}");
+    }
 }
