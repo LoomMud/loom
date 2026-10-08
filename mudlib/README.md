@@ -11,13 +11,13 @@ docker compose up --build
 
 Two things to know before you drop a checkout in here:
 
-* `warp.lock` is **not** mudlib content and not a Python/pip lockfile. It is the
-  commit the CI load lane serves and prints in its reports (OBI-326), read by
-  `loadtest-e1-1` / `loadtest-smoke` and enforced by rule 9 of
-  `scripts/check-ci-load-lane.py`. Keep it tracked; edit it to change the world
-  the gate measures, never to point it at a branch.
+* The world the CI load gate measures is **not** in this directory. It is
+  `LoomMud/warp`, checked out into `warp/` inside the job at the commit pinned in
+  [`/warp.ref`](../warp.ref) (OBI-326). Nothing that belongs to CI lives under
+  `mudlib/`: this tree is only ever mounted read-only by `docker-compose.yml` and
+  passed to `loom serve` by the local dev scripts.
 * The engine only scans a mudlib root for `*.wf` files
-  (`crates/loom-compiler/src/mudlib.rs`, `collect_wf`), so this directory
-  tolerating non-source files is not an accident -- but if you clone `warp` in
-  here as `warp/`, that is a *second* copy of the world and CI will not use it:
-  the lane checks its own pinned copy out into `warp`, not into `mudlib/`.
+  (`crates/loom-compiler/src/mudlib.rs`, `collect_wf`), so a populated `mudlib/`
+  is a *second* copy of the world and CI will not use it -- if you clone `warp`
+  in here for local play, say `mudlib/warp`, name it explicitly in your
+  `loom serve --mudlib` argument and remember it is floating, not pinned.

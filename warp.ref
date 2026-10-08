@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# The warp commit the CI load lane serves (OBI-326). One line: a full, lowercase,
+# 40-character commit SHA. Never a branch or tag name -- a name can move
+# underneath a run, which is the exact failure this file exists to prevent.
+#
+# Why this file exists. `loadtest-e1-1` and `loadtest-smoke` build loom from this
+# checkout, then run `loom-cli serve --mudlib warp`, where `warp` is a *second*
+# repository checked out inside the job. That world is an input to the p99 this
+# gate prints: a warp-side change to a hot path (fan-out in the Entrance Hall,
+# the login state machine, `/std/player` save work) moves the number without a
+# single loom file changing. It also moves the *session mix*, because E1.1 runs
+# `--mix warp/loadbot/mix.tsv` out of that same checkout. Before OBI-326 the
+# checkout floated on warp's default branch, so a warp change could regress p99
+# while every loom PR skipped the lane (OBI-325) -- and no committed number named
+# the mudlib that produced it.
+#
+# What reads it.
+#   * `.github/workflows/ci.yml` -- the `warp-pin` step in each load job reads
+#     this SHA and checks that exact commit out of `LoomMud/warp`. There is no
+#     fallback: a missing or malformed pin fails the gate rather than quietly
+#     serving warp's default branch again.
+#   * `scripts/check-ci-load-lane.py` rule 9 -- `hygiene`, a required check that
+#     runs on every PR, re-reads this file and refuses any workflow that serves a
+#     mudlib from an unpinned checkout, so the pin cannot rot into a comment.
+#   * `scripts/load-lane-classify.py` -- this path is runtime-relevant, so
+#     bumping the world takes a lane place and gets measured, exactly like a
+#     `Cargo.lock` bump.
+#   * `loom-loadtest --note` -- the resolved `LoomMud/warp@<sha>` is stamped into
+#     every report the job writes (`results/ci-e1-1.json`/`.md` and the uploaded
+#     artifact), so a number always names its mudlib.
+#
+# How to bump it. Put the full SHA of the warp commit you want measured on the
+# last non-comment line, exactly as `git rev-parse` prints it (the job compares
+# against that). Bump it in its own PR, or a PR that clearly intends it: the run
+# that follows measures a different world than the reports in `results/`. Keep the
+# pinned commit reachable from warp's default branch, and name the warp PR it came
+# from in the commit message, so the archaeology is one hop rather than a search.
+#
+# The repository itself is not pinned here: it is `LoomMud/warp`, and rule 9
+# asserts that literal in the workflow. `hygiene` runs on every PR whatever the
+# classifier decides, so pointing the load jobs at someone else's fork fails a
+# required check even though `.github/**` is on the skip list.
+
+1b0cd394d4cd41586e1a2d5fd449786b75c96976

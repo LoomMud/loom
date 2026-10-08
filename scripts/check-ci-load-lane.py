@@ -78,17 +78,27 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      the shell sees them. One is a workflow file GitHub cannot compile: no job
      runs, and on `pull_request` not even a check run appears, so required
      checks do not go red, they vanish. PR #144 lost its CI to exactly this.
-  9. the mudlib the lane serves is a *pinned input* (OBI-326). `mudlib/warp.lock`
-     is the one place that names the `repository`/`rev` of the world being
-     measured, it carries a full 40-character commit SHA (never a branch name,
-     which can move underneath a run), the classifier counts it
+  9. the mudlib the lane serves is a *pinned input* (OBI-326). `warp.ref` names
+     the world being measured -- one line, a full 40-character commit SHA, never
+     a branch name, which can move underneath a run -- the classifier counts it
      runtime-relevant so a bump takes a lane place, and every job that serves a
-     mudlib reads the rev from that file, refuses an unpinned external checkout,
-     re-reads the file to verify what landed on disk, and stamps the rev into
-     the report with `--note`. Rule 9 is what keeps the OBI-325 skip honest for
-     the one input that lives in a second repository: without it a warp-side
-     change moves p99 while every loom PR skips, and the next source PR is
-     blamed for a regression it did not cause.
+     mudlib reads the rev from that file, refuses an external checkout whose rev
+     comes from anywhere else, re-reads the file to verify what landed on disk,
+     and stamps the rev into the report with `--note`. The repository name is the
+     one half that may stay a workflow literal (`LoomMud/warp`), and rule 9
+     asserts that literal, so a fork swap fails `hygiene` even though `.github/**`
+     is on the skip list. Rule 9 is what keeps the OBI-325 skip honest for the one
+     input that lives in a second repository: without it a warp-side change moves
+     p99 while every loom PR skips, and the next source PR is blamed for a
+     regression it did not cause; and
+ 10. the workflow keeps a *drift backstop* (OBI-326): `on.schedule` and
+     `on.workflow_dispatch` are both still triggers. Neither carries a commit
+     range, so the classifier falls closed to "take the lane", which means the
+     nightly run measures `main` every day however quiet the diffs are, and a
+     release SHA can be measured on demand instead of forced through the lane by
+     an empty commit. Rule 10 exists for the same reason as rule 8: the trigger
+     list lives in `.github/**`, which the lane counts irrelevant, so a backstop
+     that can be deleted without a required check noticing is a comment.
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -161,18 +171,31 @@ WF_OTHER_EVENTS = ("push", "pull_request_target", "workflow_dispatch", "workflow
 
 # Rule 9 (OBI-326): the mudlib is a second repository, and it is an input to the
 # number the gate prints, so it is pinned in this one -- the same way `Cargo.lock`
-# pins dependencies. These are the exact shapes the workflow must use; a step that
-# hard-codes either value, or drops one, is an unpinned checkout by another name.
-MUDLIB_PIN = "mudlib/warp.lock"
+# pins dependencies. `warp.ref` holds exactly one thing: the commit SHA. The
+# repository name is the one half that may stay a workflow literal, because it
+# never moves and because `hygiene` runs rule 9 on every PR whatever `classify`
+# decides -- a fork swap there fails a required check even though `.github/**` is
+# on the skip list. The rev is the half that moves underneath a run, so it may
+# only ever come from the pin file.
+MUDLIB_PIN = "warp.ref"
+MUDLIB_REPO = "LoomMud/warp"
 PIN_STEP_ID = "warp-pin"
-PIN_REPOSITORY_REF = "repository: ${{ %s.outputs.repository }}" % ("steps." + PIN_STEP_ID)
 PIN_REV_REF = "ref: ${{ %s.outputs.rev }}" % ("steps." + PIN_STEP_ID)
+PIN_REPO_LINE = "repository: %s" % MUDLIB_REPO
+# A step reads the pin only if it names the file as its own path token. The regex
+# is the point: `ci/warp.ref` contains every character of `warp.ref` and is a
+# different file, and a pin read from the wrong place pins nothing.
+PIN_FILE_TOKEN = re.compile(r"(?:^|[\s:=])%s(?=$|[\s:|])" % re.escape(MUDLIB_PIN), re.M)
 # A job that measures against a mudlib: `--mudlib` names the world under test and
 # `repository:` is the external checkout that brings it in. Both only appear in
 # the two load jobs -- `build`'s `-p loom-loadtest` must not be mistaken for one.
 SERVING_NEEDLES = ("--mudlib", "repository:")
-PIN_REPOSITORY_NAME = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 PIN_REV_SHA = re.compile(r"^[0-9a-f]{40}$")
+
+# Rule 10 (OBI-326): the drift backstop. These two events carry no commit range,
+# so `classify` falls closed to `runtime=true` and the run measures -- the only
+# paths to a number when every diff in between was correctly skipped.
+BACKSTOP_EVENTS = ("schedule", "workflow_dispatch")
 
 
 def job_blocks(text):
@@ -524,21 +547,41 @@ def check_workflow_concurrency(wc):
     return errors
 
 
+def on_block(text):
+    """The child lines of the top-level `on:` mapping, in order."""
+    lines = text.splitlines()
+    starts = [i for i, l in enumerate(lines) if re.fullmatch(r"(?:^on:|^true:)\s*", l)]
+    if not starts:
+        return []
+    block = []
+    for line in lines[starts[0] + 1:]:
+        if re.fullmatch(r"[A-Za-z0-9_-]+:.*", line):
+            break  # next top-level key
+        block.append(line)
+    return block
+
+
+def on_trigger_keys(text):
+    """Event names this workflow fires on, from the `on:` block.
+
+    Only the block's own children count (two-space keys), so a `types:` list or a
+    `- cron:` entry is never mistaken for an event.
+    """
+    keys = []
+    for line in on_block(text):
+        m = re.fullmatch(r"  ([A-Za-z0-9_-]+):\s*.*", line)
+        if m:
+            keys.append(m.group(1))
+    return keys
+
+
 def on_pull_request_types(text):
     """`on.pull_request.types` as a set.
 
     Empty set = no `types:` key = GitHub fires on *every* activity type;
     None = `pull_request` is not a trigger of this workflow at all.
     """
-    lines = text.splitlines()
-    starts = [i for i, l in enumerate(lines) if re.fullmatch(r"(?:^on:|^true:)\s*", l)]
-    if not starts:
-        return None
-    block = []
-    for line in lines[starts[0] + 1:]:
-        if re.fullmatch(r"[A-Za-z0-9_-]+:.*", line):
-            break  # next top-level key
-        block.append(line)
+    block = on_block(text)
     idx = [i for i, l in enumerate(block)
            if re.fullmatch(r"  (?:pull_request|pull_request_target):\s*", l)]
     if not idx:
@@ -690,33 +733,32 @@ def check_run_block_expressions(text):
                     "on a pull_request no check run is created at all. Write the expression "
                     "bare in scripts (`if: !cancelled()`) instead of wrapping it.")
 def read_mudlib_pin(root):
-    """(repository, rev, error) from the file that names the world under test.
+    """(rev, error) from the file that names the world under test.
 
-    A missing or malformed pin is an error rather than a default. The load jobs
-    have no branch to fall back to, and "fall back to warp's main" is the exact
-    behaviour OBI-326 removes.
+    `warp.ref` is one payload line -- comments and blanks stripped -- holding a
+    full commit SHA. A missing or malformed pin is an error rather than a default.
+    The load jobs have no branch to fall back to, and "fall back to warp's main"
+    is the exact behaviour OBI-326 removes.
     """
     path = Path(root) / MUDLIB_PIN
     if not path.is_file():
-        return None, None, (f"{MUDLIB_PIN} is missing: the load lane serves its mudlib from a "
-                            "second repository, which is an input to the number it prints, so the "
-                            "commit has to be named here (rule 9)")
-    repo = rev = None
-    for line in path.read_text().splitlines():
-        if line.startswith("repository="):
-            repo = line.split("=", 1)[1].strip()
-        elif line.startswith("rev="):
-            rev = line.split("=", 1)[1].strip()
-    if not repo or not rev:
-        return repo, rev, (f"{MUDLIB_PIN} must carry both `repository=` and `rev=` "
-                           f"(got repository={repo!r}, rev={rev!r})")
-    if not PIN_REPOSITORY_NAME.match(repo):
-        return repo, rev, f"{MUDLIB_PIN} repository={repo!r} is not an `owner/name` repository"
+        return None, (f"{MUDLIB_PIN} is missing: the load lane serves its mudlib from a "
+                      "second repository, which is an input to the number it prints, so the "
+                      "commit has to be named here (rule 9)")
+    lines = [l.strip() for l in path.read_text().splitlines()
+             if l.strip() and not l.lstrip().startswith("#")]
+    if not lines:
+        return None, (f"{MUDLIB_PIN} carries only comments: the gate refuses to guess which "
+                      "mudlib to serve")
+    if len(lines) > 1:
+        return None, (f"{MUDLIB_PIN} must hold exactly one line -- the commit SHA -- but carries "
+                      f"{len(lines)}: a second rev is a second world the gate could serve")
+    rev = lines[0]
     if not PIN_REV_SHA.match(rev):
-        return repo, rev, (f"{MUDLIB_PIN} rev={rev!r} is not a full 40-character commit SHA: a "
-                           "branch or tag name can move underneath a run, which is what the pin "
-                           "exists to prevent")
-    return repo, rev, None
+        return rev, (f"{MUDLIB_PIN} rev={rev!r} is not a full 40-character lowercase commit SHA: "
+                     "a branch or tag name can move underneath a run, which is what the pin "
+                     "exists to prevent")
+    return rev, None
 
 
 def classifier_relevance(root, path):
@@ -746,13 +788,14 @@ def check_mudlib_pin(text, root):
     fixing one is how you create another:
 
       * the pin file names a commit, not a branch (else "pinned" is a comment);
-      * the workflow's external checkout takes both repository and rev from that
-        file, so there is no second place to change what gets served;
+      * the workflow's external checkout takes its rev from that file, so there is
+        no second place to change what gets served, and its repository is the one
+        this repo means to measure against;
       * the job verifies what landed and stamps it onto the report, so a
         committed number can be read against the world that produced it.
     """
     errors = []
-    _repo, _rev, pin_err = read_mudlib_pin(root)
+    _rev, pin_err = read_mudlib_pin(root)
     if pin_err:
         errors.append(pin_err)
     relevant = classifier_relevance(root, MUDLIB_PIN)
@@ -781,9 +824,10 @@ def check_mudlib_pin(text, root):
                               f"`{escape_test(job)}` -- an unguarded step also runs on the skip "
                               "path, so a docs-only PR would fail a gate that never measured "
                               "anything")
-            if MUDLIB_PIN not in step_code(pin):
+            if not PIN_FILE_TOKEN.search(step_code(pin)):
                 errors.append(f"`{job}`: the `{PIN_STEP_ID}` step does not read `{MUDLIB_PIN}` -- "
-                              "hard-coding a rev in a step is a comment, not a pin")
+                              "hard-coding a rev in a step, or reading some other file, is a "
+                              "comment rather than a pin")
             if "0-9a-f" not in step_code(pin):
                 errors.append(f"`{job}`: the `{PIN_STEP_ID}` step does not validate the rev as a "
                               "commit SHA, so a branch name in the pin file would be served "
@@ -792,14 +836,17 @@ def check_mudlib_pin(text, root):
             body = step_code(step)
             if not re.search(r"^\s+repository:", body, re.M):
                 continue
-            for needle, what in ((PIN_REPOSITORY_REF, "the repository"),
-                                 (PIN_REV_REF, "the rev")):
-                if needle not in body:
-                    errors.append(f"`{job}` checks out an external repository without pinning "
-                                  f"{what} from `{MUDLIB_PIN}` (expected `{needle}`): a floating "
-                                  "mudlib checkout moves p99 underneath a queue of PRs that "
-                                  "skipped the lane (OBI-325's blind spot, closed by OBI-326)")
-        if not any("rev-parse" in step_code(s) and MUDLIB_PIN in step_code(s) for s in steps):
+            if PIN_REPO_LINE not in body:
+                errors.append(f"`{job}` checks out an external repository that is not "
+                              f"`{MUDLIB_REPO}` (expected the line `{PIN_REPO_LINE}`): the world "
+                              "the gate measures is a named input, not a matter of opportunity")
+            if PIN_REV_REF not in body:
+                errors.append(f"`{job}` checks out `{MUDLIB_REPO}` without pinning its rev from "
+                              f"`{MUDLIB_PIN}` (expected `{PIN_REV_REF}`): a floating mudlib "
+                              "checkout moves p99 underneath a queue of PRs that skipped the lane "
+                              "(OBI-325's blind spot, closed by OBI-326)")
+        if not any("rev-parse" in step_code(s) and PIN_FILE_TOKEN.search(step_code(s))
+                   for s in steps):
             errors.append(f"`{job}` never re-reads `{MUDLIB_PIN}` to verify the commit it checked "
                           "out: the gate must serve the world the repository names, not the world "
                           "a step output claims")
@@ -811,6 +858,34 @@ def check_mudlib_pin(text, root):
                 errors.append(f"`{job}` writes a report without stamping the mudlib rev into it "
                               "(`--note`): a committed p99 that cannot name its inputs cannot be "
                               "compared or bisected (see results/README.md)")
+    return errors
+
+
+def check_drift_backstop(text):
+    """Rule 10: the workflow keeps a path to a measurement that no diff can skip.
+
+    OBI-325 made the lane conditional, which is right, and left a consequence: a
+    run of irrelevant diffs means `main` can go unmeasured for as long as that run
+    lasts, and `warp.ref` bumps -- which change the world under test -- arrive on
+    their own schedule. `on.schedule` gives every day a number, and
+    `on.workflow_dispatch` gives a release SHA one without faking a commit. Both
+    are asserted because both live in `.github/**`, which the classifier counts
+    irrelevant: without rule 10 the backstop could be removed by a PR that never
+    entered the lane.
+    """
+    keys = on_trigger_keys(text)
+    errors = []
+    if "schedule" not in keys:
+        errors.append("`on.schedule` is gone: after the OBI-325 skip a run of "
+                      "runtime-irrelevant diffs leaves `main` unmeasured, and a "
+                      "warp-side drift then has no date to land on -- it lands on "
+                      "whoever's PR happens to be measured next (rule 10)")
+    if "workflow_dispatch" not in keys:
+        errors.append("`on.workflow_dispatch` is gone: results/README.md requires a "
+                      "measured green `loadtest-e1-1` for a release SHA, and that "
+                      "candidate may legitimately have skipped the lane -- without a "
+                      "dispatch the only way to get the number is an empty commit "
+                      "that forces a lane run (rule 10)")
     return errors
 
 
@@ -906,6 +981,7 @@ def check_text(text, root="."):
     errors += check_run_block_expressions(text)
     check_e11_verdict_isolation(jobs, errors)
     errors += check_mudlib_pin(text, root)
+    errors += check_drift_backstop(text)
 
     e11 = [l for l in jobs.get("loadtest-e1-1", []) if not l.lstrip().startswith("#")]
     body = "\n".join(e11)  # comments excluded: the flags must be in the command
@@ -1189,20 +1265,30 @@ MUTANTS = [
     # documented, or only half-read, is that same hazard wearing a comment.
     ("mudlib checkout floats on a branch",
      lambda t: _replace(t, PIN_REV_REF, "ref: main")),
-    ("mudlib repository hard-coded in the workflow",
-     lambda t: _replace(t, PIN_REPOSITORY_REF, "repository: LoomMud/warp")),
+    ("mudlib rev taken from somewhere other than the pin",
+     lambda t: _replace(t, PIN_REV_REF, "ref: ${{ github.sha }}")),
+    ("mudlib repository swapped for someone else's",
+     lambda t: _replace(t, PIN_REPO_LINE, "repository: someone-else/warp")),
     ("mudlib pin step removed",
      lambda t: _sub(t, f"id: {PIN_STEP_ID}", None)),
     ("mudlib pin step loses its lane guard",
      lambda t: _unguard(t, "loadtest-e1-1", "read the pinned mudlib rev")),
     ("mudlib pin step reads a different file",
-     lambda t: _replace(t, "PIN_FILE: mudlib/warp.lock", "PIN_FILE: ci/warp.lock")),
+     lambda t: _replace(t, "PIN_FILE: warp.ref", "PIN_FILE: ci/warp.ref")),
     ("mudlib rev accepted without SHA validation",
      lambda t: _sub(t, "-ne 40", None)),
     ("served mudlib no longer verified against the pin",
      lambda t: _sub(t, "rev-parse HEAD", None)),
     ("report no longer stamped with the mudlib rev",
      lambda t: _sub(t, '--note "mudlib', None)),
+    # OBI-326 rule 10: the drift backstop is two triggers, and both are deletable
+    # through `.github/**`, which the lane counts irrelevant. Same argument as
+    # rule 8 for the toolchain: an invariant that lives on the skip list needs a
+    # guard in `hygiene`, which runs on every PR.
+    ("nightly drift backstop removed",
+     lambda t: _sub(t, "  schedule:", None)),
+    ("on-demand measurement path removed",
+     lambda t: _sub(t, "  workflow_dispatch:", None)),
 ]
 
 

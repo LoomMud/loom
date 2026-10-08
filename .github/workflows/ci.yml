@@ -12,6 +12,37 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [main]
+  # ── The drift backstop (OBI-326) ──────────────────────────────────────────────
+  # After OBI-325 a run only takes a place in the load lane when its diff can move
+  # the numbers, so a long stretch of irrelevant merges can leave `main`
+  # unmeasured -- and the world under test now changes on *warp's* schedule, when
+  # `warp.ref` is bumped, not on yours. These two triggers carry no commit range,
+  # so `classify` falls closed to `runtime=true` (an unreadable or absent range is
+  # never evidence that nothing changed: see scripts/load-lane-classify.py) and the
+  # run measures.
+  #
+  #   schedule          one measurement of `main` against the pinned world every
+  #                     day, so drift lands on a date instead of on whoever's PR
+  #                     happens to get measured next. GitHub only fires scheduled
+  #                     workflows on the default branch, which is exactly the
+  #                     branch this backstop is for; the minute is off the hour so
+  #                     we are not queuing behind every other repo's midnight run.
+  #   workflow_dispatch the on-demand measurement a release needs. The release
+  #                     policy in results/README.md requires a green,
+  #                     *measured* `loadtest-e1-1` for a release SHA, and the
+  #                     candidate for that SHA may well be a diff the classifier
+  #                     correctly skipped. Dispatch is how you get the number
+  #                     without inventing a commit to force a lane run.
+  #
+  # Neither of them is cancellable, and neither may cancel: rule 5 keeps the
+  # workflow-level group on `github.run_id` for any non-`pull_request` event with
+  # `cancel-in-progress` false, so a nightly run can never kill an in-flight gate
+  # and a force-push cannot kill the nightly measurement. Rule 10 asserts both
+  # triggers are still here -- a backstop that can be deleted through `.github/**`
+  # (which the classifier counts irrelevant) is a comment, not a backstop.
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
 permissions:
   contents: read
 
@@ -134,7 +165,7 @@ concurrency:
 # relevant because `bench` measures them inside this same lane, and skipping
 # would silently retire the only bench regression gate. The one input that lives
 # in a *second* repository -- the `warp` mudlib the gate serves -- is pinned in
-# `mudlib/warp.lock` (OBI-326) and read by the `warp-pin` step in each load job,
+# `warp.ref` (OBI-326) and read by the `warp-pin` step in each load job,
 # so it is classified from a path the lane counts (`mudlib/**`) and a bump takes
 # a lane place like a `Cargo.lock` bump does. Before that the checkout floated on
 # warp's default branch: a warp-side change could move p99 while every loom PR
@@ -341,7 +372,7 @@ jobs:
         # workflow-level group cancelling superseded `pull_request` runs only:
         # a workflow-level cancel reaches into jobs whose own
         # `cancel-in-progress: false` forbids it. Rule 9 also reads
-        # `mudlib/warp.lock` here, so the world the gate serves cannot stop
+        # `warp.ref` here, so the world the gate serves cannot stop
         # being pinned without failing a required check.
         run: |
           set -euo pipefail
@@ -573,7 +604,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: needs.loadtest-e1-1.outputs.runtime != 'false'
       # OBI-326: the mudlib is an input to the number this gate prints, so the
-      # job reads `mudlib/warp.lock` and checks that exact commit out. There is
+      # job reads `warp.ref` and checks that exact commit out. There is
       # no fallback here on purpose: an absent, unreadable or branch-named pin
       # fails the gate instead of quietly serving warp's default branch again.
       # Rule 9 of scripts/check-ci-load-lane.py enforces this shape -- and that
@@ -584,30 +615,29 @@ jobs:
         id: warp-pin
         if: needs.loadtest-e1-1.outputs.runtime != 'false'
         env:
-          PIN_FILE: mudlib/warp.lock
+          PIN_FILE: warp.ref
         run: |
           set -euo pipefail
           if [ ! -f "$PIN_FILE" ]; then
             echo "::error::$PIN_FILE is missing: the gate refuses to guess which mudlib to serve"
             exit 1
           fi
-          repo=$(sed -n 's/^repository=//p' "$PIN_FILE" | head -1)
-          rev=$(sed -n 's/^rev=//p' "$PIN_FILE" | head -1)
-          if [ -z "$repo" ] || [ -z "$rev" ]; then
-            echo "::error::$PIN_FILE carries no repository=/rev= (the gate refuses to guess)"
+          # One payload line: comments and blanks stripped, the SHA, nothing else.
+          rev=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PIN_FILE" | head -1)
+          if [ -z "$rev" ]; then
+            echo "::error::$PIN_FILE carries no commit SHA (the gate refuses to guess)"
             exit 1
           fi
           if [ "${#rev}" -ne 40 ] || [[ "$rev" =~ [^0-9a-f] ]]; then
-            echo "::error::$PIN_FILE rev must be a full 40-character commit SHA, got '$rev'"
+            echo "::error::$PIN_FILE must hold one full 40-character lowercase commit SHA, got '$rev'"
             echo '::error::a branch name can move underneath a run, which is what this pin prevents'
             exit 1
           fi
-          echo "repository=$repo" >> "$GITHUB_OUTPUT"
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         if: needs.loadtest-e1-1.outputs.runtime != 'false'
         with:
-          repository: ${{ steps.warp-pin.outputs.repository }}
+          repository: LoomMud/warp
           path: warp
           ref: ${{ steps.warp-pin.outputs.rev }}
       - name: verify the mudlib under measurement
@@ -617,13 +647,13 @@ jobs:
           # Re-read the pin file rather than trust the step output above: the
           # gate serves the commit the repository names, and stamps the number
           # it prints with the mudlib that produced it (results/README.md).
-          want=$(sed -n 's/^rev=//p' mudlib/warp.lock | head -1)
+          want=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' warp.ref | head -1)
           got=$(git -C warp rev-parse HEAD)
           if [ "$got" != "$want" ]; then
-            echo "::error::serving warp@$got while mudlib/warp.lock pins $want"
+            echo "::error::serving warp@$got while warp.ref pins $want"
             exit 1
           fi
-          echo "mudlib: \`LoomMud/warp@$got\` (from \`mudlib/warp.lock\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "mudlib: \`LoomMud/warp@$got\` (pinned in \`warp.ref\`)" >> "$GITHUB_STEP_SUMMARY"
       - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
         if: needs.loadtest-e1-1.outputs.runtime != 'false'
       - name: run loom serve + loadtest smoke
@@ -657,7 +687,7 @@ jobs:
             --ramp-per-sec 10 \
             --metrics-url http://127.0.0.1:4001/metrics \
             --out results/ci-smoke \
-            --note "mudlib ${{ steps.warp-pin.outputs.repository }}@${{ steps.warp-pin.outputs.rev }} (pinned in mudlib/warp.lock)"
+            --note "mudlib LoomMud/warp@${{ steps.warp-pin.outputs.rev }} (pinned in warp.ref)"
           kill "$(cat /tmp/loom-serve.pid)" || true
           cat /tmp/loom-serve.log
           cp /tmp/loom-serve.log results/loom-serve-smoke.log
@@ -758,49 +788,48 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: needs.classify.outputs.runtime != 'false'
       # OBI-326: same contract as `loadtest-smoke` -- the mudlib comes from the
-      # rev in `mudlib/warp.lock`, never from whatever warp's default branch
+      # rev in `warp.ref`, never from whatever warp's default branch
       # points at today, and the report says which mudlib it measured against.
       - name: read the pinned mudlib rev
         id: warp-pin
         if: needs.classify.outputs.runtime != 'false'
         env:
-          PIN_FILE: mudlib/warp.lock
+          PIN_FILE: warp.ref
         run: |
           set -euo pipefail
           if [ ! -f "$PIN_FILE" ]; then
             echo "::error::$PIN_FILE is missing: the gate refuses to guess which mudlib to serve"
             exit 1
           fi
-          repo=$(sed -n 's/^repository=//p' "$PIN_FILE" | head -1)
-          rev=$(sed -n 's/^rev=//p' "$PIN_FILE" | head -1)
-          if [ -z "$repo" ] || [ -z "$rev" ]; then
-            echo "::error::$PIN_FILE carries no repository=/rev= (the gate refuses to guess)"
+          # One payload line: comments and blanks stripped, the SHA, nothing else.
+          rev=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PIN_FILE" | head -1)
+          if [ -z "$rev" ]; then
+            echo "::error::$PIN_FILE carries no commit SHA (the gate refuses to guess)"
             exit 1
           fi
           if [ "${#rev}" -ne 40 ] || [[ "$rev" =~ [^0-9a-f] ]]; then
-            echo "::error::$PIN_FILE rev must be a full 40-character commit SHA, got '$rev'"
+            echo "::error::$PIN_FILE must hold one full 40-character lowercase commit SHA, got '$rev'"
             echo '::error::a branch name can move underneath a run, which is what this pin prevents'
             exit 1
           fi
-          echo "repository=$repo" >> "$GITHUB_OUTPUT"
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         if: needs.classify.outputs.runtime != 'false'
         with:
-          repository: ${{ steps.warp-pin.outputs.repository }}
+          repository: LoomMud/warp
           path: warp
           ref: ${{ steps.warp-pin.outputs.rev }}
       - name: verify the mudlib under measurement
         if: needs.classify.outputs.runtime != 'false'
         run: |
           set -euo pipefail
-          want=$(sed -n 's/^rev=//p' mudlib/warp.lock | head -1)
+          want=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' warp.ref | head -1)
           got=$(git -C warp rev-parse HEAD)
           if [ "$got" != "$want" ]; then
-            echo "::error::serving warp@$got while mudlib/warp.lock pins $want"
+            echo "::error::serving warp@$got while warp.ref pins $want"
             exit 1
           fi
-          echo "mudlib: \`LoomMud/warp@$got\` (from \`mudlib/warp.lock\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "mudlib: \`LoomMud/warp@$got\` (pinned in \`warp.ref\`)" >> "$GITHUB_STEP_SUMMARY"
       - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
         if: needs.classify.outputs.runtime != 'false'
       - name: capture runner context
@@ -875,7 +904,7 @@ jobs:
             --metrics-scrape-ms 1000 \
             --timeline-bucket-ms 5000 \
             --out results/ci-e1-1 \
-            --note "mudlib ${{ steps.warp-pin.outputs.repository }}@${{ steps.warp-pin.outputs.rev }} (pinned in mudlib/warp.lock)" \
+            --note "mudlib LoomMud/warp@${{ steps.warp-pin.outputs.rev }} (pinned in warp.ref)" \
             --fail-on-sla-miss
           status=$?
           # OBI-344 follow-up (main run 37862921160 on eaf9ceb): everything
