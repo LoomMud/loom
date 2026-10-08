@@ -61,6 +61,11 @@ Rules, enforced both by naming and by a hard runtime check:
 any loom/warp DB-backed work, and use the disposable-DB helper below
 instead of exporting your own DSN.**
 
+Building loom stopped being DB-backed work with OBI-321: `.cargo/config.toml`
+defaults `SQLX_OFFLINE=true`, so sqlx's compile-time `query!` macros read the
+committed `.sqlx/` cache instead of connecting -- see "SQLx offline metadata"
+at the end of this document.
+
 ### `scripts/with-disposable-postgres.sh`
 
 Boots a throwaway Postgres instance this run owns -- `initdb`/`pg_ctl` on a
