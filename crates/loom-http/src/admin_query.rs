@@ -219,6 +219,21 @@ pub trait WorldAdminQuery: Send + Sync {
         tier: i16,
         program_prefix: Option<&str>,
     ) -> Result<Vec<ErrorGroup>, WorldQueryError>;
+
+    /// `POST /api/v1/admin/broadcast` (OBI-233, M-ADM-5): deliver `text`
+    /// -- already tier/step-up/size/sanitization-checked and prefixed by
+    /// `loom-http`'s `AuthService::admin_broadcast` -- to every
+    /// *interactive* session, i.e. every live connection `who_sessions`
+    /// reports an `account` for (CTO review, OBI-233: "route it through
+    /// the world thread to interactive objects only", not every raw
+    /// socket including a connection still at the login prompt). This is
+    /// the normal mudlib output path (`Host::send`, the same one
+    /// `World::tick`/`World::input` use), never a side channel into
+    /// `loom-net`. Returns the number of sessions the text was sent to
+    /// (0 is a valid, non-error answer: nobody is logged in). `text` is
+    /// sent verbatim, one `Host::send` call per interactive session --
+    /// this trait never re-sanitizes or re-prefixes it.
+    async fn broadcast(&self, text: &str) -> Result<usize, WorldQueryError>;
 }
 
 /// The wire request [`ChannelWorldQuery`] sends; the world-thread-side
@@ -244,6 +259,13 @@ pub enum WorldQueryRequest {
         tier: i16,
         program_prefix: Option<String>,
         reply: oneshot::Sender<Result<Vec<ErrorGroup>, WorldQueryError>>,
+    },
+    /// OBI-233: `text` is already sanitized/prefixed; the world-thread
+    /// side only needs to fan it out to every interactive session (see
+    /// [`WorldAdminQuery::broadcast`]'s doc comment).
+    Broadcast {
+        text: String,
+        reply: oneshot::Sender<Result<usize, WorldQueryError>>,
     },
 }
 
@@ -337,6 +359,18 @@ impl WorldAdminQuery for ChannelWorldQuery {
                 euid: euid.to_string(),
                 tier,
                 program_prefix: program_prefix.map(|s| s.to_string()),
+                reply,
+            },
+            reply_rx,
+        )
+        .await
+    }
+
+    async fn broadcast(&self, text: &str) -> Result<usize, WorldQueryError> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.roundtrip(
+            WorldQueryRequest::Broadcast {
+                text: text.to_string(),
                 reply,
             },
             reply_rx,
