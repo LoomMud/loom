@@ -347,8 +347,21 @@ jobs:
           elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
               && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
             scripts/check-dco.sh "$BEFORE..$AFTER"
+          elif git rev-parse -q --verify "$AFTER^" >/dev/null 2>&1; then
+            # No readable change range: a scheduled or dispatched run, or a push whose
+            # `before` is gone. Audit the commit this run is standing on, and only that.
+            # The fallback used to be `scripts/check-dco.sh HEAD`, which walks the *whole*
+            # history, and this repository's history contains commits authored by the
+            # founder and signed off by the agent who wrote them (a1d3dc4, 7f1b074 --
+            # author `Greg Oberfield`, trailer `Signed-off-by: Gimli`). The rule compares
+            # the trailer to the author, so that scan fails on the same two commits every
+            # single time. A nightly that is red by construction is not a drift backstop,
+            # it is noise people learn to skip -- and whether an agent's sign-off satisfies
+            # DCO for a human-authored commit is a policy call for the CTO, not something
+            # a scheduled run should be re-litigating on old merged history.
+            scripts/check-dco.sh "$AFTER^..$AFTER"
           else
-            scripts/check-dco.sh HEAD
+            scripts/check-dco.sh "$AFTER"
           fi
   hygiene:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}

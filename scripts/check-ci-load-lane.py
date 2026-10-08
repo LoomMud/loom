@@ -99,6 +99,13 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      an empty commit. Rule 10 exists for the same reason as rule 8: the trigger
      list lives in `.github/**`, which the lane counts irrelevant, so a backstop
      that can be deleted without a required check noticing is a comment.
+ 10b. a job that audits commit sign-off gives an answer for an event with no
+     commit range, and the answer is a bounded range, never a bare rev. A schedule
+     or dispatch run that audits "every commit reachable from HEAD" is red on the
+     first night and stays red, because merged history contains commits whose
+     sign-off names the agent who wrote them rather than the author (run
+     37752599276). A permanently red backstop is not a backstop; it is a
+     notification nobody reads.
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -872,6 +879,10 @@ def check_drift_backstop(text):
     are asserted because both live in `.github/**`, which the classifier counts
     irrelevant: without rule 10 the backstop could be removed by a PR that never
     entered the lane.
+
+    The trigger alone is not enough: a backstop that cannot go green measures
+    nothing, so rule 10 also requires every job to answer for an event that carries
+    no commit range -- see `check_rangeless_audit`.
     """
     keys = on_trigger_keys(text)
     errors = []
@@ -886,6 +897,49 @@ def check_drift_backstop(text):
                       "candidate may legitimately have skipped the lane -- without a "
                       "dispatch the only way to get the number is an empty commit "
                       "that forces a lane run (rule 10)")
+    return errors
+
+
+def check_rangeless_audit(text):
+    """Rule 10b: a run with no commit range must not be asked to audit all history.
+
+    `schedule` and `workflow_dispatch` carry no `base` and no `before`. The first
+    dispatch of this workflow (run 37752599276) went red on `dco` for exactly that
+    reason: its fallback was `scripts/check-dco.sh HEAD`, which lists every commit
+    reachable from the tip, and two of them (`a1d3dc4`, `7f1b074`) are authored by
+    the founder and signed off by the agent who wrote them -- the rule compares the
+    trailer to the author, so that scan fails on the same pair every time it runs.
+    Not merely strict: unsatisfiable. And an unsatisfiable check on a nightly is
+    noise that trains everyone to skip the one run whose colour is supposed to mean
+    "the world drifted". Whether an agent's sign-off satisfies DCO for a
+    human-authored commit is a policy question for the CTO; a scheduled run must not
+    answer it by re-auditing merged history.
+
+    So: every `check-dco.sh` call must name a bounded set of commits. A range with
+    `..` is bounded. A bare rev is bounded only where the step has just proved that
+    rev has no parent (`git rev-parse -q --verify "$AFTER^"`), which is the
+    first-commit/initial-push case where the whole history *is* one commit. `HEAD`
+    is never acceptable: in a `fetch-depth: 0` checkout it is the whole repository.
+    """
+    errors = []
+    for job, block in job_blocks(text).items():
+        for step in steps_of(block):
+            code = step_code(step)
+            if "check-dco.sh" not in code:
+                continue
+            bounded_one = 'rev-parse -q --verify "$AFTER^"' in code
+            for m in re.finditer(r'check-dco\.sh(?:\s+")([^"\n]*)"|check-dco\.sh\s+(\S+)', code):
+                arg = (m.group(1) or m.group(2) or "").strip()
+                if not arg or ".." in arg:
+                    continue
+                if arg == "$AFTER" and bounded_one:
+                    continue
+                errors.append(f"`{job}` audits sign-off over `{arg}`, which is every commit "
+                              "reachable from one rev: scheduled and dispatched runs carry no "
+                              "commit range, and the merged history contains commits whose "
+                              "sign-off does not name their author, so the nightly could never "
+                              "go green -- name the commits the run stands on as a range "
+                              "(rule 10b)")
     return errors
 
 
@@ -982,6 +1036,7 @@ def check_text(text, root="."):
     check_e11_verdict_isolation(jobs, errors)
     errors += check_mudlib_pin(text, root)
     errors += check_drift_backstop(text)
+    errors += check_rangeless_audit(text)
 
     e11 = [l for l in jobs.get("loadtest-e1-1", []) if not l.lstrip().startswith("#")]
     body = "\n".join(e11)  # comments excluded: the flags must be in the command
@@ -1289,6 +1344,15 @@ MUTANTS = [
      lambda t: _sub(t, "  schedule:", None)),
     ("on-demand measurement path removed",
      lambda t: _sub(t, "  workflow_dispatch:", None)),
+    # OBI-326 rule 10b: the backstop has to be able to go green. Both mutants are
+    # shapes the workflow actually held before the first dispatch run showed `dco`
+    # failing on commits merged long before ci.yml existed.
+    ("sign-off audit walks all history",
+     lambda t: _sub(t, 'scripts/check-dco.sh "$AFTER^..$AFTER"',
+                    'scripts/check-dco.sh HEAD')),
+    ("range-less path has no bound at all",
+     lambda t: _sub(t, 'elif git rev-parse -q --verify "$AFTER^" >/dev/null 2>&1; then',
+                    'elif true; then')),
 ]
 
 

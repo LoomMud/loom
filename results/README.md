@@ -426,7 +426,7 @@ so a missing or unreadable verdict means "take the lane and measure". Rule 8 of
 `scripts/check-ci-load-lane.py` pins the whole shape -- the expression, its
 run-scoped arm, the classifier's inability to be skipped or to fail the job, and
 a step guard beside every measurement -- because each of those has a fail-open
-mutation: 55 of them now, all run in `hygiene`.
+mutation: 57 of them now, all run in `hygiene`.
 
 Putting `.github/**` on the irrelevant list is only safe because of rule 9: the
 workflow may not install a `toolchain:` that `rust-toolchain.toml` does not
@@ -627,7 +627,7 @@ into jobs whose own `cancel-in-progress: false` forbids being cancelled.
   on nothing but `opened`/`synchronize`/`reopened`, and keeps `opened` and
   `synchronize`.
 
-Eleven mutants prove both bite, including flipping the required gate's own
+The mutants aimed at rules 5 and 6 include flipping the required gate's own
 `cancel-in-progress` to `true` beside the new block and putting `labeled` back
 in the trigger.
 
@@ -662,6 +662,20 @@ The release policy that goes with it: a release SHA needs a **measured** green
 at all, so "the check is green on the release commit" is not sufficient evidence;
 the run has to be one that took the lane. Both triggers are asserted by rule 10
 because they live in a path the lane itself counts irrelevant.
+
+A trigger nobody can read the result of is no backstop either, which is what rule
+10b guards. Neither `schedule` nor `workflow_dispatch` carries a commit range, and
+the first dispatch run (37752599276) went red on `dco` because of it: the step's
+fallback for a range-less event was an audit of *every commit reachable from HEAD*,
+and this repository's merged history contains commits authored by the founder and
+signed off by the agent who wrote them, so the comparison against the author fails
+on the same pair (`a1d3dc4`, `7f1b074`) on every run, forever. Not strict --
+unsatisfiable. The event-scoped audit now names the commits the run stands on, and
+rule 10b fails any `check-dco.sh` call handed a bare rev, because the next range-less
+fallback would arrive as a plausible-looking tightening of the sign-off gate. Whether
+an agent's `Signed-off-by` should satisfy DCO on a human-authored commit is a policy
+question for the CTO; it is not something a nightly should answer by re-judging
+history the gate already accepted.
 
 ## Limitations
 
