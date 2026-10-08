@@ -250,6 +250,13 @@ pub struct RunReport {
     /// fixed-interval timer actually fired. The bot side of the attribution
     /// -- a starved measuring process cannot report 50 ms honestly.
     pub bot_timer_lag: Option<LatencyReport>,
+    /// `loom_runtime_errors_total{program}` groups parsed out of the
+    /// end-of-run scrape (OBI-324). An uncaught Weft error in a live object
+    /// is a *correctness* signal the latency numbers above cannot see, so
+    /// it gets its own report section and its own exit-code gate
+    /// (`--fail-on-runtime-errors`) instead of hiding in `server_metrics`.
+    /// Empty == the server recorded nothing, which is the passing case.
+    pub runtime_errors: Vec<(String, u64)>,
     /// Raw `/metrics` scrape from `loom-http` at the end of the run
     /// (OBI-177), if `--metrics-url` was given. Not parsed/aggregated here
     /// -- bot-side latency remains the E1.1 source of truth -- this is
@@ -402,6 +409,32 @@ impl RunReport {
             ));
         }
         self.push_tail_sections(&mut out);
+        // OBI-324: the runtime-error gate. Rendered even when clean, so a
+        // run that never scraped says so instead of looking like a pass.
+        out.push_str("## Runtime errors (`loom_runtime_errors_total`, OBI-324)\n\n");
+        match &self.server_metrics {
+            None => out.push_str(
+                "- **unmeasured**: no end-of-run scrape succeeded (no `--metrics-url`, or every \
+                 scrape failed -- see the notes above), so this run cannot assert zero server-side \
+                 errors\n\n",
+            ),
+            Some(_) if self.runtime_errors.is_empty() => {
+                out.push_str("- none recorded (0)\n\n");
+            }
+            Some(_) => {
+                let total: u64 = self.runtime_errors.iter().map(|(_, n)| n).sum();
+                out.push_str("| program | count |\n|---|---|\n");
+                for (program, count) in &self.runtime_errors {
+                    out.push_str(&format!("| {program} | {count} |\n"));
+                }
+                out.push_str(&format!(
+                    "\n**{total} uncaught Weft error(s) recorded by the server during the run. \
+                     Read them in the driver's error inbox (`errors` efun, or \
+                     `/api/v1/admin/errors`), not in the latency table above -- an error is a \
+                     correctness failure, not a slow one (OBI-324).**\n\n"
+                ));
+            }
+        }
         if !self.notes.is_empty() {
             out.push_str("## Notes\n\n");
             for n in &self.notes {
@@ -735,6 +768,7 @@ mod tests {
             server_timeline: vec![],
             server_instrumented: false,
             bot_timer_lag: None,
+            runtime_errors: vec![],
             server_metrics: None,
         }
     }
@@ -778,5 +812,32 @@ mod tests {
             "{md}"
         );
         assert!(md.contains("2.0 - 3.0"), "{md}");
+    }
+
+    /// OBI-324: the gate's own report surface. A run that scraped a server
+    /// with errors must say so in the markdown; a clean run must say "none
+    /// recorded"; a run that never scraped must not imply a pass.
+    #[test]
+    fn markdown_surfaces_server_runtime_errors() {
+        let mut s = Samples::default();
+        for _ in 0..100 {
+            s.push_at(0, Duration::from_millis(10));
+        }
+        let mut report = empty_report(&s, None);
+        // 1. nothing scraped: the absence of a count is not a pass, and the
+        // report must not read as one.
+        let md = report.to_markdown();
+        assert!(md.contains("**unmeasured**"), "{md}");
+
+        // 2. scraped, nothing recorded.
+        report.server_metrics = Some("# TYPE loom_runtime_errors_total counter\n".into());
+        assert!(report.to_markdown().contains("none recorded (0)"));
+
+        // 3. scraped, errors recorded: per-program table plus the note that
+        //    sends the reader to the driver's error inbox.
+        report.runtime_errors = vec![("/std/player".to_string(), 150)];
+        let md = report.to_markdown();
+        assert!(md.contains("| /std/player | 150 |"), "{md}");
+        assert!(md.contains("150 uncaught Weft error(s)"), "{md}");
     }
 }
