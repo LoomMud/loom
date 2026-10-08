@@ -24,6 +24,22 @@
  * switching to the ESM build and a bundler, which is a separate decision
  * (it adds a build step to a web client that has none today) -- noted in
  * OBI-180 for the CTO rather than done silently here.
+ *
+ * Known advisories in what gets staged (so the next reader of
+ * `npm run audit` does not have to rediscover this): the LOW findings are
+ * `dompurify` <=3.4.15, and they are *not* merely graph noise -- DOMPurify
+ * 3.4.15 and `marked` are prebundled inside `vs/editor-*.js`, so pruning
+ * the file or adding an npm override changes neither the served bundle nor
+ * the advisory. 0.57.0 is the newest release and pins 3.4.15; the fix lands
+ * in dompurify 3.4.16, which no Monaco release carries yet.
+ *
+ * What limits the exposure is our own configuration, and the tests in
+ * `src/ide/editor.ts` pin it: the markdown renderers run with
+ * `supportHtml: false`, so builder-authored text is escaped before
+ * DOMPurify is ever reached, and `isTrusted: false` keeps Monaco's Trusted
+ * Types path from handing raw strings to the DOM. The advisory's actual
+ * blast radius is HTML that *this* client deliberately does not render.
+ * Re-checked when Monaco ships 3.4.16.
  */
 
 import {

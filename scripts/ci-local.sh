@@ -14,10 +14,12 @@ scripts/check-dco.sh
 # (`npm ci`, so a missing devDependency fails the same way here as in CI --
 # `npm install` would let a stale lockfile pass), vendor + type-check, lint
 # the HTML-sink and static-CSP audits, run the unit tests, then the licence
-# and vulnerability gates (OBI-180 M-IDE-1/2/3).
+# and vulnerability gates (OBI-180 M-IDE-1/2/3). `npm run audit` names
+# `--include=dev` because a local `omit=dev` is exactly what let PR #141's first
+# CI run fail on a devDependency chain this script had passed clean.
 if [ -d web-client ]; then
   (cd web-client && npm ci --include=dev && npm run build && npm run lint \
-    && npm test && npm run check-licenses && npm audit --audit-level=high)
+    && npm test && npm run check-licenses && npm run audit)
   node --test scripts/check-static-csp.test.mjs
 fi
 echo "ci-local: all gates green"
