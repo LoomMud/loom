@@ -157,7 +157,9 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   workflow-level `concurrency` group that cancels a PR's *superseded* runs and
   nothing else -- no required check on a mergeable candidate is ever cancelled
   -- and the PR trigger is narrowed to the activities that change the commit.
-  See "Which runs may be cancelled" below.
+  It only reaches runs whose own workflow copy declares the block, so a PR that
+  has not rebased onto `0b8ca74` yet is cancelled by hand instead. See "Which
+  runs may be cancelled" below.
 - `scripts/check-ci-load-lane.py` asserts all of the above (and that the
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
   headroom, that no required check became skippable or optional, and that the
@@ -225,6 +227,98 @@ because the newest commit is always the survivor of the cancel -- which is the
 reason the OBI-308 rule ("no required check may be cancelled or skipped") and
 this one are the same rule, not two competing ones.
 
+**What the block can reach (OBI-322).** A run joins this group only if *its
+own* copy of `ci.yml` declares the block: `concurrency` is read per run, from
+the workflow file at that run's commit. A superseded commit that does not
+contain `45d85b6` -- the commit that adds this block, on main since the `0b8ca74`
+merge -- sits in an implicit per-run group that nothing on `main` can cancel --
+not this block, and not a guard step added to `ci.yml` later either, because a
+step only exists in runs that already contain it. Those runs are cancelled by
+hand, which is expected practice during the transition and not an incident:
+
+```bash
+gh run list --repo LoomMud/loom --workflow ci --branch <pr-head-branch> \
+  --json databaseId,number,headSha,status,createdAt \
+  --jq '.[] | select(.status != "completed")'   # runs still holding lane places
+gh run cancel <databaseId>                       # only when nothing is measuring
+```
+
+Check the required gate is not mid-flight first. GitHub stamps `started_at` on a
+lane job the moment it *starts waiting*, so `started_at` alone proves nothing --
+run 37717596409's `loadtest-smoke` and `bench` both carry `started_at`
+02:50:43Z, the second that run was cancelled, and never executed. But a job
+still pending after its own `timeout-minutes` cannot have been executing,
+because it would have finished or hit the budget. Two runs were cancelled on
+2026-10-08 on that basis, both for a documented reason and neither mid-gate:
+
+* 37720694440 (PR #138's superseded `9a23ab5`) at 03:51:41Z -- its
+  `loadtest-e1-1` had been pending 50 minutes against a 30-minute budget, and
+  it went `cancelled` without a measurement.
+* 37716516501 (PR #124's twice-superseded `b3a9998`) at 03:58:38Z -- its
+  required gate and `loadtest-smoke` had already gone green on that commit, and
+  its `bench` had been pending 28 minutes against a 20-minute budget.
+
+**The two reports that started OBI-322 were not the queue swallowing a cancel.**
+Run 37718540063 (PR #124, `7db7279`) and run 37717596409 (PR **#122**, `8d160e8`
+-- not PR #180 as first written down) both carry a `ci.yml` with no workflow-level
+`concurrency` block at all, checked per head with
+`GET /repos/{owner}/{repo}/contents/.github/workflows/ci.yml?ref=<head_sha>`. So
+neither was ever a member of `ci-refs/pull/<n>/merge`, and neither was available
+to be cancelled by the block. 37717596409 in particular ended `cancelled` at
+02:50:43Z while its `loadtest-e1-1` was **executing** (02:46:40Z -> 02:50:42Z),
+49 s after its successor run 37719788325 was created -- something outside the
+block did that, so it is evidence for neither side. As of 2026-10-08 03:42Z, 3 of
+8 open PRs carry the block (`#122 3554996`, `#124 db18202`, `#139 8ca37b5`); the
+other five reach it by rebasing onto current `main`, which is the only way a PR
+gets inside the rule at all.
+
+**The queue question has a documented answer, and an unobserved half.** The
+[workflow syntax reference](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idconcurrency)
+says of a concurrency group: "When a concurrent job or workflow is queued, if
+another job or workflow using the same concurrency group in the repository is in
+progress, the queued job or workflow will be `pending`. By default, any existing
+pending job or workflow in the same concurrency group will be canceled and the
+new queued job or workflow will take its place. To also cancel any currently
+running job or workflow in the same concurrency group, specify
+`cancel-in-progress: true`." Both states are covered for our case, because the
+block sets `cancel-in-progress` true for `pull_request`. Run 37723058077 (PR
+#124's head, `db18202`) is in exactly that shape as of 04:05Z: 8 of its 9 jobs
+are green and only `loadtest-e1-1` waits on the lane, and the *run* reports
+`status: pending`. That is also why a run's `status` is not the safety signal for
+hand-cancelling -- the per-job timestamps are.
+
+What the same reference does settle is the cost of leaving a stale run alive:
+"Jobs or workflow runs in the same concurrency group are processed in
+first-in-first-out (FIFO) order according to the time each one started waiting on
+the concurrency group, not the time each workflow was dispatched." Inside PR #124
+on 2026-10-08 the timestamps say exactly that -- the twice-superseded run
+37716516501 held a lane slot for `loadtest-smoke` 03:18:45Z -> 03:30:38Z, the
+superseded run 37718540063 held one for `loadtest-e1-1` 03:31:48Z -> 03:35:05Z,
+and 37723058077, the actual head, created 03:30:35Z, waited behind both. A stale
+run that is not cancelled does not merely waste a measurement: it takes the lane
+*before* the mergeable candidate.
+
+The half that stays unobserved is the interaction between the two levels -- a
+workflow-level cancel landing on a job that is mid-queue inside
+`loom-ci-load-lane`, whose own `cancel-in-progress: false` forbids being
+cancelled. #136's header asserts the cancel reaches it, the wording above
+supports it, and no run has demonstrated it yet: until #136 merged there was
+never a pair of runs sharing a group, and every supersede since has involved a
+head that lacks the block. The first natural test is the next `synchronize` on
+#122, #124 or #139 -- the three PRs that carry it -- and the observable is
+whether the superseded run's *waiting* `loadtest-e1-1` ends `cancelled`. Record
+the result here either way. If it does not, option 1 from OBI-322 (an
+in-workflow "am I still the PR head?" guard) is the fallback, and it goes to the
+CTO: it costs a `pull-requests: read` token on a workflow that today holds only
+`contents: read`, and it would inherit the same coverage limit as the block.
+
+Nothing in any of this licenses changing the lane to make stale runs disappear:
+`cancel-in-progress: true` on `loom-ci-load-lane` kills live measurements, which
+is the invariant OBI-308 exists to protect and rule 1 pins -- and as a `queue:
+max` group it would not even pass workflow validation, since GitHub rejects that
+combination outright. The lane may queue up to 100 waiters or replace them, never
+both.
+
 **The trigger had to be narrowed for that to be safe.** With `types:` omitted,
 GitHub fires a `pull_request` workflow for *every* activity -- `labeled`,
 `assigned`, `edited`, `review_requested` -- and each of those used to start a
@@ -236,8 +330,9 @@ being measured. `opened` and `synchronize` may not be dropped -- that is how a
 required check gets quietly skipped under cover of "narrowing the trigger", and
 the guard fails it.
 
-The guard is the load-bearing part, because a workflow-level cancel reaches
-into jobs whose own `cancel-in-progress: false` forbids being cancelled.
+The guard is the load-bearing part, because a workflow-level cancel is assumed
+to reach into jobs whose own `cancel-in-progress: false` forbids being cancelled
+(see the unobserved note above).
 
 * Rule 5, if the block exists at all: `group` must contain `github.workflow`
   (a constant group name would be a repo-wide mutex where one PR cancels

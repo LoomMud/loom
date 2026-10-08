@@ -32,9 +32,25 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      cancel legal. `group` must be
      PR-scoped and carry `github.run_id` as the non-PR fallback, and
      `cancel-in-progress` must be an expression that is true only for
-     `pull_request`. Rule 5 exists because a workflow-level cancel reaches into
-     jobs whose own `cancel-in-progress: false` forbids being cancelled -- rule
-     1 is only as strong as what the block above it is allowed to kill; and
+     `pull_request`. Rule 5 exists because a workflow-level cancel is expected to
+     reach into jobs whose own `cancel-in-progress: false` forbids being
+     cancelled -- rule
+     1 is only as strong as what the block above it is allowed to kill. Two
+     limits on what the block can reach, neither of which this file is able to
+     check, so do not read rule 5 as "stale PR runs are handled" (OBI-322):
+     (a) each run computes its own group from its *own* copy of the workflow, so
+     a superseded run whose commit lacks the block -- `45d85b6`, on main since
+     the `0b8ca74` merge, i.e. a PR not yet brought up to date -- sits in an
+     implicit per-run group and nothing on `main` can cancel it; hand-cancel it,
+     per results/README.md. (b) No run has yet demonstrated the cancel landing
+     on a job that is mid-queue inside the *lane* group -- GitHub cancels a
+     `pending` group member by default, so queue state is in scope by the
+     wording, but that boundary is unproven here. The two runs reported as
+     evidence that it is not (37718540063 / `7db7279`, 37717596409 / `8d160e8`)
+     both had no block in their own copy, so they are case (a), not case (b).
+     Neither limit licenses setting `cancel-in-progress: true` on the lane group
+     to make stale runs disappear -- that is rule 1, it kills live measurements,
+     and as a `queue: max` group it would not even validate; and
   6. if that block cancels `pull_request` runs, `on.pull_request.types` is
      narrowed to the activities that change the commit (`opened`, `synchronize`,
      `reopened`) -- with `types:` omitted GitHub fires on *every* activity, so
