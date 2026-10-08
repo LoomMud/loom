@@ -364,12 +364,14 @@ jobs:
       # broken scanner has to fail loudly instead of passing vacuously.
       - run: node --test ../scripts/check-static-csp.test.mjs
       - run: npm run check-licenses
-      # `--audit-level=high` on purpose: the findings today are LOW advisories
-      # against `dompurify`, which arrives only as Monaco's transitive
-      # dependency. Blocking on LOW here would mean pinning around
-      # Microsoft's own graph or maintaining a suppression file nobody reads;
-      # the run still surfaces them.
-      - run: npm audit --audit-level=high
+      # `--audit-level=high`, but *not* `--omit=dev`: CI installs devDeps and
+      # audits them, which is how PR #141's first run caught a HIGH chain
+      # (`typescript-eslint` -> `fast-glob` -> `micromatch` -> `braces`) that a
+      # local run with `omit=dev` in npm's config had passed clean. The dev
+      # graph is the supply-chain surface that ends up executing at build time,
+      # so it belongs in the gate; `npm run audit` spells `--include=dev` out
+      # so no runner's config can narrow it silently.
+      - run: npm run audit
   loadtest-smoke:
     # R4 load-bot smoke (OBI-40): 20 simulated players, 60s, against a real
     # `loom serve` on this checkout's fixture mudlib driven by Warp's
