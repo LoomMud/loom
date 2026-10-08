@@ -202,13 +202,57 @@ on top of 0001:
 
 ## SQLx offline metadata
 
-`loom-persist` uses `sqlx::query!` macros and commits generated metadata under
-`.sqlx/` (workspace root) so `cargo check -p loom-persist` can run with
-`SQLX_OFFLINE=true` without a database connection.
+`loom-persist` uses `sqlx::query!` macros and commits the generated metadata
+under `.sqlx/` (workspace root).
 
-Refresh metadata after query changes (from the workspace root, connected as
-`loom_owner` against a migrated database):
+**An offline build is the workspace default** (OBI-321): `.cargo/config.toml`
+sets `[env] SQLX_OFFLINE = { value = "true", force = false }`, so `cargo
+build`, `cargo check`, `cargo test` and rust-analyzer compile the macros from
+`.sqlx/` and never open a connection. Before that file, a plain `cargo build`
+dialled whatever the ambient `DATABASE_URL` pointed at, at compile time, to
+`DESCRIBE` the schema -- and on an agent shell that is Paperclip's own
+control-plane Postgres ([OBI-150](/OBI/issues/OBI-150), see "Local DB testing"
+above). The failure looked like a broken migration
+(`column "key" of relation "object_state" does not exist`,
+`function roles_set_tier(...) does not exist`) against a live database you do
+not own, which is exactly the wrong invitation to "fix the schema". CI
+(`SQLX_OFFLINE: "true"` in `.github/workflows/ci.yml`) and the image build
+(`ENV SQLX_OFFLINE=true` in the `Dockerfile`) already built offline; this only
+makes the same thing true for a bare `cargo` invocation.
+
+Because `force = false`, a value already in the environment wins: a live-DB
+build stays available as an explicit opt-in, and `cargo sqlx prepare` (which
+sets `SQLX_OFFLINE=false` on the `cargo check` it spawns itself) keeps working.
+
+### Refreshing the cache
+
+After adding or editing a `query!`, the cache is missing an entry and the
+offline build says so -- `SQLX_OFFLINE=true but there is no cached data for
+this query`. That is the expected failure, and the fix is a refresh, never a
+change to some database:
 
 ```bash
-DATABASE_URL=postgres://loom_owner:...@host/db cargo sqlx prepare --workspace -p loom-persist -- --tests
+scripts/sqlx-prepare.sh
 ```
+
+That script re-execs itself under
+[`scripts/with-disposable-postgres.sh`](../scripts/with-disposable-postgres.sh),
+applies `loom-persist`'s migrations to that throwaway instance as `loom_owner`,
+runs `cargo sqlx prepare` against it, then re-checks the macros offline from the
+cache it just wrote -- so a refresh that the default build cannot use fails
+there instead of in CI. Commit the resulting `git diff .sqlx` with the query
+change. `crates/loom-persist/tests/sqlx_offline_default.rs` guards both the
+config entry and the presence of the cache.
+
+The manual form, if you must use it, is the same prepare the script runs --
+connected as `loom_owner` (the schema owner: `loom_app` cannot `DESCRIBE` the
+`security definer` functions) against a migrated database **you own**:
+
+```bash
+SQLX_OFFLINE=false DATABASE_URL=postgres://loom_owner:...@host/db \
+    cargo sqlx prepare --workspace -- -p loom-persist --tests
+```
+
+Note where `-p` goes: sqlx-cli 0.8's `prepare` has no package flag of its own,
+so the package and target filters belong after `--`, where they are handed to
+the `cargo check` it runs.

@@ -24,6 +24,13 @@ Applied from the first commit (spec v2 §4.4):
   an `SPDX-License-Identifier` tag with value `AGPL-3.0-only`. `reuse lint` gates CI.
 - **No secrets, credentials or unlicensed third-party assets.** `gitleaks` gates CI.
 - **`unsafe` is denied workspace-wide.** Any exception is local to `loom-vm`, justified in a comment, and CTO-reviewed.
+- **A plain `cargo build` must never connect to a database.** `.cargo/config.toml`
+  pins `SQLX_OFFLINE = { value = "true", force = false }` (OBI-321), so sqlx's
+  compile-time `query!` macros compile from the committed `.sqlx/` cache. The live-DB
+  build stays an explicit opt-in (`force = false` means your shell's value wins), and
+  refreshing the cache is `scripts/sqlx-prepare.sh` -- which boots its own disposable
+  Postgres. If a build says `SQLX_OFFLINE=true but there is no cached data for this
+  query`, run that script; see `docs/persistence.md#sqlx-offline-metadata`.
 - **Never point a local Postgres-backed test or `loom serve` run at the
   ambient `DATABASE_URL`** (OBI-151). Agent shells export `DATABASE_URL` for
   Paperclip's own control-plane Postgres (OBI-150); loom/warp's DB-backed
