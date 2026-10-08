@@ -81,9 +81,11 @@ SQLX_OFFLINE=false DATABASE_URL="$LOOM_TEST_DB_MIGRATE_URL" \
     cargo sqlx prepare --workspace -- -p loom-persist --tests
 
 # Step 4: prove the default (offline) build can use what we just wrote.
-# `SQLX_OFFLINE` is not part of cargo's fingerprint, so a cached `cargo check`
-# would silently do nothing; drop loom-persist's artifacts first so the
-# macros really do re-expand against `.sqlx/`.
+# `SQLX_OFFLINE` is in cargo's fingerprint now (crates/loom-persist/build.rs,
+# OBI-328), so the mode flip alone would force a re-check -- but the *contents*
+# of `.sqlx/` are still not tracked, because the macros read the cache without
+# recording a dependency on it. Drop loom-persist's artifacts first, or this
+# would be a cache hit that re-validates nothing.
 echo "sqlx-prepare: re-checking the macros offline from the refreshed cache"
 unset SQLX_OFFLINE DATABASE_URL
 cargo clean -p loom-persist
