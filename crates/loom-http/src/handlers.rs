@@ -94,6 +94,7 @@ pub fn auth_router() -> Router<HttpState> {
         .route("/auth/github/start", get(github_start))
         .route("/auth/github/callback", get(github_callback))
         .route("/auth/github/totp", post(github_totp))
+        .route("/api/v1/ws-ticket", post(ws_ticket))
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +158,7 @@ fn auth_error_response(error: AuthError) -> (StatusCode, Json<ErrorResponse>) {
         AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
         AuthError::InvalidPendingToken => (StatusCode::UNAUTHORIZED, "invalid_pending_token"),
         AuthError::InvalidOAuthState => (StatusCode::UNAUTHORIZED, "invalid_oauth_state"),
+        AuthError::InvalidWsTicket => (StatusCode::UNAUTHORIZED, "invalid_ws_ticket"),
     };
     (status, Json(ErrorResponse { error: code }))
 }
@@ -177,15 +179,46 @@ fn auth_context(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> Auth
 /// `None` for a missing header or a token that fails verification --
 /// callers answer `401` either way; they never need to distinguish.
 pub(crate) fn bearer_uid(headers: &HeaderMap, state: &HttpState) -> Option<String> {
+    bearer_claims(headers, state).map(|claims| claims.sub)
+}
+
+/// As [`bearer_uid`], but the full [`crate::auth::AccessClaims`] --
+/// `/api/v1/ws-ticket` (D-TM4) needs `sid` too, not just `sub`.
+pub(crate) fn bearer_claims(
+    headers: &HeaderMap,
+    state: &HttpState,
+) -> Option<crate::auth::AccessClaims> {
     let auth = state.auth.as_ref()?;
     let value = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
         .ok()?;
     let token = value.strip_prefix("Bearer ")?;
-    auth.verify_access_token(token)
-        .ok()
-        .map(|claims| claims.sub)
+    auth.verify_access_token(token).ok()
+}
+
+/// `POST /api/v1/ws-ticket` (D-TM4, OBI-180): Bearer-authenticated, mints
+/// a single-use 30s ticket for `/lsp`'s first WS frame. `401` with no
+/// `Authorization` header or an invalid/expired access token -- same
+/// shape as every other bearer-gated route here.
+pub(crate) async fn ws_ticket(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(claims) = bearer_claims(&headers, &state) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    // Safe to unwrap: `bearer_claims` only returns `Some` when
+    // `state.auth` is `Some`.
+    let auth = state.auth.as_ref().unwrap();
+    match auth.issue_ws_ticket(&claims) {
+        Ok(ticket) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ticket": ticket, "expires_in": 30 })),
+        )
+            .into_response(),
+        Err(error) => auth_error_response(error).into_response(),
+    }
 }
 
 /// Build the `200 OK` response for a successful login/refresh/GitHub-totp

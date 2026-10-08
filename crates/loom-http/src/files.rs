@@ -1044,6 +1044,9 @@ mod tests {
             ) -> Result<(), DirectoryError> {
                 unimplemented!("not exercised by these tests")
             }
+            async fn session_family_live(&self, _sid: &str) -> Result<bool, DirectoryError> {
+                unimplemented!("not exercised by these tests")
+            }
             async fn session_rotate(
                 &self,
                 _old_token_hash: &str,

@@ -6,6 +6,10 @@
 //! Routes:
 //! - `/ws` (OBI-39): a browser session gets the same seam as telnet
 //!   (`loom_net::NetEvent`/`NetCommand`).
+//! - `/lsp` (OBI-180, `lsp.rs`): the production WebSocket bridge to
+//!   `loom-lsp`'s protocol core, gated by an Origin allowlist and a
+//!   D-TM4 single-use ticket from `POST /api/v1/ws-ticket` (M-LSP-1/
+//!   M-LSP-4).
 //! - `/healthz` (OBI-28/OBI-115): liveness -- "is the process up at
 //!   all". Always `200 OK` once the axum server itself is serving
 //!   requests; never consults readiness or any backend.
@@ -44,6 +48,7 @@ pub mod auth;
 mod client_ip;
 pub mod files;
 mod handlers;
+mod lsp;
 pub mod webhook;
 
 pub use handlers::auth_router;
@@ -72,6 +77,17 @@ pub struct HttpState {
     file_op_tx: Option<files::FileOpSender>,
     write_rate_limiter: files::WriteRateLimiter,
     world_query: Option<std::sync::Arc<dyn admin_query::WorldAdminQuery>>,
+    /// M-LSP-4's session caps for `/lsp` (OBI-180) -- always present
+    /// (unlike `file_op_tx`'s `Option`), since an empty limiter still
+    /// correctly allows sessions right up to the cap; the route itself
+    /// answers `503` before ever touching this if no file-op channel is
+    /// wired.
+    lsp_sessions: lsp::SessionLimiter,
+    /// Test-only override for `/lsp`'s timing constants (idle timeout,
+    /// ping interval, first-frame timeout, revocation-recheck interval)
+    /// -- `None` uses the real spec values (M-LSP-1/M-LSP-4). Set via
+    /// [`Self::with_lsp_tuning_for_test`], never by `loom-cli`.
+    lsp_tuning: lsp::LspTuning,
 }
 
 impl HttpState {
@@ -93,6 +109,8 @@ impl HttpState {
             file_op_tx: None,
             write_rate_limiter: files::new_write_rate_limiter(),
             world_query: None,
+            lsp_sessions: lsp::SessionLimiter::default(),
+            lsp_tuning: lsp::LspTuning::default(),
         }
     }
 
@@ -177,6 +195,37 @@ impl HttpState {
     pub(crate) fn world_query(&self) -> Option<&dyn admin_query::WorldAdminQuery> {
         self.world_query.as_deref()
     }
+
+    /// `lsp.rs`'s own accessors: `/lsp` reuses the M-FS-1 file-op channel
+    /// and the M-AUTH-6 staff-origin allowlist exactly as `files.rs`/
+    /// `handlers.rs` do, plus its own always-present session limiter.
+    pub(crate) fn file_op_tx(&self) -> Option<&files::FileOpSender> {
+        self.file_op_tx.as_ref()
+    }
+
+    pub(crate) fn staff_origins(&self) -> &[String] {
+        &self.staff_origins
+    }
+
+    pub(crate) fn lsp_sessions(&self) -> &lsp::SessionLimiter {
+        &self.lsp_sessions
+    }
+
+    pub(crate) fn lsp_tuning(&self) -> &lsp::LspTuning {
+        &self.lsp_tuning
+    }
+
+    /// Shrink `/lsp`'s timing constants for a fast, deterministic test
+    /// (idle timeout/ping interval/revocation-recheck interval all
+    /// default to tens of seconds, far too slow for a test to wait out
+    /// in real wall-clock time). Test-only -- `loom-cli` never calls
+    /// this, so every real `/lsp` connection gets the spec's actual
+    /// M-LSP-4 values.
+    #[cfg(test)]
+    pub(crate) fn with_lsp_tuning_for_test(mut self, tuning: lsp::LspTuning) -> Self {
+        self.lsp_tuning = tuning;
+        self
+    }
 }
 
 /// M-IDE-1/M-IDE-2 (OBI-179 threat model) for the static web client
@@ -206,6 +255,7 @@ pub fn app(state: HttpState) -> Router {
         .merge(admin::admin_router())
         .merge(webhook::webhook_router())
         .merge(files::files_router())
+        .merge(lsp::lsp_router())
         .with_state(state);
     match web_root {
         Some(root) => {
