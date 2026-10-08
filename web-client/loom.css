@@ -1,0 +1,31 @@
+/* SPDX-FileCopyrightText: 2026 Oberfield */
+/* SPDX-License-Identifier: AGPL-3.0-only */
+
+/*
+ * The player client's stylesheet, in a file rather than an inline
+ * `<style>` block: `index.html`'s `<meta>` CSP says `style-src 'self'`,
+ * and the header CSP that loom-http stamps on the static bundle only
+ * allows inline styles because Monaco measures text with them
+ * (M-IDE-1). Nothing else on the player page needs that exception, so
+ * the page takes it away from itself.
+ */
+
+body {
+  font-family: monospace;
+  background: #111;
+  color: #ddd;
+  margin: 0;
+}
+
+#pane {
+  white-space: pre-wrap;
+  height: 80vh;
+  overflow-y: auto;
+  padding: 0.5rem;
+}
+
+#input {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: monospace;
+}

@@ -7,3 +7,10 @@ target
 **/target
 *.log
 .DS_Store
+
+# The web client is built inside the image from the lockfile; a host-built
+# vendor tree or `dist` would silently ship instead of being regenerated
+# (OBI-180 M-IDE-3 wants the image's Monaco to come from *this* lockfile).
+web-client/node_modules
+web-client/dist
+web-client/vendor

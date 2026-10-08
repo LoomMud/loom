@@ -4,25 +4,42 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <!--
+      M-IDE-1 (OBI-179 threat model v2 §5, OBI-180). The same policy
+      loom-http stamps on the static bundle as a `Content-Security-
+      Policy` header, minus the directives a `<meta>` cannot carry
+      (`frame-ancestors` is ignored in meta per the CSP spec, which is
+      why OBI-294 ships it as a header). Two policies on one document are
+      both enforced, so this copy can only narrow the header, never widen
+      it: it is here so the page stays held to `script-src 'self'` if the
+      bundle is ever served without loom-http in front of it.
+
+      Tighter than the header on purpose: no `style-src 'unsafe-inline'`
+      (that exception exists only for Monaco, and the player client's
+      stylesheet now lives in loom.css) and no `worker-src blob:`.
+
+      `connect-src 'self'` covers the same-origin `/ws` socket: CSP3
+      matches a `ws`/`wss` URL against `'self'` when the host matches the
+      document's origin. A future client that dials a separate socket
+      host must name that host here -- never a wildcard.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    />
     <title>Loom</title>
-    <style>
-      body { font-family: monospace; background: #111; color: #ddd; margin: 0; }
-      #pane { white-space: pre-wrap; height: 80vh; overflow-y: auto; padding: 0.5rem; }
-      #input { width: 100%; box-sizing: border-box; font-family: monospace; }
-    </style>
+    <link rel="stylesheet" href="./loom.css" />
   </head>
   <body>
     <div id="pane"></div>
     <input id="input" autofocus placeholder="type a command and press enter" />
-    <script type="module">
-      import { mountLoomClient } from "./dist/app.js";
-
-      const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
-      mountLoomClient({
-        pane: document.getElementById("pane"),
-        input: document.getElementById("input"),
-        wsUrl,
-      });
-    </script>
+    <!--
+      External module only (M-IDE-1): `script-src 'self'` blocks an inline
+      `<script>`, so the bootstrap lives in `src/main.ts` and ships as
+      `dist/main.js`. `scripts/check-static-csp.mjs` enforces that no
+      served page grows an inline script, style attribute, or `on*=`
+      handler back (O3-T6).
+    -->
+    <script type="module" src="./dist/main.js"></script>
   </body>
 </html>

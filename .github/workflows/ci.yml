@@ -331,11 +331,14 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - run: FUZZ_SECONDS=45 scripts/fuzz-smoke.sh lsp
   web-client:
-    # Minimal TS web client (OBI-39): build + unit tests, and an npm
-    # dependency licence gate mirroring `deny.toml`'s OSI allow-list (the
-    # client ships zero production dependencies today; `--production`
-    # scopes the gate to whatever actually ends up in the browser bundle,
-    # not this repo's own build tooling).
+    # The web client (OBI-39 player page, OBI-165 admin console, OBI-180 IDE
+    # shell): build + unit tests, an npm licence gate mirroring
+    # `deny.toml`'s OSI allow-list, the supply-chain and CSP audits the IDE
+    # added a browser-side dependency surface for.
+    #
+    # Order matters: `build` stages Monaco out of the lockfile and fails on a
+    # version mismatch, `lint` audits the source *and* the manifest that step
+    # just produced, and `test` runs the compiled output.
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
     defaults:
       run:
@@ -345,11 +348,28 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "22"
-      - run: npm install --include=dev
-      - run: npm run lint
+      # `npm ci`, not `npm install`: OBI-180 M-IDE-3 makes the lockfile the
+      # pinned source of truth for what runs in a builder's browser, which is
+      # only true if CI installs exactly it. `--include=dev` is spelled out
+      # rather than left to the default -- the type-checker, ESLint, and
+      # license-checker are devDependencies, and an `omit=dev`/`NODE_ENV=
+      # production` runner would otherwise turn "lint passed" into "lint
+      # never ran".
+      - run: npm ci --include=dev
       - run: npm run build
+      - run: npm run lint
       - run: npm test
+      # The audit gate's own gate: `check-static-csp.mjs` is the CI half of
+      # M-IDE-1 for documents served outside the Rust `ServeDir` wiring, so a
+      # broken scanner has to fail loudly instead of passing vacuously.
+      - run: node --test ../scripts/check-static-csp.test.mjs
       - run: npm run check-licenses
+      # `--audit-level=high` on purpose: the findings today are LOW advisories
+      # against `dompurify`, which arrives only as Monaco's transitive
+      # dependency. Blocking on LOW here would mean pinning around
+      # Microsoft's own graph or maintaining a suppression file nobody reads;
+      # the run still surfaces them.
+      - run: npm audit --audit-level=high
   loadtest-smoke:
     # R4 load-bot smoke (OBI-40): 20 simulated players, 60s, against a real
     # `loom serve` on this checkout's fixture mudlib driven by Warp's
