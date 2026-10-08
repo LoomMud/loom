@@ -114,10 +114,13 @@ threshold.
    `head`, and `ctrl` -- a second, byte-identical *copy* of the head binary at
    its own path and inode. Before OBI-312 there were two arms and the order
    alternated A-B, B-A; now the order rotates through all three slots
-   (`head,ctrl,base` / `ctrl,base,head` / `base,head,ctrl`) so every arm gets
-   each slot exactly once per three rounds, and any effect of "what ran
-   immediately before" (frequency ramp, page-cache state, a neighbour's
-   burst) lands on all arms in turn instead of on one side. All three
+   (`head,ctrl,base` / `ctrl,base,head` / `base,head,ctrl`) so every arm holds
+   each *slot position* exactly once per three rounds and no arm can
+   systematically get the warm slot. Cyclic rotation covers 3 of the 6 orders,
+   so it does **not** equalise every predecessor (head always follows ctrl or
+   runs first); "what ran immediately before" -- frequency ramp, page-cache
+   state, a neighbour's burst -- is therefore controlled for by the `ctrl` arm,
+   not by the schedule. All three
    binaries are staged into one directory under equal-length names
    (`bin/a1|a2|a3/vm_bench`) and always executed from that same cwd, so
    neither argv[0] length nor working directory can differ between arms.
@@ -138,7 +141,19 @@ threshold.
    labelled `INVALID harness` -- red, but never blamed on the PR. Equally, if
    `sha256(base binary) == sha256(head binary)` the diff compiled to identical
    code, so an out-of-band `head / base` is by definition an artifact and also
-   exits 3.
+   exits 3. A row whose median printed as `0.000 ms` is an invalid row, not a
+   division and not a result.
+
+   **Precedence: a named regression outranks an invalid neighbour**
+   (OBI-312 review, B1). If any workload is classified `REGRESSION` while *its
+   own* control sat inside the tolerance and the binaries differ, the run exits
+   **1** and names it, even when other workloads in the same run have control
+   misses or no control sample at all -- those rows are reported and listed as
+   untrustworthy, but they do not get the last word. The reverse precedence was
+   the original mistake wearing a different hat: one flaky short workload could
+   turn every real slowdown into "harness invalid, not your fault". Within a
+   *single* row the control miss still wins, because a row whose own control
+   moved is not evidence about code.
 5. **Confirmation pass.** If the first pass fails -- regression *or* control
    miss -- run a second pass of the same size and recompute over all rounds;
    fail only if the miss survives. A real regression survives; a one-off noisy
@@ -159,12 +174,16 @@ threshold.
 `scripts/bench_compare.py` parses the Markdown tables `vm_bench` itself
 prints (stdlib Python, no external deps), writes the comparison table -- plus
 the per-round medians of anything that moved -- to the job summary, and exits
-`0` pass / `1` regression / `2` usage or a completely missing arm / `3`
-invalid harness (control out of tolerance, identical binaries moving, or no
-control sample for a workload the other two arms timed).
+`0` pass / `1` regression / `2` usage, a completely missing arm, a comparator
+error, or a `base` round that failed to run / `3`
+invalid harness (control out of tolerance, identical binaries moving, a
+non-positive median, or no control sample for a workload the other two arms
+timed) -- the last only when no workload qualified as a regression under the
+precedence above.
 `python3 scripts/bench_compare.py --self-test` checks that classifier on
-synthetic logs, and runs in `hygiene`, so the semantics cannot rot without a
-release build noticing.
+synthetic logs (14 cases, covering every exit code, the unit conversion, the
+control gap, the precedence rule, and the report/CSV shape), and runs in
+`hygiene`, so the semantics cannot rot without a release build noticing.
 
 ### The two arms do *not* differ by build path (OBI-312)
 

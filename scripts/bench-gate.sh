@@ -162,14 +162,22 @@ run() { # arm-round save-name  (arm = base|head|ctrl)
   if ! (cd "$bin_dir" && "./$slot/vm_bench" "$iters") >>"$log" 2>&1; then
     cat "$log" >&2
     echo "bench-gate: bench run $arm$r failed" >&2
+    # A `base` that never printed a table is a setup error: there is nothing to
+    # compare against, and calling that a regression would blame the PR for the
+    # baseline build (OBI-312 review, N1). `head` or `ctrl` failing stays 1 --
+    # the change under test broke its own benchmark.
+    if [ "$arm" = base ]; then exit 2; fi
     exit 1
   fi
 }
 
-# Rotate the order, not just the pair: with three arms, cyclic rotation gives
-# every arm each slot exactly once per three rounds, so a slot effect (what
-# ran immediately before, frequency ramp, page-cache state) cannot select a
-# side.
+# Rotate the order, not just the pair. With three arms, cyclic rotation covers 3
+# of the 6 orders, so each arm holds each *slot position* exactly once per three
+# rounds: no arm can systematically get the warm slot. What it does *not* do is
+# equalise every predecessor (head always follows ctrl or runs first), so
+# "what ran immediately before" -- frequency ramp, page-cache state, a
+# neighbour's burst -- is controlled for by the byte-identical `ctrl` arm, not
+# by the schedule.
 pass() { # first-round last-round
   local r
   for ((r = $1; r <= $2; r++)); do
@@ -208,7 +216,7 @@ if [ $rc -eq 0 ]; then
 fi
 case $rc in
   1) echo "bench-gate: FAIL (regression)" >&2 ;;
-  3) echo "bench-gate: FAIL (INVALID: the harness could not measure 1.00 against its own byte-identical control arm, so the head/base numbers are not trustworthy and the PR's code is not implicated). See the 'control' column and $work/logs/meta.env." >&2 ;;
+  3) echo "bench-gate: FAIL (INVALID: the harness could not measure 1.00 against its own byte-identical control arm, so no head/base number in this run -- including any that looked like a regression -- can be trusted). No workload was classified REGRESSION in the confirmation pass. See the 'ctrl/head' column and $work/logs/meta.env." >&2 ;;
   *) echo "bench-gate: setup/comparison error (exit $rc)" >&2; exit 2 ;;
 esac
 exit $rc

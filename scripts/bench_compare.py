@@ -145,6 +145,17 @@ def evaluate(logs_dir: Path, threshold: float) -> tuple:
             )
             continue
         b, h, c = min(base.values()), min(head.values()), min(ctrl.values())
+        if b <= 0.0 or h <= 0.0 or c <= 0.0:
+            # A zero/negative median means a broken print or a truncated table,
+            # not a speedup: the row is evidence about nothing. Without this
+            # guard a `0.000 ms` row raised ZeroDivisionError, which the shell
+            # reported as a regression (OBI-312 review, N1).
+            invalid.append(f"{workload} (non-positive median)")
+            lines.append(
+                f"| `{workload}` | {fmt(b)} | {fmt(h)} | | {fmt(c)} | | "
+                f"{min(len(base), len(head), len(ctrl))} | **INVALID (non-positive median)** |"
+            )
+            continue
         ratio = h / b
         ctrl_ratio = c / h
         # A control deviation in either direction is equally fatal to trust:
@@ -213,6 +224,27 @@ def evaluate(logs_dir: Path, threshold: float) -> tuple:
         det.append("</details>")
         report += "\n" + "\n".join(det)
 
+    # Precedence (OBI-312 review, B1): a `REGRESSION` row whose *own* control
+    # sat inside the tolerance is evidence about this PR's code, and must not
+    # be relabelled "harness invalid" because some other workload's control
+    # arm misbehaved. That would re-run the original mistake in reverse: one
+    # flaky short workload exonerating a genuine slowdown everywhere else.
+    # So regressions win the exit code; untrustworthy rows are still listed.
+    if regressions:
+        report += (
+            f"\n\nbench-gate: {len(regressions)} regression(s): "
+            f"{', '.join(regressions)}"
+        )
+        if invalid or ctrl_gaps:
+            report += (
+                "\n\nThis run additionally could not trust "
+                f"{len(invalid) + len(ctrl_gaps)} workload(s) "
+                f"({', '.join(invalid + ctrl_gaps)}): their control arm moved or "
+                "produced no sample. Those rows do not change the verdict -- the "
+                "regressions above each carry a control that measured 1.00 -- but "
+                "they mean the run is worth repeating once the host is quieter."
+            )
+        return report, 1
     if ctrl_gaps:
         report += (
             "\n\nbench-gate: INVALID harness -- no control sample for "
@@ -230,12 +262,6 @@ def evaluate(logs_dir: Path, threshold: float) -> tuple:
             "quiet host (OBI-311) and re-run. Do not raise BENCH_THRESHOLD."
         ).format(names=", ".join(invalid))
         return report, 3
-    if regressions:
-        report += (
-            f"\n\nbench-gate: {len(regressions)} regression(s): "
-            f"{', '.join(regressions)}"
-        )
-        return report, 1
     return report, 0
 
 
@@ -328,6 +354,18 @@ def self_test() -> int:
         ("regression, control also missed", dict(base=b, head=h_slow, ctrl=ctrl_bad, meta="identical_binaries=false\n"), 3),
         ("no regression but control missed", dict(base=b, head=b, ctrl=arm(base_v * 1.30), meta="identical_binaries=false\n"), 3),
         ("control faster than head", dict(base=b, head=b, ctrl=arm(base_v * 0.70), meta="identical_binaries=false\n"), 3),
+        # B1: a real regression with a healthy control must not be buried by a
+        # different workload whose control arm moved.
+        (
+            "mixed: real regression + another workload's control invalid",
+            dict(
+                base=_ms([("other", 1.0), (wl, base_v)]),
+                head=_ms([("other", 1.0), (wl, head_v)]),
+                ctrl=_ms([("other", 1.0 * 1.30), (wl, head_v * 0.98)]),
+                meta="identical_binaries=false\n",
+            ),
+            1,
+        ),
         ("genuine speedup passes", dict(base=arm(head_v), head=b, ctrl=arm(base_v * 0.98), meta="identical_binaries=false\n"), 0),
     ]
     failures = 0
@@ -346,10 +384,19 @@ def self_test() -> int:
         # Unit handling: vm_bench prints µs for sub-ms workloads and s above
         # 1000 ms; a control comparison that mixed up the units would be
         # nonsense, so pin the conversion.
+        # Same quantities, different units per arm: if a factor were wrong the
+        # ratio would move, so this fixture can actually fail. (All three arms
+        # carrying identical rows would cancel any constant factor.)
         d = Path(td) / "units"
         d.mkdir()
-        mixed = [("tiny", 512.0, "µs"), ("huge", 1.5, "s"), (wl, 2.0, "ms")]
-        _write(d, rounds=2, base=mixed, head=mixed, ctrl=mixed, meta="identical_binaries=true\n")
+        _write(
+            d,
+            rounds=2,
+            base=[("tiny", 512.0, "µs"), ("huge", 1.5, "s"), (wl, 2.0, "ms")],
+            head=[("tiny", 0.512, "ms"), ("huge", 1500.0, "ms"), (wl, 2.0, "ms")],
+            ctrl=[("tiny", 0.512, "ms"), ("huge", 1500.0, "ms"), (wl, 2.0, "ms")],
+            meta="identical_binaries=true\n",
+        )
         got = evaluate(d, 0.15)[1]
         if got != 0:
             print(f"FAIL unit conversion: exit {got}, want 0", file=sys.stderr)
@@ -392,9 +439,18 @@ def self_test() -> int:
             if token not in report:
                 print(f"FAIL report missing {token!r}", file=sys.stderr)
                 failures += 1
+        case_bad = 0
+        for token in ("head/base", "ctrl/head", "REGRESSION", "Per-round medians", "priv_control"):
+            if token not in report:
+                print(f"FAIL report missing {token!r}", file=sys.stderr)
+                failures += 1
+                case_bad += 1
         if got != 1:
             print(f"FAIL report case: exit {got}, want 1", file=sys.stderr)
             failures += 1
+            case_bad += 1
+        if case_bad == 0:
+            print("ok   report carries the columns reviewers read, and exits 1")
         write_csv(d, collect(d))
         if not (d / "bench-rounds.csv").is_file():
             print("FAIL bench-rounds.csv not written", file=sys.stderr)
@@ -406,6 +462,52 @@ def self_test() -> int:
                 failures += 1
             else:
                 print("ok   raw per-round CSV written (2 rounds x 3 arms)")
+
+        # B1: when a run carries both, the report has to name the regression
+        # *and* the rows it could not trust, so nobody reads exit 1 as "the
+        # whole run is garbage" or exit 3 as "nothing regressed".
+        d = Path(td) / "mixedreport"
+        d.mkdir()
+        _write(
+            d,
+            rounds=2,
+            base=_ms([("other", 1.0), (wl, base_v)]),
+            head=_ms([("other", 1.0), (wl, head_v)]),
+            ctrl=_ms([("other", 1.0 * 1.30), (wl, head_v * 0.98)]),
+            meta="identical_binaries=false\n",
+        )
+        report, got = evaluate(d, 0.15)
+        bad = 0
+        for phrase in ("1 regression(s): priv_control", "could not trust 1 workload(s) (other)"):
+            if phrase not in report:
+                print(f"FAIL mixed report missing {phrase!r}\n{report}", file=sys.stderr)
+                failures += 1
+                bad += 1
+        if got != 1:
+            print(f"FAIL mixed report exit: {got}, want 1", file=sys.stderr)
+            failures += 1
+            bad += 1
+        if bad == 0:
+            print("ok   a regression outranks another workload's invalid control")
+
+        # N1: a `0.000 ms` row used to raise ZeroDivisionError, which the shell
+        # reported as a regression. A broken print is an untrustworthy row.
+        d = Path(td) / "zeromedian"
+        d.mkdir()
+        _write(
+            d,
+            rounds=2,
+            base=_ms([(wl, 0.0)]),
+            head=_ms([(wl, 2.0)]),
+            ctrl=_ms([(wl, 2.0)]),
+            meta="identical_binaries=false\n",
+        )
+        got = evaluate(d, 0.15)[1]
+        if got != 3:
+            print(f"FAIL zero median: exit {got}, want 3", file=sys.stderr)
+            failures += 1
+        else:
+            print("ok   a zero median is an invalid row, not a crash or a regression")
     if failures:
         print(f"bench_compare self-test: {failures} failure(s)", file=sys.stderr)
         return 1
@@ -414,4 +516,12 @@ def self_test() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    try:
+        sys.exit(main(sys.argv))
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a broken run is never a regression
+        # Documented contract: setup/comparison errors are 2, only a verdict
+        # about the measured code is 1.
+        print(f"bench-gate: comparator error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        sys.exit(2)
