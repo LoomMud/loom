@@ -267,10 +267,26 @@ neither was ever a member of `ci-refs/pull/<n>/merge`, and neither was available
 to be cancelled by the block. 37717596409 in particular ended `cancelled` at
 02:50:43Z while its `loadtest-e1-1` was **executing** (02:46:40Z -> 02:50:42Z),
 49 s after its successor run 37719788325 was created -- something outside the
-block did that, so it is evidence for neither side. As of 2026-10-08 03:42Z, 3 of
-8 open PRs carry the block (`#122 3554996`, `#124 db18202`, `#139 8ca37b5`); the
-other five reach it by rebasing onto current `main`, which is the only way a PR
-gets inside the rule at all.
+block did that, so it is evidence for neither side. Coverage moves as PRs get
+rebased, so re-measure instead of trusting these numbers: at 2026-10-08 03:42Z, 3
+of 8 open PRs carried the block (`#122 3554996`, `#124 db18202`, `#139 8ca37b5`);
+rescanned at 04:25Z the same day, 5 of 10 did (`#122 3554996`, `#124 db18202`,
+`#139 d8af8a6`, `#140 b108d49`, `#141 9301a0c`; missing `#101`, `#127`, `#131`,
+`#134`, `#138`). The rest reach the rule only by rebasing onto current `main` --
+there is no other way a PR gets inside it:
+
+```bash
+for pr in $(gh pr list --repo LoomMud/loom --state open --json number --jq '.[].number'); do
+  sha=$(gh pr view "$pr" --repo LoomMud/loom --json headRefOid --jq .headRefOid)
+  has=$(gh api "repos/LoomMud/loom/contents/.github/workflows/ci.yml?ref=$sha" \
+          --jq .content | base64 -d | grep -c '^concurrency:')
+  [ "$has" -ge 1 ] && echo "#$pr ${sha:0:7} CARRIES" || echo "#$pr ${sha:0:7} missing"
+done
+```
+
+The marker is a workflow-level `^concurrency:` at column 0. Do not grep for the
+rendered group name: `${{ github.workflow }}` is `ci`, and `ci-refs/pull/<n>/merge`
+only exists once the expression is evaluated at run time.
 
 **A merged PR's leftover gates are covered by nothing.** PR #136's own run
 37717628548 (head `5429a0b`) is the counter-example: the PR merged at 03:14Z and
@@ -336,8 +352,9 @@ needing a `pull-requests: read` token on a workflow that today holds only
 `contents: read`) has no remaining justification: the two real gaps -- heads that
 lack the block, and a merged PR no successor will ever displace -- are both
 outside its reach as well, because a step only runs in runs that already contain
-it. What is left to do is ordinary branch hygiene (bring the five open PRs up to
-`45d85b6`, which is what puts them inside the rule) plus the CTO question above.
+it. What is left to do is ordinary branch hygiene (rebase the open PRs that the
+command above reports as `missing` onto current `main`, which is what puts them
+inside the rule) plus the CTO question above.
 
 One correction this experiment also settles: #136's header claimed a
 workflow-level cancel reaches into jobs whose own `cancel-in-progress: false`
