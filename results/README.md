@@ -272,6 +272,22 @@ block did that, so it is evidence for neither side. As of 2026-10-08 03:42Z, 3 o
 other five reach it by rebasing onto current `main`, which is the only way a PR
 gets inside the rule at all.
 
+**A merged PR's leftover gates are covered by nothing.** PR #136's own run
+37717628548 (head `5429a0b`) is the counter-example: the PR merged at 03:14Z and
+the run kept measuring afterwards -- its `loadtest-smoke` took a lane slot
+04:04:42Z -> 04:07:24Z, 50 minutes after the merge, with `bench` queued behind
+it. A merge does not create a new `pull_request` run, so nothing ever joins
+`ci-refs/pull/136/merge` to displace it, while `main`'s push run 37721777219
+(`0b8ca74`) measures the same tree plus the merge. By the argument that makes a
+superseded SHA cancellable -- a commit branch protection will never evaluate --
+these are stale measurements too, but the rule as accepted names only "superseded
+by a newer push to the same PR", so cancelling one would be acting outside the
+written rule. It is a CTO question, not an edit: are a merged PR's still-queued
+gates a cancellable category? Until that is answered they run to completion.
+(Attribution caveat while checking: `GET /actions/runs/{id}` returns
+`pull_requests: []` once a PR has merged, so map runs to PRs by `head_branch`
+plus `event`, not by that field.)
+
 **The queue question has a documented answer, and an unobserved half.** The
 [workflow syntax reference](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idconcurrency)
 says of a concurrency group: "When a concurrent job or workflow is queued, if
