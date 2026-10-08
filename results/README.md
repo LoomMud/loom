@@ -153,12 +153,18 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   (run 37663331238, 2026-10-07 18:01:00Z -> 18:16Z, cancelled mid-build while
   an intentionally contending probe PR ran eight jobs beside it). Slow is
   survivable; cancelled is not.
+- A stale SHA is not allowed to hold a place: the workflow also carries a
+  workflow-level `concurrency` group that cancels a PR's *superseded* runs and
+  nothing else -- no required check on a mergeable candidate is ever cancelled
+  -- and the PR trigger is narrowed to the activities that change the commit.
+  See "Which runs may be cancelled" below.
 - `scripts/check-ci-load-lane.py` asserts all of the above (and that the
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
-  headroom, and that no required check became skippable or optional), plus a
-  `--self-test` of 15 mutations. Both run in the required `hygiene` job, so
-  the lane cannot rot silently and the comment here cannot drift from the
-  workflow.
+  headroom, that no required check became skippable or optional, and that the
+  workflow-level block can only ever cancel a superseded `pull_request` run),
+  plus a `--self-test` of 26 mutations. Both run in the required `hygiene`
+  job, so the lane cannot rot silently and the comment here cannot drift from
+  the workflow.
 
 **What the lane does *not* claim.** GitHub scopes a job-level concurrency
 group per workflow *and job*, so the hard guarantee is "the same gate never
@@ -181,6 +187,71 @@ under ten. Do not respond to a wait, or to a p99 miss on a run that overlapped
 another, by raising the threshold, dropping the population, marking the check
 optional, or re-running it into a quiet window by hand -- `hygiene` fails
 those changes.
+
+### Which runs may be cancelled, and which may never be (OBI-313)
+
+Queueing is not the only way the lane gets stuck. Because
+`loom-ci-load-lane` is a FIFO **across runs**, one PR that takes three pushes
+holds three places in it until they drain -- including the two pushes nobody
+meant to measure. Run 37698132725 (2026-10-07 22:44:59Z) was a *draft* PR whose
+diff was two README paragraphs and a comment block: it opened a full CI run,
+took lane places, and was cancelled by hand at 22:45:42Z. Draft state does not
+suppress `pull_request` runs in this repo, so "I'll keep it draft to avoid
+load" is not a control we have, and a job-level `if:` that skipped runs for
+drafts would *skip required checks* -- the one thing the lane rules forbid.
+
+So `.github/workflows/ci.yml` carries a workflow-level `concurrency` block, and
+the policy is written down rather than inferred from YAML.
+
+**The rule, accepted by the CTO on 2026-10-08: no required check on a
+*mergeable candidate* may be cancelled.** A mergeable candidate is the commit
+branch protection actually evaluates. For a pull request that is its newest
+commit, because `strict: true` + `required_linear_history: true` mean a stale
+SHA never satisfies the branch; for `main` every push is a mergeable candidate,
+and so is any run already in flight. A superseded PR SHA is therefore the only
+measurement the block is allowed to throw away.
+
+| Run | Cancellation | Why |
+|---|---|---|
+| `pull_request`, commit already superseded by a newer push to the same PR | **may be cancelled** | not a mergeable candidate: its measurements describe a SHA branch protection never evaluates, and holding its lane place only delays the gates that do count |
+| `pull_request`, newest commit, anything already running | **never cancelled** | this is the mergeable candidate. `cancel-in-progress: false` + `queue: max` on the lane jobs; a cancelled required check blocks a PR exactly like a failed one |
+| `push` to `main` | **never cancelled** | the group falls back to `github.run_id`, so each main run is its own group and there is nothing to cancel. OBI-311's "5 sequential un-retried E1.1 runs" on `main` stays measurable |
+| `workflow_dispatch` / a re-run of any job | **never cancelled** | same `github.run_id` fallback: a re-run cannot displace the run it is re-measuring |
+
+What it costs: the check on the superseded commit ends `cancelled` and the
+newer commit is measured again, so a PR gets exactly one live E1.1 measurement
+instead of one per push. Nothing measured on a mergeable candidate is ever lost,
+because the newest commit is always the survivor of the cancel -- which is the
+reason the OBI-308 rule ("no required check may be cancelled or skipped") and
+this one are the same rule, not two competing ones.
+
+**The trigger had to be narrowed for that to be safe.** With `types:` omitted,
+GitHub fires a `pull_request` workflow for *every* activity -- `labeled`,
+`assigned`, `edited`, `review_requested` -- and each of those used to start a
+whole CI run that took a fresh lane place for a diff that had not changed.
+Once the workflow-level block can cancel, one of them would have killed that
+PR's own in-flight 150-player gate for a label. So `on.pull_request.types` is
+now `[opened, synchronize, reopened]`: the only activities that change what is
+being measured. `opened` and `synchronize` may not be dropped -- that is how a
+required check gets quietly skipped under cover of "narrowing the trigger", and
+the guard fails it.
+
+The guard is the load-bearing part, because a workflow-level cancel reaches
+into jobs whose own `cancel-in-progress: false` forbids being cancelled.
+
+* Rule 5, if the block exists at all: `group` must contain `github.workflow`
+  (a constant group name would be a repo-wide mutex where one PR cancels
+  another PR's in-flight gate) **and** `github.run_id` as the non-`pull_request`
+  fallback; and `cancel-in-progress` must be an expression true only for
+  `pull_request` -- a literal `true`, a `!=`, an `||`, or any mention of another
+  event name fails.
+* Rule 6, if that block cancels PR runs: `on.pull_request.types` exists, fires
+  on nothing but `opened`/`synchronize`/`reopened`, and keeps `opened` and
+  `synchronize`.
+
+Eleven mutants prove both bite, including flipping the required gate's own
+`cancel-in-progress` to `true` beside the new block and putting `labeled` back
+in the trigger.
 
 ## Limitations
 
