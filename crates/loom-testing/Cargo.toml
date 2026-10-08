@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# OBI-305: test-support only. This crate is never a dependency of any
+# shipping target -- it is a `dev-dependencies` entry, so `cargo build`,
+# the Dockerfile, and the release binary's dependency graph do not see it.
+[package]
+name = "loom-testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

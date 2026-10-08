@@ -5,14 +5,16 @@
 //! the `tworoom` fixture over `/ws` exactly like the telnet tests walk it
 //! over raw TCP, and a WS reader that never drains its socket gets
 //! dropped without taking any other connection down with it.
+//!
+//! The server here comes from [`loom_testing::Spawn`], so it is only handed
+//! back once it is actually serving (OBI-292/OBI-305) -- which is what makes
+//! `connect_ws_with_retry` below slack rather than the thing that papers over
+//! "did the process even bind?".
 
-use std::net::TcpListener as StdTcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use loom_testing::Spawn;
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -21,14 +23,9 @@ const YARD: &str = "The Yard";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_client_walks_two_rooms() {
-    let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
-    let mut server = LoomServer::spawn(&mudlib, &telnet_bind, &http_bind);
-    let mut ws = connect_ws_with_retry(&http_bind, Duration::from_secs(5)).await;
+    let mudlib = loom_testing::fixture(env!("CARGO_MANIFEST_DIR"), "tworoom");
+    let mut server = Spawn::serve(&mudlib).start();
+    let mut ws = connect_ws_with_retry(server.http_bind(), Duration::from_secs(5)).await;
 
     // logon() drops the player in the Great Hall.
     let greeting = recv_line(&mut ws, Duration::from_secs(5)).await;
@@ -53,14 +50,9 @@ async fn ws_client_walks_two_rooms() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_gmcp_round_trips_over_the_wire() {
-    let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
-    let mut server = LoomServer::spawn(&mudlib, &telnet_bind, &http_bind);
-    let mut ws = connect_ws_with_retry(&http_bind, Duration::from_secs(5)).await;
+    let mudlib = loom_testing::fixture(env!("CARGO_MANIFEST_DIR"), "tworoom");
+    let mut server = Spawn::serve(&mudlib).start();
+    let mut ws = connect_ws_with_retry(server.http_bind(), Duration::from_secs(5)).await;
     let _ = recv_line(&mut ws, Duration::from_secs(5)).await; // logon greeting
 
     ws.send(Message::Text(
@@ -83,13 +75,9 @@ async fn ws_gmcp_round_trips_over_the_wire() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_ws_reader_is_dropped_without_affecting_a_fast_one() {
-    let mudlib = fixture("tworoom");
-    let telnet_port = reserve_local_port();
-    let http_port = reserve_local_port();
-    let telnet_bind = format!("127.0.0.1:{telnet_port}");
-    let http_bind = format!("127.0.0.1:{http_port}");
-
-    let mut server = LoomServer::spawn(&mudlib, &telnet_bind, &http_bind);
+    let mudlib = loom_testing::fixture(env!("CARGO_MANIFEST_DIR"), "tworoom");
+    let mut server = Spawn::serve(&mudlib).start();
+    let http_bind = server.http_bind().to_owned();
 
     let mut slow = connect_ws_with_retry(&http_bind, Duration::from_secs(5)).await;
     let _ = recv_line(&mut slow, Duration::from_secs(5)).await; // logon greeting
@@ -193,84 +181,4 @@ async fn connect_ws_with_retry(http_bind: &str, timeout: Duration) -> WsStream {
             Err(err) => panic!("failed to connect WS to {url} before timeout: {err}"),
         }
     }
-}
-
-fn reserve_local_port() -> u16 {
-    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("read local addr").port()
-}
-
-struct LoomServer {
-    child: Child,
-}
-
-impl LoomServer {
-    fn spawn(mudlib: &Path, telnet_bind: &str, http_bind: &str) -> Self {
-        let loom_bin = std::env::var("CARGO_BIN_EXE_loom-cli")
-            .or_else(|_| std::env::var("CARGO_BIN_EXE_loom_cli"))
-            .expect("cargo binary path for loom-cli");
-
-        let child = Command::new(loom_bin)
-            .arg("serve")
-            .arg("--mudlib")
-            .arg(mudlib)
-            .env("LOOM_TELNET_ADDR", telnet_bind)
-            .env("LOOM_HTTP_ADDR", http_bind)
-            .env("RUST_LOG", "")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn loom serve");
-
-        Self { child }
-    }
-
-    fn assert_alive(&mut self) {
-        if let Some(status) = self.child.try_wait().expect("poll server process") {
-            panic!("loom server exited early with status {status}");
-        }
-    }
-}
-
-impl Drop for LoomServer {
-    fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-static N: AtomicU32 = AtomicU32::new(0);
-
-fn scratch(tag: &str) -> PathBuf {
-    let n = N.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{tag}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir scratch");
-    dir
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).expect("mkdir destination");
-    for entry in std::fs::read_dir(from).expect("read fixture directory") {
-        let path = entry.expect("fixture entry").path();
-        let dest = to.join(path.file_name().expect("fixture filename"));
-        if path.is_dir() {
-            copy_dir(&path, &dest);
-        } else {
-            std::fs::copy(&path, &dest).expect("copy fixture file");
-        }
-    }
-}
-
-fn fixture(name: &str) -> PathBuf {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name);
-    let dir = scratch(name);
-    copy_dir(&src, &dir);
-    dir
 }

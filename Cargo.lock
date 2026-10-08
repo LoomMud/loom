@@ -1253,6 +1253,7 @@ dependencies = [
  "loom-obs",
  "loom-persist",
  "loom-supervise",
+ "loom-testing",
  "loom-vm",
  "serde_json",
  "sqlx",
@@ -1419,6 +1420,10 @@ version = "0.0.1"
 dependencies = [
  "proptest",
 ]
+
+[[package]]
+name = "loom-testing"
+version = "0.0.1"
 
 [[package]]
 name = "loom-vm"
