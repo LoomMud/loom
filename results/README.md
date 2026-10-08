@@ -101,13 +101,61 @@ cannot merge (branch protection lists it alongside `rust`/`deny`/`dco`/
 (`results/ci-e1-1.*`, also `.gitignore`d — CI runners vary in CPU/host
 noise from the reference host above, so this job proves "no regression
 *on this runner*", not the headline number; the committed reports above
-remain the reference-host record). As of this gate landing, the scraped
-`/metrics` body is typically empty in CI runs: `loom-net`/the world
-thread don't yet record any `metrics::counter!`/`histogram!` values on
-the connection/command path, so there's nothing for `loom-obs`'s
-recorder to render. That's a separate instrumentation gap, not a bug in
-the scrape itself -- `--metrics-url` will start carrying real server-side
-histograms once that lands.
+remain the reference-host record). When this gate landed, the scraped
+`/metrics` body was typically empty in CI runs: `loom-net`/the world
+thread recorded no `metrics::counter!`/`histogram!` values on
+the connection/command path, so there was nothing for `loom-obs`'s
+recorder to render. That instrumentation gap is what **OBI-344** closed -- see
+the next section for what the report carries now.
+
+## Tail attribution in the E1.1 report (OBI-344)
+
+The paragraph above is now closed. The gate went red intermittently on a p99
+tail that nothing in the artifact could explain: the first two reports we
+compared (failed run 37788128494, passed run 37814776730) showed p50 2.08 ms /
+p95 14.55 ms but p99 227.87 ms and max 475.68 ms on the red run against p99
+23.92 ms / max 78.27 ms on the green one -- a bimodal tail of roughly a hundred
+samples, not a throughput regression (the red run's *median* was faster). With
+one post-run scrape and no per-sample timestamps, the run could not say whether
+the world thread, the net task, the bot process, or the login ramp was
+responsible.
+
+What the report carries now:
+
+- **Latency timeline** -- p50/p95/p99/max per `--timeline-bucket-ms` slice,
+  each slice stamped with whether a server stall window overlapped it
+  (`no` vs `unmeasured` is a real distinction; an uninstrumented server must
+  never render as a quiet one).
+- **Slowest samples** with their offset from the start of the run.
+- **Tail attribution** -- the SLA-breaching samples split across server
+  world-loop stall windows, loadtest-process timer starvation, and the login
+  ramp, with p99 recomputed excluding server-stall-attributed slices as an
+  informational number. The gate stays the measured p99.
+- **Server world-loop counters scraped during the run** (default every 1 s):
+  tick id, loop iterations, stall count/stall ms, slowest iteration, longest
+  between-iteration gap, blocked world->net command sends, runtime errors --
+  published by `loom_obs::WorldLoopProbe`/`NetCommandProbe` from the world
+  thread's own event loop (`LOOM_WORLD_STALL_MS`, default 50 ms -- the same
+  number the SLA is written against).
+- **Loadtest process timer lag**, self-measured: how late the bot's own fixed
+  intervals fired. Lag here inflates every number in the report, including the
+  gate's, so it is measured rather than assumed away.
+- The `loadtest-e1-1` job now runs `loom serve` with `RUST_LOG=info` and
+  `LOOM_SERVE_ERROR_LOG=1` and uploads `/tmp/loom-serve.log`; previously the
+  serve log was captured at the default level, which printed nothing.
+
+The first finding that visibility produced: the
+`loom_runtime_errors_total{program="/std/player"}` count of exactly 150 that
+every CI run carried is `/std/player::save_character` (line 251) failing as
+`save_object("/players/<bot>") failed: <mudlib>/../saves: No such file or
+directory (os error 2)` -- CI never creates the save root, so in the E1.1 job
+no character ever persists and each player logs one runtime error. Running the
+same binary with `--save-dir` pointing at a real directory produces zero
+errors and one `.o` file per bot. The gate's own numbers are unchanged by this
+(it is reported as a metric, not an SLA), but the fix -- create the save root
+in the job, or have `serve` create it at boot -- changes what E1.1 measures
+(real file writes on the save path), so it is deliberately not folded into
+this instrumentation commit.
 
 ## CI load lane (OBI-308)
 

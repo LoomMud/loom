@@ -403,6 +403,12 @@ jobs:
           path: warp
       - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
       - name: run loom serve + loadtest smoke
+        env:
+          # OBI-344: the same visibility as the gate. The serve log used to be
+          # captured at the default level, which prints nothing, so a smoke
+          # run carried no server-side evidence at all.
+          RUST_LOG: info
+          LOOM_SERVE_ERROR_LOG: "1"
         run: |
           set -euo pipefail
           ./target/release/loom-cli serve --mudlib warp > /tmp/loom-serve.log 2>&1 &
@@ -417,13 +423,18 @@ jobs:
             --players 20 \
             --duration-secs 60 \
             --ramp-per-sec 10 \
+            --metrics-url http://127.0.0.1:4001/metrics \
             --out results/ci-smoke
           kill "$(cat /tmp/loom-serve.pid)" || true
           cat /tmp/loom-serve.log
+          cp /tmp/loom-serve.log results/loom-serve-smoke.log
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
         with:
           name: loadtest-smoke-report
-          path: results/ci-smoke.*
+          path: |
+            results/ci-smoke.*
+            results/loom-serve-smoke.log
   loadtest-e1-1:
     # E1.1 regression gate (150 players, p99 < 50 ms, OBI-177): a required
     # check. Scales up loadtest-smoke's same real `loom serve` + warp mudlib
@@ -461,7 +472,41 @@ jobs:
           repository: LoomMud/warp
           path: warp
       - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
+      - name: capture runner context
+        # OBI-344: E1.1 measures wall-clock latency on a *shared* self-hosted
+        # runner set, and the lane only guarantees one gate at a time -- the
+        # host's other tenants are not in that guarantee. A p99 tail is only
+        # interpretable next to what the host was doing, so record it. Read-
+        # only probes, no load added; every one degrades to `n/a` rather than
+        # failing the gate.
+        run: |
+          set -uo pipefail
+          mkdir -p results
+          {
+            date -u +"captured_at=%Y-%m-%dT%H:%M:%SZ"
+            echo "## uname"; uname -a
+            echo "## nproc: $(nproc 2>/dev/null || echo n/a)"
+            echo "## loadavg"; cat /proc/loadavg 2>/dev/null || echo "n/a"
+            echo "## uptime"; uptime 2>/dev/null || echo "n/a"
+            echo "## cgroup v2 cpu.max"; cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo "n/a"
+            echo "## cgroup v2 cpu.stat (throttling)"; head -6 /sys/fs/cgroup/cpu.stat 2>/dev/null || echo "n/a"
+            echo "## cgroup v1 quota/period"; cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo "n/a"
+            echo "## meminfo"; grep -E "^(MemTotal|MemAvailable|Dirty):" /proc/meminfo 2>/dev/null || echo "n/a"
+            echo "## top cpu consumers"; ps -eo pid,comm,%cpu --sort=-%cpu 2>/dev/null | head -12 || echo "n/a"
+          } > results/runner-context-before.txt 2>&1
+          cat results/runner-context-before.txt
       - name: run loom serve + E1.1 load test (150 players)
+        env:
+          # OBI-344: the gate went red on an intermittent p99 tail with no
+          # server-side visibility at all -- the serve log was captured at the
+          # default level (which prints nothing) and `/metrics` was scraped
+          # once, *after* the run, so there was no tick id, no stall counter
+          # and no timeline to attribute the tail against. `info` makes the
+          # world-thread stall warnings land in the artifact; the error log
+          # names the `/std/player` runtime error that every run so far has
+          # counted 150 of without ever saying what it is.
+          RUST_LOG: info
+          LOOM_SERVE_ERROR_LOG: "1"
         run: |
           set -uo pipefail
           ./target/release/loom-cli serve --mudlib warp > /tmp/loom-serve.log 2>&1 &
@@ -478,15 +523,34 @@ jobs:
             --ramp-per-sec 15 \
             --slow-reader-fraction 0.1 \
             --metrics-url http://127.0.0.1:4001/metrics \
+            --metrics-scrape-ms 1000 \
+            --timeline-bucket-ms 5000 \
             --out results/ci-e1-1 \
             --fail-on-sla-miss
           status=$?
           kill "$(cat /tmp/loom-serve.pid)" || true
+          wait 2>/dev/null || true
+          # The serve log is the attribution evidence: world-thread stall
+          # warnings with their event kind, and runtime-error detail. It is
+          # printed *and* uploaded so a red run is readable without the
+          # artifact in hand.
+          echo "::group::loom serve log"
           cat /tmp/loom-serve.log
+          echo "::endgroup::"
+          cp /tmp/loom-serve.log results/loom-serve.log
+          {
+            echo "## loadtest stderr markers"
+            grep -cE "ERROR|WARN" /tmp/loom-serve.log || true
+            echo "## final /metrics (world loop + net command counters)"
+            curl -s --max-time 2 http://127.0.0.1:4001/metrics 2>/dev/null | grep -E "^loom_(world_loop|net_command|runtime_errors)" || echo "(server already stopped)"
+          } >> results/loom-serve.log 2>&1 || true
           exit $status
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: loadtest-e1-1-report
-          path: results/ci-e1-1.*
+          path: |
+            results/ci-e1-1.*
+            results/loom-serve.log
+            results/runner-context-before.txt
 
