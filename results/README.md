@@ -8,9 +8,11 @@ one Markdown per run, named `<date>-<players>-players[-<label>].{json,md}`.
 `2026-09-27-150-players.{json,md}`: **PASS**, p99 46.91 ms < 50 ms SLA.
 
 Reference host: Intel Core i7-9750H @ 2.60GHz (12 logical CPUs), 32 GiB RAM,
-Linux. `loom serve --mudlib warp` (this checkout's mudlib snapshot, `HEAD` at
-run time), `loom-loadtest` on the same host (so this includes no network
-latency beyond loopback — see "Limitations" below).
+Linux. `loom serve --mudlib warp` (a local `warp` checkout at whatever its `HEAD`
+was that day -- nothing recorded it, which is the gap `mudlib/warp.lock` closes;
+*Report provenance* below attributes it to warp `618b90c`), `loom-loadtest` on
+the same host (so this includes no network latency beyond loopback -- see
+"Limitations" below).
 
 Run command:
 
