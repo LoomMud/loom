@@ -91,7 +91,7 @@ fn sigterm_to_the_supervisor_is_forwarded_to_the_child_and_both_exit() {
     loom_supervise::signal::send_sigterm(supervisor.child.id())
         .expect("send SIGTERM to the supervisor process");
 
-    let status = wait_with_timeout(&mut supervisor.child, Duration::from_secs(10))
+    let status = wait_with_timeout(&mut supervisor.child, READY_BUDGET)
         .expect("supervisor did not exit after SIGTERM within the timeout");
     assert!(
         status.success(),
@@ -102,7 +102,7 @@ fn sigterm_to_the_supervisor_is_forwarded_to_the_child_and_both_exit() {
     // and shut its own listener down -- give it a brief moment (its own
     // graceful `shutdown_signal` drain) and then confirm nothing is
     // listening on the telnet port anymore.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + READY_BUDGET;
     loop {
         match TcpStream::connect(&telnet_bind) {
             Err(_) => break,
@@ -144,7 +144,7 @@ fn sigkill_the_supervisor_still_terminates_the_child_via_pdeathsig() {
         .child
         .kill()
         .expect("SIGKILL the supervisor process");
-    let status = wait_with_timeout(&mut supervisor.child, Duration::from_secs(10))
+    let status = wait_with_timeout(&mut supervisor.child, READY_BUDGET)
         .expect("supervisor did not exit after SIGKILL within the timeout");
     assert!(
         !status.success(),
@@ -154,7 +154,7 @@ fn sigkill_the_supervisor_still_terminates_the_child_via_pdeathsig() {
     // The kernel delivers PDEATHSIG to the child independently of
     // anything the (now-dead) supervisor's own code does -- give that a
     // moment and confirm the telnet port stops accepting.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + READY_BUDGET;
     loop {
         match TcpStream::connect(&telnet_bind) {
             Err(_) => break,
@@ -183,7 +183,7 @@ fn standby_child_crash_is_respawned_against_the_same_listener() {
     let mudlib = fixture("tworoom");
     let (mut supervisor, telnet_bind, mut stream) = spawn_until_serving(&mudlib);
 
-    let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
+    let child_pid = find_child_pid(supervisor.child.id(), READY_BUDGET)
         .expect("did not find the standby child's pid under /proc");
     loom_supervise::signal::send_sigkill(child_pid).expect("SIGKILL the standby child directly");
 
@@ -204,12 +204,12 @@ fn standby_child_crash_is_respawned_against_the_same_listener() {
     // plain handoff tests above) needs to cover the crash-respawn
     // sequence's own 1s backoff plus a fresh mudlib compile, not just a
     // single already-warm child's response time (CTO review, OBI-253).
-    let mut reconnected = connect_with_retry(&telnet_bind, Duration::from_secs(15));
+    let mut reconnected = connect_with_retry(&telnet_bind, READY_BUDGET);
     let mut respawned_preamble = [0_u8; TELNET_PREAMBLE_LEN];
     fill_before_deadline(
         &mut reconnected,
         &mut respawned_preamble,
-        Instant::now() + Duration::from_secs(15),
+        Instant::now() + READY_BUDGET,
         &mut supervisor,
     )
     .expect("read telnet negotiation preamble from the respawned child");
@@ -231,7 +231,7 @@ fn sigterm_during_crash_backoff_stops_the_supervisor_without_a_further_respawn()
     let mudlib = fixture("tworoom");
     let (mut supervisor, telnet_bind, _stream) = spawn_until_serving(&mudlib);
 
-    let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
+    let child_pid = find_child_pid(supervisor.child.id(), READY_BUDGET)
         .expect("did not find the standby child's pid under /proc");
     loom_supervise::signal::send_sigkill(child_pid).expect("SIGKILL the standby child directly");
 
@@ -244,7 +244,7 @@ fn sigterm_during_crash_backoff_stops_the_supervisor_without_a_further_respawn()
     loom_supervise::signal::send_sigterm(supervisor.child.id())
         .expect("send SIGTERM to the supervisor during crash-backoff");
 
-    let status = wait_with_timeout(&mut supervisor.child, Duration::from_secs(10))
+    let status = wait_with_timeout(&mut supervisor.child, READY_BUDGET)
         .expect("supervisor did not exit after a SIGTERM sent during crash-backoff");
     assert!(
         status.success(),
@@ -377,7 +377,7 @@ fn version_file_change_is_detected_and_logged() {
 
     std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + READY_BUDGET;
     let mut saw_change = false;
     while Instant::now() < deadline {
         match line_rx.recv_timeout(Duration::from_millis(200)) {
@@ -432,7 +432,7 @@ fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
 
     std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + READY_BUDGET;
     let mut saw_forwarded = false;
     let mut saw_snapshot_taken = false;
     let mut saw_acknowledged = false;
@@ -552,10 +552,10 @@ fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
     // came back. Establish real, specific state first: `logon()` sends
     // "Welcome to Loom!" and starts the player in the hall; move north
     // into the yard before triggering the round trip.
-    read_until_contains(&mut reader, "Welcome to Loom!", Duration::from_secs(5));
-    read_until_contains(&mut reader, "Exits:", Duration::from_secs(2)); // the hall's own look()
+    read_until_contains(&mut reader, "Welcome to Loom!", READY_BUDGET);
+    read_until_contains(&mut reader, "Exits:", READY_BUDGET); // the hall's own look()
     send_line(&mut reader, "go north");
-    let moved = read_until_contains(&mut reader, "Exits:", Duration::from_secs(2));
+    let moved = read_until_contains(&mut reader, "Exits:", READY_BUDGET);
     assert!(
         moved.contains("The Yard"),
         "expected 'go north' to move into the yard, got:\n{moved}"
@@ -563,7 +563,7 @@ fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
 
     std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + READY_BUDGET;
     let mut reclaimed_count: Option<usize> = None;
     while Instant::now() < deadline && reclaimed_count.is_none() {
         match line_rx.recv_timeout(Duration::from_millis(200)) {
@@ -617,7 +617,7 @@ fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
         .read_exact(&mut fresh_preamble)
         .expect("read the fresh telnet negotiation preamble the readopt triggers");
     send_line(&mut reader, "look");
-    let transcript = read_until_contains(&mut reader, "Exits:", Duration::from_secs(5));
+    let transcript = read_until_contains(&mut reader, "Exits:", READY_BUDGET);
     assert!(
         transcript.contains("The Yard"),
         "expected the reclaimed/readopted session to still be in the yard, got:\n{transcript}"
@@ -871,7 +871,9 @@ fn read_until_contains(
                     err.kind(),
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) => {}
-            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
+            Err(err) => panic!(
+                "socket read failed while waiting for `{needle}`: {err}. Transcript so far:\n{transcript}"
+            ),
         }
     }
 }
@@ -988,11 +990,25 @@ fn bind_string(port: u16) -> String {
 /// preamble never arrives.
 const TELNET_PREAMBLE_LEN: usize = 12;
 
-/// How long one startup attempt may take before it is written off. This
-/// bounds the *whole* attempt -- bind, spawn the standby, compile the
-/// mudlib in debug, first bytes on the wire -- so it is a liveness check
-/// on the server rather than a fixed sleep; eight tests' worth of servers
-/// share one 4-core runner in CI.
+/// The one time budget in this file that means "give up": every wait for
+/// *state* uses it -- startup (bind, spawn the standby, compile the mudlib in
+/// debug, first bytes on the wire), a process exiting, a port stopping
+/// accepting, a child pid appearing under /proc, a supervisor log line
+/// arriving, and a needle in a connection's transcript.
+///
+/// It is a hang detector, never a performance claim, which is the point: the
+/// file used to budget these individually at 2 s / 5 s / 10 s, and a wall clock
+/// cannot tell "the hand-off is broken" apart from "this CI runner is sharing
+/// four cores with eight servers and a mudlib compile". Same class as the
+/// OBI-292 startup flake and the OBI-329 `accounts_demo` failure. A test that
+/// genuinely never reaches its state still fails -- at 30 s, and printing the
+/// transcript.
+///
+/// The absolute durations left in this file are poll intervals and *negative*
+/// windows ("no further respawn for 3 s", "collect the boot log for ~1 s"),
+/// where the window is the assertion rather than a budget. (`crates/loom-cli`
+///'s `accounts_demo.rs` calls the same idea `READY_DEADLINE` at 60 s; OBI-305's
+/// shared `loom_testing` helpers should settle on one name and value.)
 const READY_BUDGET: Duration = Duration::from_secs(30);
 
 /// How many times [`spawn_until_serving`] will tear down a supervisor that
@@ -1356,7 +1372,7 @@ fn booting_with_a_matching_desired_version_triggers_no_copyover() {
     // The guard would be vacuous if the watcher simply never ran, so make
     // exactly one change and require it to be detected.
     std::fs::write(&version_file, "v2.0.0\n").expect("write updated desired-version");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + READY_BUDGET;
     let mut saw_deliberate_change = false;
     while Instant::now() < deadline && !saw_deliberate_change {
         // Lines still buffered from the boot window must be consumed first.
@@ -1401,7 +1417,7 @@ fn transcript_reads_survive_binary_telnet_noise_between_lines() {
     });
 
     let mut reader = std::io::BufReader::new(stream);
-    let transcript = read_until_contains(&mut reader, "Exits:", Duration::from_secs(2));
+    let transcript = read_until_contains(&mut reader, "Exits:", READY_BUDGET);
     server.join().expect("transcript server thread");
 
     assert!(
