@@ -323,6 +323,14 @@ save path is covered by
 and a relative `--mudlib warp` now puts saves *beside* the mudlib instead of
 inside it (spec §8.5).
 
+One more thing the A/B turned up, about the gate itself: a bot's `quit` is
+fire-and-forget, and the autosave it causes runs later on the world thread,
+so scraping the instant the last bot handle resolves can land *before* the
+errors are recorded. The pre-fix driver measured `0` at scrape and `3` (one
+per player) three seconds later. The harness now waits a bounded 2 s
+(`METRICS_SETTLE`) before scraping when `--metrics-url` is set, so
+`--fail-on-runtime-errors` cannot pass a run it simply outran.
+
 ## CI load lane (OBI-308)
 
 **Invariant: `loadtest-e1-1`, `loadtest-smoke` and `bench` must never run at

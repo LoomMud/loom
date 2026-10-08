@@ -42,6 +42,16 @@ use server_metrics::ServerRow;
 /// to keep a committed report readable.
 const TAIL_SAMPLES_IN_REPORT: usize = 20;
 
+/// OBI-324: how long to let the server settle before scraping `/metrics`.
+/// A bot's `quit` is fire-and-forget from the harness's side, and the
+/// autosave it triggers runs later on the world thread -- so a scrape issued
+/// the instant the last bot handle resolves can land *before* the errors it
+/// exists to gate on have been recorded, and read as a clean run. Measured
+/// on the pre-fix driver: 0 errors at scrape, 3 (one per player) 3 s later.
+/// Two seconds covers the full 150-player teardown on the CI runner; the
+/// wait is bounded and only taken when a `--metrics-url` was given.
+const METRICS_SETTLE: Duration = Duration::from_secs(2);
+
 struct Args {
     addr: String,
     mix_path: PathBuf,
@@ -473,6 +483,7 @@ async fn run(args: Args) -> Result<(), String> {
     }
 
     let server_metrics = if let Some(url) = &args.metrics_url {
+        tokio::time::sleep(METRICS_SETTLE).await;
         match metrics_scrape::scrape(url).await {
             Ok(text) => Some(text),
             Err(e) => {
