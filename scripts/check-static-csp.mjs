@@ -32,6 +32,19 @@
  *      addition to the header (both are enforced), so this checks the
  *      page isn't *weakening* its own document with, e.g., a second
  *      policy that grants `unsafe-eval`.
+ *   6. a page that opens a WebSocket (`SOCKET_PAGES`) must not carry
+ *      `connect-src` **or** `default-src` in its `<meta>`, and every other
+ *      page must carry `default-src 'self'`. Reason: a `<meta>` sits in a
+ *      static file, so it can never name the host it will be served from,
+ *      and CSP3 matches `'self'` on scheme equality with only an
+ *      http->https allowance -- `default-src 'self'` fills in for a missing
+ *      `connect-src` and, in the browsers that follow the spec rather than
+ *      extending `'self'` to `ws:`/`wss:`, silently kills `/ws` and `/lsp`.
+ *      The header is where the websocket source lives, because loom-http
+ *      knows the request's `Host` (see `static_csp` in
+ *      `crates/loom-http/src/lib.rs`). A page that is *not* a socket page
+ *      keeps the full standalone `default-src 'self'`, so the
+ *      belt-and-braces copy stays strict wherever it costs nothing.
  *
  * `frame-ancestors`, `sandbox`, `report-to` and friends are ignored in
  * `<meta>` per the CSP spec, so they are loom-http's job alone -- and
@@ -98,10 +111,38 @@ function attributes(attrText) {
 
 const URL_CARRYING = new Set(["src", "href"]);
 
+/**
+ * Documents that open a WebSocket, by file name: the player client's `/ws`
+ * (`web-client/src/main.ts`) and the builder IDE's `/lsp`
+ * (`web-client/src/ide/`, M-LSP-1). Adding a socket to a new page means
+ * adding it here *and* accepting that the page's `<meta>` no longer stands
+ * alone for `connect-src`; the header is then the only thing gating it.
+ *
+ * Kept as an explicit list rather than "grep the bundled JS for
+ * `new WebSocket`" so that the decision is a reviewable diff line.
+ */
+const SOCKET_PAGES = new Set(["index.html", "ide.html"]);
+
+/** The directives a socket page's `<meta>` must still narrow by itself,
+ * because the header grants them more loosely (`style-src 'unsafe-inline'`,
+ * `worker-src blob:`) for Monaco's sake. */
+const ALWAYS_NARROWED = [
+  ["object-src", "'none'"],
+  ["base-uri", "'none'"],
+  ["frame-ancestors", "'none'"],
+];
+
+/** @param {string} policyContent @param {string} directive */
+function sourcesOf(policyContent, directive) {
+  const match = new RegExp(`(?:^|;)\\s*${directive}([^;]*)`, "i").exec(policyContent);
+  return match?.[1].trim();
+}
+
 /** @param {string} text @param {string} path @returns {string[]} findings */
 export function auditDocument(text, path) {
   const findings = [];
   const flat = withoutComments(text).replace(/\n/g, " ");
+  const pageName = path.split("/").pop();
   const report = (message) => findings.push(`${path}: ${message}`);
   const attrOf = (tagText) => attributes(tagText ?? "");
 
@@ -149,7 +190,7 @@ export function auditDocument(text, path) {
   }
   for (const policy of policies) {
     const content = attrOf(policy[1]).find(([n]) => n === "content")?.[1] ?? "";
-    const scriptSrc = /(?:^|;)\s*script-src([^;]*)/i.exec(content)?.[1]?.trim();
+    const scriptSrc = sourcesOf(content, "script-src");
     if (scriptSrc === undefined) {
       report("the <meta> CSP has no script-src (M-IDE-1)");
       continue;
@@ -162,6 +203,29 @@ export function auditDocument(text, path) {
     }
     if (!/'self'/.test(scriptSrc)) {
       report(`meta CSP script-src is not 'self': ${JSON.stringify(scriptSrc)}`);
+    }
+
+    // Rule 6: the websocket carve-out. See the header comment for why a
+    // static `<meta>` must not be the thing that decides `connect-src`.
+    const isSocketPage = SOCKET_PAGES.has(pageName);
+    if (isSocketPage) {
+      for (const directive of ["connect-src", "default-src"]) {
+        if (sourcesOf(content, directive) !== undefined) {
+          report(
+            `socket page carries ${directive} in its <meta>: a static file cannot name the host \`${pageName}\` is served from, and 'self' does not cover the websocket schemes in every browser -- loom-http's header owns connect-src (M-IDE-1)`,
+          );
+        }
+      }
+      for (const [directive, expected] of ALWAYS_NARROWED) {
+        if (sourcesOf(content, directive) !== expected) {
+          report(`meta CSP must narrow ${directive} to ${expected} (M-IDE-1)`);
+        }
+      }
+    } else if (sourcesOf(content, "default-src") !== "'self'") {
+      report(
+        "non-socket page must carry a standalone default-src 'self': the <meta> is " +
+          "the copy that still applies if something other than loom-http serves it (M-IDE-1)",
+      );
     }
   }
 
