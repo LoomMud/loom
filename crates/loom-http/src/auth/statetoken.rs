@@ -4,7 +4,9 @@
 //! Opaque, HMAC-signed tokens for the two short-lived, single-purpose
 //! credentials the GitHub login flow needs (OBI-201, M-AUTH-7): the
 //! `__Host-` OAuth state/PKCE cookie and the pending-TOTP cookie handed
-//! back when a T3+ GitHub login still needs a code.
+//! back when a T3+ GitHub login still needs a code. [`super::wsticket`]
+//! reuses this module's key *type* for a third credential -- with its own
+//! key instance, so its own domain.
 //!
 //! Deliberately **not** JWTs, and deliberately signed with a key that has
 //! nothing to do with [`super::jwt::JwtKeys`] (CTO review on PR #78,
@@ -49,9 +51,11 @@ pub trait HasExpiry {
     fn expires_at(&self) -> i64;
 }
 
-/// An HMAC-SHA256 key for this module's two token types only -- never
+/// An HMAC-SHA256 key for this module's two token types and for
+/// [`super::wsticket`]'s tickets -- that is, for the not-a-JWT signing
+/// domains in this auth module, each with its *own* key instance. Never
 /// used to sign/verify an [`super::claims::AccessClaims`] or anything
-/// else outside this file.
+/// outside those domains.
 #[derive(Clone)]
 pub struct StateTokenKey {
     key: [u8; 32],

@@ -7,9 +7,17 @@
 //! `sub`+`sid`. The client opens the WS and must send `{"auth":ticket}`
 //! in the first frame.
 //!
-//! Signed with [`super::statetoken::StateTokenKey`] (the same
-//! not-a-JWT HMAC domain the OAuth-state/pending-TOTP tokens use) --
-//! deliberately not the staff access-token EdDSA keyset, for the same
+//! Signed with [`super::statetoken::StateTokenKey`] -- the same *mechanism*
+//! as the OAuth-state/pending-TOTP tokens (a two-part `claims.sig`
+//! HMAC-SHA256 over a random, process-lifetime-only key, deliberately not
+//! JWT-shaped), but deliberately **not the same key**: [`WsTicketIssuer`]
+//! holds its own `StateTokenKey`, generated at startup and never shared
+//! with `AuthService`'s `state_key`, so this is a third signing domain
+//! rather than a reuse of that one. A ticket can therefore never verify as
+//! a state or pending-TOTP token, whatever its claims are made to look
+//! like -- and, symmetrically, a captured state cookie is not a ticket.
+//!
+//! It is equally not the staff access-token EdDSA keyset, for the same
 //! reason OBI-298 split those off: a bug in this (new, WS-specific) path
 //! must not be able to forge, or be confused with, a real access token.
 //!
