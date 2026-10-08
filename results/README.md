@@ -656,6 +656,23 @@ report lands in the downloaded artifact and in the job summary, but copying it
 into the header of a committed `results/ci-e1-1.md` is still a human step. That
 promotion is OBI-326's follow-up.
 
+### The first rows recorded *by* the mechanism, not by archaeology
+
+Both taken at loom `39e2bad` on the CI lane host, with `warp.ref` naming
+`1b0cd394d4cd41586e1a2d5fd449786b75c96976`, and both entered the lane because the
+change touched the pin -- one by commit range, one because it had no range at all:
+
+| Run | Event | p50 / p95 / p99 (150 players, 90 s) | Verdict | Report `## Notes` |
+|---|---|---|---|---|
+| 37755092634 | `pull_request` | 3.15 / 15.83 / **22.35 ms** (10 061 cmds, 0 disc, 0 login fails) | E1.1 PASS | `mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in warp.ref)` |
+| 37755215021 | `workflow_dispatch` | 3.27 / 16.36 / **23.91 ms** (10 011 cmds, 0 disc, 0 login fails) | E1.1 PASS | same |
+
+The two numbers are 1.6 ms apart on the same world, which is the point: the pair is
+comparable in a way the 37.6 / 39.6 / 47.7 ms records above were not. Step sequence on
+both: `read the pinned mudlib rev` -> external checkout at that rev -> `verify the mudlib
+under measurement` -> build -> measure -> upload, all green, so the rev in the report is
+the rev served, not the rev a default branch happened to point at.
+
 The release policy that goes with it: a release SHA needs a **measured** green
 `loadtest-e1-1` -- one from the nightly `on.schedule` run, or one started by
 `on.workflow_dispatch`. Since OBI-325 a PR can be green while having no p99 in it
