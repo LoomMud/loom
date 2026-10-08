@@ -37,11 +37,8 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use loom_obs::{PrometheusMetrics, Readiness};
 use tokio::sync::mpsc;
+use tower::Layer;
 use tower_http::services::ServeDir;
-// `ServeFileSystemResponseBody` is `ServeDir`'s response body type, reached
-// through `services::fs` (only `ServeDir`/`ServeFile` are re-exported from
-// `services` itself).
-use tower_http::services::fs::ServeFileSystemResponseBody;
 use tracing::debug;
 
 mod admin;
@@ -255,13 +252,91 @@ impl HttpState {
 /// `index.html`'s bootstrap into `loom.css` + `dist/main.js`; the
 /// `check-static-csp.mjs` gate in `npm run lint` keeps that true, per
 /// O3-T6's "a CI-enforced test that no served static file contains an
-/// inline script"). `connect-src 'self'` is deliberate and the one line
-/// that could break a deployment: it means **same-origin `/ws` only**
-/// (the player's `ws://`/`wss://` to this host's own port is covered --
-/// CSP3 'self' matches the same host through the ws/wss upgrade), so a
-/// future client connecting to a separate telnet or WS host must widen
-/// this with an explicit host list rather than a wildcard.
-const STATIC_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+/// inline script").
+///
+/// `{CONNECT}` is filled in per request by [`static_csp`], because
+/// `connect-src` is the one directive here that cannot be a literal.
+const STATIC_CSP_TEMPLATE: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; img-src 'self' data:; connect-src {CONNECT}; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// The static bundle's `connect-src`, computed per request from the
+/// authority it arrived on (OBI-180, M-IDE-1).
+///
+/// **Why this is not the literal `'self'`.** Both documents served from
+/// this origin open a WebSocket: the player's `/ws` (`web-client/src/main.ts`,
+/// shipped since OBI-39) and the IDE's `/lsp` (M-LSP-1). CSP3 matches
+/// `'self'` on *scheme equality* with one documented allowance -- an `http`
+/// document may match an `https` source. There is no ws/wss upgrade in the
+/// spec, and MDN says so outright: "`connect-src 'self'` does not resolve to
+/// websocket schemes in all browsers". A literal `connect-src 'self'` is
+/// therefore a policy whose correctness depends on an undocumented,
+/// browser-specific extension: fine in the browsers that implemented the
+/// upgrade, and a silently dead `/ws` in the ones that did not. This is the
+/// directive that gates exfiltration, so it gets the reading that works
+/// everywhere: `'self'` for same-origin `fetch` to `/api/v1/*`, plus this
+/// request's own host under both websocket schemes.
+///
+/// **Why host-pinned rather than `ws: wss:`.** A scheme-only source matches
+/// *any* host under that scheme, which would hand injected script a working
+/// exfiltration channel to an attacker's server -- precisely the capability
+/// `default-src 'self'` exists to remove. Pinning the request's authority
+/// grants nothing to a third party: `main.ts` builds the socket URL from
+/// `location.host`, so a client can only ever dial the host it was served
+/// from.
+///
+/// A missing or non-conforming `Host` yields `'self'` alone (fail closed),
+/// and [`ws_authority`] is a character allow-list rather than a sanity
+/// filter, so no `Host` value can inject source expressions into the policy.
+///
+/// Deployment constraint this implies: the `Host` loom-http sees must be the
+/// authority the browser dialed, i.e. the proxy must pass it through (Caddy
+/// and the compose stack both do; an nginx `proxy_set_header Host
+/// $upstream_host` would grant a source the client cannot match and
+/// silently kill its socket).
+pub fn static_csp(host: Option<&str>) -> String {
+    let connect = match ws_authority(host) {
+        Some(authority) => format!("'self' ws://{authority} wss://{authority}"),
+        None => "'self'".to_string(),
+    };
+    STATIC_CSP_TEMPLATE.replace("{CONNECT}", &connect)
+}
+
+/// The request authority a websocket source may be built from, if `host` is
+/// a bare `name[:port]` or a bracketed IPv6 literal `[addr]:port`. Letters,
+/// digits, `.`, `-`, `_` (or a real `Ipv6Addr` inside brackets) only -- no
+/// `@`, `'`, `/`, or stray whitespace -- so no `Host` value can inject a
+/// source expression into the policy or break out of the header. See
+/// [`static_csp`].
+fn ws_authority(host: Option<&str>) -> Option<&str> {
+    let host = host?;
+    if let Some(rest) = host.strip_prefix('[') {
+        // Bracketed IPv6 literal, with an optional port after `]`. Parsed
+        // rather than pattern-matched: the legal shape of an IPv6 literal is
+        // fiddly, and `Ipv6Addr` is the authority on it.
+        let (addr, suffix) = rest.split_once(']')?;
+        return (addr.parse::<std::net::Ipv6Addr>().is_ok() && port_ok(suffix)).then_some(host);
+    }
+    let (name, port) = match host.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    let name_ok = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'));
+    (name_ok && port.is_none_or(is_port)).then_some(host)
+}
+
+/// `:443` -> true, `""` -> true (no port present), anything else -> false.
+fn port_ok(suffix: &str) -> bool {
+    match suffix.strip_prefix(':') {
+        Some(port) => is_port(port),
+        None => suffix.is_empty(),
+    }
+}
+
+fn is_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())
+}
 
 /// The rest of M-IDE-1's static-bundle header set, as `(name, value)`
 /// pairs so the policy stays one reviewable list. Values are all
@@ -284,27 +359,45 @@ const STATIC_SECURITY_HEADERS: [(&str, &str); 4] = [
     ("cross-origin-opener-policy", "same-origin"),
 ];
 
-/// Stamp [`STATIC_CSP`] + [`STATIC_SECURITY_HEADERS`] onto a response
-/// from the static-file service (OBI-180/M-IDE-1). Applied by
-/// [`app`]'s fallback chain, so it covers every path the file service
-/// answers -- including a 404 for a missing file, which is harmless and
-/// cheaper than path-sniffing -- and deliberately not on `/ws`,
-/// `/metrics` or the API routes, which set their own per-response
-/// headers (a file body served by `/api/v1/files/content` carries a
+/// Stamp the static-bundle policy onto every response the file service
+/// produces (OBI-180/M-IDE-1). Applied as a `tower::Layer` on the
+/// [`axum::middleware::from_fn`] service in [`app`], so it covers every path
+/// the file service answers -- including a 404 for a missing file, which is
+/// harmless and cheaper than path-sniffing -- and deliberately not on `/ws`,
+/// `/metrics` or the API routes, which set their own per-response headers (a
+/// file body served by `/api/v1/files/content` carries a
 /// `sandbox; default-src 'none'` CSP of its own, M-FS-4). Only headers
 /// change; the body and status pass through.
-fn with_static_security_headers(
-    mut response: axum::response::Response<ServeFileSystemResponseBody>,
-) -> axum::response::Response<ServeFileSystemResponseBody> {
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(STATIC_CSP),
-    );
-    for (name, value) in STATIC_SECURITY_HEADERS {
-        headers.insert(
+///
+/// It is a request-aware middleware rather than the `map_response` this
+/// function replaced because `connect-src` needs the `Host` the request came
+/// in on; see [`static_csp`] for why a literal cannot do that job.
+async fn with_static_security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // `to_str` rather than lossy conversion: a non-ASCII `Host` (an IDN) is
+    // not something this policy will pin, and `ws_authority` would reject it
+    // anyway. `HeaderMap::get(HOST)` is the authority the browser dialed,
+    // which is what its own `location.host` will be.
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let mut response = next.run(request).await;
+    let csp = static_csp(host.as_deref());
+    // `from_str` cannot fail here: every byte of `csp` is ASCII by
+    // construction (`STATIC_CSP_TEMPLATE` is ASCII, and `ws_authority`
+    // only lets `[A-Za-z0-9._-:]` through into the interpolation).
+    let value = HeaderValue::from_str(&csp).unwrap_or_else(|_| HeaderValue::from_static("invalid"));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_SECURITY_POLICY, value);
+    for (name, header_value) in STATIC_SECURITY_HEADERS {
+        response.headers_mut().insert(
             header::HeaderName::from_static(name),
-            HeaderValue::from_static(value),
+            HeaderValue::from_static(header_value),
         );
     }
     response
@@ -325,19 +418,15 @@ pub fn app(state: HttpState) -> Router {
         .with_state(state);
     match web_root {
         Some(root) => {
-            // The qualified `ServiceExt` call is load-bearing, not ceremony:
-            // `ServeDir` serves *any* request body, and `map_response` adds a
-            // second free type parameter for the response, so the plain
-            // method-call form leaves the request body ambiguous and the crate
-            // does not compile (E0283). Naming the request here says exactly
-            // what the router's fallback will send -- `axum::extract::Request`
-            // -- and lets the response type be inferred from
-            // [`with_static_security_headers`]'s signature.
+            // `from_fn` is used as a `tower::Layer` here rather than through a
+            // `Router::layer`, because the thing that needs stamping is the
+            // `ServeDir` *service* -- putting it on the router would also wrap
+            // `/api`, `/ws` and `/metrics`, whose responses set their own
+            // headers. `ServeDir`'s request body stays implicit: it is a single
+            // generic type (the fallback), and `Service<Request>` is picked from
+            // the router's `fallback_service` bound.
             let static_files =
-                <ServeDir as tower::ServiceExt<axum::extract::Request>>::map_response(
-                    ServeDir::new(root),
-                    with_static_security_headers,
-                );
+                axum::middleware::from_fn(with_static_security_headers).layer(ServeDir::new(root));
             router.fallback_service(static_files)
         }
         None => router,
@@ -371,6 +460,10 @@ async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The authority a browser would put in `Host` when served the bundle in
+    /// production; [`static_csp`] builds `connect-src` around it.
+    const TEST_HOST: &str = "mud.example";
 
     use std::net::SocketAddr;
 
@@ -855,6 +948,10 @@ mod tests {
         // -http is not in front of (a proxy serving the bundle directly).
         // Two policies on one document are both enforced, so a tighter
         // `<meta>` can only narrow what the header allows, never widen it.
+        // The `<meta>` policies leave out `connect-src` *and* `default-src`
+        // on purpose: a static file cannot name the host it will be served
+        // from, and `default-src` would fill in for a missing `connect-src`
+        // and block `/ws`/`/lsp`. `check-static-csp.mjs` pins that shape.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<html>loom</html>").unwrap();
         std::fs::write(
@@ -873,22 +970,31 @@ mod tests {
         let app = app(state);
 
         for path in ["/", "/admin.html"] {
-            let request = axum::http::Request::builder()
-                .uri(path)
-                .body(axum::body::Body::empty())
+            let response = app
+                .clone()
+                .oneshot(static_request(path, "mud.example"))
+                .await
                 .unwrap();
-            let response = app.clone().oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK, "path: {path}");
             let csp = response
                 .headers()
                 .get(header::CONTENT_SECURITY_POLICY)
                 .unwrap_or_else(|| panic!("missing CSP header on {path}"))
                 .to_str()
-                .unwrap();
-            assert_eq!(csp, STATIC_CSP, "path: {path}");
+                .unwrap()
+                .to_owned();
+            assert_eq!(
+                csp,
+                static_csp(Some("mud.example")),
+                "path: {path}: the header must be the policy this host needs"
+            );
             assert!(
                 csp.contains("frame-ancestors 'none'"),
                 "frame-ancestors must ride in the header, not only the meta: {path}"
+            );
+            assert!(
+                csp.contains("wss://mud.example"),
+                "the player's /ws and the IDE's /lsp are WebSockets; 'self' alone \n            is not documented to cover them: {path}"
             );
             let xfo = response
                 .headers()
@@ -924,7 +1030,9 @@ mod tests {
     /// appear in another directive's source list.
     #[test]
     fn static_csp_grants_no_script_escape_hatch() {
-        let script_src = csp_directive(STATIC_CSP, "script-src");
+        let policy = static_csp(Some(TEST_HOST));
+        let policy = policy.as_str();
+        let script_src = csp_directive(policy, "script-src");
         assert_eq!(script_src, "'self'", "script-src must stay 'self' only");
         for forbidden in [
             "unsafe-inline",
@@ -941,49 +1049,139 @@ mod tests {
         }
         // `default-src` is the fallback for every directive the policy
         // does not name, so it must not be looser than script-src either.
-        assert_eq!(csp_directive(STATIC_CSP, "default-src"), "'self'");
-        assert_eq!(csp_directive(STATIC_CSP, "object-src"), "'none'");
-        assert_eq!(csp_directive(STATIC_CSP, "base-uri"), "'none'");
-        assert_eq!(csp_directive(STATIC_CSP, "form-action"), "'self'");
+        assert_eq!(csp_directive(policy, "default-src"), "'self'");
+        assert_eq!(csp_directive(policy, "object-src"), "'none'");
+        assert_eq!(csp_directive(policy, "base-uri"), "'none'");
+        assert_eq!(csp_directive(policy, "form-action"), "'self'");
     }
 
     /// The two `style-src`/`worker-src` exceptions are documented in
-    /// `STATIC_CSP` as Monaco-only. Pin them so a future "tighten
+    /// [`static_csp`] as Monaco-only. Pin them so a future "tighten
     /// everything" change can't silently drop them (Monaco renders wrong
     /// without inline styles and starts its workers from a blob URL), and
     /// so the exceptions cannot spread to `script-src`.
     #[test]
     fn static_csp_keeps_the_monaco_exceptions_scoped_to_monaco() {
-        assert_eq!(
-            csp_directive(STATIC_CSP, "style-src"),
-            "'self' 'unsafe-inline'"
-        );
-        assert_eq!(csp_directive(STATIC_CSP, "worker-src"), "'self' blob:");
+        let policy = static_csp(Some(TEST_HOST));
+        let policy = policy.as_str();
+        assert_eq!(csp_directive(policy, "style-src"), "'self' 'unsafe-inline'");
+        assert_eq!(csp_directive(policy, "worker-src"), "'self' blob:");
         // `blob:` belongs to workers only: if it ever reached the script
         // or fetch directives, a same-origin blob could carry code. The
         // admin pages' `<meta>` is where the `style-src` exception is
         // narrowed back to `'self'` for pages that don't mount Monaco.
         for directive in ["script-src", "connect-src", "default-src"] {
             assert!(
-                !csp_directive(STATIC_CSP, directive).contains("blob:"),
+                !csp_directive(policy, directive).contains("blob:"),
                 "{directive} must not allow blob:"
             );
         }
     }
 
-    /// `connect-src 'self'` is the directive that decides whether the
-    /// player client can reach the driver at all: the WS is same-origin
-    /// (`/ws`, `/lsp`), which CSP3's `ws`/`wss` upgrade matching covers,
-    /// but a split client host would not be covered and would need an
-    /// explicit host list here -- never a wildcard. Pinned so the
+    /// `connect-src` is the directive that decides whether a client can
+    /// reach the driver at all, and both clients use a WebSocket (`/ws` for
+    /// the player, `/lsp` for the IDE). CSP3 matches `'self'` by scheme
+    /// equality with only an http->https allowance, and MDN records that
+    /// `connect-src 'self'` "does not resolve to websocket schemes in all
+    /// browsers" -- so the policy names this request's host under `ws:` and
+    /// `wss:` explicitly instead of relying on an undocumented extension.
+    /// A wildcard source is not acceptable here: it would hand injected
+    /// script an exfiltration channel to any host (M-IDE-1). Pinned so the
     /// constraint is visible at the point someone tries to widen it.
     #[test]
-    fn static_csp_connect_src_is_same_origin_only() {
-        assert_eq!(csp_directive(STATIC_CSP, "connect-src"), "'self'");
-        assert!(
-            !STATIC_CSP.contains("connect-src *") && !STATIC_CSP.contains("wss://*"),
-            "a wildcard connect-src would let a compromised staff page exfiltrate to any host"
+    fn static_csp_pins_connect_src_to_the_requests_host() {
+        assert_eq!(
+            csp_directive(&static_csp(Some(TEST_HOST)), "connect-src"),
+            "'self' ws://mud.example wss://mud.example"
         );
+        // A port is part of the authority the browser dials, so it must
+        // survive into the source (compose maps `localhost:8080 -> :3000`,
+        // and the browser's own Host is what CSP matches).
+        assert_eq!(
+            csp_directive(&static_csp(Some("localhost:3000")), "connect-src"),
+            "'self' ws://localhost:3000 wss://localhost:3000"
+        );
+        // IPv6 literals are bracketed; dev against `http://[::1]:3000` must
+        // not silently lose its socket.
+        assert_eq!(
+            csp_directive(&static_csp(Some("[::1]:3000")), "connect-src"),
+            "'self' ws://[::1]:3000 wss://[::1]:3000"
+        );
+        // No Host (HTTP/1.0-style request, or a probe) -> fail closed.
+        assert_eq!(
+            csp_directive(&static_csp(None), "connect-src"),
+            "'self'",
+            "without a usable Host the policy must not guess a websocket source"
+        );
+        for policy in [static_csp(Some(TEST_HOST)), static_csp(None)] {
+            assert!(
+                !policy.contains("connect-src *") && !policy.contains(":*"),
+                "a wildcard connect-src would let a compromised staff page exfiltrate: {policy}"
+            );
+        }
+    }
+
+    /// The host lands inside a header value, so a `Host` that could inject
+    /// a source expression -- or a second header -- must be refused, not
+    /// sanitised. `ws_authority` is a character allow-list for exactly this
+    /// reason; these are the shapes an attacker (or a confused proxy) could
+    /// put in the header.
+    #[test]
+    fn ws_authority_refuses_hosts_that_could_inject_a_source() {
+        for hostile in [
+            "",
+            ":3000",
+            "mud.example:",
+            "mud.example:port",
+            "mud.example:3000:4000",
+            "evil.com mud.example",
+            "evil.com/",
+            "evil.com/\"",
+            "evil.com;js=1",
+            "u@evil.com",
+            "evil.com 'unsafe-eval'",
+            "evil.com'",
+            "mud.example\r\nx-content-security-policy: default-src *",
+            "mud.example\nref",
+            "[::1]:",
+            "[gg::1]:3000",
+            "[..]:3000",
+            "[]:3000",
+            "mud.example:3000x",
+            "\u{00e9}mud.example", // non-ASCII (IDN): `to_str` refuses it, and so must this
+        ] {
+            assert_eq!(
+                ws_authority(Some(hostile)),
+                None,
+                "must not be usable as a websocket source: {hostile:?}"
+            );
+            assert!(
+                !static_csp(Some(hostile)).contains("wss://"),
+                "policy for {hostile:?} leaked a websocket source"
+            );
+        }
+        for good in [
+            "mud.example",
+            "localhost:3000",
+            "127.0.0.1:3000",
+            "[::1]",
+            "[::1]:3000",
+            "mud-2.example",
+            "stage.mud.example.",
+        ] {
+            assert_eq!(ws_authority(Some(good)).unwrap(), good, "refused {good:?}");
+        }
+    }
+
+    /// A request to the static fallback, with the `Host` a browser would
+    /// send. `Request::builder` does not add one implicitly, and the policy
+    /// now depends on it.
+    fn static_request(path: &str, host: &str) -> axum::extract::Request {
+        axum::http::Request::builder()
+            .uri(path)
+            .header(header::HOST, host)
+            .body(axum::body::Body::empty())
+            .unwrap()
     }
 
     #[tokio::test]

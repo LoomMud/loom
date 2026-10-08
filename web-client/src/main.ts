@@ -13,8 +13,13 @@
  * loom-http in front.
  *
  * The URL is derived from `location` -- same-origin, always over the
- * protocol the page was loaded with -- because `connect-src 'self'`
- * allows exactly that and nothing else.
+ * protocol the page was loaded with. That is not just tidiness: the
+ * document's CSP grants `connect-src` for exactly this authority, which
+ * loom-http builds from the request's own `Host` header (`static_csp`), so
+ * `location.host` and the `Host` must be the same `name[:port]` pair. A
+ * reverse proxy that rewrites `Host` to its upstream name would make the
+ * granted source unmatchable and silently kill the socket; Caddy (staging)
+ * and the compose stack both pass it through.
  */
 
 import { mountLoomClient } from "./app.js";

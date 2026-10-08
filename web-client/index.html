@@ -18,14 +18,23 @@
       (that exception exists only for Monaco, and the player client's
       stylesheet now lives in loom.css) and no `worker-src blob:`.
 
-      `connect-src 'self'` covers the same-origin `/ws` socket: CSP3
-      matches a `ws`/`wss` URL against `'self'` when the host matches the
-      document's origin. A future client that dials a separate socket
-      host must name that host here -- never a wildcard.
+      No `connect-src` and no `default-src` here, unlike `admin.html`:
+      this page opens the same-origin `/ws` socket, and a `<meta>` cannot
+      name the host it will be served from. CSP3 matches `'self'` on scheme
+      equality with only an http->https allowance, and MDN records that
+      `connect-src 'self'` "does not resolve to websocket schemes in all
+      browsers" -- so a `default-src 'self'` here would fill in for the
+      missing `connect-src` and could silently kill the player's connection.
+      The websocket source is loom-http's job: `static_csp` pins
+      `connect-src 'self' ws://<this host> wss://<this host>` from the
+      request's own `Host`, and `scripts/check-static-csp.mjs` keeps this
+      page in that rule's socket list. If this page ever gains a second
+      socket host, it goes in the header as an explicit host -- never a
+      wildcard, and never here.
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+      content="script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
     />
     <title>Loom</title>
     <link rel="stylesheet" href="./loom.css" />

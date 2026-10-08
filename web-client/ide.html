@@ -38,10 +38,19 @@
           filesystem URL during local development.
         - `form-action 'self'`, `base-uri 'none'` -- no cross-origin form
           exfil, no `<base>` hijack of the relative `./vendor/...` paths.
+        - no `connect-src`, and therefore no `default-src` either. This
+          page dials `/lsp` as a WebSocket (M-LSP-1), and a `<meta>` is
+          fixed text: it cannot name the host it will be served from, and
+          `connect-src 'self'` does not cover `ws:`/`wss:` in every browser
+          (MDN says so outright). `default-src 'self'` would stand in for a
+          missing `connect-src` and break the socket the same way. So
+          `static_csp` in loom-http owns `connect-src`, pinned to the
+          request's own `Host`; `scripts/check-static-csp.mjs` keeps
+          `ide.html` in the socket-page list that enforces this split.
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; img-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+      content="script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; img-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
     />
     <title>Loom IDE</title>
     <link rel="stylesheet" href="./ide.css" />

@@ -11,6 +11,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { auditDocument, servedDocuments } from "./check-static-csp.mjs";
 
@@ -131,4 +132,69 @@ test("a meta CSP whose script-src is a wildcard or missing is reported", () => {
 test("the audited document set is the authored pages, not vendored or built files", () => {
   const rel = servedDocuments().map((f) => f.slice(f.indexOf("web-client") + "web-client/".length));
   assert.deepEqual(rel.sort(), ["admin.html", "ide.html", "index.html"]);
+});
+
+// Rule 6: the websocket carve-out. A `<meta>` is fixed text and cannot
+// name the host it will be served from, so for a page that opens a socket
+// it must not decide `connect-src` at all (see `static_csp` in
+// `crates/loom-http/src/lib.rs`, which does it per request). These tests
+// pin both halves of that rule, because the failure mode is a silently
+// dead `/ws` or `/lsp` in the browser that follows CSP3 literally.
+
+/** A policy of the shape a socket page is allowed to carry. */
+const SOCKET_POLICY = policy(
+  "script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+);
+
+function socketFindings(documentText) {
+  return auditDocument(documentText, "web-client/ide.html");
+}
+
+test("a socket page whose <meta> omits connect-src and default-src is clean", () => {
+  assert.deepEqual(socketFindings(doc(`<script src="./a.js"></script>`, SOCKET_POLICY)), []);
+});
+
+test("a socket page that carries default-src or connect-src is reported", () => {
+  for (const content of [
+    `default-src 'self'; ${SOCKET_POLICY.match(/content="([^"]*)"/)[1]}`,
+    SOCKET_POLICY.match(/content="([^"]*)"/)[1] + "; connect-src 'self'",
+  ]) {
+    const found = socketFindings(doc(`<script src="./a.js"></script>`, policy(content)));
+    assert.ok(
+      found.some((f) => f.includes("websocket")),
+      `expected a websocket finding for ${JSON.stringify(content)}, got ${found.join("\n")}`,
+    );
+  }
+});
+
+test("a socket page must still narrow object-src/base-uri/frame-ancestors itself", () => {
+  const found = socketFindings(
+    doc(`<script src="./a.js"></script>`, policy("script-src 'self'")),
+  );
+  for (const directive of ["object-src", "base-uri", "frame-ancestors"]) {
+    assert.ok(
+      found.some((f) => f.includes(`must narrow ${directive}`)),
+      found.join("\n"),
+    );
+  }
+});
+
+test("a non-socket page that drops default-src is reported", () => {
+  const found = findings(doc(`<script src="./a.js"></script>`, SOCKET_POLICY));
+  assert.ok(
+    found.some((f) => f.includes("non-socket page must carry a standalone default-src")),
+    found.join("\n"),
+  );
+});
+
+test("the repo's own documents satisfy the policy pair they advertise", () => {
+  // Not a tautology: this reads the real `web-client/*.html`, so a page
+  // that gains a socket without joining `SOCKET_PAGES` -- or a header
+  // policy quietly narrowed back to `connect-src 'self'` alone with the
+  // meta still carrying it -- fails here instead of failing in staging.
+  for (const file of servedDocuments()) {
+    const name = file.slice(file.lastIndexOf("/") + 1);
+    const found = auditDocument(readFileSync(file, "utf8"), file);
+    assert.deepEqual(found, [], `${name} is not clean:\n${found.join("\n")}`);
+  }
 });
