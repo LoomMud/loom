@@ -37,9 +37,11 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use loom_obs::{PrometheusMetrics, Readiness};
 use tokio::sync::mpsc;
-use tower::ServiceBuilder;
 use tower_http::services::ServeDir;
-use tower_http::set_header::SetResponseHeaderLayer;
+// `ServeFileSystemResponseBody` is `ServeDir`'s response body type, reached
+// through `services::fs` (only `ServeDir`/`ServeFile` are re-exported from
+// `services` itself).
+use tower_http::services::fs::ServeFileSystemResponseBody;
 use tracing::debug;
 
 mod admin;
@@ -228,21 +230,85 @@ impl HttpState {
     }
 }
 
-/// M-IDE-1/M-IDE-2 (OBI-179 threat model) for the static web client
-/// (`web-client/admin.html` and friends, OBI-294): `admin.html` already
-/// carries this via a `<meta http-equiv="Content-Security-Policy">` tag,
-/// but `frame-ancestors` (and `sandbox`/`report-uri`) are no-ops when
-/// delivered that way per the CSP spec -- they only take effect as an
-/// actual response header. A header and a `<meta>` tag can coexist
-/// (browsers enforce the intersection), so the header carries *only*
-/// the header-only directive: it wraps every file under the web root,
-/// including the player client (`index.html`), which uses an inline
-/// `<style>` and inline module `<script>` that admin.html's
-/// `script-src 'self'; style-src 'self'` would block. Page-specific
-/// policy stays in each page's `<meta>` tag. `X-Frame-Options: DENY`
-/// rides along as a header-only fallback for UAs that predate
-/// `frame-ancestors`.
-const STATIC_CSP: &str = "frame-ancestors 'none'";
+/// The static bundle's response CSP (OBI-180 M-IDE-1, threat model v2
+/// §5), sent by loom-http as a header so `frame-ancestors` actually
+/// applies (it is ignored in `<meta>` per the CSP spec; `report-uri`
+/// and `sandbox` are the other header-only directives).
+///
+/// This is the threat model's policy *verbatim*. Two directives look
+/// looser than they need to be and are not optional:
+///
+/// * `style-src 'unsafe-inline'` -- Monaco injects inline `<style>` and
+///   `style=` attributes for every measured text block; without it the
+///   editor renders wrong. It is the one exception the threat model
+///   grants explicitly ("'unsafe-inline' styles are only for Monaco").
+///   Pages that don't need it tighten it back in their own `<meta>`
+///   (`index.html`, `admin.html`), since a document bound by both a
+///   header and a meta must satisfy *both*.
+/// * `worker-src 'self' blob:` -- Monaco's language/ editor workers are
+///   started from a same-origin blob URL. `blob:` is scoped to workers
+///   only; scripts stay `'self'`.
+///
+/// `script-src 'self'` with no `'unsafe-inline'`/`'unsafe-eval'` is the
+/// point of the whole policy: it is only safe to send because no served
+/// file contains an inline script any more (OBI-180 moved
+/// `index.html`'s bootstrap into `loom.css` + `dist/main.js`; the
+/// `check-static-csp.mjs` gate in `npm run lint` keeps that true, per
+/// O3-T6's "a CI-enforced test that no served static file contains an
+/// inline script"). `connect-src 'self'` is deliberate and the one line
+/// that could break a deployment: it means **same-origin `/ws` only**
+/// (the player's `ws://`/`wss://` to this host's own port is covered --
+/// CSP3 'self' matches the same host through the ws/wss upgrade), so a
+/// future client connecting to a separate telnet or WS host must widen
+/// this with an explicit host list rather than a wildcard.
+const STATIC_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// The rest of M-IDE-1's static-bundle header set, as `(name, value)`
+/// pairs so the policy stays one reviewable list. Values are all
+/// literals, hence `from_static`.
+///
+/// * `X-Frame-Options: DENY` -- header-only fallback for UAs that
+///   predate `frame-ancestors`.
+/// * `X-Content-Type-Options: nosniff` -- a served `.txt`/`.js` is never
+///   sniffed into something the CSP would then have to protect against.
+/// * `Referrer-Policy: no-referrer` -- an admin/IDE URL *is* a domain
+///   path (`/builders/<u>/<area>/...`, M-IDE-1/T-IDE-2), so it must not
+///   leak to a third party through the Referer of a sub-resource.
+/// * `Cross-Origin-Opener-Policy: same-origin` -- isolates this
+///   document's browsing group, so a window opened by another origin
+///   can't hold a handle on the staff session's window (M-IDE-1).
+const STATIC_SECURITY_HEADERS: [(&str, &str); 4] = [
+    ("x-frame-options", "DENY"),
+    ("x-content-type-options", "nosniff"),
+    ("referrer-policy", "no-referrer"),
+    ("cross-origin-opener-policy", "same-origin"),
+];
+
+/// Stamp [`STATIC_CSP`] + [`STATIC_SECURITY_HEADERS`] onto a response
+/// from the static-file service (OBI-180/M-IDE-1). Applied by
+/// [`app`]'s fallback chain, so it covers every path the file service
+/// answers -- including a 404 for a missing file, which is harmless and
+/// cheaper than path-sniffing -- and deliberately not on `/ws`,
+/// `/metrics` or the API routes, which set their own per-response
+/// headers (a file body served by `/api/v1/files/content` carries a
+/// `sandbox; default-src 'none'` CSP of its own, M-FS-4). Only headers
+/// change; the body and status pass through.
+fn with_static_security_headers(
+    mut response: axum::response::Response<ServeFileSystemResponseBody>,
+) -> axum::response::Response<ServeFileSystemResponseBody> {
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(STATIC_CSP),
+    );
+    for (name, value) in STATIC_SECURITY_HEADERS {
+        headers.insert(
+            header::HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    response
+}
 
 pub fn app(state: HttpState) -> Router {
     let web_root = state.web_root.clone();
@@ -259,16 +325,19 @@ pub fn app(state: HttpState) -> Router {
         .with_state(state);
     match web_root {
         Some(root) => {
-            let static_files = ServiceBuilder::new()
-                .layer(SetResponseHeaderLayer::overriding(
-                    header::CONTENT_SECURITY_POLICY,
-                    HeaderValue::from_static(STATIC_CSP),
-                ))
-                .layer(SetResponseHeaderLayer::overriding(
-                    header::HeaderName::from_static("x-frame-options"),
-                    HeaderValue::from_static("DENY"),
-                ))
-                .service(ServeDir::new(root));
+            // The qualified `ServiceExt` call is load-bearing, not ceremony:
+            // `ServeDir` serves *any* request body, and `map_response` adds a
+            // second free type parameter for the response, so the plain
+            // method-call form leaves the request body ambiguous and the crate
+            // does not compile (E0283). Naming the request here says exactly
+            // what the router's fallback will send -- `axum::extract::Request`
+            // -- and lets the response type be inferred from
+            // [`with_static_security_headers`]'s signature.
+            let static_files =
+                <ServeDir as tower::ServiceExt<axum::extract::Request>>::map_response(
+                    ServeDir::new(root),
+                    with_static_security_headers,
+                );
             router.fallback_service(static_files)
         }
         None => router,
@@ -775,14 +844,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn static_fallback_carries_frame_ancestors_as_a_header_not_only_meta() {
-        // OBI-294: `admin.html`'s `frame-ancestors 'none'` is a no-op
-        // when delivered only via `<meta http-equiv="Content-Security-
-        // Policy">` (ignored by the CSP spec for that directive). The
-        // static fallback must also carry it as a real response header
-        // for every path under the served tree -- not just `admin.html`
-        // -- plus `X-Frame-Options: DENY` as a header-only fallback for
-        // older UAs.
+    async fn static_fallback_carries_the_m_ide_1_csp_and_header_set() {
+        // OBI-294/OBI-180 M-IDE-1: `frame-ancestors` (and `report-uri`/
+        // `sandbox`) are no-ops when delivered only via
+        // `<meta http-equiv="Content-Security-Policy">` -- they take
+        // effect as a response header alone. So the static fallback sends
+        // the whole M-IDE-1 policy as headers, for every path under the
+        // served tree -- not just the staff pages -- and each page's
+        // `<meta>` stays as the belt-and-braces copy for whatever loom
+        // -http is not in front of (a proxy serving the bundle directly).
+        // Two policies on one document are both enforced, so a tighter
+        // `<meta>` can only narrow what the header allows, never widen it.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.html"), "<html>loom</html>").unwrap();
         std::fs::write(
@@ -813,10 +885,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing CSP header on {path}"))
                 .to_str()
                 .unwrap();
-            assert_eq!(csp, "frame-ancestors 'none'", "path: {path}");
-            // Must not constrain script/style: index.html relies on an
-            // inline <style> and inline module <script>.
-            assert!(!csp.contains("script-src") && !csp.contains("default-src"));
+            assert_eq!(csp, STATIC_CSP, "path: {path}");
+            assert!(
+                csp.contains("frame-ancestors 'none'"),
+                "frame-ancestors must ride in the header, not only the meta: {path}"
+            );
             let xfo = response
                 .headers()
                 .get(header::HeaderName::from_static("x-frame-options"))
@@ -827,7 +900,8 @@ mod tests {
         }
 
         // Explicit (non-fallback) routes are untouched by the static-file
-        // CSP layer -- it only wraps the `ServeDir` fallback service.
+        // header stamping -- it only wraps the `ServeDir` fallback
+        // service. `/healthz` must not pick up a document CSP.
         let request = axum::http::Request::builder()
             .uri("/healthz")
             .body(axum::body::Body::empty())
@@ -840,5 +914,141 @@ mod tests {
                 .get(header::CONTENT_SECURITY_POLICY)
                 .is_none()
         );
+    }
+
+    /// A `script-src 'self'` with an escape hatch is the same as no
+    /// script-src at all for a page that renders builder-authored text
+    /// (M-IDE-2/T-IDE-1: a stored `<script>`-shaped string is only
+    /// dangerous if the policy lets inline or remote script in). Pin the
+    /// exact directive rather than grepping for substrings that could
+    /// appear in another directive's source list.
+    #[test]
+    fn static_csp_grants_no_script_escape_hatch() {
+        let script_src = csp_directive(STATIC_CSP, "script-src");
+        assert_eq!(script_src, "'self'", "script-src must stay 'self' only");
+        for forbidden in [
+            "unsafe-inline",
+            "unsafe-eval",
+            "blob:",
+            "data:",
+            "*",
+            "http",
+        ] {
+            assert!(
+                !script_src.contains(forbidden),
+                "script-src carries {forbidden:?}: {script_src}"
+            );
+        }
+        // `default-src` is the fallback for every directive the policy
+        // does not name, so it must not be looser than script-src either.
+        assert_eq!(csp_directive(STATIC_CSP, "default-src"), "'self'");
+        assert_eq!(csp_directive(STATIC_CSP, "object-src"), "'none'");
+        assert_eq!(csp_directive(STATIC_CSP, "base-uri"), "'none'");
+        assert_eq!(csp_directive(STATIC_CSP, "form-action"), "'self'");
+    }
+
+    /// The two `style-src`/`worker-src` exceptions are documented in
+    /// `STATIC_CSP` as Monaco-only. Pin them so a future "tighten
+    /// everything" change can't silently drop them (Monaco renders wrong
+    /// without inline styles and starts its workers from a blob URL), and
+    /// so the exceptions cannot spread to `script-src`.
+    #[test]
+    fn static_csp_keeps_the_monaco_exceptions_scoped_to_monaco() {
+        assert_eq!(
+            csp_directive(STATIC_CSP, "style-src"),
+            "'self' 'unsafe-inline'"
+        );
+        assert_eq!(csp_directive(STATIC_CSP, "worker-src"), "'self' blob:");
+        // `blob:` belongs to workers only: if it ever reached the script
+        // or fetch directives, a same-origin blob could carry code. The
+        // admin pages' `<meta>` is where the `style-src` exception is
+        // narrowed back to `'self'` for pages that don't mount Monaco.
+        for directive in ["script-src", "connect-src", "default-src"] {
+            assert!(
+                !csp_directive(STATIC_CSP, directive).contains("blob:"),
+                "{directive} must not allow blob:"
+            );
+        }
+    }
+
+    /// `connect-src 'self'` is the directive that decides whether the
+    /// player client can reach the driver at all: the WS is same-origin
+    /// (`/ws`, `/lsp`), which CSP3's `ws`/`wss` upgrade matching covers,
+    /// but a split client host would not be covered and would need an
+    /// explicit host list here -- never a wildcard. Pinned so the
+    /// constraint is visible at the point someone tries to widen it.
+    #[test]
+    fn static_csp_connect_src_is_same_origin_only() {
+        assert_eq!(csp_directive(STATIC_CSP, "connect-src"), "'self'");
+        assert!(
+            !STATIC_CSP.contains("connect-src *") && !STATIC_CSP.contains("wss://*"),
+            "a wildcard connect-src would let a compromised staff page exfiltrate to any host"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_fallback_sends_nosniff_referrer_policy_and_coop() {
+        // M-IDE-1's remaining three headers. `Referrer-Policy` matters
+        // because the *path itself* is a domain path (T-IDE-2), and
+        // `nosniff` because `/api/v1/files/content` serves raw builder
+        // text -- the same reasoning as M-FS-4's per-response headers.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>loom</html>").unwrap();
+        std::fs::write(dir.path().join("admin.html"), "<html>admin</html>").unwrap();
+        std::fs::create_dir(dir.path().join("dist")).unwrap();
+        std::fs::write(dir.path().join("dist/app.js"), "export {};\n").unwrap();
+        let app = app_with_static_root(dir.path());
+
+        for path in ["/", "/admin.html", "/dist/app.js", "/nope.html"] {
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            for (name, expected) in STATIC_SECURITY_HEADERS {
+                let value = response
+                    .headers()
+                    .get(header::HeaderName::from_static(name))
+                    .unwrap_or_else(|| panic!("missing {name} header on {path}"))
+                    .to_str()
+                    .unwrap();
+                assert_eq!(value, expected, "{name} on {path}");
+            }
+            assert!(
+                response
+                    .headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .is_some(),
+                "missing CSP header on {path}"
+            );
+        }
+    }
+
+    /// The sources of one CSP directive, or `"<absent>"`. Matching is on
+    /// the whole directive token (splitting on `;` and then on the first
+    /// space) rather than `contains`, so `script-src` assertions can't be
+    /// satisfied by `worker-src`'s or `style-src`'s source list.
+    fn csp_directive(policy: &str, directive: &str) -> String {
+        policy
+            .split(';')
+            .map(str::trim)
+            .find_map(|part| {
+                let (name, rest) = part.split_once(char::is_whitespace)?;
+                (name == directive).then(|| rest.trim().to_owned())
+            })
+            .unwrap_or_else(|| format!("<{directive} absent>"))
+    }
+
+    /// `app` with a `web_root` pointing at `root` (the static-file path
+    /// needs one; every other route is left at its default).
+    fn app_with_static_root(root: &std::path::Path) -> Router {
+        let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
+        let state = HttpState::new(
+            ws_accept_tx,
+            Readiness::new(),
+            PrometheusMetrics::new_unregistered(),
+        )
+        .with_web_root(root.to_path_buf());
+        app(state)
     }
 }
