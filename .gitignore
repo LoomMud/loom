@@ -22,3 +22,7 @@
 # results/*.json,*.md are committed by hand.
 /results/ci-smoke.*
 /results/ci-e1-1.*
+
+# Python bytecode from scripts/ that import each other (rule 9 reads the
+# classifier as a module). Never a source file, never worth a dirty tree.
+__pycache__/
