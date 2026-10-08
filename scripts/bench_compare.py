@@ -435,10 +435,6 @@ def self_test() -> int:
         d.mkdir()
         _write(d, rounds=2, base=b, head=h_slow, ctrl=ctrl_ok, meta="identical_binaries=false\n")
         report, got = evaluate(d, 0.15)
-        for token in ("head/base", "ctrl/head", "REGRESSION", "Per-round medians", "priv_control"):
-            if token not in report:
-                print(f"FAIL report missing {token!r}", file=sys.stderr)
-                failures += 1
         case_bad = 0
         for token in ("head/base", "ctrl/head", "REGRESSION", "Per-round medians", "priv_control"):
             if token not in report:
