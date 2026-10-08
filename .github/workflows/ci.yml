@@ -249,6 +249,14 @@ jobs:
           SQL
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: sqlx offline and live-DB builds are separate builds (OBI-328)
+        # Cargo's fingerprint used to ignore SQLX_OFFLINE, so a live-DB build of
+        # an unchanged loom-persist was answered from the cache: exit 0, and not
+        # one DESCRIBE reached Postgres. `crates/loom-persist/build.rs` pins the
+        # mode into the fingerprint; this proves it on a closed localhost port,
+        # so the step never dials a database that is not its own (OBI-150) and
+        # needs no Postgres service.
+        run: scripts/check-sqlx-cache-modes.sh
       # `--no-fail-fast`: cargo aborts the remaining test targets at the first
       # failing one, so one broken crate silently hides the verdict of every
       # crate after it -- OBI-317's first run died in a loom-cli test and never
