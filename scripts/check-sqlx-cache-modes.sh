@@ -81,12 +81,29 @@ note "probe ports: ${PORT_A}, ${PORT_B} (both closed)"
 
 # Run one `cargo check`, capturing output and exit status without letting
 # `set -e` end the script on the failure we are looking for.
+#
+# The assertions below match on cargo's own words ("Dirty loom-persist ...: the
+# env variable SQLX_OFFLINE changed"), and CI exports `CARGO_TERM_COLOR=always`:
+# colour splits those words with escape sequences (`^[[1m^[[92m Dirty^[[0m
+# loom-persist`), so a pattern that matches on a terminal does not match in the
+# `rust` job. Pin colour off, and strip anything left, so the gate runs the same
+# logic here and on a runner. Reproduced both ways: the old script fails with
+# `CARGO_TERM_COLOR=always` and passes without it.
+export CARGO_TERM_COLOR=never
+SCSI_SGR=$(printf '\033')
+
 check() {
     local -a cmd=("$@")
     set +e
-    CHECK_OUT=$("${cmd[@]}" 2>&1)
-    CHECK_STATUS=$?
+    CHECK_OUT=$("${cmd[@]}" 2>&1 | sed -e "s/${SCSI_SGR}\[[0-9;]*m//g")
+    CHECK_STATUS=${PIPESTATUS[0]}
     set -e
+}
+
+# What a failure actually needs: the lines about this package and the errors,
+# not twenty lines of "Fresh serde".
+excerpt() {
+    grep -E "${PACKAGE}|^error|^warning" <<<"$CHECK_OUT" | tail -15
 }
 
 # 1. The workspace default: offline, from `.sqlx/`, and successful.
@@ -94,7 +111,7 @@ note "1/4 checking ${PACKAGE} offline (the workspace default)"
 check env -u DATABASE_URL SQLX_OFFLINE=true cargo check -p "$PACKAGE"
 [ "$CHECK_STATUS" -eq 0 ] ||
     fail "the offline default build did not succeed; nothing else here is meaningful:
-$CHECK_OUT"
+$(grep -E "${PACKAGE}|^error|^warning" <<<"$CHECK_OUT" | tail -15)"
 
 # 2. The mode flip, on the same unchanged sources. This is the OBI-328 case.
 note "2/4 the same crate, live mode, closed port -- must recompile and must dial"
@@ -106,10 +123,10 @@ OBI-328 hazard is back. Check that crates/loom-persist/build.rs still emits
 cargo:rerun-if-env-changed=SQLX_OFFLINE."
 grep -Eq "(Compiling|Checking|Dirty) ${PACKAGE} " <<<"$CHECK_OUT" ||
     fail "${PACKAGE} was not recompiled on the SQLX_OFFLINE flip -- cargo reused the offline artifact:
-$(head -20 <<<"$CHECK_OUT")"
+$(excerpt)"
 grep -q "error communicating with database" <<<"$CHECK_OUT" ||
     fail "the live build recompiled but never tried to connect (expected 'error communicating with database'):
-$(head -20 <<<"$CHECK_OUT")"
+$(excerpt)"
 note "  -> $(grep -Em1 "(Dirty|Fresh) ${PACKAGE} " <<<"$CHECK_OUT" | sed 's/^ *//')"
 
 # 3. Only DATABASE_URL changes: still live, a different closed port. A live
@@ -124,10 +141,10 @@ grep -Eq "Dirty ${PACKAGE} .*the env variable DATABASE_URL changed" <<<"$CHECK_O
     fail "cargo did not report the crate as dirty when only DATABASE_URL changed (if this is a
 wording change in cargo rather than a real regression, the rest of this script still
 passing is the evidence -- update the pattern, do not delete the check):
-$(head -20 <<<"$CHECK_OUT")"
+$(excerpt)"
 grep -q "error communicating with database" <<<"$CHECK_OUT" ||
     fail "the second live build recompiled but never tried to connect:
-$(head -20 <<<"$CHECK_OUT")"
+$(excerpt)"
 
 # 4. Leave the workspace the way a normal `cargo build` would find it: an
 #    offline artifact, so nothing after this in CI inherits a half-built crate.
@@ -135,7 +152,7 @@ note "4/4 back to the offline default"
 check env -u DATABASE_URL SQLX_OFFLINE=true cargo check -p "$PACKAGE" -v
 [ "$CHECK_STATUS" -eq 0 ] ||
     fail "the offline build after the probe did not succeed:
-$CHECK_OUT"
+$(grep -E "${PACKAGE}|^error|^warning" <<<"$CHECK_OUT" | tail -15)"
 grep -Eq "Dirty ${PACKAGE} .*the env variable SQLX_OFFLINE changed" <<<"$CHECK_OUT" ||
     note "  (note: cargo rebuilt for a different reason here, which is fine -- a failed build is never cached)"
 
