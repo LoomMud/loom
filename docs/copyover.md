@@ -80,3 +80,35 @@ same shape of work a mudlib already has to do for the "planned reboot"
 path in design §9.9's table, so it is not new mudlib-side surface area,
 just the same `reconnect()` hook also covering copyover's abbreviated
 pause instead of only a full reboot.
+
+## In-flight player output: not carried either (OBI-304)
+
+`loom-net`'s `run_server_full` buffers output the world emitted for a
+session across its own reclaim/readopt boundary and replays it, in order,
+onto the re-adopted connection (`HandoffOutbox`). That exists so
+`loom serve`'s in-process reclaim/readopt rehearsal -- which cannot freeze
+the world -- stops silently dropping a player's `logon()` burst.
+
+**Decision:** that buffering is same-process only, and is *not* the
+copyover's output story. Parked output is deliberately not serialised into
+the handoff manifest: a second source of truth for world output would
+compete with the snapshot, and the manifest's trust boundary stays "fds
+plus the snapshot pointer" (§7.5 step 2/3). Consequences for the real
+hand-off:
+
+1. The driver must stop world output -- `World::tick` *and* input handling
+   -- before the **first** reclaim. Anything the world emits after that is
+   a driver bug, not state the hand-off owes anyone.
+2. Whatever the old process still had parked when it exited is lost with
+   it. `run_server_full` makes that loud, not silent: a `warn!` plus
+   `loom_net_handoff_outbox_dropped_total` at shutdown, and the same
+   counter on the per-session overflow path (`output_queue_depth`).
+3. Re-join state the parked queue would otherwise have carried --
+   `SetEcho`, `SendGmcp`, `Close` -- is the world's job via `reconnect()`
+   (§7.5, OBI-221) and the snapshot, not this queue's. A replayed
+   `SendGmcp` in particular usually doesn't reach the player anyway: the
+   new connection has not renegotiated GMCP yet.
+
+This is the same reasoning as the scheduler decision above: the snapshot
+carries the object graph, `reconnect()` re-establishes everything that has
+to be re-established, and the hand-off carries fds -- nothing more.

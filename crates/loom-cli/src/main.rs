@@ -44,6 +44,18 @@ const AUDIT_QUEUE_DEPTH: usize = 64;
 /// never needs to carry more than one request at a time in practice --
 /// sized the same as `AUDIT_QUEUE_DEPTH` for a comfortable margin rather
 /// than tuning it tightly against a workload that doesn't exist yet.
+///
+/// **Updated (OBI-304):** for this in-process rehearsal, "quiesce/drain
+/// first" is a *world-state* requirement rather than an output one:
+/// `loom-net`'s `run_server_full` flushes already-queued commands before it
+/// lets a reclaim remove a session's entry, and buffers anything emitted in
+/// the window between reclaim and readopt for replay on adoption, so a round
+/// trip like the one below -- which does not (and cannot) freeze the world
+/// -- no longer costs a player their `logon()` output. That guarantee is
+/// same-process only. A *real* copyover still needs the full quiesce: parked
+/// output does not cross the process boundary, so world output (tick and
+/// input) must be stopped before the first reclaim or whatever the world
+/// emitted after it dies with the old process.
 const RECLAIM_QUEUE_DEPTH: usize = 64;
 
 /// World tick granularity (spec r5 N2): `World::tick` (heartbeats,
@@ -1025,6 +1037,16 @@ const RECLAIM_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// disconnected on its own in the gap between the snapshot and this
 /// call is not an error, just one fewer to carry forward, exactly as a
 /// real copyover would also need to tolerate).
+///
+/// **OBI-304:** this pass runs while the world keeps ticking, so output
+/// for a session is emitted right across its reclaim/readopt boundary.
+/// That is `loom-net`'s problem to solve, not this loop's: the reclaim
+/// arm drains already-queued commands first and the readopt replays
+/// anything parked during the window, so a rehearsal like this one cannot
+/// silently drop a player's intro. Same-process only -- a real hand-off
+/// must stop world output before the first reclaim, because parked output
+/// does not cross the process boundary. `NetEvent`/`NetCommand` ordering
+/// promises and bounds live in `loom_net::ReclaimRequest`'s docs.
 ///
 /// **A reclaim reply that arrives *after* the timeout is still re-
 /// adopted, never dropped (CTO review, OBI-266/B3):** dropping a
