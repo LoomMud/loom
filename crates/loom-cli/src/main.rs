@@ -789,7 +789,16 @@ fn valid_compile(path: string, ob: object) -> bool {
         std::fs::write(&prog, "var x: int = 1\n").unwrap();
         let world = World::boot(&root).expect("boot");
         let (command_tx, _command_rx) = mpsc::channel(8);
-        (world, NetHost { command_tx })
+        (
+            world,
+            NetHost {
+                command_tx,
+                // Deterministic threshold in tests: never read the
+                // environment, so a stray `LOOM_WORLD_STALL_MS` can't
+                // change what a test observes.
+                cmd_probe: loom_obs::NetCommandProbe::new(Duration::from_millis(50)),
+            },
+        )
     }
 
     /// Sends a `Compile` request on its own thread (mirroring how an
@@ -3046,7 +3055,10 @@ fn spawn_world_thread(
             world.set_roles_backend(Box::new(ChannelRolesMutations {
                 request_tx: db_req_tx,
             }));
-            let mut host = NetHost { command_tx };
+            let mut host = NetHost {
+                command_tx,
+                cmd_probe: loom_obs::NetCommandProbe::from_env(),
+            };
             let mut audit_cursor: u64 = 0;
             // OBI-180 M-FS-5 (CTO review of PR #119, must-fix 2): per-uid
             // compile queue state -- see `CompileSlot`'s doc comment.
@@ -3220,13 +3232,65 @@ fn spawn_world_thread(
                 }
             };
 
+            // OBI-344: attribution for the E1.1 p99 tail. Every iteration
+            // of this loop is timed, so a report can say whether a slow
+            // command was in flight while the world thread itself was busy
+            // for longer than the stall budget -- and if so, under which
+            // event kind and which tick. Threshold: `LOOM_WORLD_STALL_MS`,
+            // default 50 ms, so the same number the SLA is written against.
+            let mut world_probe = loom_obs::WorldLoopProbe::from_env();
+            // OBI-344: with `LOOM_SERVE_ERROR_LOG=1`, name each runtime-error
+            // group the moment it is first seen. `loom_runtime_errors_total`
+            // carries only a `program` label, and the label set is fixed by
+            // loom-gitops alerting, so this log is how an operator (and CI)
+            // gets the function, line and message.
+            let error_log_enabled = std::env::var("LOOM_SERVE_ERROR_LOG")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let mut seen_errors: std::collections::HashSet<(String, String, u32, u64)> =
+                std::collections::HashSet::new();
+
             while let Some(event) = event_rx.blocking_recv() {
+                let iter_started = std::time::Instant::now();
+                let iter_kind = match &event {
+                    NetEvent::Tick => loom_obs::WorldEventKind::Tick,
+                    NetEvent::Line(..) => loom_obs::WorldEventKind::Input,
+                    NetEvent::Connected(..) => loom_obs::WorldEventKind::Connect,
+                    NetEvent::Disconnected(..) => loom_obs::WorldEventKind::Disconnect,
+                    NetEvent::WindowSize(..) | NetEvent::TerminalType(..) | NetEvent::Gmcp(..) => {
+                        loom_obs::WorldEventKind::Negotiation
+                    }
+                };
                 match event {
                     NetEvent::Connected(conn) => world.connect(conn, &mut host),
                     NetEvent::Line(conn, line) => world.input(conn, &line, &mut host),
                     NetEvent::Disconnected(conn) => world.disconnect(conn, &mut host),
                     NetEvent::Tick => {
                         world.tick(&mut host);
+                        if error_log_enabled {
+                            // Once per tick (100 ms), never in a handler: this
+                            // is a poll of the inbox the VM already maintains,
+                            // and its cost is one grouped snapshot per tick.
+                            for err in world.errors_snapshot(None) {
+                                let key = (
+                                    err.program.clone(),
+                                    err.function.clone(),
+                                    err.line,
+                                    err.count,
+                                );
+                                if seen_errors.insert(key) {
+                                    tracing::warn!(
+                                        program = %err.program,
+                                        function = %err.function,
+                                        line = err.line,
+                                        count = err.count,
+                                        first_seen_unix_ms = err.first_seen_unix_ms,
+                                        message = %err.message,
+                                        "runtime error recorded (OBI-344)"
+                                    );
+                                }
+                            }
+                        }
                         // Cleared only after `World::tick` returns: the
                         // timer must not queue up a second `Tick` while
                         // this one is still (synchronously) running, so
@@ -3402,6 +3466,13 @@ fn spawn_world_thread(
                         };
                     req.respond(result);
                 }
+
+                world_probe.record_iteration(
+                    iter_kind,
+                    iter_started,
+                    std::time::Instant::now(),
+                    loom_obs::world::unix_ms(),
+                );
             }
         })
         .map_err(|err| format!("failed to spawn world thread: {err}"))?;
@@ -3443,25 +3514,44 @@ fn broadcast_to_interactive_sessions(world: &World, host: &mut dyn Host, text: &
     count
 }
 
+/// The world thread's handle to the net task.
+///
+/// Every method here runs on the world thread and `blocking_send`s: a full
+/// command channel parks the world, which is a stall that shows up in every
+/// player's latency, not just the slow client's. `cmd_probe` times each send
+/// and publishes `loom_net_command_blocked_*` so OBI-344's report can tell
+/// "the world thread was slow" apart from "the net task wasn't draining".
 struct NetHost {
     command_tx: mpsc::Sender<NetCommand>,
+    cmd_probe: loom_obs::NetCommandProbe,
+}
+
+impl NetHost {
+    /// One instrumented `blocking_send`: the wait is the world thread's,
+    /// so it is measured on this side.
+    fn send_command(&mut self, cmd: NetCommand) {
+        let started = std::time::Instant::now();
+        let _ = self.command_tx.blocking_send(cmd);
+        let waited = started.elapsed();
+        self.cmd_probe.record_send(
+            waited,
+            std::time::Instant::now(),
+            loom_obs::world::unix_ms(),
+        );
+    }
 }
 
 impl Host for NetHost {
     fn send(&mut self, conn: u64, text: &str) {
-        let _ = self
-            .command_tx
-            .blocking_send(NetCommand::Send(conn, text.to_string()));
+        self.send_command(NetCommand::Send(conn, text.to_string()));
     }
 
     fn close(&mut self, conn: u64) {
-        let _ = self.command_tx.blocking_send(NetCommand::Close(conn));
+        self.send_command(NetCommand::Close(conn));
     }
 
     fn set_echo(&mut self, conn: u64, enabled: bool) {
-        let _ = self
-            .command_tx
-            .blocking_send(NetCommand::SetEcho(conn, enabled));
+        self.send_command(NetCommand::SetEcho(conn, enabled));
     }
 }
 
