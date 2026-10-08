@@ -37,9 +37,11 @@
 # detector -- if this file is stale relative to warp, the nightly says so on a
 # date, and a release SHA can get a measured number on demand.
 #
-# How to bump it. Put the full SHA of the warp commit you want measured on the
-# last non-comment line, exactly as `git rev-parse` prints it (the job compares
-# against that). Bump it in its own PR, or a PR that clearly intends it: the run
+# How to bump it. Replace the one payload line with the full SHA of the warp
+# commit you want measured, exactly as `git rev-parse` prints it (the job
+# compares against that). Two payload lines are not "the later one wins": the
+# step that reads this file fails on a line count of anything but one, and rule 9
+# says so too. Bump it in its own PR, or a PR that clearly intends it: the run
 # that follows measures a different world than the reports in `results/`. Keep the
 # pinned commit reachable from warp's default branch, and name the warp PR it came
 # from in the commit message, so the archaeology is one hop rather than a search.
