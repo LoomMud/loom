@@ -31,6 +31,12 @@
 #     every report the job writes (`results/ci-e1-1.json`/`.md` and the uploaded
 #     artifact), so a number always names its mudlib.
 #
+# Who else moves under it. `ci.yml` also carries `on.schedule` and
+# `on.workflow_dispatch` (rule 10): neither carries a commit range, so both take
+# the lane and measure whatever `warp.ref` names that day. That is the drift
+# detector -- if this file is stale relative to warp, the nightly says so on a
+# date, and a release SHA can get a measured number on demand.
+#
 # How to bump it. Put the full SHA of the warp commit you want measured on the
 # last non-comment line, exactly as `git rev-parse` prints it (the job compares
 # against that). Bump it in its own PR, or a PR that clearly intends it: the run
