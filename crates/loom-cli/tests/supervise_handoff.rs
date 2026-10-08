@@ -981,6 +981,43 @@ fn bind_string(port: u16) -> String {
     format!("127.0.0.1:{port}")
 }
 
+/// How many ports [`hold_a_port`] will try before it gives up.
+const PORT_HOLD_ATTEMPTS: usize = 8;
+
+/// Reserve a port *and hold it*, for the tests that need a socket already
+/// sitting on the address the supervisor is about to be told to bind.
+///
+/// [`reserve_local_port`]'s probe bind and this bind are two separate binds, and
+/// the gap between them is a race the runner can win. The band is non-ephemeral
+/// by sysctl, but every outbound `TcpStream::connect` in the job -- including the
+/// other tests' telnet reconnects -- takes a source port, and a host whose
+/// `ip_local_port_range` has been lowered sits on top of exactly this band; the
+/// kernel then holds those source ports in `TIME_WAIT` for a minute. The CI
+/// signature is this test's own `could not occupy 127.0.0.1:20631 for the test:
+/// Address already in use` panic, which says nothing about the supervisor and
+/// everything about port scarcity on the runner.
+///
+/// Retrying on a fresh reservation is the honest fix: the test needs *a* port it
+/// can hold, never *that* one, and the supervisor is told to bind whichever port
+/// came out of the hold.
+fn hold_a_port(what: &str) -> (String, std::net::TcpListener) {
+    let mut last = None;
+    for _ in 0..PORT_HOLD_ATTEMPTS {
+        let bind = bind_string(reserve_local_port());
+        match std::net::TcpListener::bind(&bind) {
+            Ok(listener) => return (bind, listener),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                last = Some(format!("{bind}: {err}"));
+            }
+            Err(err) => panic!("could not occupy {bind} for {what}: {err}"),
+        }
+    }
+    panic!(
+        "could not hold any port for {what} in {PORT_HOLD_ATTEMPTS} tries; last: {}",
+        last.unwrap_or_default()
+    );
+}
+
 /// How many bytes `loom serve` writes before a client has said anything:
 /// the telnet option-negotiation preamble (OBI-26: `DO NAWS`, `DO TTYPE`,
 /// `WILL GMCP`, `WILL MSSP` -- 12 bytes). Receiving it is the cheapest
@@ -1258,6 +1295,33 @@ fn reserved_test_ports_stay_in_the_non_ephemeral_band() {
     );
 }
 
+/// OBI-329 guard for the third port failure in this file: a test that needs to
+/// *hold* a port panics with `Address already in use` when the kernel took the
+/// reserved port as an outbound connection's source address between
+/// [`reserve_local_port`]'s probe bind and the test's own bind (CI: `could not
+/// occupy 127.0.0.1:20631 for the test`). [`hold_a_port`] retries on a fresh
+/// reservation instead, and this pins the property the retry exists to provide:
+/// two concurrent holds never share a port, so a test can never squatter over
+/// another test's held port.
+#[test]
+fn a_held_port_stays_held_and_two_holds_never_share_one() {
+    let (first, _held_a) = hold_a_port("guard hold A");
+    let (second, _held_b) = hold_a_port("guard hold B");
+    assert_ne!(
+        first, second,
+        "two holds were handed the same port while both were still bound"
+    );
+    // Releasing a hold must make the port reservable again rather than leaving
+    // a listener behind: drop both, then take a third.
+    drop(_held_a);
+    drop(_held_b);
+    let (third, _held_c) = hold_a_port("guard hold C");
+    assert!(
+        third.starts_with("127.0.0.1:"),
+        "a hold after two releases did not produce a loopback address: {third}"
+    );
+}
+
 /// OBI-292 regression guard for the *attribution* half of the
 /// `ECONNRESET` failure: a supervisor that cannot bind its telnet port
 /// exits for a startup-only reason, and the one line that names the cause
@@ -1275,12 +1339,9 @@ fn reserved_test_ports_stay_in_the_non_ephemeral_band() {
 #[test]
 fn a_supervisor_blocked_from_its_bind_reports_its_own_reason() {
     let mudlib = fixture("tworoom");
-    let telnet_bind = bind_string(reserve_local_port());
-    let http_bind = bind_string(reserve_local_port());
-
     // Occupy the telnet port the supervisor is about to be told to bind.
-    let squatter = std::net::TcpListener::bind(&telnet_bind)
-        .unwrap_or_else(|err| panic!("could not occupy {telnet_bind} for the test: {err}"));
+    let (telnet_bind, squatter) = hold_a_port("the blocked-bind squatter");
+    let http_bind = bind_string(reserve_local_port());
 
     let (mut supervisor, _lines) = Supervisor::start(&mudlib, &telnet_bind, &http_bind, None);
 
@@ -1399,8 +1460,7 @@ fn booting_with_a_matching_desired_version_triggers_no_copyover() {
 /// only does substring matching.
 #[test]
 fn transcript_reads_survive_binary_telnet_noise_between_lines() {
-    let listener = std::net::TcpListener::bind(bind_string(reserve_local_port()))
-        .expect("loopback listener for the transcript test");
+    let (_bind, listener) = hold_a_port("the transcript listener");
     let addr = listener.local_addr().expect("listener address");
     // The client end of a `BufReader<TcpStream>` the server writes to.
     let stream = TcpStream::connect(addr).unwrap_or_else(|err| panic!("connect to {addr}: {err}"));
