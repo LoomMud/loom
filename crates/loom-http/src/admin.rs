@@ -672,12 +672,20 @@ mod tests {
     /// apart from "never got that far".
     struct FakeWorldQuery {
         broadcasts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// When set, [`FakeWorldQuery::broadcast`] answers with this error
+        /// instead of the fixed `Ok(2)` -- OBI-233 (CTO review, third pass,
+        /// optional item 1): the delivery-failure audit path (`outcome=\`
+        /// unknown`/`not_delivered`) is only reachable through a world side
+        /// that actually fails.
+        broadcast_error:
+            Option<std::sync::Arc<dyn Fn() -> crate::admin_query::WorldQueryError + Send + Sync>>,
     }
 
     impl Default for FakeWorldQuery {
         fn default() -> Self {
             FakeWorldQuery {
                 broadcasts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                broadcast_error: None,
             }
         }
     }
@@ -778,14 +786,19 @@ mod tests {
         /// Captures the exact text [`crate::auth::AuthService::
         /// admin_broadcast`] handed it (already sanitized and prefixed)
         /// so tests can assert on it, and returns a fixed fake recipient
-        /// count (`2`) -- standing in for "the world thread fanned it
-        /// out to every interactive session".
+        /// count (`2`) -- standing in for "the world thread fanned it out
+        /// to every interactive session". When `broadcast_error` is set it
+        /// still captures the text (the world side *did* receive the
+        /// request), but answers with that error.
         async fn broadcast(
             &self,
             text: &str,
         ) -> Result<usize, crate::admin_query::WorldQueryError> {
             self.broadcasts.lock().unwrap().push(text.to_string());
-            Ok(2)
+            match &self.broadcast_error {
+                Some(make_err) => Err(make_err()),
+                None => Ok(2),
+            }
         }
     }
 
@@ -809,15 +822,36 @@ mod tests {
         (app(state), auth, dir)
     }
 
-    /// Same as [`test_app`], but also returns a handle onto the exact
-    /// strings [`FakeWorldQuery::broadcast`] was called with -- the
-    /// broadcast route's delivery side, which `test_app`'s shared
+    /// Same as [`test_app`], but also returns the [`Dir`] (so tests can
+    /// read the `admin.broadcast` audit rows, M-ADM-4) and a handle onto
+    /// the exact strings [`FakeWorldQuery::broadcast`] was called with --
+    /// the broadcast route's delivery side, which `test_app`'s shared
     /// `FakeWorldQuery` already answers (so the `200`/`recipients` wire
     /// shape is identical), but these tests also need to inspect what
     /// was actually "delivered".
     fn test_app_with_broadcast_capture() -> (
         axum::Router,
         AuthService,
+        Dir,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        test_app_with_broadcast_failing(None)
+    }
+
+    /// [`test_app_with_broadcast_capture`], but with the world side's
+    /// `broadcast` answering `Err(make_err())` instead of `Ok(2)` -- the
+    /// delivery-failure path (CTO review, OBI-233 third pass, optional
+    /// item 1: a request that was already queued to a world thread that
+    /// then went silent must be audited as an *unknown* outcome, not as a
+    /// clean "did not deliver").
+    fn test_app_with_broadcast_failing(
+        make_err: Option<
+            std::sync::Arc<dyn Fn() -> crate::admin_query::WorldQueryError + Send + Sync>,
+        >,
+    ) -> (
+        axum::Router,
+        AuthService,
+        Dir,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
         let keys = JwtKeys::single(
@@ -826,9 +860,13 @@ mod tests {
             "https://build.loommud.com/",
             jwt::AUDIENCE,
         );
-        let auth = AuthService::new(std::sync::Arc::new(Dir::default()), keys);
+        let dir = Dir::default();
+        let auth = AuthService::new(std::sync::Arc::new(dir.clone()), keys);
         let (ws_accept_tx, _ws_accept_rx) = tokio::sync::mpsc::channel(1);
-        let query = FakeWorldQuery::default();
+        let query = FakeWorldQuery {
+            broadcasts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            broadcast_error: make_err,
+        };
         let broadcasts = query.broadcasts.clone();
         let state = HttpState::new(
             ws_accept_tx,
@@ -837,7 +875,7 @@ mod tests {
         )
         .with_auth(auth.clone())
         .with_world_query(std::sync::Arc::new(query));
-        (app(state), auth, broadcasts)
+        (app(state), auth, dir, broadcasts)
     }
 
     /// Same as [`test_app`], but with [`HttpState::with_world_query`]
@@ -1410,11 +1448,79 @@ mod tests {
         )
     }
 
+    /// The `sub` the broadcast tests below mint their token for, and the
+    /// actor `broadcast_audit` asserts the row carries (M-ADM-1: always the
+    /// token's `sub`, never anything the body could say).
+    const BROADCAST_ACTOR: &str = "root";
+
+    /// M-ADM-4: the single `admin.broadcast` audit row an attempt must have
+    /// produced, as `(verdict, detail)`. Asserts *exactly one* row -- not
+    /// `any(...)` -- so an outcome that audits twice, or not at all, fails
+    /// the test rather than passing on a stray sibling row.
+    fn broadcast_audit(dir: &Dir) -> (String, String) {
+        let rows: Vec<crate::auth::AuditEvent> = {
+            let audits = dir.audits.lock().unwrap();
+            audits
+                .iter()
+                .filter(|e| e.kind == "admin.broadcast")
+                .cloned()
+                .collect()
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected exactly one `admin.broadcast` audit row, got {}",
+            rows.len()
+        );
+        let row = &rows[0];
+        assert_eq!(
+            row.uid.as_deref(),
+            Some(BROADCAST_ACTOR),
+            "M-ADM-4: the audited actor is the token's `sub`"
+        );
+        assert!(
+            row.ip.is_some(),
+            "M-ADM-4: the audit row carries the request's IP"
+        );
+        (
+            row.verdict.to_string(),
+            row.detail.clone().unwrap_or_default(),
+        )
+    }
+
+    /// The `reason=<token>` inside a deny `detail`, or `""` when the row
+    /// carries none (the `allow` row has no reason to give).
+    fn audit_reason(detail: &str) -> String {
+        detail
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("reason="))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The `text=<delivered>` part of an `admin.broadcast` `detail` --
+    /// everything after the first ` text=` token, so M-IDE-2 can be checked
+    /// against exactly what went to sessions.
+    fn audit_delivered_text(detail: &str) -> String {
+        detail
+            .split_once(" text=")
+            .map(|(_, rest)| rest.to_string())
+            .unwrap_or_default()
+    }
+
+    /// The audit shape every deny path shares: exactly one `admin.broadcast`
+    /// row, verdict `deny`, carrying `reason=<expected_reason>`.
+    fn assert_denied_audit(dir: &Dir, expected_reason: &str) {
+        let (verdict, detail) = broadcast_audit(dir);
+        assert_eq!(verdict, "deny", "detail was {detail:?}");
+        assert_eq!(audit_reason(&detail), expected_reason);
+    }
+
     #[tokio::test]
     async fn broadcast_is_503_when_world_query_is_not_wired() {
         let (app, auth) = test_app_without_world_query();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let token = access_token(&auth, "root", 5, Some(now)).await;
+        let token = access_token(&auth, BROADCAST_ACTOR, 5, Some(now)).await;
         let response = app
             .oneshot(broadcast_request(&token, "server restart in 5m"))
             .await
@@ -1424,7 +1530,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_without_bearer_is_401() {
-        let (app, _auth, _broadcasts) = test_app_with_broadcast_capture();
+        let (app, _auth, _dir, _broadcasts) = test_app_with_broadcast_capture();
         let request = with_peer(
             Request::builder()
                 .method("POST")
@@ -1439,37 +1545,69 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// M-ADM-2 + M-ADM-4: a T3 caller (enough for a role change, not for
+    /// broadcast) is refused *and* the refusal is on the audit trail with
+    /// `reason=forbidden` -- nothing reaches the world side at all.
     #[tokio::test]
-    async fn broadcast_below_tier_4_is_forbidden() {
-        let (app, auth, _broadcasts) = test_app_with_broadcast_capture();
+    async fn broadcast_below_tier_4_is_forbidden_and_audited() {
+        let (app, auth, dir, broadcasts) = test_app_with_broadcast_capture();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        // Tier 3 is enough for a role change (`admin_set_tier`'s floor),
-        // but not for broadcast.
         let token = access_token(&auth, "lead", 3, Some(now)).await;
         let response = app
             .oneshot(broadcast_request(&token, "server restart"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        {
+            // The actor here is `lead`, not `BROADCAST_ACTOR`, so check the
+            // row directly instead of through `broadcast_audit`.
+            let audits = dir.audits.lock().unwrap();
+            let rows: Vec<&crate::auth::AuditEvent> = audits
+                .iter()
+                .filter(|e| e.kind == "admin.broadcast")
+                .collect();
+            assert_eq!(rows.len(), 1, "expected exactly one audit row");
+            assert_eq!(rows[0].verdict, "deny");
+            assert_eq!(rows[0].uid.as_deref(), Some("lead"));
+            assert!(rows[0].ip.is_some());
+            assert_eq!(
+                audit_reason(rows[0].detail.as_deref().unwrap_or("")),
+                "forbidden"
+            );
+        }
+        assert!(
+            broadcasts.lock().unwrap().is_empty(),
+            "a forbidden broadcast must never reach the world side"
+        );
     }
 
+    /// M-ADM-2 + M-ADM-4: high enough tier but no fresh `mfa_at` is refused
+    /// with `reason=step_up_required`, audited, and never delivered.
     #[tokio::test]
-    async fn broadcast_at_tier_4_without_step_up_is_forbidden() {
-        let (app, auth, _broadcasts) = test_app_with_broadcast_capture();
+    async fn broadcast_at_tier_4_without_step_up_is_forbidden_and_audited() {
+        let (app, auth, dir, broadcasts) = test_app_with_broadcast_capture();
         // `mfa_at: None` -- never stepped up.
-        let token = access_token(&auth, "root", 4, None).await;
+        let token = access_token(&auth, BROADCAST_ACTOR, 4, None).await;
         let response = app
             .oneshot(broadcast_request(&token, "server restart"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_denied_audit(&dir, "step_up_required");
+        assert!(
+            broadcasts.lock().unwrap().is_empty(),
+            "a step-up refusal must never reach the world side"
+        );
     }
 
+    /// M-ADM-5 + M-ADM-4: an over-1 KiB body is rejected (not truncated),
+    /// audited as `reason=body_too_large`, and never delivered.
     #[tokio::test]
-    async fn broadcast_with_a_body_over_1kib_is_rejected() {
-        let (app, auth, _broadcasts) = test_app_with_broadcast_capture();
+    async fn broadcast_with_a_body_over_1kib_is_rejected_and_audited() {
+        let (app, auth, dir, broadcasts) = test_app_with_broadcast_capture();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let token = access_token(&auth, "root", 5, Some(now)).await;
+        let token = access_token(&auth, BROADCAST_ACTOR, 5, Some(now)).await;
         let oversized = "a".repeat(1025);
         let response = app
             .oneshot(broadcast_request(&token, &oversized))
@@ -1481,36 +1619,53 @@ mod tests {
             "expected 413 or 400, got {}",
             response.status()
         );
+        let (verdict, detail) = broadcast_audit(&dir);
+        assert_eq!(verdict, "deny");
+        assert_eq!(audit_reason(&detail), "body_too_large");
+        assert!(
+            detail.contains("bytes=1025"),
+            "the row should say how big the body was: {detail:?}"
+        );
+        assert!(
+            !detail.contains("text="),
+            "an oversized body must not be recorded verbatim: {detail:?}"
+        );
+        assert!(
+            broadcasts.lock().unwrap().is_empty(),
+            "an oversized body must never reach the world side, even truncated"
+        );
     }
 
+    /// A body that sanitizes down to nothing is a 400 with
+    /// `reason=empty_after_sanitizing`, audited, and never delivered as a
+    /// blank line (CTO review, first pass, non-blocking 3).
     #[tokio::test]
-    async fn broadcast_that_sanitizes_to_nothing_is_400() {
-        let (app, auth, _broadcasts) = test_app_with_broadcast_capture();
+    async fn broadcast_that_sanitizes_to_nothing_is_400_and_audited() {
+        let (app, auth, dir, broadcasts) = test_app_with_broadcast_capture();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let token = access_token(&auth, "root", 5, Some(now)).await;
-        // Entirely C0 control characters: sanitizes down to the empty
-        // string.
+        let token = access_token(&auth, BROADCAST_ACTOR, 5, Some(now)).await;
+        // Entirely control characters: sanitizes down to the empty string.
         let response = app
             .oneshot(broadcast_request(&token, "\x07\x1b\x01"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_denied_audit(&dir, "empty_after_sanitizing");
+        assert!(
+            broadcasts.lock().unwrap().is_empty(),
+            "a blank broadcast must never reach the world side"
+        );
     }
 
-    /// Integration/smoke: a successful broadcast reaches the normal
-    /// mudlib output path -- `crate::admin_query::WorldAdminQuery::
-    /// broadcast` -- with the sanitized text, a driver-fixed
-    /// `[Broadcast] ` prefix on every line (CTO review, OBI-233), and
-    /// exactly one trailing `\n` (CTO review, first pass, must-fix 1) --
-    /// and the response reports the fake recipient count
-    /// [`FakeWorldQuery::broadcast`] returns, not a bare `204` a caller
-    /// could mistake for "delivered" even if nothing were wired
-    /// (must-fix 2).
+    /// M-ADM-4 + M-IDE-2 + CTO review (first pass, must-fix 1): the `allow`
+    /// row records the *exact* string delivered to sessions -- sanitized,
+    /// `[Broadcast] `-prefixed, one trailing `\n` -- plus the real recipient
+    /// count, and never the raw input.
     #[tokio::test]
     async fn broadcast_succeeds_for_t4_with_step_up_and_reaches_world_query() {
-        let (app, auth, broadcasts) = test_app_with_broadcast_capture();
+        let (app, auth, dir, broadcasts) = test_app_with_broadcast_capture();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let token = access_token(&auth, "root", 4, Some(now)).await;
+        let token = access_token(&auth, BROADCAST_ACTOR, 4, Some(now)).await;
         let response = app
             .oneshot(broadcast_request(&token, "server restart in 5m\x07"))
             .await
@@ -1522,32 +1677,68 @@ mod tests {
 
         let delivered = broadcasts.lock().unwrap().clone();
         assert_eq!(delivered, vec!["[Broadcast] server restart in 5m\n"]);
+
+        let (verdict, detail) = broadcast_audit(&dir);
+        assert_eq!(verdict, "allow");
+        assert_eq!(audit_reason(&detail), "", "an allow row carries no reason");
+        assert!(
+            detail.contains("recipients=2"),
+            "the row records how many sessions got it: {detail:?}"
+        );
+        // M-IDE-2: audited text == delivered text, byte for byte, control
+        // character stripped -- one string, never two derivations.
+        assert_eq!(
+            audit_delivered_text(&detail),
+            delivered[0],
+            "the audited detail must be exactly what was delivered"
+        );
+        assert!(
+            !detail.contains('\u{7}'),
+            "raw control bytes must not be stored"
+        );
     }
 
-    /// A multi-line body gets the prefix on *every* line, and the
-    /// sanitizer strips bidi/zero-width characters (CTO review, second
-    /// pass) in addition to C0/C1 controls.
+    /// A multi-line body gets the prefix on *every* line (CTO review, second
+    /// pass), and the sanitizer strips bidi/zero-width characters, the
+    /// line/paragraph separators and `U+061C` (CTO review, third pass,
+    /// optional 2) in addition to C0/C1 controls.
     #[tokio::test]
     async fn broadcast_prefixes_every_line_and_strips_bidi_and_zero_width() {
-        let (app, auth, broadcasts) = test_app_with_broadcast_capture();
+        let (app, auth, dir, broadcasts) = test_app_with_broadcast_capture();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let token = access_token(&auth, "root", 4, Some(now)).await;
-        let text = "line one\u{202E}\nline\u{200B} two\u{FEFF}";
+        let token = access_token(&auth, BROADCAST_ACTOR, 4, Some(now)).await;
+        let text =
+            "line one\u{202E}\nline\u{200B} two\u{FEFF}\nthree\u{2028}\u{2029}\u{061C}four\u{2066}";
         let response = app.oneshot(broadcast_request(&token, text)).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
         let delivered = broadcasts.lock().unwrap().clone();
         assert_eq!(
             delivered,
-            vec!["[Broadcast] line one\n[Broadcast] line two\n"]
+            vec!["[Broadcast] line one\n[Broadcast] line two\n[Broadcast] threefour\n"]
         );
+
+        // Every line of a multi-line broadcast keeps its prefix, so nothing
+        // can be delivered as an unattributed continuation line.
+        let delivered_text = &delivered[0];
+        assert!(delivered_text.starts_with("[Broadcast] "));
+        for line in delivered_text.trim_end_matches('\n').split('\n') {
+            assert!(
+                line.starts_with("[Broadcast] "),
+                "line {line:?} lost its attribution"
+            );
+        }
+
+        let (verdict, detail) = broadcast_audit(&dir);
+        assert_eq!(verdict, "allow");
+        assert_eq!(audit_delivered_text(&detail), delivered_text.as_str());
     }
 
     #[tokio::test]
     async fn broadcast_with_an_unknown_field_is_400() {
-        let (app, auth, _broadcasts) = test_app_with_broadcast_capture();
+        let (app, auth, dir, _broadcasts) = test_app_with_broadcast_capture();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let token = access_token(&auth, "root", 5, Some(now)).await;
+        let token = access_token(&auth, BROADCAST_ACTOR, 5, Some(now)).await;
         let request = with_peer(
             Request::builder()
                 .method("POST")
@@ -1561,5 +1752,71 @@ mod tests {
         );
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Deliberate, and matching `admin_set_tier`: a body that never
+        // parsed is a 400 from the handler, before `AuthService` ever sees
+        // it, so there is no `admin.broadcast` row for it.
+        let audits = dir.audits.lock().unwrap();
+        assert!(
+            !audits.iter().any(|e| e.kind == "admin.broadcast"),
+            "a body that failed to parse must not produce an allow/deny row"
+        );
+    }
+
+    /// CTO review (OBI-233, first pass, must-fix 2) and (third pass,
+    /// optional 1): a delivery that the world side *refused outright*
+    /// (`Busy`: the request never left `loom-http`) is a `503`, audited as a
+    /// deny with `outcome=not_delivered` -- never a `204` an operator could
+    /// misread as "sent".
+    #[tokio::test]
+    async fn broadcast_reports_503_and_audits_not_delivered_when_the_world_is_busy() {
+        let (app, auth, dir, _broadcasts) =
+            test_app_with_broadcast_failing(Some(std::sync::Arc::new(|| {
+                crate::admin_query::WorldQueryError::Busy
+            })));
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, BROADCAST_ACTOR, 4, Some(now)).await;
+        let response = app
+            .oneshot(broadcast_request(&token, "server restart in 5m"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let (verdict, detail) = broadcast_audit(&dir);
+        assert_eq!(verdict, "deny");
+        assert_eq!(audit_reason(&detail), "Busy");
+        assert!(
+            detail.contains("outcome=not_delivered"),
+            "a `try_send` that failed never left the process: {detail:?}"
+        );
+    }
+
+    /// CTO review (OBI-233, third pass, optional 1): a `Timeout` means the
+    /// request *was* queued to the world thread and no reply came back, so
+    /// the broadcast may well have gone out. The audit row must say the
+    /// outcome is unknown, not imply it definitely wasn't delivered.
+    #[tokio::test]
+    async fn broadcast_audits_an_unknown_outcome_when_the_world_times_out() {
+        let (app, auth, dir, broadcasts) =
+            test_app_with_broadcast_failing(Some(std::sync::Arc::new(|| {
+                crate::admin_query::WorldQueryError::Timeout
+            })));
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(&auth, BROADCAST_ACTOR, 4, Some(now)).await;
+        let response = app
+            .oneshot(broadcast_request(&token, "server restart in 5m"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let (verdict, detail) = broadcast_audit(&dir);
+        assert_eq!(verdict, "deny");
+        assert_eq!(audit_reason(&detail), "Timeout");
+        assert!(
+            detail.contains("outcome=unknown"),
+            "a queued-but-unanswered request may have been delivered: {detail:?}"
+        );
+        // The request really did reach the channel, which is *why* the
+        // outcome is unknowable from here.
+        assert_eq!(broadcasts.lock().unwrap().len(), 1);
     }
 }

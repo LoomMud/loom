@@ -1538,7 +1538,11 @@ impl AuthService {
     /// (`crate::admin_query::WorldAdminQuery::broadcast`'s doc comment);
     /// this method never talks to `loom-net` directly. Every outcome --
     /// forbidden, step-up required, too large, empty, or allowed/denied
-    /// by the world side -- is audited.
+    /// by the world side -- is audited. A *denied* delivery row also
+    /// carries an `outcome=` saying whether delivery can be ruled out at
+    /// all (`Busy` never left this process, so `not_delivered`; a
+    /// `Timeout`/`Closed` was already queued to the world thread, so
+    /// `unknown` -- see `delivery_outcome_label`).
     pub async fn admin_broadcast(
         &self,
         claims: &AccessClaims,
@@ -1609,12 +1613,24 @@ impl AuthService {
                 Ok(count)
             }
             Err(err) => {
+                // CTO review (OBI-233, third pass, optional item 1): a
+                // `Timeout`/`Closed` here means the request was already
+                // handed to the world thread and we simply stopped hearing
+                // about it, so the broadcast *may* have gone out. Audit it
+                // as a deny (the operator got a 503), but say plainly that
+                // the delivery outcome is unknown instead of implying it
+                // definitely did not land -- an operator who retries after
+                // a blind failure can otherwise duplicate a message that
+                // was already delivered, with no record of the first one.
                 self.audit(
                     "admin.broadcast",
                     Some(claims.sub.clone()),
                     ctx,
                     "deny",
-                    Some(format!("reason={err:?} text={delivered}")),
+                    Some(format!(
+                        "reason={err:?} outcome={} text={delivered}",
+                        delivery_outcome_label(&err)
+                    )),
                 )
                 .await;
                 Err(err.into())
@@ -1724,6 +1740,17 @@ fn is_or_might_be_secure(path: &str) -> bool {
 /// space/non-joiner/joiner and the left-to-right/right-to-left marks
 /// (`U+200B..=U+200F`), and the BOM/zero-width no-break space
 /// (`U+FEFF`).
+///
+/// CTO review (OBI-233, third pass, optional item 2): also `U+2028` LINE
+/// SEPARATOR, `U+2029` PARAGRAPH SEPARATOR and `U+061C` ARABIC LETTER
+/// MARK. The first two are line breaks a JSON body can carry that some
+/// terminals/renderers honour, which would split a `[Broadcast] `-prefixed
+/// line into an unprefixed continuation and defeat the attribution -- they
+/// are stripped rather than mapped to `\n`, since a broadcast's only line
+/// terminator is `\n` (see [`prefix_broadcast_lines`]) and every other
+/// line-break lookalike (`\r`, `U+0085` NEL) is already stripped. `U+061C`
+/// is a bidi initiator in the same family as the `U+202A..=U+202E`
+/// controls above.
 fn sanitize_broadcast_text(input: &str) -> String {
     input
         .chars()
@@ -1736,10 +1763,38 @@ fn sanitize_broadcast_text(input: &str) -> String {
             let is_bidi_or_zero_width = (0x202A..=0x202E).contains(&code)
                 || (0x2066..=0x2069).contains(&code)
                 || (0x200B..=0x200F).contains(&code)
-                || code == 0xFEFF;
+                || code == 0xFEFF
+                || code == 0x2028
+                || code == 0x2029
+                || code == 0x061C;
             !(is_control || is_bidi_or_zero_width)
         })
         .collect()
+}
+
+/// Whether a failed delivery can be *ruled out*, for the `admin.broadcast`
+/// deny audit row's `outcome=` field (CTO review, OBI-233 third pass,
+/// optional item 1).
+///
+/// `"unknown"` for [`crate::admin_query::WorldQueryError::Timeout`] and
+/// [`crate::admin_query::WorldQueryError::Closed`]: both happen *after* the
+/// request was queued to (or picked up by) the world thread, so the text
+/// may well have reached sessions even though no reply came back.
+/// `"not_delivered"` for
+/// [`crate::admin_query::WorldQueryError::Busy`], a `try_send` that failed
+/// on a full queue -- the request never left `loom-http`, so nothing could
+/// have been sent. `NotFound`/`Internal` are never produced by the
+/// broadcast arm today; they are reported as `"unknown"` rather than
+/// guessed at.
+fn delivery_outcome_label(err: &crate::admin_query::WorldQueryError) -> &'static str {
+    use crate::admin_query::WorldQueryError;
+    match err {
+        WorldQueryError::Busy => "not_delivered",
+        WorldQueryError::Timeout
+        | WorldQueryError::Closed
+        | WorldQueryError::NotFound
+        | WorldQueryError::Internal(_) => "unknown",
+    }
 }
 
 /// CTO review (OBI-233, second pass): a driver-fixed [`BROADCAST_PREFIX`]
