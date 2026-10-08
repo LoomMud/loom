@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2026 Oberfield
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# Cargo configuration for the loom workspace (OBI-321).
+#
+# `loom-persist` uses sqlx's compile-time `query!` macros. Unless
+# `SQLX_OFFLINE` is set, those macros open a connection to whatever
+# `DATABASE_URL` says, at *build* time, to `DESCRIBE` the schema. On a
+# developer or agent shell `DATABASE_URL` is typically some unrelated live
+# database -- on a Paperclip agent shell it is Paperclip's own control-plane
+# Postgres (OBI-150) -- and the build then dies with errors that read like a
+# broken migration (`column "key" of relation "object_state" does not exist`,
+# `function roles_set_tier(...) does not exist`). That is the wrong nudge to
+# leave next to a live company database: the tempting "fix" is to run
+# migrations against it.
+#
+# So an offline build is the *default* here: the macros read the committed
+# `.sqlx/` cache at the workspace root and never connect. Nothing is invented
+# by this file -- CI (`SQLX_OFFLINE: "true"` in `.github/workflows/ci.yml`)
+# and the image build (`ENV SQLX_OFFLINE=true` in `Dockerfile`) already asked
+# for it; it only extends the same default to a plain `cargo build`,
+# `cargo check`, `cargo test` and to rust-analyzer.
+#
+# `force = false` keeps the live-DB path open: a value already in the
+# environment wins, so a refresh stays opt-in and explicit --
+#
+#     scripts/sqlx-prepare.sh            # disposable Postgres, then a rebuild
+#
+# Never run a refresh against a database you do not own.
+# `crates/loom-persist/tests/sqlx_offline_default.rs` guards this file.
+
+[env]
+SQLX_OFFLINE = { value = "true", force = false }
