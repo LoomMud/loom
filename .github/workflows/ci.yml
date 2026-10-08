@@ -103,7 +103,13 @@ jobs:
           SQL
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # `--no-fail-fast`: cargo aborts the remaining test targets at the first
+      # failing one, so one broken crate silently hides the verdict of every
+      # crate after it -- OBI-317's first run died in a loom-cli test and never
+      # reached loom-lsp, which made that change's CI result unobservable. The
+      # job still goes red on any failure; this only makes all of them visible
+      # in one run instead of one per iteration.
+      - run: cargo test --workspace --no-fail-fast
   bench:
     # VM benchmark regression gate (OBI-25 / OBI-118 / OBI-312): this PR's
     # base vs its working tree, same runner, >15% on any workload fails.
