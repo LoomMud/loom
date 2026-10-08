@@ -256,12 +256,20 @@ for (`tail_attribution.server_stall` against `kind="disconnect"` windows) instea
 a guess. It is intermittent: the two runs above with identical code recorded no
 stalls at all, and a local 20-player run never exceeded 12 ms per iteration.
 
-Deliberately not a gate: a non-zero runtime-error count raises a workflow
-*warning annotation* (`::warning title=OBI-344 runtime errors::`), it does not
-fail the job. The p99 verdict is the only pass/fail signal in E1.1, and adding
-a second failure mode to a required check would change the gate's meaning
-without changing what it measures. A warning is loud enough to keep the
-finding from being silently counted again.
+As shipped by OBI-344 this was *deliberately not a gate*: a non-zero
+runtime-error count raised a workflow warning annotation instead of failing
+the job, on the grounds that the p99 verdict is E1.1's only pass/fail signal
+and a second failure mode would change the gate's meaning without changing
+what it measures. OBI-324 reversed that call with the
+CTO: a warning is exactly what let 150 errors per run ride through every
+green E1.1 report for the life of the gate, so "loud enough" was measured
+against the outcome, not the intent -- and the outcome was that the finding
+*was* silently counted, every single run. The count now decides via
+`--fail-on-runtime-errors` (the verdict is still `loom-loadtest`'s exit
+status, captured before `status=$?`, so the rule-7 shape is untouched: one
+command still produces the whole verdict). The workflow's own final scrape
+stays as informational text -- a second opinion for attribution, never a
+second decider.
 
 Two consequences for reading the numbers from here on. First, E1.1 now costs
 the world thread real file writes on the save path, so its tail may differ
@@ -270,11 +278,50 @@ regression, and the attribution section is what distinguishes the two. Second,
 `loom_runtime_errors_total` disappearing from the final scrape is now the
 expected healthy shape -- its presence is the anomaly to read.
 
-The alternative fix -- have `loom-cli serve` `create_dir_all` the default save
-root at boot -- was not taken here: it would let a driver bug write into a
-mudlib tree silently, and it removes the very failure this run was counting.
-That is a design call for the CTO if we want it; the CI job no longer depends
-on the answer.
+The alternative fix this section declined -- have the driver create its own
+save root -- has since landed under OBI-324, and the
+objection here was the right one to answer rather than to act on: creating
+`<mudlib>/saves` at boot *would* have made a driver bug write silently into a
+Git-backed mudlib tree. The fix therefore does two things at once: it creates
+the save root (eagerly at `loom serve` boot, and lazily in `save_object`), and
+it moves where a relative `--mudlib warp` puts that root -- beside the mudlib,
+not inside it, which is what spec section 8.5 wanted all along. The silent
+mudlib write is gone, and so is the failure. The CI job's explicit
+`--save-dir "$RUNNER_TEMP/..."` stays: it is now belt-and-braces, and it keeps
+save files out of the repo regardless of what the driver defaults to.
+
+### The one number the gate was not reading (OBI-324)
+
+`loom_runtime_errors_total{program}` is that instrumentation, and it *was*
+rendering: every `loadtest-e1-1` report from the gate's first landing carried
+`loom_runtime_errors_total{program="/std/player"} 149`-`150` in the fenced
+`/metrics` block. The job scraped it, printed it, and passed anyway, because
+nothing parsed it -- a p99 of 3.44 ms and 150 uncaught Weft errors in the
+same run both read as "E1.1 PASS".
+
+An uncaught error there means a *throw*, not a slow command: it is
+`World::exec`'s tail recording an `Err` that escaped a top-level execution
+(autosave, a command, a scheduled call_out), labelled with the innermost
+frame's declaring program (M-ERR-1). So `loadtest-e1-1` now also runs with
+`--fail-on-runtime-errors`, and the report gets its own
+`## Runtime errors` section that distinguishes "none recorded (0)" from
+"not scraped (no `--metrics-url`)" from a per-program table.
+
+The bug the new gate was pointed at, and the reason it was in every run:
+`save_object` writes under `World::save_root`, and `fileio`'s confinement
+check canonicalizes that root -- `ENOENT` for a directory nobody created.
+Since that check runs before the `create_dir_all` that would have made it,
+the failure could never repair itself: every disconnect autosave threw,
+and **no character on the test server ever saved at all**. `loom serve`
+costumed as CI (`--mudlib warp`, a relative path, fresh checkout) reproduces
+it with one bot: `loom_runtime_errors_total{program="/std/player"} 1`, no
+`saves/` directory. The driver now creates its own save root (eagerly at
+`loom serve` boot so an unusable one fails loudly, and again lazily in
+`save_object` so a `World::boot` caller without that step still saves), the
+save path is covered by
+`loom-vm/tests/obi_171_persistence.rs:an_autosave_on_disconnect_into_a_never_created_save_root_errors_nothing`,
+and a relative `--mudlib warp` now puts saves *beside* the mudlib instead of
+inside it (spec §8.5).
 
 ## CI load lane (OBI-308)
 

@@ -22,3 +22,7 @@
 # results/*.json,*.md are committed by hand.
 /results/ci-smoke.*
 /results/ci-e1-1.*
+# OBI-324: `loom serve` creates its player save root beside the mudlib it
+# boots (`<cwd>/saves` for `--mudlib .`, and the same for a relative
+# `--mudlib warp`). It holds serialized player objects -- never commit it.
+/saves/

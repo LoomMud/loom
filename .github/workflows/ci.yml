@@ -625,6 +625,15 @@ jobs:
     # into the uploaded report. See results/README.md for what this job
     # does and does not prove (runner noise vs. the reference-host record).
     #
+    # OBI-324 adds the second half of the gate: `--fail-on-runtime-errors`.
+    # Latency alone was blind to a correctness failure -- every run from the
+    # OBI-177 gate's first landing onward carried ~150 uncaught
+    # `/std/player` errors in `loom_runtime_errors_total` while still
+    # reporting "E1.1 PASS". The counter has been scraped into the report
+    # since then; nothing read it. The fleet-wide e2e lane already asserts
+    # the same counter is 0, so this brings the load gate up to the standard
+    # the other lane has been holding.
+    #
     # Load-lane holder (OBI-308): the p99 number is meaningless if anything
     # else is on the host, so this job takes the `loom-ci-load-lane` group
     # alone-across-runs (queueing, never cancelling). It carries exactly one
@@ -785,7 +794,8 @@ jobs:
             --metrics-scrape-ms 1000 \
             --timeline-bucket-ms 5000 \
             --out results/ci-e1-1 \
-            --fail-on-sla-miss
+            --fail-on-sla-miss \
+            --fail-on-runtime-errors
           status=$?
           # OBI-344 follow-up (main run 37862921160 on eaf9ceb): everything
           # below this line collects evidence; none of it decides the verdict,
@@ -828,20 +838,28 @@ jobs:
           # runtime error from being silently counted and forgotten. Neither
           # check gates the SLA -- the p99 verdict below is the only thing
           # that decides pass/fail -- they surface as warnings annotations.
+          #
+          # OBI-324: the runtime-error count stopped being a warning because
+          # a warning is not a gate: every run from the OBI-177 gate's first
+          # landing printed one and still reported PASS. `--fail-on-runtime-errors`
+          # above now decides, so what is left here is the *second* opinion --
+          # the server's own final scrape, kept as informational text for
+          # attribution (it is scraped after the harness wrote its report, so
+          # it can legitimately differ from the harness's number).
           saved=$(find "$SAVES" -type f -name '*.o' 2>/dev/null | wc -l)
           echo "save_path: objects_saved=$saved players=150 save_dir=$SAVES"
           if [ -s /tmp/loom-metrics-final.txt ]; then
             if grep -q "^loom_runtime_errors_total" /tmp/loom-metrics-final.txt; then
               runtime_errors=$(awk '/^loom_runtime_errors_total/ {s+=$2} END {printf "%d", s+0}' /tmp/loom-metrics-final.txt)
-              echo "runtime_errors_total=$runtime_errors"
+              echo "runtime_errors_total=$runtime_errors (informational; --fail-on-runtime-errors decided)"
               if [ "$runtime_errors" != "0" ]; then
-                echo "::warning title=OBI-344 runtime errors::E1.1 recorded $runtime_errors mudlib runtime error(s); see results/loom-serve.log (does not affect the p99 verdict)"
+                echo "note: the server's final scrape counts $runtime_errors mudlib runtime error(s); the per-program breakdown is in the loadtest report, the detail in the serve log above"
               fi
             else
               echo "runtime_errors_total=0 (no loom_runtime_errors_total series in the scrape; that family is created on the first error)"
             fi
           else
-            echo "::warning title=OBI-344 runtime errors unmeasured::the server did not expose /metrics at the end of the run, so the runtime-error count is unknown"
+            echo "note: the server did not expose /metrics at the end of the run, so this scrape cannot cross-check the harness's runtime-error count"
           fi
           if [ "$saved" -eq 0 ]; then
             echo "::warning title=OBI-344 save path not exercised::no save objects were written to $SAVES; E1.1 is not measuring character persistence"
