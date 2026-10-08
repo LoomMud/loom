@@ -49,7 +49,9 @@ permissions:
 # run 37725992152's `loadtest-e1-1`, queued in the lane since 04:07:50Z and never
 # started, ended `cancelled` one second after its successor run was created),
 # which is why scripts/check-ci-load-lane.py pins both the group and this
-# expression rather than trusting a comment above them.
+# expression rather than trusting a comment above them. Observed twice: run
+# 37726332056's `loadtest-e1-1` (queued since 04:12:39Z, never started) went
+# `cancelled` at 04:16:18Z, one second after run 37726682123 was created.
 #
 # COVERAGE (OBI-322): this cancels a run only if that run joined *this* group,
 # and `concurrency` is read per run from the workflow file at *its* commit. A

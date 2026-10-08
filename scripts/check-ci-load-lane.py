@@ -36,7 +36,8 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      into jobs whose own `cancel-in-progress: false` forbids being cancelled --
      observed on 2026-10-08: run 37725992152's `loadtest-e1-1`, queued in the
      lane since 04:07:50Z and never started, ended `cancelled` one second after
-     the run that superseded it was created -- rule
+     the run that superseded it was created, and run 37726332056's did the same
+     at 04:16:18Z -- rule
      1 is only as strong as what the block above it is allowed to kill. Two
      limits on what the block can reach, neither of which this file is able to
      check, so do not read rule 5 as "stale PR runs are handled" (OBI-322):

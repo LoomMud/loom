@@ -325,7 +325,10 @@ lane from the first second. Pushing `ccd23a5` created run 37726332056 at
 `loadtest-smoke` and `bench` with it; the run closed `cancelled` at 04:12:39Z
 when its last non-lane job let go. Nothing in the lane lost a measurement -- the
 cancelled gate had never started, which is exactly what `queue: max` on the jobs
-plus `cancel-in-progress: true` on the PR-scoped group is meant to buy.
+plus `cancel-in-progress: true` on the PR-scoped group is meant to buy. The same
+shape repeated one commit later: run 37726332056's `loadtest-e1-1`, queued since
+04:12:39Z and never started, ended `cancelled` at 04:16:18Z, one second after run
+37726682123 (`7f4ee86`) was created.
 
 So OBI-322's "queued in the load lane" gap does not exist for runs that are
 inside the group, and option 1 (an in-workflow "am I still the PR head?" guard,
