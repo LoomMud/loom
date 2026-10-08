@@ -901,6 +901,206 @@ fn valid_compile(path: string, ob: object) -> bool {
     }
 }
 
+/// OBI-233 (M-ADM-5) delivery side: `broadcast_to_interactive_sessions`
+/// is the world thread's whole job for an admin broadcast, and it is the
+/// one arm of `drain_admin_queries` that touches players. Tested against a
+/// real [`World`] booted from a real (if tiny) mudlib rather than a mock, so
+/// "interactive session" means what the driver actually reports via
+/// `who_sessions` -- an `account` only appears once a session's object has
+/// really been `seteuid`'d past login.
+#[cfg(test)]
+mod broadcast_delivery_tests {
+    use super::*;
+    use loom_vm::Host;
+    use std::collections::HashMap;
+
+    /// Records every `send`, per connection, so a test can assert both
+    /// "this session got exactly this text" and "that session got nothing
+    /// at all" -- the second is the one that matters for M-ADM-5 (nobody
+    /// mid-login should see staff output).
+    #[derive(Default)]
+    struct CapturingHost {
+        sent: HashMap<u64, Vec<String>>,
+    }
+
+    impl Host for CapturingHost {
+        fn send(&mut self, conn: u64, text: &str) {
+            self.sent.entry(conn).or_default().push(text.to_string());
+        }
+        fn close(&mut self, _conn: u64) {}
+        fn set_echo(&mut self, _conn: u64, _enabled: bool) {}
+    }
+
+    /// The minimum mudlib that gives a *logged-in* session: `connect()`
+    /// clones a player whose `process_input` `seteuid`s on `become <name>`,
+    /// which is exactly what `World::who_sessions` takes as "past the login
+    /// prompt" (that method's doc comment is the authority on why an `euid`
+    /// change is the only such signal the driver has).
+    const MASTER: &str = r#"
+pub fn connect() -> object {
+    return clone_object("/std/player")
+}
+
+fn valid_efun(name: string, class: int, ob: object) -> bool {
+    return true
+}
+
+fn valid_compile(path: string, ob: object) -> bool {
+    return true
+}
+
+fn valid_read(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_write(path: string, ob: object, op: string) -> bool {
+    return true
+}
+
+fn valid_seteuid(ob: object, e: string) -> bool {
+    return true
+}
+"#;
+
+    const PLAYER: &str = r#"
+pub fn logon() {
+    send(self, "Welcome.\n")
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    if words[0] == "become" and len(words) == 2 {
+        seteuid(words[1])
+        send(self, "ok\n")
+    }
+}
+
+pub fn net_dead() {
+}
+"#;
+
+    fn boot_mudlib(tag: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("loom-cli-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("secure")).unwrap();
+        std::fs::create_dir_all(dir.join("std")).unwrap();
+        std::fs::write(dir.join("secure/master.wf"), MASTER).unwrap();
+        std::fs::write(dir.join("std/player.wf"), PLAYER).unwrap();
+        dir
+    }
+
+    /// One broadcast to two connections: conn 1 has typed `become alice`
+    /// (so its player object carries `alice`'s euid -- a logged-in session),
+    /// conn 2 is still sitting at the login prompt (its object is the
+    /// root-euid player clone `connect()` made). Only conn 1 sees anything,
+    /// and it sees exactly the text, once.
+    #[test]
+    fn a_broadcast_reaches_logged_in_sessions_and_no_one_else() {
+        let root = boot_mudlib("bcast");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = CapturingHost::default();
+
+        world.connect(1, &mut host);
+        world.connect(2, &mut host);
+        world.input(1, "become alice", &mut host);
+        // Drop everything the mudlib itself sent during connect/logon so
+        // what's left is only what the broadcast put there.
+        host.sent.values_mut().for_each(Vec::clear);
+
+        let text = "[Broadcast] server restart in 5m\n";
+        let recipients = broadcast_to_interactive_sessions(&world, &mut host, text);
+
+        assert_eq!(recipients, 1, "only the logged-in session is a recipient");
+        assert_eq!(
+            host.sent.get(&1).cloned().unwrap_or_default(),
+            vec![text.to_string()],
+            "a logged-in session receives exactly the text, exactly once"
+        );
+        assert_eq!(
+            host.sent.get(&2).cloned().unwrap_or_default(),
+            Vec::<String>::new(),
+            "a session still at the login prompt must receive nothing"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A multi-line broadcast is one `Host::send`, not one per line -- the
+    /// per-line `[Broadcast] ` prefixing is `loom-http`'s job (M-IDE-2: the
+    /// exact audited string is the exact delivered string), and the world
+    /// thread must not re-derive it.
+    #[test]
+    fn a_broadcast_is_one_send_per_recipient_with_no_further_editing() {
+        let root = boot_mudlib("bcast-lines");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = CapturingHost::default();
+
+        world.connect(1, &mut host);
+        world.input(1, "become alice", &mut host);
+        host.sent.values_mut().for_each(Vec::clear);
+
+        let text = "[Broadcast] line one\n[Broadcast] line two\n";
+        let recipients = broadcast_to_interactive_sessions(&world, &mut host, text);
+
+        assert_eq!(recipients, 1);
+        assert_eq!(
+            host.sent.get(&1).cloned().unwrap_or_default(),
+            vec![text.to_string()],
+            "the world thread sends the audited string verbatim, in one send"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With nobody logged in -- every connection still at the prompt -- the
+    /// broadcast has zero recipients and sends nothing. `loom-http` reports
+    /// `recipients: 0` (with an audit row) rather than failing, so this must
+    /// not blow up or pretend to have delivered.
+    #[test]
+    fn with_no_logged_in_sessions_it_delivers_nothing_and_reports_zero() {
+        let root = boot_mudlib("bcast-empty");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = CapturingHost::default();
+
+        world.connect(1, &mut host);
+        world.connect(2, &mut host);
+        host.sent.values_mut().for_each(Vec::clear);
+
+        let recipients = broadcast_to_interactive_sessions(&world, &mut host, "[Broadcast] hi\n");
+
+        assert_eq!(recipients, 0, "no logged-in session, no recipient");
+        assert!(
+            host.sent.values().all(Vec::is_empty),
+            "nothing may be sent when there is no recipient"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A session that disconnected is gone from `who_sessions`, so a
+    /// broadcast can never be sent to a dead connection id (and a
+    /// re-connected id is only ever a recipient once it logs in again).
+    #[test]
+    fn a_disconnected_session_is_not_a_recipient() {
+        let root = boot_mudlib("bcast-gone");
+        let mut world = World::boot(&root).expect("boot");
+        let mut host = CapturingHost::default();
+
+        world.connect(1, &mut host);
+        world.input(1, "become alice", &mut host);
+        host.sent.values_mut().for_each(Vec::clear);
+        world.disconnect(1, &mut host);
+
+        let recipients = broadcast_to_interactive_sessions(&world, &mut host, "[Broadcast] hi\n");
+
+        assert_eq!(recipients, 0, "a disconnected session is not a recipient");
+        assert!(
+            host.sent.values().all(Vec::is_empty),
+            "nothing may be sent to a connection that is gone"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 /// A snapshot-request reply: the encoded world bytes plus the `ConnId`s
 /// `World::live_connections()` reported live at that same instant (see
 /// `request_snapshot`'s own doc). Named so the channel types that carry
@@ -3006,30 +3206,14 @@ fn spawn_world_thread(
                             let _ = reply.send(result);
                         }
                         // OBI-233 (CTO review: "route it through the
-                        // world thread to interactive objects only"):
-                        // `text` is already sanitized/prefixed by
-                        // `loom_http::auth::AuthService::admin_broadcast`
-                        // -- this only fans it out, one `Host::send` per
-                        // session, to every connection `who_sessions`
-                        // reports an `account` for (i.e. past the login
-                        // prompt; see that method's doc comment for why
-                        // that's the driver's only available "logged in"
-                        // proxy). A connection still at the login/
-                        // creation prompt never sees it. `Host::send`'s
-                        // own backpressure (a slow client's full output
-                        // queue) already drops *that* client, never this
-                        // loop or the world thread.
+                        // world thread to interactive objects only").
+                        // The whole delivery decision lives in
+                        // [`broadcast_to_interactive_sessions`] so it is
+                        // testable without a live net thread; see that
+                        // function for the recipient rule.
                         WorldQueryRequest::Broadcast { text, reply } => {
-                            let recipients: Vec<u64> = world
-                                .who_sessions()
-                                .into_iter()
-                                .filter(|s| s.account.is_some())
-                                .map(|s| s.conn_id)
-                                .collect();
-                            let count = recipients.len();
-                            for conn_id in recipients {
-                                host.send(conn_id, &text);
-                            }
+                            let count =
+                                broadcast_to_interactive_sessions(world, host, &text);
                             let _ = reply.send(Ok(count));
                         }
                     }
@@ -3225,6 +3409,38 @@ fn spawn_world_thread(
         .recv()
         .map_err(|_| "world thread exited during boot".to_string())??;
     Ok(handle)
+}
+
+/// The world thread's entire broadcast delivery (OBI-233, M-ADM-5; split
+/// out of `spawn_world_thread`'s `Broadcast` arm at CTO review, third
+/// pass, must-fix 2, so the recipient rule is testable without a live net
+/// thread).
+///
+/// `text` arrives already sanitized and `[Broadcast] `-prefixed by
+/// [`loom_http::auth::AuthService::admin_broadcast`] -- this only fans it
+/// out, one [`Host::send`] per session, to every connection
+/// [`World::who_sessions`] reports an `account` for (i.e. past the login
+/// prompt; see that method's doc comment for why an `euid` change is the
+/// driver's only available "logged in" proxy). A connection still at the
+/// login/creation prompt never sees it.
+///
+/// [`Host::send`]'s own backpressure (a slow client's full output queue)
+/// drops *that* client, never this loop or the world thread.
+///
+/// Returns how many sessions it was handed to, which is what goes back to
+/// the `loom-http` handler as `recipients` (and into its audit row).
+fn broadcast_to_interactive_sessions(world: &World, host: &mut dyn Host, text: &str) -> usize {
+    let recipients: Vec<u64> = world
+        .who_sessions()
+        .into_iter()
+        .filter(|s| s.account.is_some())
+        .map(|s| s.conn_id)
+        .collect();
+    let count = recipients.len();
+    for conn_id in recipients {
+        host.send(conn_id, text);
+    }
+    count
 }
 
 struct NetHost {
