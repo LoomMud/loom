@@ -5854,6 +5854,14 @@ impl<'a> RegistryHost<'a> {
             .expect("checked above")
             .save_root
             .clone();
+        // OBI-324: the save root is driver state, so the driver makes it
+        // exist. Without this, a save root that was never created (CI's
+        // fresh checkout, a container with an unmounted volume) failed
+        // `write_file_atomic`'s `canonicalize(root)` confinement pre-check
+        // on *every* save -- and because that check runs before the
+        // `create_dir_all` below it, it could never recover.
+        crate::fileio::ensure_save_root(&save_root)
+            .map_err(|e| RtError::new(format!("save_object(\"{raw_path}\") failed: {e}")))?;
         crate::fileio::write_file_atomic(&save_root, &save_file, &text)
             .map_err(|e| RtError::new(format!("save_object(\"{raw_path}\") failed: {e}")))
     }

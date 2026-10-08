@@ -3030,6 +3030,19 @@ fn spawn_world_thread(
             if let Some(dir) = save_dir {
                 world.set_save_root(dir);
             }
+            // OBI-324: `World::save_root`'s doc promises the save root is
+            // created eagerly so a driver started against a missing or
+            // read-only saves directory fails loudly at boot. Honour that
+            // here (`save_object` additionally creates it lazily, so a
+            // `World::boot` caller that never goes through this thread
+            // still saves correctly).
+            if let Err(err) = loom_vm::fileio::ensure_save_root(world.save_root()) {
+                let _ = ready_tx.send(Err(format!(
+                    "save root {} is not usable: {err}",
+                    world.save_root().display()
+                )));
+                return;
+            }
             // OBI-123: without Postgres (`persist` was `None`), `LOOM_ROLES_SEED`
             // is the dev/CI path (`crate::roles::load_seed_from_env`'s doc): a
             // set-but-malformed seed is a boot failure, never a silent empty
