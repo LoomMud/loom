@@ -54,7 +54,13 @@ pub struct Session {
 
 impl Session {
     pub async fn connect(addr: &str, client_name: &str) -> Result<Self, SessionError> {
-        let mut stream = TcpStream::connect(addr).await?;
+        let stream = TcpStream::connect(addr).await?;
+        // OBI-344: the server sets `TCP_NODELAY` on accept; a latency test
+        // whose *client* leaves Nagle on can add a delayed-ACK round trip to
+        // its own measurements. Disable it so the numbers are the driver's,
+        // not the algorithm's.
+        stream.set_nodelay(true)?;
+        let mut stream = stream;
         stream.write_all(&initial_negotiation(80, 24)).await?;
         Ok(Self {
             stream,
