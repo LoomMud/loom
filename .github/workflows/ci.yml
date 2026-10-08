@@ -226,6 +226,28 @@ jobs:
           set -euo pipefail
           scripts/ci-ensure-tools.sh python3:python3-minimal
           python3 scripts/bench_compare.py --self-test
+      - name: lsp thread-count guard isolation (OBI-317)
+        # tests/lsp_thread_count.rs measures /proc/self/task, a *process-wide*
+        # thread list. The number only means "one LSP session did not leak"
+        # while that binary hosts exactly one session, so a second #[test] in
+        # it re-creates the flake the file exists to remove (sibling sessions
+        # starting/stopping in the measurement window). No runtime assertion can
+        # tell "the harness grew" from "a sibling session appeared", so the
+        # rule is checked where it is unambiguous: statically, in the lane.
+        run: |
+          set -euo pipefail
+          f=crates/loom-lsp/tests/lsp_thread_count.rs
+          if [ ! -f "$f" ]; then
+            echo "$f is missing: the G1/M-LSP-4 thread-count guard needs its own test binary" >&2
+            exit 1
+          fi
+          n=$(grep -c '^#\[test\]' "$f" || true)
+          if [ "$n" != 1 ]; then
+            echo "$f must contain exactly one #[test] (found $n). Its thread-count" >&2
+            echo "measurement is process-wide, so a sibling session in the same binary" >&2
+            echo "makes it flaky (OBI-317). Put the new test in lsp_integration.rs." >&2
+            exit 1
+          fi
       - uses: fsfe/reuse-action@bb774aa972c2a89ff34781233d275075cbddf542 # v5.0.0
   fuzz-smoke:
     # Weft parser fuzz smoke (OBI-23): <= 60 s of libFuzzer seeded from the
