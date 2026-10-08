@@ -25,7 +25,11 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      `--fail-on-sla-miss`, with enough `timeout-minutes` that host load can
      only make the measurement slow, never get the job cancelled; and
   5. if the workflow has a *workflow-level* `concurrency` block (OBI-313), it
-     cancels superseded `pull_request` runs and nothing else: `group` must be
+     cancels superseded `pull_request` runs and nothing else. The rule the CTO
+     accepted (2026-10-08) is that no required check on a *mergeable candidate*
+     may be cancelled; a superseded PR SHA is not a mergeable candidate under
+     `strict: true` + `required_linear_history: true`, which is what makes the
+     cancel legal. `group` must be
      PR-scoped and carry `github.run_id` as the non-PR fallback, and
      `cancel-in-progress` must be an expression that is true only for
      `pull_request`. Rule 5 exists because a workflow-level cancel reaches into

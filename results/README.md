@@ -155,8 +155,9 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   survivable; cancelled is not.
 - A stale SHA is not allowed to hold a place: the workflow also carries a
   workflow-level `concurrency` group that cancels a PR's *superseded* runs and
-  nothing else, and the PR trigger is narrowed to the activities that change
-  the commit -- see "Which runs may be cancelled" below.
+  nothing else -- no required check on a mergeable candidate is ever cancelled
+  -- and the PR trigger is narrowed to the activities that change the commit.
+  See "Which runs may be cancelled" below.
 - `scripts/check-ci-load-lane.py` asserts all of the above (and that the
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
   headroom, that no required check became skippable or optional, and that the
@@ -200,20 +201,29 @@ load" is not a control we have, and a job-level `if:` that skipped runs for
 drafts would *skip required checks* -- the one thing the lane rules forbid.
 
 So `.github/workflows/ci.yml` carries a workflow-level `concurrency` block, and
-the policy is written down rather than inferred from YAML:
+the policy is written down rather than inferred from YAML.
+
+**The rule, accepted by the CTO on 2026-10-08: no required check on a
+*mergeable candidate* may be cancelled.** A mergeable candidate is the commit
+branch protection actually evaluates. For a pull request that is its newest
+commit, because `strict: true` + `required_linear_history: true` mean a stale
+SHA never satisfies the branch; for `main` every push is a mergeable candidate,
+and so is any run already in flight. A superseded PR SHA is therefore the only
+measurement the block is allowed to throw away.
 
 | Run | Cancellation | Why |
 |---|---|---|
-| `pull_request`, commit already superseded by a newer push to the same PR | **may be cancelled** | its measurements describe a SHA nobody can merge: `strict: true` + `required_linear_history: true` mean branch protection only ever evaluates the PR's newest commit |
-| `pull_request`, newest commit, anything already running | **never cancelled** | `cancel-in-progress: false` + `queue: max` on the lane jobs; a cancelled required check blocks a PR exactly like a failed one |
+| `pull_request`, commit already superseded by a newer push to the same PR | **may be cancelled** | not a mergeable candidate: its measurements describe a SHA branch protection never evaluates, and holding its lane place only delays the gates that do count |
+| `pull_request`, newest commit, anything already running | **never cancelled** | this is the mergeable candidate. `cancel-in-progress: false` + `queue: max` on the lane jobs; a cancelled required check blocks a PR exactly like a failed one |
 | `push` to `main` | **never cancelled** | the group falls back to `github.run_id`, so each main run is its own group and there is nothing to cancel. OBI-311's "5 sequential un-retried E1.1 runs" on `main` stays measurable |
 | `workflow_dispatch` / a re-run of any job | **never cancelled** | same `github.run_id` fallback: a re-run cannot displace the run it is re-measuring |
 
 What it costs: the check on the superseded commit ends `cancelled` and the
 newer commit is measured again, so a PR gets exactly one live E1.1 measurement
-instead of one per push. That is the OBI-313 design question -- it is the same
-class of decision as "no required check may be cancelled or skipped", which is
-why it goes to review out loud and not into a YAML default.
+instead of one per push. Nothing measured on a mergeable candidate is ever lost,
+because the newest commit is always the survivor of the cancel -- which is the
+reason the OBI-308 rule ("no required check may be cancelled or skipped") and
+this one are the same rule, not two competing ones.
 
 **The trigger had to be narrowed for that to be safe.** With `types:` omitted,
 GitHub fires a `pull_request` workflow for *every* activity -- `labeled`,

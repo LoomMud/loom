@@ -16,6 +16,13 @@ permissions:
   contents: read
 
 # ── Which runs may be cancelled, and which may never be (OBI-313) ─────────
+# The rule, as accepted by the CTO on 2026-10-08: no required check on a
+# MERGEABLE CANDIDATE may be cancelled. A mergeable candidate is the commit
+# branch protection actually evaluates -- for a pull request, its newest
+# commit, because `strict: true` + `required_linear_history: true` mean a stale
+# SHA never satisfies the branch anyway. A superseded PR SHA is therefore not a
+# mergeable candidate, so cancelling it is permitted; everything else is not.
+#
 # MAY BE CANCELLED -- a `pull_request` run whose commit is already superseded
 # by a newer push to the same PR. That is the only thing this block cancels.
 # It exists because `loom-ci-load-lane` is a FIFO across runs: a PR with three
@@ -31,7 +38,8 @@ permissions:
 # above is narrowed to the commit-changing activity types: a label is not a
 # superseded commit, and must not be able to kill a running gate.
 #
-# NEVER CANCELLED -- a `push` to `main`, and any measurement already running.
+# NEVER CANCELLED -- a PR's newest commit (a mergeable candidate), a `push` to
+# `main`, and any measurement already running.
 # For a non-`pull_request` event the group falls back to `github.run_id`, so
 # every main push is its own group and there is nothing for a later run to
 # cancel: OBI-311's "5 sequential un-retried E1.1 runs" stays measurable. The
@@ -42,11 +50,14 @@ permissions:
 # than trusting a comment above them.
 #
 # What cancellation costs: the check on the superseded commit ends `cancelled`
-# and the newer commit is measured again. Branch protection evaluates the PR's
-# newest commit, and `strict: true` + `required_linear_history: true` mean a
-# stale SHA never satisfied the branch here anyway, so the merge gate keeps the
-# same shape. That trade is OBI-313's design question for the CTO, not a change
-# to be assumed in YAML.
+# and the newer commit is measured again, so a PR gets one live E1.1
+# measurement instead of one per push. Nothing measured on a mergeable candidate
+# is lost, because the newest commit is always the survivor of the cancel. The
+# narrowing of `on.pull_request.types` above is what keeps that true: an event
+# that does not change the commit must never be able to kill the gate running on
+# the mergeable candidate. Rules 5-6 of scripts/check-ci-load-lane.py pin both
+# the shape of this block and the trigger, and `results/README.md` states the
+# policy this comment is summarising.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
