@@ -186,22 +186,63 @@ runtime_errors_total=0
 | saved objects on disk | 0 | one `players/<bot>.o` per connected player |
 | what the world thread did | `save_object` failing on ENOENT | the same call, writing |
 
-And the measured cost of finally exercising the path, from two consecutive
-`loadtest-e1-1` runs of the same runner set -- `main` at `75ebef1` (instrumented,
-no save root) against PR #151 (instrumented, save root):
+And the measured cost of finally exercising the path, from four consecutive
+`loadtest-e1-1` runs of the same runner set (8 vCPU, `loadavg` at job start in the
+last column; ms throughout):
 
-| run | p50 | p95 | p99 | max | n | slowest world iteration | tail over 50 ms | runtime errors | loadavg at start |
+| run | p50 | p95 | p99 | max | n | slowest world iteration | samples over 50 ms | runtime errors | loadavg |
 |---|---|---|---|---|---|---|---|---|---|
-| before, `75ebef1` (37837002588) | 3.196 ms | 16.660 | **23.669** | 40.755 | 9977 | 32 ms | 0 | 149 | 5.96 (8 vCPU) |
-| after, PR #151 (37838121286) | 2.800 ms | 14.405 | **22.538** | 38.159 | 9909 | 24 ms | 0 | 0 | 5.20 (8 vCPU) |
+| before, `75ebef1` (37837002588) | 3.196 | 16.660 | **23.669** | 40.755 | 9977 | 32 ms | 0 | 149 | 5.96 |
+| after, `31faf3f` (37838121286) | 2.800 | 14.405 | **22.538** | 38.159 | 9909 | 24 ms | 0 | 0 | 5.20 |
+| after, `92f4526` (37840315609) | 3.030 | 15.427 | **22.827** | 42.171 | 10035 | 25 ms | 0 | 0 | 6.87 |
+| after, on `main`, `ad489db` (37843414478) | 3.110 | 16.427 | **24.270** | 38.446 | 10181 | **562 ms** | 0 | 0 | 6.05 |
 
-Persistence is not free, but at 150 players it is not measurable against the
-noise floor either: the tail did not move, the slowest world-loop iteration got
-*faster* (32 -> 24 ms), and both runs report zero SLA-breaching samples. So the
-save path is now genuinely in the measurement without costing the gate. The two
-rows are not a controlled A/B -- different host load, different sample counts --
-but they do bound the effect: writing 150 characters is not what makes this
-gate red.
+The first three rows support the narrow claim: writing 150 characters does not move
+the sampled tail. **The fourth row says the claim was incomplete, and it is the
+reason the last column is not enough.** That run passed -- p99 24.27 ms, zero
+SLA-breaching samples -- while the world thread spent **562 ms inside one
+iteration**, with 31 iterations over the 50 ms stall budget totalling 4 905 ms, every
+one labelled `kind="disconnect"`:
+
+```text
+loom_world_loop_stalls_total{kind="disconnect"} 31
+loom_world_loop_stall_ms_total 4905
+loom_world_loop_duration_ms_max 562
+```
+
+All 31 landed between t+91 s and t+94 s, *after* `--duration-secs 90` had stopped
+issuing commands: that is the 150 bots logging out at once. `World::disconnect`
+(`crates/loom-vm/src/world.rs`) applies `autosave` -- which is `save_character`,
+whose `save_object` PR #151 just made succeed -- and then `net_dead`, both on the
+world thread; the serve loop handles one event per iteration, so 562 ms is the cost
+of **one** logout, not of the batch. The tick counter confirms it: ticks froze at 901
+while iterations kept advancing.
+
+So the honest sentence is: *persistence costs nothing in the numbers this gate
+reports, and up to half a second of world-thread time per logout when many sessions
+drop together.* The gate cannot see the second part because its sampling window
+closes first. Two consequences, both recorded so nobody has to rediscover them:
+
+- A green `loadtest-e1-1` is **not** evidence that the world thread never blocked
+  for longer than the SLA. The job now prints `world_loop: worst_iteration_ms=…
+  stall_events=… kinds=…` after every run and raises a warning annotation when that
+  number exceeds 50 ms, precisely so "passed" cannot be read as "no stall
+  happened". It is still not gating: making teardown stalls fail the job would be a
+  change to what the gate means, not just what it measures, and that is a CTO call.
+- The stall WARN lines in `results/loom-serve.log` are rate-limited to one per 5 s
+  (`STALL_LOG_INTERVAL` in `crates/loom-obs/src/world.rs`), so 31 events print as 3
+  lines. The counters are the census; the log is a sample. Read
+  `loom_world_loop_stalls_total`, not `grep -c`.
+
+This is also why the historical tail is still open. Before PR #151 the same
+disconnect path failed instantly on ENOENT and the worst iteration in a green run
+was 32 ms, so the logout-save cost cannot be what made `2872bcd` and its siblings
+red: those runs had 250-475 ms samples *inside* the window. What `ad489db` adds is
+a recorded instance of the right shape -- one event handler holding the world thread
+for hundreds of milliseconds -- so a future red run has a specific thing to look
+for (`tail_attribution.server_stall` against `kind="disconnect"` windows) instead of
+a guess. It is intermittent: the two runs above with identical code recorded no
+stalls at all, and a local 20-player run never exceeded 12 ms per iteration.
 
 Deliberately not a gate: a non-zero runtime-error count raises a workflow
 *warning annotation* (`::warning title=OBI-344 runtime errors::`), it does not
