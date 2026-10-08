@@ -411,7 +411,14 @@ jobs:
           LOOM_SERVE_ERROR_LOG: "1"
         run: |
           set -euo pipefail
-          ./target/release/loom-cli serve --mudlib warp > /tmp/loom-serve.log 2>&1 &
+          # OBI-344: the save root. It used to not exist in a CI checkout, so
+          # `/std/player::save_character` failed with ENOENT once per player
+          # and no character ever persisted -- the smoke run never touched the
+          # save path. RUNNER_TEMP is run-scoped: nothing is left behind, and
+          # nothing here is uploaded.
+          SAVES="${RUNNER_TEMP:-/tmp}/loom-saves"
+          rm -rf "$SAVES"; mkdir -p "$SAVES"
+          ./target/release/loom-cli serve --mudlib warp --save-dir "$SAVES" > /tmp/loom-serve.log 2>&1 &
           echo $! > /tmp/loom-serve.pid
           for i in $(seq 1 50); do
             python3 -c "import socket; socket.create_connection(('127.0.0.1',4000),timeout=1).close()" 2>/dev/null && break
@@ -509,7 +516,18 @@ jobs:
           LOOM_SERVE_ERROR_LOG: "1"
         run: |
           set -uo pipefail
-          ./target/release/loom-cli serve --mudlib warp > /tmp/loom-serve.log 2>&1 &
+          # OBI-344: give the run a save root that exists. Every E1.1 run so
+          # far recorded `loom_runtime_errors_total{program="/std/player"}
+          # = 150` -- one per connected player -- because `save_character`
+          # writes to `<mudlib>/saves`, which a fresh checkout does not have.
+          # That means the gate has never measured the save path at all; with
+          # this line it measures real `save_object` file writes on the world
+          # thread, which is the point. RUNNER_TEMP is run-scoped, so nothing
+          # is left behind and no save file is ever uploaded.
+          SAVES="${RUNNER_TEMP:-/tmp}/loom-saves"
+          rm -rf "$SAVES"; mkdir -p "$SAVES"
+          echo "save_dir=$SAVES"
+          ./target/release/loom-cli serve --mudlib warp --save-dir "$SAVES" > /tmp/loom-serve.log 2>&1 &
           echo $! > /tmp/loom-serve.pid
           for i in $(seq 1 50); do
             python3 -c "import socket; socket.create_connection(('127.0.0.1',4000),timeout=1).close()" 2>/dev/null && break
@@ -528,6 +546,11 @@ jobs:
             --out results/ci-e1-1 \
             --fail-on-sla-miss
           status=$?
+          # Scrape before stopping: the previous version of this step curled
+          # `/metrics` *after* `kill`, so the "final /metrics" section was
+          # always empty and the artifact's only server numbers were the
+          # in-run scrapes inside the report.
+          curl -s --max-time 2 http://127.0.0.1:4001/metrics > /tmp/loom-metrics-final.txt 2>/dev/null || true
           kill "$(cat /tmp/loom-serve.pid)" || true
           wait 2>/dev/null || true
           # The serve log is the attribution evidence: world-thread stall
@@ -538,12 +561,37 @@ jobs:
           cat /tmp/loom-serve.log
           echo "::endgroup::"
           cp /tmp/loom-serve.log results/loom-serve.log
+          cp /tmp/loom-metrics-final.txt results/loom-metrics-final.txt
           {
             echo "## loadtest stderr markers"
             grep -cE "ERROR|WARN" /tmp/loom-serve.log || true
             echo "## final /metrics (world loop + net command counters)"
-            curl -s --max-time 2 http://127.0.0.1:4001/metrics 2>/dev/null | grep -E "^loom_(world_loop|net_command|runtime_errors)" || echo "(server already stopped)"
+            grep -E "^loom_(world_loop|net_command)" /tmp/loom-metrics-final.txt || echo "(none -- server not instrumented or already stopped)"
+            echo "## final /metrics (runtime errors)"
+            grep -E "^loom_runtime_errors" /tmp/loom-metrics-final.txt || echo "(no loom_runtime_errors_total series)"
           } >> results/loom-serve.log 2>&1 || true
+          # OBI-344: prove the save path was exercised, and keep a mudlib
+          # runtime error from being silently counted and forgotten. Neither
+          # check gates the SLA -- the p99 verdict below is the only thing
+          # that decides pass/fail -- they surface as warnings annotations.
+          saved=$(find "$SAVES" -type f -name '*.o' 2>/dev/null | wc -l)
+          echo "save_path: objects_saved=$saved players=150 save_dir=$SAVES"
+          if [ -s /tmp/loom-metrics-final.txt ]; then
+            if grep -q "^loom_runtime_errors_total" /tmp/loom-metrics-final.txt; then
+              runtime_errors=$(awk '/^loom_runtime_errors_total/ {s+=$2} END {printf "%d", s+0}' /tmp/loom-metrics-final.txt)
+              echo "runtime_errors_total=$runtime_errors"
+              if [ "$runtime_errors" != "0" ]; then
+                echo "::warning title=OBI-344 runtime errors::E1.1 recorded $runtime_errors mudlib runtime error(s); see results/loom-serve.log (does not affect the p99 verdict)"
+              fi
+            else
+              echo "runtime_errors_total=0 (no loom_runtime_errors_total series in the scrape; that family is created on the first error)"
+            fi
+          else
+            echo "::warning title=OBI-344 runtime errors unmeasured::the server did not expose /metrics at the end of the run, so the runtime-error count is unknown"
+          fi
+          if [ "$saved" -eq 0 ]; then
+            echo "::warning title=OBI-344 save path not exercised::no save objects were written to $SAVES; E1.1 is not measuring character persistence"
+          fi
           exit $status
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
@@ -552,5 +600,6 @@ jobs:
           path: |
             results/ci-e1-1.*
             results/loom-serve.log
+            results/loom-metrics-final.txt
             results/runner-context-before.txt
 

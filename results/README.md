@@ -151,11 +151,77 @@ every CI run carried is `/std/player::save_character` (line 251) failing as
 directory (os error 2)` -- CI never creates the save root, so in the E1.1 job
 no character ever persists and each player logs one runtime error. Running the
 same binary with `--save-dir` pointing at a real directory produces zero
-errors and one `.o` file per bot. The gate's own numbers are unchanged by this
-(it is reported as a metric, not an SLA), but the fix -- create the save root
-in the job, or have `serve` create it at boot -- changes what E1.1 measures
-(real file writes on the save path), so it is deliberately not folded into
-this instrumentation commit.
+errors and one `.o` file per bot.
+
+### The save root: E1.1 now measures persistence (follow-up to the above)
+
+That was not a cosmetic error: **no E1.1 run before this ever wrote a
+character**, so the gate's claim to model a live player population silently
+excluded the save path. Both load jobs now create a run-scoped save root and
+pass it to the driver:
+
+```sh
+SAVES="${RUNNER_TEMP:-/tmp}/loom-saves"; rm -rf "$SAVES"; mkdir -p "$SAVES"
+./target/release/loom-cli serve --mudlib warp --save-dir "$SAVES" ...
+```
+
+`RUNNER_TEMP` is wiped by the runner at the end of the job, nothing is written
+inside the mudlib checkout, and no save file is uploaded as an artifact. The
+`rm -rf` at the start matters too: a leftover character would make the next
+run's login take the "existing character + password" branch instead of the
+"new character" branch, which is a different measurement.
+
+The job then *asserts the path was exercised* rather than trusting it, and
+prints both numbers into the log and the serve-log artifact. The healthy shape
+is:
+
+```
+save_path: objects_saved=150 players=150 save_dir=/home/runner/work/_temp/loom-saves
+runtime_errors_total=0
+```
+
+| | before | after |
+|---|---|---|
+| `loom_runtime_errors_total{program="/std/player"}` | 150 (one per player) | 0 (series absent -- the family is created on first error) |
+| saved objects on disk | 0 | one `players/<bot>.o` per connected player |
+| what the world thread did | `save_object` failing on ENOENT | the same call, writing |
+
+And the measured cost of finally exercising the path, from two consecutive
+`loadtest-e1-1` runs of the same runner set -- `main` at `75ebef1` (instrumented,
+no save root) against PR #151 (instrumented, save root):
+
+| run | p50 | p95 | p99 | max | n | slowest world iteration | tail over 50 ms | runtime errors | loadavg at start |
+|---|---|---|---|---|---|---|---|---|---|
+| before, `75ebef1` (37837002588) | 3.196 ms | 16.660 | **23.669** | 40.755 | 9977 | 32 ms | 0 | 149 | 5.96 (8 vCPU) |
+| after, PR #151 (37838121286) | 2.800 ms | 14.405 | **22.538** | 38.159 | 9909 | 24 ms | 0 | 0 | 5.20 (8 vCPU) |
+
+Persistence is not free, but at 150 players it is not measurable against the
+noise floor either: the tail did not move, the slowest world-loop iteration got
+*faster* (32 -> 24 ms), and both runs report zero SLA-breaching samples. So the
+save path is now genuinely in the measurement without costing the gate. The two
+rows are not a controlled A/B -- different host load, different sample counts --
+but they do bound the effect: writing 150 characters is not what makes this
+gate red.
+
+Deliberately not a gate: a non-zero runtime-error count raises a workflow
+*warning annotation* (`::warning title=OBI-344 runtime errors::`), it does not
+fail the job. The p99 verdict is the only pass/fail signal in E1.1, and adding
+a second failure mode to a required check would change the gate's meaning
+without changing what it measures. A warning is loud enough to keep the
+finding from being silently counted again.
+
+Two consequences for reading the numbers from here on. First, E1.1 now costs
+the world thread real file writes on the save path, so its tail may differ
+from the pre-change runs; that is a *more* honest measurement, not a
+regression, and the attribution section is what distinguishes the two. Second,
+`loom_runtime_errors_total` disappearing from the final scrape is now the
+expected healthy shape -- its presence is the anomaly to read.
+
+The alternative fix -- have `loom-cli serve` `create_dir_all` the default save
+root at boot -- was not taken here: it would let a driver bug write into a
+mudlib tree silently, and it removes the very failure this run was counting.
+That is a design call for the CTO if we want it; the CI job no longer depends
+on the answer.
 
 ## CI load lane (OBI-308)
 
