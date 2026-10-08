@@ -386,7 +386,7 @@ One thing the classifier cannot see: the `warp` mudlib E1.1 serves is checked
 out of `LoomMud/warp`, unpinned, inside the job. A warp-side change can move
 the p99 while every loom PR skips the lane. That is a property of the existing
 un-pinned checkout, not of the skip decision -- pinning warp (or measuring it
-as an input) is the follow-up, and it is listed on OBI-325.
+as an input) is OBI-326.
 
 A cheap `classify` job answers it, and the three lane jobs read the verdict
 twice: through a conditional `concurrency.group` (runtime-relevant, or
@@ -406,6 +406,20 @@ place where it is pinned -- and that file is runtime-relevant, which means a
 toolchain bump is measured instead of skipped. Before rule 8, bumping the
 version in `ci.yml` alone would have changed what every later run builds and
 never entered the lane.
+
+**First live skip (PR #144, run 37736253093, 2026-10-08).** The PR that
+introduces this decides its own diff irrelevant, and the numbers are what the
+case study was about: `classify` 97 s end to end (3 s for the decision step
+itself, the rest is runner start and a full checkout), `loadtest-e1-1` 27 s with
+`run loom serve + E1.1 load test (150 players)`, the release build, the warp
+checkout and the artifact upload all reported *skipped*, and
+`loadtest-smoke` 20 s / `bench` 8 s behind it. The four-job lane chain finished
+in 3m20s (06:13:17Z -> 06:16:37Z) inside a lane that was in use by nothing; no
+`::warning::` annotation appeared, so the classifier answered rather than
+defaulting. `hygiene` ran both checkers and both self-tests against the new
+workflow in the same job, which is the proof that the escape is still shaped
+correctly -- the measurement path is unchanged code and was not exercised by
+this run, so the next runtime-relevant PR is the check that it still measures.
 
 **What a green `loadtest-e1-1` means now.** Two different greens. On a
 runtime-relevant diff it is the 150-player measurement, unchanged. On a

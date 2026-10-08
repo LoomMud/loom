@@ -130,8 +130,8 @@ concurrency:
 # retire the only bench regression gate. What the classifier cannot see is the
 # mudlib the gate serves: `warp` is checked out of LoomMud/warp, unpinned,
 # inside the job -- a warp-side change can move p99 while every loom PR skips.
-# That is a property of the un-pinned checkout, not of the decision; pinning
-# warp (or treating it as an input) is the OBI-325 follow-up.
+# That is a property of the un-pinned checkout, not of the decision; pinning it
+# (or treating it as an input) is OBI-326.
 #
 # `.github/**` itself is on the irrelevant list, and that is only honest because
 # of rule 8 of scripts/check-ci-load-lane.py: no job may install a `toolchain:`
