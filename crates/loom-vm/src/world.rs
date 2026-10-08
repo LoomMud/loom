@@ -38,10 +38,28 @@ pub const MASTER_PATH: &str = "/secure/master";
 /// it has no parent at all (e.g. booted at a filesystem root, which
 /// real deployments never do -- `loom-cli`'s `--save-dir` is there for
 /// anyone who needs a different layout).
+///
+/// `mudlib_root` is made absolute against `cwd` first (OBI-324). A
+/// relative `--mudlib warp` used to reach the fallback branch here: its
+/// `parent()` is the empty path, so the "beside the mudlib" default
+/// silently became `warp/saves` -- *inside* the Git-backed tree §8.5
+/// exists to keep save data out of. Absolutizing lexically (no
+/// `canonicalize`, so a symlinked mudlib root stays where the operator
+/// put it) makes `parent()` mean what it says for either form.
 fn default_save_root(mudlib_root: &Path) -> PathBuf {
-    match mudlib_root.parent() {
+    match std::env::current_dir() {
+        Ok(cwd) => default_save_root_in(&cwd, mudlib_root),
+        Err(_) => default_save_root_in(std::path::Path::new("/"), mudlib_root),
+    }
+}
+
+/// [`default_save_root`] with the working directory supplied, so the
+/// relative-path case is testable without mutating process state.
+fn default_save_root_in(cwd: &Path, mudlib_root: &Path) -> PathBuf {
+    let abs = cwd.join(mudlib_root);
+    match abs.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join("saves"),
-        _ => mudlib_root.join("saves"),
+        _ => abs.join("saves"),
     }
 }
 
@@ -2974,6 +2992,55 @@ mod tick_share_window_tests {
             4,
             "a slot's stale usage from 60 buckets ago must not leak into a reused slot"
         );
+    }
+}
+
+#[cfg(test)]
+mod default_save_root_tests {
+    use super::*;
+
+    /// OBI-324: the save root lives *beside* the mudlib (spec §8.5 --
+    /// player save data is never a `git add`/revert/recompile candidate),
+    /// including for the relative `--mudlib warp` form CI and the README
+    /// use. Before this, `Path::parent()` of a relative single-segment
+    /// path is the empty path, which fell through to "inside the mudlib".
+    #[test]
+    fn a_relative_mudlib_root_saves_beside_it_not_inside_it() {
+        let cwd = Path::new("/home/runner/_work/loom/loom");
+        let root = default_save_root_in(cwd, Path::new("warp"));
+        assert_eq!(root, cwd.join("saves"));
+        assert!(
+            !root.starts_with(cwd.join("warp")),
+            "a relative `--mudlib warp` must not put player saves inside the \
+             Git-backed mudlib tree, got {root:?}"
+        );
+        // A deeper relative path behaves the same way.
+        assert_eq!(
+            default_save_root_in(cwd, Path::new("lib/warp")),
+            cwd.join("lib/saves")
+        );
+    }
+
+    /// An absolute mudlib root keeps the documented `/mudlib` -> `/saves`
+    /// layout, and a root with no parent at all still gets a writable
+    /// fallback rather than an empty path.
+    #[test]
+    fn an_absolute_mudlib_root_keeps_the_beside_it_layout() {
+        let cwd = Path::new("/somewhere/else");
+        assert_eq!(
+            default_save_root_in(cwd, Path::new("/mudlib")),
+            PathBuf::from("/saves")
+        );
+        assert_eq!(
+            default_save_root_in(cwd, Path::new("/mudlib/domains")),
+            PathBuf::from("/mudlib/saves")
+        );
+        assert_eq!(
+            default_save_root_in(cwd, Path::new("/")),
+            PathBuf::from("/saves")
+        );
+        // The cwd must not leak into an absolute root's answer.
+        assert!(!default_save_root_in(cwd, Path::new("/mudlib")).starts_with(cwd));
     }
 }
 
