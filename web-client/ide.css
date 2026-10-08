@@ -1,0 +1,190 @@
+/* SPDX-FileCopyrightText: 2026 Oberfield */
+/* SPDX-License-Identifier: AGPL-3.0-only */
+
+/*
+ * The staff IDE's layout (OBI-180). An external stylesheet rather than a
+ * `<style>` block: `ide.html`'s `<meta>` CSP inherits the header's
+ * `style-src 'unsafe-inline'` only because Monaco needs it to measure
+ * text, and the page's own rules do not get to ride on that exception.
+ * `scripts/check-static-csp.mjs` fails CI if a served document grows a
+ * `<style>` element or an inline `style=` attribute back.
+ */
+
+body {
+  font-family: system-ui, sans-serif;
+  margin: 0;
+  background: #111;
+  color: #ddd;
+  /* The IDE is a fixed-viewport tool: the tree scrolls inside its own
+   * column and the editor never moves the page. */
+  height: 100vh;
+  overflow: hidden;
+}
+
+#ide-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+}
+
+#ide-title {
+  font-weight: 600;
+}
+
+#ide-path {
+  font-family: monospace;
+  color: #9cdcfe;
+}
+
+#ide-status {
+  flex: 1;
+  color: #aaa;
+  /* A compiler message is as long as it is; never let it push the Save
+   * button off the screen. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#ide-main {
+  display: flex;
+  height: calc(100vh - 8.5rem);
+  min-height: 20rem;
+}
+
+#ide-tree {
+  width: 18rem;
+  overflow-y: auto;
+  border-right: 1px solid #333;
+  padding: 0.5rem 0;
+  font-family: monospace;
+  font-size: 0.85rem;
+}
+
+.ide-tree-root {
+  padding: 0 0.75rem 0.4rem;
+  color: #777;
+}
+
+#ide-tree ul,
+#ide-diagnostics ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.ide-tree-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  padding: 0.15rem 0.75rem;
+  cursor: pointer;
+}
+
+.ide-tree-row:hover {
+  background: #232323;
+}
+
+.ide-dir {
+  color: #dcdcaa;
+}
+
+/* Indent by depth rather than nesting `<ul>`s per directory: the model is
+ * a flat list of visible rows (`src/ide/tree.ts`), and a depth-moved list
+ * keeps that projection and the DOM identical. */
+.ide-depth-1 {
+  padding-left: 1.75rem;
+}
+.ide-depth-2 {
+  padding-left: 2.75rem;
+}
+.ide-depth-3 {
+  padding-left: 3.75rem;
+}
+.ide-depth-4 {
+  padding-left: 4.75rem;
+}
+.ide-depth-5 {
+  padding-left: 5.75rem;
+}
+
+.ide-tree-note {
+  color: #777;
+  font-size: 0.75rem;
+  padding: 0 0.75rem;
+}
+
+#ide-editor {
+  flex: 1;
+  min-width: 0;
+}
+
+#ide-diagnostics {
+  height: 8.5rem;
+  overflow-y: auto;
+  border-top: 1px solid #333;
+  background: #161616;
+  font-family: monospace;
+  font-size: 0.8rem;
+  padding: 0.4rem 0.75rem;
+}
+
+#ide-diagnostics h2 {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #777;
+  margin: 0 0 0.3rem;
+}
+
+.ide-diagnostic {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  white-space: pre-wrap;
+  padding: 0.1rem 0;
+  cursor: pointer;
+}
+
+.ide-diagnostic:disabled {
+  cursor: default;
+}
+
+.sev-error {
+  color: #f48771;
+}
+
+.sev-warning {
+  color: #cca700;
+}
+
+.sev-info {
+  color: #9cdcfe;
+}
+
+.ide-empty,
+.ide-note {
+  color: #777;
+  margin: 0.2rem 0;
+}
+
+button.ghost {
+  background: none;
+  border: 1px solid #444;
+  color: #aaa;
+}
+
+#ide-auth {
+  padding: 1rem;
+}
