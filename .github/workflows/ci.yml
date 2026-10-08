@@ -623,11 +623,20 @@ jobs:
             exit 1
           fi
           # One payload line: comments and blanks stripped, the SHA, nothing else.
-          rev=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PIN_FILE" | head -1)
-          if [ -z "$rev" ]; then
+          # The line count is checked, not just the shape: `head -1` would otherwise
+          # serve the first of two revs and leave rule 9 to notice -- a gate should
+          # fail on the input it was handed, not on a later reader's arithmetic.
+          payload=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PIN_FILE")
+          if [ -z "$payload" ]; then
             echo "::error::$PIN_FILE carries no commit SHA (the gate refuses to guess)"
             exit 1
           fi
+          if [ "$(printf '%s\n' "$payload" | wc -l)" -ne 1 ]; then
+            echo "::error::$PIN_FILE must hold exactly one line -- the commit SHA -- not two worlds"
+            printf '%s\n' "$payload" | sed 's/^/  /'
+            exit 1
+          fi
+          rev="$payload"
           if [ "${#rev}" -ne 40 ] || [[ "$rev" =~ [^0-9a-f] ]]; then
             echo "::error::$PIN_FILE must hold one full 40-character lowercase commit SHA, got '$rev'"
             echo '::error::a branch name can move underneath a run, which is what this pin prevents'
@@ -802,11 +811,20 @@ jobs:
             exit 1
           fi
           # One payload line: comments and blanks stripped, the SHA, nothing else.
-          rev=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PIN_FILE" | head -1)
-          if [ -z "$rev" ]; then
+          # The line count is checked, not just the shape: `head -1` would otherwise
+          # serve the first of two revs and leave rule 9 to notice -- a gate should
+          # fail on the input it was handed, not on a later reader's arithmetic.
+          payload=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PIN_FILE")
+          if [ -z "$payload" ]; then
             echo "::error::$PIN_FILE carries no commit SHA (the gate refuses to guess)"
             exit 1
           fi
+          if [ "$(printf '%s\n' "$payload" | wc -l)" -ne 1 ]; then
+            echo "::error::$PIN_FILE must hold exactly one line -- the commit SHA -- not two worlds"
+            printf '%s\n' "$payload" | sed 's/^/  /'
+            exit 1
+          fi
+          rev="$payload"
           if [ "${#rev}" -ne 40 ] || [[ "$rev" =~ [^0-9a-f] ]]; then
             echo "::error::$PIN_FILE must hold one full 40-character lowercase commit SHA, got '$rev'"
             echo '::error::a branch name can move underneath a run, which is what this pin prevents'
