@@ -39,6 +39,11 @@ export interface MonacoLike {
     setLanguageConfiguration(id: string, config: unknown): unknown;
     registerDocumentLinkProvider(id: string, provider: unknown): unknown;
     registerCompletionItemProvider?(id: string, provider: unknown): unknown;
+    registerHoverProvider?(id: string, provider: unknown): unknown;
+    /** Monaco's own `CompletionItemKind` enum. Its numbering is Monaco's
+     * (Method is 0, Text is 18) and shares nothing with LSP's, so the
+     * mapping in `./lsp-monaco.ts` looks members up by name. */
+    CompletionItemKind?: Record<string, number>;
   };
   KeyMod: { CtrlCmd: number; Alt: number };
   KeyCode: { KeyS: number };
@@ -219,7 +224,7 @@ export function createMonacoEditor(options: MonacoEditorOptions): EditorPort {
     currentPath() {
       return path;
     },
-    setMarkers(markers) {
+    setMarkers(markers, owner = "loom-ide") {
       const model = editor.getModel();
       if (model === null) {
         return;
@@ -227,7 +232,7 @@ export function createMonacoEditor(options: MonacoEditorOptions): EditorPort {
       const severity = monaco.MarkerSeverity;
       (monaco.editor as unknown as {
         setModelMarkers(uri: unknown, owner: string, markers: unknown[]): void;
-      }).setModelMarkers(model.uri, "loom-ide", markers.map((marker) => markerToMonaco(marker, severity)));
+      }).setModelMarkers(model.uri, owner, markers.map((marker) => markerToMonaco(marker, severity)));
       editor.layout();
     },
     revealLine(line) {
