@@ -26,8 +26,14 @@
 //!   `web_root` (the default -- see `LOOM_WEB_ROOT` in `loom-cli`), the
 //!   fallback is a plain `404`, matching pre-OBI-158 behaviour for tests
 //!   and local runs that don't set it.
+//! - fallback caching (OBI-338): the same file service stamps
+//!   `Cache-Control` and a validator on what it serves -- `immutable`
+//!   only inside a version-stamped `/vendor/<package>/<version>/` tree,
+//!   revalidation for everything else. See
+//!   [`with_static_cache_headers`].
 
 use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
 
 use axum::Router;
 use axum::extract::State;
@@ -403,6 +409,267 @@ async fn with_static_security_headers(
     response
 }
 
+/// `Cache-Control` for a file whose URL cannot outlive its bytes (OBI-338).
+///
+/// `immutable` is the Cache-Control extension of RFC 8246 §2: the server
+/// asserts that the representation behind this URL will not change during
+/// its freshness lifetime, so a client "never needs to revalidate a cached
+/// fresh resource" -- which is the whole point, because the vendored bundle
+/// is ~21.9 MB of Monaco (OBI-180 accepted that size on this condition) and
+/// revalidation is precisely what stops being paid on a page load.
+///
+/// One year is what RFC 8246 §2.2 uses as its own example
+/// (`max-age=31536000, immutable`), and it is not a number pulled out of the
+/// air: RFC 9111 §5.3 records that HTTP capped freshness at a year
+/// historically, and that even now larger values are useless because caches
+/// evict far sooner and 32-bit date arithmetic overflows (§1.2.2). So a year
+/// is the longest promise that is worth making, not the longest one allowed.
+const STATIC_CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+
+/// `Cache-Control` for every other file the static service answers.
+///
+/// `max-age=0, must-revalidate` looks like a strange thing to send on a
+/// response we are asking to be cached, so the reasoning is spelled out:
+/// the web client's own build step is `tsc` with no bundler, so `dist/**`
+/// is *not* content-hashed -- `/dist/ide/app.js` is the same URL in every
+/// deploy, holding different bytes. A positive `max-age` there would let a
+/// builder load yesterday's editor code against today's `ide.html` (the two
+/// are never deployed independently of each other, but a cache happily serves
+/// them independently), which is exactly the "needs a hard reload to take
+/// effect" failure this issue exists to prevent. So the response is stored
+/// and revalidated through the validator below, which costs a header-only
+/// `304` rather than the file.
+///
+/// If `dist/**` ever grows a content hash (a real bundler, or the stamping
+/// `scripts/vendor-monaco.mjs` does for `vendor/`), the class flips to
+/// [`STATIC_CACHE_IMMUTABLE`] and this constant is what changes.
+const STATIC_CACHE_REVALIDATE: &str = "public, max-age=0, must-revalidate";
+
+/// Is `path` a file inside a **version-stamped** vendor tree --
+/// `/vendor/<package>/<version>/<file..>`, e.g. the
+/// `/vendor/monaco/0.57.0/vs/loader.js` that `scripts/vendor-monaco.mjs`
+/// stages (OBI-338)?
+///
+/// This is the only gate on [`STATIC_CACHE_IMMUTABLE`], and it is deliberately
+/// structural rather than "is under `/vendor/`": `immutable` is safe exactly
+/// when the URL changes as the bytes do, so an unversioned
+/// `/vendor/monaco/vs/loader.js` -- which is what the tree looked like before
+/// this issue, and what a hand-placed asset or a `latest` symlink would look
+/// like -- must not get it. A false positive here is a stale 21 MB bundle in
+/// every builder's browser until they clear their cache; a false negative
+/// costs a `304`.
+///
+/// The rules, each of which is tested:
+///
+/// * the stamp is the *third* segment and starts with a digit, which is what
+///   separates `0.57.0` from `vs`, `monaco`, or `latest`;
+/// * every segment is `[A-Za-z0-9._-]`, non-empty, and neither `.` nor `..`
+///   -- a URL that `ServeDir` would resolve somewhere else than under the
+///   stamp must not be pinned;
+/// * the path contains no `%`, because a percent-encoded URL is not the path
+///   on disk it resolves to, so the URL alone no longer identifies the bytes;
+/// * at least one segment follows the stamp: the stamp *directory* is not an
+///   asset (`ServeDir` answers it with a redirect or an index, not bytes).
+fn is_version_stamped_asset(path: &str) -> bool {
+    if path.contains('%') {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    if segments.next() != Some("vendor") {
+        return false;
+    }
+    let (Some(package), Some(stamp)) = (segments.next(), segments.next()) else {
+        return false;
+    };
+    if !is_plain_segment(package) || !is_version_stamp(stamp) {
+        return false;
+    }
+    match segments.next() {
+        None => false,
+        Some(first) => is_plain_segment(first) && segments.all(is_plain_segment),
+    }
+}
+
+/// A path segment with nothing in it that could resolve elsewhere: no empty
+/// segment, no dot-segment, and only characters that survive percent-encoding
+/// unchanged (`ServeDir` percent-decodes what it is given).
+fn is_plain_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
+/// A plain segment that begins with a digit -- the shape of the npm version
+/// `scripts/vendor-monaco.mjs` puts in the URL.
+fn is_version_stamp(segment: &str) -> bool {
+    segment.starts_with(|byte: char| byte.is_ascii_digit()) && is_plain_segment(segment)
+}
+
+/// A validator for one served file, from the two headers the file service
+/// already paid to produce: `content-length` and `last-modified`.
+///
+/// **Weak, on purpose.** A strong validator has to change whenever anything
+/// observable in the payload changes (RFC 9110 §8.8.1), and `(length, mtime)`
+/// cannot promise that -- a length-preserving edit inside the same second,
+/// or two builds under a pinned `SOURCE_DATE_EPOCH`, would collide. Weakness
+/// costs nothing here: `If-None-Match` compares with the weak function
+/// anyway (RFC 9110 §13.1.2, §8.8.3.2), so revalidation works exactly as
+/// well, and the only thing given up is `If-Range`/`206` composition, which
+/// nothing in this bundle uses.
+///
+/// Shaped as `<mtime-seconds-hex>-<length-hex>` -- the same two inputs nginx
+/// hashes into its `ETag`, in hex -- so that a report of "the IDE is serving
+/// me an old file" can be answered by reading the validator instead of
+/// guessing.
+///
+/// Returns `None` when either header is missing (a filesystem without mtimes,
+/// or a response that is not a file at all): no validator, no conditional
+/// handling, and the freshness lifetime still applies.
+fn static_etag(headers: &axum::http::HeaderMap) -> Option<HeaderValue> {
+    let last_modified = headers
+        .get(header::LAST_MODIFIED)?
+        .to_str()
+        .ok()
+        .and_then(|value| httpdate::parse_http_date(value).ok())?;
+    let seconds = last_modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let length: u64 = headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()?;
+    HeaderValue::from_str(&format!("W/\"{seconds:x}-{length:x}\"")).ok()
+}
+
+/// Does one `If-None-Match` header value select the representation we are
+/// about to send? `*` matches anything, and a list is comma-separated.
+///
+/// Splitting on `,` is safe for the values this crate emits: [`static_etag`]
+/// is hex, `-`, and quotes, so it cannot contain a comma. Stripping `W/` from
+/// both sides is the weak comparison that RFC 9110 §13.1.2 makes mandatory
+/// for `If-None-Match`, and needed anyway -- a client echoes back the `W/`
+/// prefix we sent.
+fn if_none_match_matches(candidates: &str, etag: &str) -> bool {
+    let ours = strip_weakness(etag);
+    candidates.split(',').any(|candidate| {
+        let candidate = strip_weakness(candidate);
+        candidate == "*" || candidate == ours
+    })
+}
+
+fn strip_weakness(value: &str) -> &str {
+    value.trim().strip_prefix("W/").unwrap_or(value).trim()
+}
+
+/// Turn a `200` whose body the client already holds into the `304` RFC 9110
+/// §15.4.5 asks for. That section names the headers a `304` must still carry
+/// (`Content-Location`, `Date`, `ETag`, `Vary`, `Cache-Control`, `Expires` --
+/// all of them already on the `200` we are converting, so this function adds
+/// none) and says a sender SHOULD NOT generate other representation metadata:
+/// so the four payload headers below, which describe a body this response
+/// does not have, come off, along with the body itself.
+fn to_not_modified(response: axum::response::Response) -> axum::response::Response {
+    let (mut parts, _body) = response.into_parts();
+    parts.status = StatusCode::NOT_MODIFIED;
+    for name in [
+        header::CONTENT_LENGTH,
+        header::CONTENT_TYPE,
+        header::CONTENT_ENCODING,
+        header::CONTENT_LANGUAGE,
+    ] {
+        parts.headers.remove(name);
+    }
+    axum::response::Response::from_parts(parts, axum::body::Body::empty())
+}
+
+/// Freshness and validators for the static bundle (OBI-338), layered under
+/// [`with_static_security_headers`] in [`app`].
+///
+/// Two classes only, and the split is [`is_version_stamped_asset`]: a
+/// version-stamped vendor URL is [`STATIC_CACHE_IMMUTABLE`], and everything
+/// else the file service answers is [`STATIC_CACHE_REVALIDATE`] with a
+/// validator. `/api`, `/ws`, `/metrics` and `/healthz` never reach this layer
+/// -- they are explicit routes above the fallback, and `handlers.rs` already
+/// sets `no-store` on the responses that need it.
+///
+/// The M-IDE-1 header set is untouched: this layer only adds headers, and the
+/// security layer wraps it, so a `304` produced here is still stamped with
+/// the CSP (a `304` updates a cache's stored headers, so an entry that loses
+/// the policy would be a policy the next load does not get).
+async fn with_static_cache_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let immutable = is_version_stamped_asset(request.uri().path());
+    // Collected before the request is moved into `next.run`. A client may
+    // send the header more than once, and all of them are then compared.
+    let if_none_match: Vec<String> = request
+        .headers()
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .collect();
+    let mut response = next.run(request).await;
+
+    let status = response.status();
+    // Say nothing about freshness unless the response carries the file (or a
+    // `304` about it). This is not decoration: stamping a `404` for a not-yet
+    // deployed `/vendor/monaco/0.58.0/...` would cache the miss for a year,
+    // and the page that eventually ships those files would never see them.
+    if !(status.is_success() || status == StatusCode::NOT_MODIFIED) {
+        return response;
+    }
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(if immutable {
+            STATIC_CACHE_IMMUTABLE
+        } else {
+            STATIC_CACHE_REVALIDATE
+        }),
+    );
+    // The CSP riding on this response is computed from the request's `Host`
+    // (`static_csp`, because `connect-src` has to name the authority the
+    // browser dialed), so the response varies on something its URL does not
+    // name. A cache keyed on the URL alone could hand host A's policy to host
+    // B -- and B's `/ws` would be the thing that breaks. Browsers key on
+    // origin anyway; this is for anything shared in front of them, and
+    // `public` above is what makes that case reachable.
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Host"));
+
+    // Validators only for a complete `200`: a `206`'s `content-length` is the
+    // range's, not the file's, and a `304` from the file service's own
+    // `If-Modified-Since` handling has no metadata of its own to read.
+    if status != StatusCode::OK {
+        return response;
+    }
+    let Some(etag) = static_etag(response.headers()) else {
+        return response;
+    };
+    // Every byte of it is ASCII by construction, so the borrow that follows
+    // cannot fail -- and if it ever did, the answer is to send no validator.
+    let Ok(etag_text) = etag.to_str() else {
+        return response;
+    };
+    let etag_text = etag_text.to_owned();
+    response.headers_mut().insert(header::ETAG, etag);
+    if if_none_match
+        .iter()
+        .any(|candidates| if_none_match_matches(candidates, &etag_text))
+    {
+        return to_not_modified(response);
+    }
+    response
+}
+
 pub fn app(state: HttpState) -> Router {
     let web_root = state.web_root.clone();
     let router = Router::new()
@@ -425,8 +692,15 @@ pub fn app(state: HttpState) -> Router {
             // headers. `ServeDir`'s request body stays implicit: it is a single
             // generic type (the fallback), and `Service<Request>` is picked from
             // the router's `fallback_service` bound.
-            let static_files =
-                axum::middleware::from_fn(with_static_security_headers).layer(ServeDir::new(root));
+            //
+            // Two layers, nested so the caching one sits next to the file
+            // service (OBI-338): it reads the `content-length`/`last-modified`
+            // `ServeDir` produces, and the security layer stamps whatever comes
+            // back -- including the `304` it may turn a `200` into, so a cached
+            // entry cannot lose M-IDE-1's policy.
+            let static_files = axum::middleware::from_fn(with_static_security_headers).layer(
+                axum::middleware::from_fn(with_static_cache_headers).layer(ServeDir::new(root)),
+            );
             router.fallback_service(static_files)
         }
         None => router,
@@ -1248,5 +1522,375 @@ mod tests {
         )
         .with_web_root(root.to_path_buf());
         app(state)
+    }
+
+    /// A web root with one file of each shape OBI-338 cares about: a
+    /// document, an unhashed `tsc` output file, and the vendored Monaco tree
+    /// both with and without its version stamp.
+    fn cache_web_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>loom</html>").unwrap();
+        std::fs::write(dir.path().join("ide.html"), "<html>ide</html>").unwrap();
+        std::fs::create_dir_all(dir.path().join("dist").join("ide")).unwrap();
+        std::fs::write(
+            dir.path().join("dist").join("ide").join("amd-boot.js"),
+            "start();",
+        )
+        .unwrap();
+        for vs in ["vendor/monaco/0.57.0/vs", "vendor/monaco/vs"] {
+            let loader = dir.path().join(vs);
+            std::fs::create_dir_all(&loader).unwrap();
+            std::fs::write(loader.join("loader.js"), "/* amd loader */").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn only_a_version_stamp_makes_a_vendor_url_immutable() {
+        // The gate on `immutable` is structural (see `is_version_stamped_asset`
+        // for the rules); these are the shapes that decide the answer, in both
+        // directions, including the ones that would *look* versioned.
+        let stamped = [
+            "/vendor/monaco/0.57.0/vs/loader.js",
+            "/vendor/monaco/0.57.0/vs/editor/editor.main.css",
+            "/vendor/monaco/0.57.0-beta.1/vs/loader.js",
+            "/vendor/loom-mudlib/2026.04.01/area.css",
+        ];
+        let not_stamped = [
+            // What the tree looked like before OBI-338: the same file, one
+            // directory shallower, and no promise that the URL moved.
+            "/vendor/monaco/vs/loader.js",
+            "/vendor/monaco/latest/vs/loader.js",
+            // The stamp directory itself, a dot-segment anywhere in the path,
+            // an encoded separator, an empty package, a leading double slash,
+            // a path that only *contains* the stamp, and everything outside
+            // `/vendor/`.
+            "/vendor/monaco/0.57.0",
+            "/vendor/monaco/0.57.0/",
+            "/vendor/monaco/0.57.0/../0.57.0/vs/loader.js",
+            "/vendor/monaco/0.57.0/./vs/loader.js",
+            "/vendor/monaco/0.57.0/vs%2Floader.js",
+            "/vendor//0.57.0/loader.js",
+            "//vendor/monaco/0.57.0/vs/loader.js",
+            "/assets/vendor/monaco/0.57.0/vs/loader.js",
+            "/index.html",
+            "/dist/ide/amd-boot.js",
+            "/",
+        ];
+        for path in stamped {
+            assert!(is_version_stamped_asset(path), "{path} is stamped");
+        }
+        for path in not_stamped {
+            assert!(
+                !is_version_stamped_asset(path),
+                "{path} must not be promised immutable"
+            );
+        }
+    }
+
+    #[test]
+    fn if_none_match_compares_weakly_and_across_a_list() {
+        // RFC 9110 §13.1.2: a recipient MUST use the weak comparison
+        // function for `If-None-Match`, so the `W/`
+        // prefix a client echoes back must not be what decides the answer --
+        // and a candidate list is a comma-separated list of them.
+        let ours = "W/\"65e4b3a0-1f\"";
+        let cases = [
+            (ours, true),
+            ("\"65e4b3a0-1f\"", true),
+            ("*", true),
+            ("W/\"deadbeef-1\", \"65e4b3a0-1f\"", true),
+            ("W/\"deadbeef-1\", W/\"cafe-2\"", false),
+            ("\"65e4b3a0-1g\"", false),
+            ("", false),
+        ];
+        for (candidate, expected) in cases {
+            assert_eq!(
+                if_none_match_matches(candidate, ours),
+                expected,
+                "If-None-Match: {candidate:?} against {ours}"
+            );
+        }
+    }
+
+    /// The request a client holding `if_none_match` would send for `path`.
+    fn conditional_get(path: &str, if_none_match: &str) -> axum::extract::Request {
+        axum::http::Request::builder()
+            .uri(path)
+            .header(header::HOST, TEST_HOST)
+            .header(header::IF_NONE_MATCH, if_none_match)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_stamped_vendor_asset_is_the_only_thing_promised_immutable() {
+        let dir = cache_web_root();
+        let app = app_with_static_root(dir.path());
+
+        let served = [
+            ("/vendor/monaco/0.57.0/vs/loader.js", STATIC_CACHE_IMMUTABLE),
+            // The same file at the old, unstamped URL: it is the whole reason
+            // the classifier is structural. A year here would be a year of
+            // stale Monaco for every builder, with no URL left to change.
+            ("/vendor/monaco/vs/loader.js", STATIC_CACHE_REVALIDATE),
+            ("/dist/ide/amd-boot.js", STATIC_CACHE_REVALIDATE),
+            ("/ide.html", STATIC_CACHE_REVALIDATE),
+            ("/", STATIC_CACHE_REVALIDATE),
+        ];
+        for (path, expected) in served {
+            let response = app
+                .clone()
+                .oneshot(static_request(path, TEST_HOST))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .unwrap_or_else(|| panic!("no Cache-Control on {path}"))
+                    .to_str()
+                    .unwrap(),
+                expected,
+                "{path}"
+            );
+            // OBI-338's other half: the M-IDE-1 header set still rides on a
+            // cached response, and `Vary: Host` is there because `connect-src`
+            // is derived from the request's `Host` (`static_csp`), so a shared
+            // cache keyed on the URL alone could serve one host's policy to
+            // another and kill *its* `/ws`.
+            assert!(
+                response
+                    .headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .is_some(),
+                "the CSP header set must survive caching on {path}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::VARY)
+                    .unwrap_or_else(|| panic!("no Vary on {path}"))
+                    .to_str()
+                    .unwrap(),
+                "Host",
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_conditional_get_on_a_revalidated_asset_answers_304_with_no_body() {
+        let dir = cache_web_root();
+        let app = app_with_static_root(dir.path());
+
+        let first = app
+            .clone()
+            .oneshot(static_request("/ide.html", TEST_HOST))
+            .await
+            .unwrap();
+        let etag = first
+            .headers()
+            .get(header::ETAG)
+            .expect("a revalidated asset must carry a validator")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            etag.starts_with("W/\"") && etag.ends_with('"'),
+            "metadata-derived, so weak (RFC 9110 §8.8.1): {etag}"
+        );
+        let body = first.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, "<html>ide</html>".as_bytes());
+
+        // The revalidation a browser sends on the next load of the page.
+        let second = app
+            .clone()
+            .oneshot(conditional_get("/ide.html", &etag))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+        // A `304` must not carry a payload, nor the headers that describe one
+        // (RFC 9110 §15.4.5) -- `ServeDir` put a `Content-Length` and a
+        // `Content-Type` in the `200` this replaced, and hyper would be right
+        // to reject the mismatch.
+        assert!(
+            second.headers().get(header::CONTENT_LENGTH).is_none(),
+            "no payload, no Content-Length"
+        );
+        assert!(
+            second.headers().get(header::CONTENT_TYPE).is_none(),
+            "a 304 must not repeat payload headers"
+        );
+        // ...but everything that decides *whether* to revalidate, and the
+        // policy the stored entry is kept under, still rides along: a `304`
+        // replaces the headers of the cached response.
+        assert_eq!(
+            second
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok())
+                .unwrap(),
+            STATIC_CACHE_REVALIDATE
+        );
+        assert_eq!(
+            second
+                .headers()
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            etag
+        );
+        assert_eq!(
+            second
+                .headers()
+                .get(header::VARY)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Host"
+        );
+        assert!(
+            second
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .is_some(),
+            "M-IDE-1's policy must not be the thing a 304 loses"
+        );
+        assert_eq!(
+            second.into_body().collect().await.unwrap().to_bytes().len(),
+            0
+        );
+
+        // A candidate list, ours second: weak comparison across the list.
+        let list = format!("W/\"deadbeef-1\", {etag}");
+        let third = app
+            .clone()
+            .oneshot(conditional_get("/ide.html", &list))
+            .await
+            .unwrap();
+        assert_eq!(third.status(), StatusCode::NOT_MODIFIED);
+        // `*` is the other thing a client may send.
+        let any = app
+            .oneshot(conditional_get("/ide.html", "*"))
+            .await
+            .unwrap();
+        assert_eq!(any.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn a_validator_that_does_not_match_streams_the_file() {
+        let dir = cache_web_root();
+        let app = app_with_static_root(dir.path());
+        let request = axum::http::Request::builder()
+            .uri("/dist/ide/amd-boot.js")
+            .header(header::HOST, TEST_HOST)
+            .header(header::IF_NONE_MATCH, "W/\"0-0\"")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, "start();".as_bytes());
+    }
+
+    #[tokio::test]
+    async fn the_validator_moves_when_the_bytes_move() {
+        // The promise behind `max-age=0, must-revalidate` is that a
+        // revalidation notices a rebuild, so pin that the validator is not
+        // constant per URL. The rewrite is a different length *and* a later
+        // mtime, so this does not depend on the filesystem's clock granularity
+        // -- the assertion is that the two differ, not what either one is.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+        let file = dir.path().join("dist").join("app.js");
+        std::fs::write(&file, "v1").unwrap();
+        let app = app_with_static_root(dir.path());
+
+        let first = app
+            .clone()
+            .oneshot(static_request("/dist/app.js", TEST_HOST))
+            .await
+            .unwrap();
+        let before = first
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        std::fs::write(&file, "v2 is longer").unwrap();
+        let second = app
+            .oneshot(static_request("/dist/app.js", TEST_HOST))
+            .await
+            .unwrap();
+        let after = second
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(before, after, "a rebuild must not keep the old validator");
+        assert_eq!(second.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_miss_says_nothing_about_freshness() {
+        // A `404` for a stamped URL must not be cached: the file may exist in
+        // the next image, and a client that cached the miss for a year would
+        // never learn about it. The CSP stamp stays (M-IDE-1's reasoning about
+        // 404s is unchanged); only the cache directives are withheld.
+        let dir = cache_web_root();
+        let app = app_with_static_root(dir.path());
+        let response = app
+            .clone()
+            .oneshot(static_request(
+                "/vendor/monaco/0.58.0/vs/loader.js",
+                TEST_HOST,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get(header::CACHE_CONTROL).is_none());
+        assert!(response.headers().get(header::ETAG).is_none());
+        assert!(response.headers().get(header::VARY).is_none());
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .is_some(),
+            "the security layer is independent of caching"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_routes_keep_their_own_response_headers() {
+        // The cache layer wraps the `ServeDir` fallback only -- `/healthz` and
+        // `/metrics` must not pick up `immutable`, a validator, or a `Vary`.
+        let dir = cache_web_root();
+        let app = app_with_static_root(dir.path());
+        for path in ["/healthz", "/metrics"] {
+            let response = app
+                .clone()
+                .oneshot(static_request(path, TEST_HOST))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            for name in [
+                header::CACHE_CONTROL,
+                header::ETAG,
+                header::VARY,
+                header::CONTENT_SECURITY_POLICY,
+            ] {
+                assert!(
+                    response.headers().get(&name).is_none(),
+                    "{path} must be untouched by the static layer, but carried {}",
+                    name.as_str()
+                );
+            }
+        }
     }
 }

@@ -1307,6 +1307,7 @@ dependencies = [
  "futures-util",
  "hmac 0.13.0",
  "http-body-util",
+ "httpdate",
  "loom-git",
  "loom-lsp",
  "loom-net",
