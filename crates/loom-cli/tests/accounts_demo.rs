@@ -26,7 +26,12 @@
 //! * the probes are pinned to actually queue hashing ([`pipeline_name`] and
 //!   [`pipelined_names_pass_the_drivers_own_validation`]): the names this file
 //!   used before were rejected by the driver's own validation, so the test was
-//!   asserting on an empty queue.
+//!   asserting on an empty queue; and
+//! * the client no longer nudges the world thread at all ([`PROBE`]). The
+//!   100 ms `look` loop predates `NetEvent::Tick` (OBI-82), and at 10 Hz it ran
+//!   at twice `loom_net`'s per-connection input limit -- which is what actually
+//!   capped these waits at 2 s, because past the burst the driver hangs up on
+//!   the test.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -63,60 +68,53 @@ const HASH_TOLERANCE: u32 = 2;
 /// a *lower* bound: a slower host can only loosen this test, never lose it.
 const MIN_ALLOWANCE: Duration = Duration::from_millis(50);
 
-/// Command sent to give the world thread something to drain on, and to probe
-/// connection `b`'s latency. `look` costs the driver no hashing and no DB round
-/// trip. It stands in for `NetEvent::Tick` (OBI-82, not landed yet): without a
-/// periodic tick nothing re-polls the account backend's result channel on an
-/// otherwise idle connection, so these tests nudge often enough that the drain
-/// in `spawn_world_thread` runs promptly. Once OBI-82 lands the nudges become
-/// redundant, not wrong.
-const NUDGE: &str = "look";
-
-/// How often to send [`NUDGE`] -- derived from the driver's own input rate limit,
-/// never guessed.
+/// The line connection `b` is probed with. `look` is what the fixture's
+/// `process_input` answers with a plain `ok`, and it costs the driver no
+/// hashing and no DB round trip, so it measures the world thread's willingness
+/// to service input rather than anything the command itself does.
 ///
-/// `loom_net` gives every connection a token bucket (`NetConfig::rate_limit_*`)
-/// that costs one token per input line, and disconnects the player when it runs
-/// out. This file used to nudge every 100 ms, i.e. 10 Hz against a 5 Hz refill
-/// with a 20-token burst: the burst buys about two seconds, after which the
-/// *test* is disconnected by its own traffic. That is the real reason the old
-/// hard-coded 2 s budgets appeared sufficient -- waiting longer than that was
-/// never an option, so a slow CI runner could only time out.
-fn nudge_interval() -> Duration {
-    let limit = loom_net::NetConfig::default().rate_limit_per_second;
-    let sustained = Duration::from_secs_f64(1.0 / limit);
-    // Half a refill period slower than the limit, so the bucket always has more
-    // tokens coming back than this test spends -- even at startup, when the
-    // pipelined creates have already taken a bite out of the burst.
-    sustained + sustained / 2
-}
+/// It is *not* a nudge. This file used to also send `look` on `a` every 100 ms
+/// to force the world thread to drain the account backend's result channel,
+/// because before `NetEvent::Tick` (OBI-82) nothing else woke the loop. The tick
+/// has landed -- `loom-cli serve` sends one every 100 ms
+/// (`WORLD_TICK_INTERVAL`), and `World::tick` calls `World::drain_account_results`
+/// -- so no client traffic is needed to make results appear, and giving some up
+/// the file's timing is what the OBI-329 rewrite is made of. The cadence that
+/// used to force the drain (10 Hz) was also twice `loom_net`'s per-connection
+/// input limit (one token per line, 5/s refill, 20 burst), which disconnects a
+/// client that exceeds it: the old 2 s budgets were not a judgement about how
+/// long hashing takes, they were how long the *test* could afford to talk before
+/// the driver dropped it. See [`client_traffic_stays_inside_the_drivers_input_limit`].
+const PROBE: &str = "look";
 
 #[test]
-fn nudges_stay_under_the_drivers_own_input_rate_limit() {
-    // The cadence has to survive a whole hashing window, not just a burst. If
-    // someone raises the driver's limit this test still passes; if someone
-    // lowers it, or nudges faster here, this fails instead of a build losing
-    // its connection mid-test.
+fn client_traffic_stays_inside_the_drivers_input_limit() {
+    // The driver disconnects a client that runs out of input tokens, so a test
+    // that talks too much does not get slow, it gets dropped -- and the failure
+    // then looks like a driver bug. Every line this file sends on one
+    // connection has to fit the burst, because the window it fits into is
+    // whatever the host's hashing takes, not something the test can predict.
     let config = loom_net::NetConfig::default();
-    let per_second = 1.0 / nudge_interval().as_secs_f64();
+    // Connection `a` only ever sees one line per command a test types: 4 in the
+    // create/duplicate/login test, `PIPELINED_CREATES` here. `b` sees the floor
+    // samples plus the probes, and the floor samples are the burstiest thing in
+    // the file (7 lines inside 7 x 20 ms).
+    let on_a = PIPELINED_CREATES;
+    let on_b = FLOOR_SAMPLES + LOADED_SAMPLES;
     assert!(
-        per_second < config.rate_limit_per_second,
-        "nudging at {per_second:.2} lines/s against a {} lines/s limit: the driver would drop \
-         the connection",
-        config.rate_limit_per_second,
+        on_a <= config.rate_limit_burst as usize && on_b <= config.rate_limit_burst as usize,
+        "this test sends {on_a} lines on `a` and {on_b} on `b` against a burst of {}; widen          the burst or send less",
+        config.rate_limit_burst,
     );
-
-    // Worst realistic window: one hash per second for every pipelined create,
-    // plus the probes. Everything the test sends on one connection over that
-    // window must fit the burst plus what the bucket refills in the same time.
-    let window = Duration::from_secs(PIPELINED_CREATES as u64);
-    let lines_sent = window.as_secs_f64() * per_second + PIPELINED_CREATES as f64;
-    let affordable =
-        f64::from(config.rate_limit_burst) + window.as_secs_f64() * config.rate_limit_per_second;
-    assert!(
-        lines_sent <= affordable,
-        "{lines_sent:.1} lines over a {window:?} window against {affordable:.1} affordable"
-    );
+    // And the probes, if they must be paced at all, are paced on results --
+    // never on a fixed interval that could out-run the bucket. Checked at
+    // compile time, since nothing about it depends on the host.
+    const {
+        assert!(
+            LOADED_SAMPLES <= PIPELINED_CREATES,
+            "one probe per outstanding create at most"
+        );
+    }
 }
 
 /// The socket read timeout while the probe window is open. A *poll* interval,
@@ -153,28 +151,28 @@ fn in_memory_account_backend_create_duplicate_and_bad_password() {
     send_line(&mut a, "create legolas hunter2pass");
     let out = read_until_contains(&mut a, "req ", READY_DEADLINE);
     assert!(out.contains("req 1\n"), "{out}");
-    let out = poll_until_contains(&mut a, "result 1 ", READY_DEADLINE);
+    let out = read_until_contains(&mut a, "result 1 ", READY_DEADLINE);
     assert!(
         out.contains("result 1 true "),
         "expected a successful create: {out}"
     );
 
     send_line(&mut a, "create legolas hunter2pass");
-    let out = poll_until_contains(&mut a, "result 2 ", READY_DEADLINE);
+    let out = read_until_contains(&mut a, "result 2 ", READY_DEADLINE);
     assert!(
         out.contains("result 2 false exists"),
         "duplicate account must be rejected as `exists`: {out}"
     );
 
     send_line(&mut a, "login legolas wrong-password");
-    let out = poll_until_contains(&mut a, "result 3 ", READY_DEADLINE);
+    let out = read_until_contains(&mut a, "result 3 ", READY_DEADLINE);
     assert!(
         out.contains("result 3 false bad_credentials"),
         "wrong password must be `bad_credentials`: {out}"
     );
 
     send_line(&mut a, "login legolas hunter2pass");
-    let out = poll_until_contains(&mut a, "result 4 ", READY_DEADLINE);
+    let out = read_until_contains(&mut a, "result 4 ", READY_DEADLINE);
     assert!(
         out.contains("result 4 true "),
         "correct login must succeed: {out}"
@@ -460,10 +458,9 @@ fn probe_hashing_window(a: &mut BufReader<TcpStream>, b: &mut BufReader<TcpStrea
     let mut transcript_b = String::new();
 
     // The first probe goes out immediately, with the whole queue ahead of it.
-    send_line(b, NUDGE);
+    send_line(b, PROBE);
     let first_probe_sent = Instant::now();
     let mut probe_sent = Some(first_probe_sent);
-    let mut last_input = first_probe_sent;
 
     loop {
         let Drain {
@@ -512,9 +509,8 @@ fn probe_hashing_window(a: &mut BufReader<TcpStream>, b: &mut BufReader<TcpStrea
             && results.len() < PIPELINED_CREATES
             && should_send_next_probe(probe_rtt.len(), result_arrivals.len())
         {
-            send_line(b, NUDGE);
+            send_line(b, PROBE);
             probe_sent = Some(Instant::now());
-            last_input = Instant::now();
         }
 
         if probe_rtt.len() == LOADED_SAMPLES && results.len() == PIPELINED_CREATES {
@@ -528,12 +524,6 @@ fn probe_hashing_window(a: &mut BufReader<TcpStream>, b: &mut BufReader<TcpStrea
                 results.len(),
                 probe_rtt.len(),
             );
-        }
-        if last_input.elapsed() >= nudge_interval() {
-            // Nothing sent, nothing arriving: keep giving the world thread a
-            // reason to run the result drain (OBI-82).
-            send_line(a, NUDGE);
-            last_input = Instant::now();
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -662,7 +652,7 @@ fn round_trips(reader: &mut BufReader<TcpStream>, count: usize) -> Vec<Duration>
 
 fn round_trip(reader: &mut BufReader<TcpStream>) -> Duration {
     let started = Instant::now();
-    send_line(reader, NUDGE);
+    send_line(reader, PROBE);
     loop {
         let drain = drain(reader);
         assert!(!drain.closed, "peer closed the connection mid-measurement");
@@ -671,7 +661,7 @@ fn round_trip(reader: &mut BufReader<TcpStream>) -> Duration {
         }
         assert!(
             started.elapsed() < READY_DEADLINE,
-            "no reply to `{NUDGE}` within {READY_DEADLINE:?}: this connection is not being \
+            "no reply to `{PROBE}` within {READY_DEADLINE:?}: this connection is not being \
              answered at all"
         );
     }
@@ -688,50 +678,6 @@ fn send_line(reader: &mut BufReader<TcpStream>, line: &str) {
     stream
         .flush()
         .unwrap_or_else(|err| panic!("flush command `{line}` failed: {err}"));
-}
-
-/// [`read_until_contains`], but also sends [`NUDGE`] on `reader` every
-/// [`nudge_interval`] while waiting, so an idle connection still gives the world
-/// thread something to drain (see [`NUDGE`]).
-fn poll_until_contains(
-    reader: &mut BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    let started = Instant::now();
-    let mut transcript = String::new();
-    let mut last_nudge = started - Duration::from_secs(1);
-
-    loop {
-        if transcript.contains(needle) {
-            return transcript;
-        }
-        if started.elapsed() > timeout {
-            panic!(
-                "timed out waiting for `{needle}` after {timeout:?}. Transcript so far:\n\
-                 {transcript}"
-            );
-        }
-        if last_nudge.elapsed() >= nudge_interval() {
-            send_line(reader, NUDGE);
-            last_nudge = Instant::now();
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => transcript.push_str(&line.replace("\r\n", "\n")),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!(
-                "socket read failed while waiting for `{needle}`: {err}. Transcript so far:\n\
-                 {transcript}"
-            ),
-        }
-    }
 }
 
 fn read_until_contains(
