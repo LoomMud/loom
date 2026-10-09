@@ -2951,22 +2951,108 @@ async fn run_roles_manager(
     }
 }
 
+/// First wait before re-attempting a failed `audit_log` insert (OBI-354).
+const AUDIT_RETRY_BASE: Duration = Duration::from_millis(25);
+/// Ceiling on that wait, so a multi-minute outage costs one bounded retry a
+/// second instead of a hot loop (OBI-354).
+const AUDIT_RETRY_MAX: Duration = Duration::from_secs(1);
+
+/// Wait before retry number `attempt` (1 = the retry after the first failure):
+/// exponential from [`AUDIT_RETRY_BASE`], capped at [`AUDIT_RETRY_MAX`]. Pure
+/// and tested, because "bounded backoff" is the part of this policy that can
+/// regress silently.
+fn audit_retry_delay(attempt: u32) -> Duration {
+    let factor = 1u32 << attempt.saturating_sub(1).min(16);
+    AUDIT_RETRY_BASE.saturating_mul(factor).min(AUDIT_RETRY_MAX)
+}
+
+/// What [`insert_audit_batch_at_least_once`] decided about one batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuditInsert {
+    /// Postgres took the batch. `attempts` counts tries, so 1 means the first.
+    Taken { attempts: u32 },
+    /// The process is stopping with this batch still un-persisted.
+    Shutdown { attempts: u32 },
+}
+
+/// Append one `audit_log` batch, at-least-once (OBI-354).
+///
+/// Board decision (2026-10-09, on this issue): a failed insert is **retried
+/// with bounded backoff**, not dropped. The two ways to treat a transient DB
+/// error are asymmetric: a gap in `audit_log` erases a denied P2+ write or a
+/// `/secure` check from the security record while the server keeps running and
+/// looking healthy; a duplicate row merely records the same decision twice.
+/// The cost of this choice is precisely that: an insert that committed *and*
+/// reported an error (a connection dropped after Postgres applied it) is
+/// written twice, and `audit_log` has no unique constraint on a decision's
+/// identity to collapse it. Readers of `audit_log` must tolerate duplicates;
+/// de-duplicating would need a migration.
+///
+/// The batch is *held* here while it retries, which is what keeps the world
+/// thread safe: the sink stops reading its queue, [`AuditHandoff`] sees
+/// `Full` and keeps the next batch in the ring, and the pressure surfaces as a
+/// rate-limited warning -- never a blocking call, never an unbounded backlog.
+async fn insert_audit_batch_at_least_once<F, Fut, E>(
+    count: usize,
+    first_kind: &'static str,
+    mut insert: F,
+    shutdown: &mut watch::Receiver<bool>,
+) -> AuditInsert
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let mut attempts: u32 = 0;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match insert().await {
+            Ok(()) => return AuditInsert::Taken { attempts },
+            Err(err) => {
+                let delay = audit_retry_delay(attempts);
+                match attempts {
+                    1 => warn!(
+                        rows = count,
+                        kind = first_kind,
+                        error = %err,
+                        retry_in_ms = delay.as_millis(),
+                        "audit_log insert failed; holding the batch and retrying (at-least-once, OBI-354)"
+                    ),
+                    n if n.is_multiple_of(8) => error!(
+                        rows = count,
+                        kind = first_kind,
+                        attempts = n,
+                        error = %err,
+                        "audit_log insert still failing; the audit queue is backing up and the world ring is filling"
+                    ),
+                    _ => debug!(
+                        rows = count,
+                        attempts,
+                        error = %err,
+                        "audit_log insert retry failed"
+                    ),
+                }
+                tokio::select! {
+                    _ = shutdown.changed() => return AuditInsert::Shutdown { attempts },
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    }
+}
+
 /// Batch-write the in-memory audit ring to the `audit_log` Postgres sink
 /// (design OBI-36 §5/D-S2.5, wired by OBI-123): drains whatever
 /// `spawn_world_thread` hands it (already-owned rows, computed on the world
-/// thread from `World::drain_audit_since`) and appends each batch in one
-/// round trip (`Persist::insert_audit_batch`). A failed batch is logged and
-/// dropped -- the audit ring itself is still the source of truth and keeps
-/// its own bounded history, so losing one batch to a transient DB error is
-/// preferable to blocking the world thread or retrying forever.
+/// thread from `World::drain_audit_since`) and appends each batch in one round
+/// trip (`Persist::insert_audit_batch`).
 ///
-/// **OBI-354:** this insert-side drop is the one path left on which a
-/// recorded decision can still fail to reach `audit_log`. Making it retry is
-/// an at-least-once/duplicate-rows policy call (a security-model change), so
-/// it goes to the CTO rather than being decided here. A successful write is
-/// now logged at `debug!` so a failed assertion in `tests/roles_demo.rs` can
-/// distinguish "the row was never written" from "the row was written after
-/// the watcher gave up".
+/// **OBI-354:** a failed insert is no longer dropped. It is retried with
+/// bounded backoff by [`insert_audit_batch_at_least_once`], which holds the
+/// batch -- and therefore stops reading its queue -- until Postgres takes it.
+/// A successful write is logged at `debug!` so a failed assertion in
+/// `tests/roles_demo.rs` can distinguish "the row was never written" from
+/// "the row was written after the watcher gave up".
 async fn run_audit_sink(
     persist: Persist,
     mut audit_rx: mpsc::Receiver<Vec<loom_vm::AuditRow>>,
@@ -2977,24 +3063,37 @@ async fn run_audit_sink(
             _ = shutdown_rx.changed() => break,
             batch = audit_rx.recv() => {
                 let Some(batch) = batch else { break };
-                let count = batch.len();
                 let first_kind = batch.first().map(|r| r.kind).unwrap_or("-");
                 let rows: Vec<loom_persist::AuditRow> = batch.into_iter().map(to_persist_audit_row).collect();
-                match persist.insert_audit_batch(&rows).await {
-                    Ok(()) => {
+                let count = rows.len();
+                match insert_audit_batch_at_least_once(
+                    count,
+                    first_kind,
+                    || persist.insert_audit_batch(&rows),
+                    &mut shutdown_rx,
+                )
+                .await
+                {
+                    AuditInsert::Taken { attempts } => {
                         debug!(
                             rows = count,
                             kind = first_kind,
+                            attempts,
                             "audit_log batch written to Postgres"
                         );
                     }
-                    Err(err) => {
-                        warn!(
+                    AuditInsert::Shutdown { attempts } => {
+                        // The only loss path left that this task controls, and
+                        // it is the process exiting: what is still queued here
+                        // and still in the world ring goes with it.
+                        error!(
                             rows = count,
                             kind = first_kind,
-                            error = %err,
-                            "audit_log insert failed; batch dropped"
+                            attempts,
+                            still_queued = audit_rx.len(),
+                            "audit_log batch unsaved at shutdown; queued audit decisions are dropped with the process"
                         );
+                        break;
                     }
                 }
             }
@@ -4282,6 +4381,139 @@ mod audit_handoff_tests {
         assert!(
             rx.try_recv().is_err(),
             "the denied write never reaches Postgres"
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_sink_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn the_audit_retry_backoff_grows_and_is_capped() {
+        // 25, 50, 100, 200, 400, 800 ms, then 1 s forever: a minute-long
+        // outage is ~55 bounded retries, not a hot loop and not a gap.
+        let got: Vec<u64> = (1..=12u32)
+            .map(|n| audit_retry_delay(n).as_millis() as u64)
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                25, 50, 100, 200, 400, 800, 1000, 1000, 1000, 1000, 1000, 1000
+            ]
+        );
+        assert!(
+            got.windows(2).all(|w| w[1] >= w[0]),
+            "backoff must never shrink"
+        );
+        assert!(
+            got.iter()
+                .all(|ms| *ms <= AUDIT_RETRY_MAX.as_millis() as u64)
+        );
+        assert_eq!(
+            audit_retry_delay(u32::MAX).as_millis(),
+            1000,
+            "no overflow at the top"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_successful_insert_is_not_retried() {
+        let (_tx, mut rx) = watch::channel(false);
+        let mut calls = 0u32;
+        let out = insert_audit_batch_at_least_once(
+            1,
+            "check",
+            || {
+                calls += 1;
+                async { Ok::<(), &'static str>(()) }
+            },
+            &mut rx,
+        )
+        .await;
+        assert_eq!(out, AuditInsert::Taken { attempts: 1 });
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_insert_failure_is_retried_and_the_batch_survives() {
+        let (_tx, mut rx) = watch::channel(false);
+        let mut calls = 0u32;
+        let out = insert_audit_batch_at_least_once(
+            2,
+            "write_file",
+            || {
+                calls += 1;
+                let n = calls;
+                async move {
+                    if n < 3 {
+                        Err("connection closed")
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            &mut rx,
+        )
+        .await;
+        assert_eq!(out, AuditInsert::Taken { attempts: 3 });
+        assert_eq!(calls, 3, "the batch is re-offered until Postgres takes it");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_insert_that_never_succeeds_is_held_not_dropped() {
+        // OBI-354's whole point: there is no attempt budget after which the
+        // sink gives up on a batch it has already accepted. Paused-time
+        // auto-advance runs the real backoff clock, so 60 s of virtual waiting
+        // must still be retrying -- the pre-OBI-354 code returned after one
+        // failure and the decisions were gone.
+        let (_tx, mut rx) = watch::channel(false);
+        let calls = std::sync::Arc::new(AtomicU32::new(0));
+        let counter = calls.clone();
+        let fut = insert_audit_batch_at_least_once(
+            4,
+            "write_file",
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { Err("connection refused") }
+            },
+            &mut rx,
+        );
+        let tried = tokio::time::timeout(std::time::Duration::from_secs(60), fut).await;
+        assert!(
+            tried.is_err(),
+            "the sink must not conclude while Postgres is down"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 40,
+            "60 s of capped backoff must be ~55 attempts, got {}",
+            calls.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_a_retry_stops_and_says_what_was_lost() {
+        let (tx, mut rx) = watch::channel(false);
+        let mut calls = 0u32;
+        let out = insert_audit_batch_at_least_once(
+            2,
+            "write_file",
+            || {
+                calls += 1;
+                if calls == 2 {
+                    // The process starts stopping while the batch is held.
+                    let _ = tx.send(true);
+                }
+                async { Err("connection closed") }
+            },
+            &mut rx,
+        )
+        .await;
+        assert_eq!(out, AuditInsert::Shutdown { attempts: 2 });
+        assert_eq!(
+            calls, 2,
+            "it stops re-offering the batch once shutdown is seen"
         );
     }
 }
