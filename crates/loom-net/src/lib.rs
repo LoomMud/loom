@@ -219,6 +219,76 @@ pub type ReclaimRequest = (ConnId, oneshot::Sender<Option<TcpStream>>);
 /// player.
 type HandoffOutbox = HashMap<ConnId, VecDeque<ConnControl>>;
 
+/// Test-only witness for the `closed_rx` arm of [`run_server_full`].
+///
+/// That arm's only effect is forgetting a [`HandoffOutbox`] marker, and the
+/// outbox has exactly one other reader -- the `adopt_rx` arm, which *consumes*
+/// whatever it finds. So nothing outside the loop can tell "the marker for a
+/// dead session was dropped with it" apart from "the marker is still there and
+/// the next `select!` will pick whichever arm it picks", and a test that wants
+/// the first must otherwise settle for a wall-clock sleep standing in for a
+/// happens-before edge. This list is that edge, reported by the loop itself.
+///
+/// Compiled only into this crate's own test binary (`#[cfg(test)]` is not set
+/// when `loom-net` is built for `loom-cli`/`loom-http` or for a release), so
+/// shipped behaviour, `run_server_full`'s signature and every public item are
+/// unchanged; the one call site sits beside the `debug!`/counter the arm
+/// already emits.
+///
+/// Conn ids are unique per loop, not per process, and `cargo test` runs this
+/// crate's tests in one process with several loops live at once -- so a test
+/// that reads this list has to use an id no other test can produce. See
+/// `MARKER_SEED` in `a_dead_session_leaves_no_handoff_marker_behind`.
+#[cfg(test)]
+mod handoff_witness {
+    use super::ConnId;
+    use std::sync::{Mutex, OnceLock};
+
+    /// What the loop did to a `HandoffOutbox` entry.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Event {
+        /// The reclaim arm accepted a request and opened the marker.
+        Installed,
+        /// The `closed_rx` arm dropped the marker, with how many commands were
+        /// still parked behind it.
+        Forgotten { parked: usize },
+    }
+
+    static EVENTS: OnceLock<Mutex<Vec<(ConnId, Event)>>> = OnceLock::new();
+
+    /// Called by the two arms that touch a marker, once per event.
+    pub(super) fn note(conn: ConnId, event: Event) {
+        EVENTS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("handoff witness lock")
+            .push((conn, event));
+    }
+
+    /// `true` once the loop has reported this event for this id.
+    pub(super) fn saw(conn: ConnId, event: Event) -> bool {
+        EVENTS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("handoff witness lock")
+            .iter()
+            .any(|(id, e)| *id == conn && *e == event)
+    }
+
+    /// `Some(parked)` once the loop has reported forgetting this id's marker.
+    pub(super) fn forgotten(conn: ConnId) -> Option<usize> {
+        EVENTS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("handoff witness lock")
+            .iter()
+            .find_map(|(id, event)| match (id == &conn, event) {
+                (true, Event::Forgotten { parked }) => Some(*parked),
+                _ => None,
+            })
+    }
+}
+
 /// Per-session bound on [`HandoffOutbox`] (OBI-304): a handed-off session
 /// gets buffered no more output than a live one would (`NetConfig::
 /// output_queue_depth`), which is also exactly what fits back into the
@@ -409,6 +479,8 @@ pub async fn run_server_full(
                 // this arm.
                 if let Some(parked) = handoff.remove(&conn_id) {
                     let parked = parked.len();
+                    #[cfg(test)]
+                    handoff_witness::note(conn_id, handoff_witness::Event::Forgotten { parked });
                     if parked > 0 {
                         debug!(
                             conn_id,
@@ -478,6 +550,8 @@ pub async fn run_server_full(
                         // the readopt is buffered (see [`HandoffOutbox`])
                         // instead of dropped.
                         handoff.entry(conn).or_default();
+                        #[cfg(test)]
+                        handoff_witness::note(conn, handoff_witness::Event::Installed);
                     }
                     None => {
                         debug!(conn, "reclaim requested for an unknown/already-gone connection");
@@ -1479,6 +1553,81 @@ mod tests {
         let mut buf = vec![0_u8; STARTUP_PREAMBLE.len()];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, STARTUP_PREAMBLE);
+    }
+
+    /// A connected loopback pair: `(client end, socket to hand the loop)`. The
+    /// socket comes off a throwaway listener, so `run_server_full`'s accept arm
+    /// can never see it -- which is how a test gives the loop a session it
+    /// *adopts* rather than accepts, while keeping the client end alive to read
+    /// that session back.
+    async fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        drop(listener);
+        (client, server)
+    }
+
+    /// Queue a reclaim for `conn` and wait for its answer, using it as a
+    /// happens-before fence on the reclaim channel: `mpsc` is FIFO and
+    /// `run_server_full` runs one `select!` arm at a time, so this returning
+    /// proves every reclaim arm queued ahead of it ran to completion --
+    /// including the side effect that comes *last* in the accepted branch
+    /// (`handoff.entry(conn).or_default()`) and the drain that comes *first* in
+    /// this one.
+    ///
+    /// Asserts the documented answer for an id the loop has already taken out of
+    /// `conns`: `None`. A socket here would mean the id was re-adopted between
+    /// the two requests, i.e. the run is not the scenario the caller thinks it
+    /// is testing.
+    async fn fence_reclaim(reclaim_tx: &mpsc::Sender<ReclaimRequest>, conn: ConnId) {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        reclaim_tx.send((conn, reply_tx)).await.unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the follow-up reclaim for {conn} was never answered: the loop never came \
+                     back to `reclaim_rx`, so it has not proved anything"
+                )
+            })
+            .unwrap_or_else(|_| {
+                panic!("the follow-up reclaim for {conn} was dropped without an answer")
+            });
+        assert!(
+            answer.is_none(),
+            "the follow-up reclaim for {conn} handed back a socket: the id was re-adopted \
+             between the two requests, which is not the scenario under test"
+        );
+    }
+
+    /// Wait for `run_server_full` to report -- see [`handoff_witness`] -- that
+    /// it forgot this id's `HandoffOutbox` marker, and return how many commands
+    /// were parked behind it.
+    ///
+    /// The bound is a liveness bound on a *positive* event, never a stand-in for
+    /// an ordering, and the caller has already witnessed the marker being
+    /// installed: timing this out therefore means exactly one thing, that the
+    /// `closed_rx` arm leaked a marker for a session whose task had already
+    /// exited -- OBI-304/B2. Not "the runner was slow", and no assertion here
+    /// turns on which arm won.
+    async fn wait_for_handoff_forgotten(conn: ConnId) -> usize {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(2);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(parked) = handoff_witness::forgotten(conn) {
+                return parked;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "run_server_full never forgot {conn}'s handoff marker, though it reported \
+                     installing it and its connection task exited: the OBI-304/B2 leak this \
+                     test guards"
+                );
+            }
+            tokio::time::sleep(POLL).await;
+        }
     }
 
     #[test]
@@ -3139,19 +3288,54 @@ mod tests {
         server.await.unwrap().unwrap();
     }
 
-    /// OBI-304/B2: when the connection task behind a reclaim dies on its
-    /// own (client EOF, write error), the caller gets no socket back and
-    /// nothing will ever re-adopt that id -- so its handoff marker must go
-    /// with it. A leaked marker parks up to `output_queue_depth` commands
-    /// per race, permanently, because ids are never reused.
+    /// OBI-304/B2: when the connection task behind a reclaim dies on its own
+    /// (client EOF, write error), the caller gets no socket back and nothing
+    /// will ever re-adopt that id -- so its handoff marker must go with it. A
+    /// leaked marker parks up to `output_queue_depth` commands per race,
+    /// permanently, because ids are never reused.
     ///
-    /// The determinism comes from the event channel: a test-sent filler
-    /// event occupies its single slot, so the exiting task pins on its
-    /// `Disconnected` send and provably has *not* sent `closed_tx` yet
-    /// while the reclaim is applied against its still-present `ConnEntry`
-    /// -- exactly the interleaving that leaked.
+    /// OBI-330 rewrote the choreography, which used to buy two orderings with
+    /// `sleep(50 ms)` -- "by now the loop has installed the marker", "by now it
+    /// has forgotten it". Both are wall-clock guesses at which `select!` arm
+    /// ran, so on a contended CI worker either can come out wrong: the first
+    /// makes the final probe assert nothing (a marker that was never installed
+    /// replays nothing -- flake-free and worthless), the second can make it fail
+    /// as a *false* leak. The orderings are asserted here instead:
+    ///
+    /// * **installed**: [`fence_reclaim`] behind the request under test.
+    ///   `reclaim_rx` is FIFO and the loop runs one arm at a time, so a fence
+    ///   being answered proves the reclaim under test ran its whole arm body --
+    ///   including `handoff.entry(conn).or_default()`, the last thing the
+    ///   accepted branch does -- and the loop says so itself
+    ///   (`handoff_witness::Event::Installed`), which is checked right after
+    ///   that fence. With the task pinned (below) that is also the proof it
+    ///   *was* the accepted branch: nothing could have removed the `ConnEntry`
+    ///   before it.
+    /// * **parked**: the `zombie` line goes onto `command_rx` only after that
+    ///   fence, and a second fence then answers from inside its own
+    ///   `drain_commands_before_reclaim` pass -- so by the time it resolves the
+    ///   zombie is behind the marker, whichever of the two arms picked it up.
+    /// * **forgotten**: [`handoff_witness`], the loop reporting it, and
+    ///   `parked == 1` there is the check that the probe was non-vacuous.
+    ///
+    /// The pin is what makes those proofs possible: a filler event occupies the
+    /// single slot of the event channel, and in *both* of `run_connection`'s
+    /// exit paths -- EOF first, or reclaim first (OBI-362's refused hand-off)
+    /// -- the `Disconnected` send comes before the `closed_tx` send, so the task
+    /// cannot get as far as forgetting its marker while the slot is full. What
+    /// no longer has to be settled by that pin is *which* path the task took:
+    /// both answer `None` and both emit `Disconnected` + `closed_tx`, so every
+    /// assertion below holds either way. Assuming it did was the flake.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dead_session_leaves_no_handoff_marker_behind() {
+        // `handoff_witness` is process-global and conn ids are only unique per
+        // `run_server_full`, with several loops live at once under `cargo
+        // test`. So claim an id range no other test can reach: adopting under
+        // `MARKER_SEED` pushes the loop's auto-increment counter past it (the
+        // `adopt_rx` arm keeps `next_conn_id` clear of adopted ids), and the
+        // session under test is then accepted as `MARKER_SEED + 1`.
+        const MARKER_SEED: ConnId = 7_000_000;
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -3174,6 +3358,16 @@ mod tests {
             reclaim_rx,
         ));
 
+        // The seed adopt: never read from, never closed, so it can neither
+        // answer anything nor emit a `Disconnected` that would be mistaken for
+        // the subject's.
+        let (mut seed_client, seed_socket) = loopback_pair().await;
+        adopt_tx.send((MARKER_SEED, seed_socket)).await.unwrap();
+        // The bump happens in the adopt arm *before* it spawns the task, so
+        // seeing that task's preamble is proof the counter is already clear of
+        // `MARKER_SEED` -- i.e. that the accept below cannot collide.
+        drain_preamble(&mut seed_client).await;
+
         let mut client = TcpStream::connect(addr).await.unwrap();
         let conn = loop {
             match event_rx.recv().await.expect("event channel closed") {
@@ -3181,25 +3375,48 @@ mod tests {
                 _ => continue,
             }
         };
+        assert_eq!(
+            conn,
+            MARKER_SEED + 1,
+            "the subject must hold an id no other test's loop can produce, or the \
+             process-global handoff witness is ambiguous"
+        );
         drain_preamble(&mut client).await;
 
-        // Occupy the one event slot, then kill the client: the connection
-        // task breaks on the EOF and blocks on its `Disconnected` send.
-        // `run_server_full` never needs that slot for the reclaim arm, so
-        // the loop stays free to take the reclaim below.
+        // Pin the session's exit: the event channel has one slot and it is now
+        // occupied by a test event, so the connection task that reads this
+        // client's EOF blocks on its `Disconnected` send and cannot reach
+        // `closed_tx`. `run_server_full` never needs that slot for the reclaim
+        // arm, so the loop stays free to take the requests below.
         event_tx.send(NetEvent::Tick).await.unwrap();
         drop(client);
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         reclaim_tx.send((conn, reply_tx)).await.unwrap();
-        // The loop has this reclaim to itself (nothing else can be ready:
-        // the task is pinned before its `closed_tx` send), so the marker is
-        // installed by the time this returns.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Premise, part 1: the marker is installed.
+        fence_reclaim(&reclaim_tx, conn).await;
+        assert!(
+            handoff_witness::saw(conn, handoff_witness::Event::Installed),
+            "the reclaim under test installed no handoff marker for {conn}: the loop answered \
+             it from the unknown-id branch even though its task was still parked on its \
+             `Disconnected` send, so `conns` lost a live `ConnEntry` and there is no marker here \
+             to forget -- which is exactly the vacuous version of this test OBI-330 is about"
+        );
+
+        // Premise, part 2: park the probe content while the marker provably
+        // exists and provably cannot yet have been dropped with the task still
+        // pinned. Sent after the fence so the reclaim under test -- not the
+        // live `ConnEntry`, whose task will never drain it -- is what receives
+        // it.
+        cmd_tx
+            .send(NetCommand::Send(conn, "zombie\n".to_string()))
+            .await
+            .unwrap();
+        fence_reclaim(&reclaim_tx, conn).await;
 
         // Drain the filler to release the task: `Disconnected` lands next,
-        // then `closed_tx` reaches the loop, and the `closed_rx` arm is
-        // what must forget `conn`.
+        // then `closed_tx` reaches the loop, and the `closed_rx` arm is what
+        // must forget `conn`.
         let filler = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
             .await
             .expect("the filler event never arrived")
@@ -3210,11 +3427,28 @@ mod tests {
         );
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
             .await
-            .expect("the EOF disconnect event never arrived")
+            .expect(
+                "no `Disconnected` for a session whose client had already gone: both of \
+                 `run_connection`'s exit paths (EOF first, reclaim first) are supposed to emit \
+                 one now (OBI-362) -- the reclaim handing a socket back instead would mean \
+                 `peer_sent_fin` read a close that was already on the wire as still in flight",
+            )
             .expect("event channel closed");
         assert!(
             matches!(event, NetEvent::Disconnected(id) if id == conn),
             "expected Disconnected({conn}), got {event:?}"
+        );
+
+        // The invariant, from the loop's own report -- and with it the proof
+        // that the `zombie` line really was sitting behind the marker, so the
+        // probe below is not asserting nothing.
+        let parked = wait_for_handoff_forgotten(conn).await;
+        assert_eq!(
+            parked, 1,
+            "the dead session's marker was forgotten with {parked} command(s) parked; the fences \
+             above prove `zombie` was buffered behind it before its task could reach `closed_tx`, \
+             so 0 means parking regressed into dropping (the OBI-304 lost-output bug) and more \
+             than 1 means something parked for this id twice"
         );
 
         // And the reclaim answers "no socket" -- no re-adopt is coming.
@@ -3226,29 +3460,14 @@ mod tests {
             Ok(Ok(None)) | Ok(Err(_)) => {}
             Err(_) => panic!("reclaim of a dying session never answered"),
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Probe the marker directly: with no marker this is the silent
-        // no-op it has always been for a gone connection; with a leaked one
-        // it is buffered and replays onto whatever is adopted under that id
-        // next.
-        cmd_tx
-            .send(NetCommand::Send(conn, "zombie\n".to_string()))
-            .await
-            .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Adopt a fresh, unrelated socket under the dead id (its own
-        // listener, so `run_server_full` never sees it as an accept) and
-        // check the probe did not come with it. Parked output always
-        // replays *ahead* of anything sent after the adopt, so a leaked
-        // marker shows up as `zombie` in this first line.
-        let probe_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let probe_addr = probe_listener.local_addr().unwrap();
-        let mut probe_client = TcpStream::connect(probe_addr).await.unwrap();
-        let (probe_server, _) = probe_listener.accept().await.unwrap();
-        drop(probe_listener);
-        adopt_tx.send((conn, probe_server)).await.unwrap();
+        // Now the observable end state, with the marker provably already gone:
+        // a fresh, unrelated socket adopted under the dead id must see nothing.
+        // Nothing can reinstall it -- only an accepted reclaim creates a marker,
+        // and this loop will never accept one for `conn` again -- so this needs
+        // no settle before it.
+        let (mut probe_client, probe_socket) = loopback_pair().await;
+        adopt_tx.send((conn, probe_socket)).await.unwrap();
         drain_preamble(&mut probe_client).await;
         cmd_tx
             .send(NetCommand::Send(conn, "after-adopt\n".to_string()))
@@ -3258,12 +3477,14 @@ mod tests {
         assert_eq!(
             got,
             vec!["after-adopt\r\n"],
-            "a dead session's handoff marker must be dropped with it"
+            "a dead session's handoff marker must be dropped with it (the loop reported \
+             forgetting {conn} with {parked} command(s) parked; a `zombie` line here is \
+             OBI-304/B2 output replaying onto the successor)"
         );
 
         // `event_tx` has one slot and the loop sends a final `Disconnected`
-        // for the adopted probe on shutdown: drop the receiver first so
-        // those sends fail fast instead of parking.
+        // for the seed and probe sessions on shutdown: drop the receiver first
+        // so those sends fail fast instead of parking.
         drop(event_rx);
         shutdown_tx.send(true).unwrap();
         server.await.unwrap().unwrap();
