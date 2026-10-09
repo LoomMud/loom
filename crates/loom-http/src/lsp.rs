@@ -46,7 +46,7 @@
 //!   no HTTP-side ACL (D-TM5).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -142,7 +142,175 @@ impl Drop for SessionGuard {
     }
 }
 
+/// TEST-ONLY (OBI-359): a rendezvous that turns "which of two `/lsp`
+/// sessions reads its first frame first" into a test input instead of a
+/// scheduling accident.
+///
+/// The bug it exists for: `a_ticket_can_only_authenticate_one_session`
+/// opened `first`, sent the ticket, then immediately opened `second` and
+/// sent the *same* ticket, and asserted that `second` is the socket that
+/// gets closed. Nothing in the server orders the two sessions' first-frame
+/// reads -- `run_session` is a fresh task per upgrade -- so whenever the
+/// runtime happened to poll `second`'s task first, `second` was the socket
+/// that redeemed the ticket, `first` was the one refused, and `second` sat
+/// open until the test's 10 s wait expired (`Elapsed`). That is a
+/// test-ordering race, not a replay hole: `WsTicketIssuer::redeem` checks
+/// and records the nonce under one mutex (see
+/// `auth::wsticket::WsTicketIssuer::redeem`, and
+/// `a_concurrent_redeem_of_one_ticket_has_exactly_one_winner`), so at most
+/// one redemption of a ticket can ever succeed.
+///
+/// When a gate is installed, the *first* session to reach
+/// [`Self::before_first_frame`] parks there before reading anything, and
+/// only continues when the test calls [`Self::release`]. Every later
+/// session goes straight through, so a test can let the socket that
+/// arrives later redeem first and still assert the invariant it actually
+/// means: exactly one session ends up authenticated, in whichever order
+/// they came in.
+#[derive(Debug)]
+pub(crate) struct FirstFrameGate {
+    /// `true` once some session has claimed the single hold.
+    claimed: AtomicBool,
+    /// Signalled by the parked session. Durable (`notify_one` keeps a
+    /// permit when nobody is waiting yet), so a test that starts waiting
+    /// after the park still completes.
+    parked: tokio::sync::Notify,
+    /// Zero permits; the test adds one to release the parked session. A
+    /// semaphore rather than a second `Notify` because the parked task may
+    /// sit here long before the test decides to let it go.
+    release: tokio::sync::Semaphore,
+}
+
+/// Built with an empty release semaphore. `Default` is hand-written because
+/// `tokio::sync::Semaphore` has no `Default` of its own.
+impl Default for FirstFrameGate {
+    fn default() -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+            parked: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl FirstFrameGate {
+    /// Called by `run_session` immediately before it reads the first frame.
+    /// Returns without doing anything for every session but the first one
+    /// to arrive.
+    async fn before_first_frame(&self) {
+        if self.claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.parked.notify_one();
+        // The semaphore is never closed, so `acquire` can only fail on a
+        // misconfigured harness -- a loud test bug, not a product one.
+        let _permit = self
+            .release
+            .acquire()
+            .await
+            .expect("first-frame gate release semaphore is never closed");
+    }
+
+    /// Resolves once a session is parked at the gate.
+    #[cfg(test)]
+    pub(crate) async fn wait_parked(&self) {
+        self.parked.notified().await;
+    }
+
+    /// Let the parked session go.
+    #[cfg(test)]
+    pub(crate) fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+/// Test-only vocabulary (OBI-365) for *which* pre-authentication refusal
+/// `run_session` took, written to the server's own rejection ledger before
+/// the `Close` frame goes out.
+///
+/// The problem it removes: every refusal path below sends the *identical*
+/// `Close(None)`, deliberately -- D-TM4 keeps a malformed ticket, a spent
+/// one, a revoked session and a full cap indistinguishable to whoever
+/// tried them. Right for the wire, and useless for a test:
+/// `a_ticket_can_only_authenticate_one_session` used to pass on "any Close
+/// arrived on the replayed socket", so [`LspTuning::first_frame_timeout`]
+/// closing a socket that had merely been slow satisfied the assertion just
+/// as well as the replay refusal it claimed to prove. Once the reason is
+/// an event the server emits, the assertion can ask for the single variant
+/// that means what it says, and wait for that event instead of a stopwatch.
+///
+/// The ledger is `None` on every real server: only
+/// [`crate::HttpState::with_lsp_rejection_log_for_test`] installs one, and
+/// `loom-cli` never calls a test-only setter -- so no variant name, and no
+/// extra byte, ever reaches a client.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rejection {
+    /// D-TM4 "must send `{"auth":ticket}` within 5 s or be closed": no
+    /// first frame arrived in time. Closes exactly like a replay refusal.
+    FirstFrameTimeout,
+    /// First frame was not a text frame.
+    FirstFrameNotText,
+    /// First frame was text, but not a `{"auth": ticket}` object.
+    NotAnAuthFrame,
+    /// The ticket failed to redeem for a reason other than replay:
+    /// malformed, unsigned, expired, or bound to nothing this process
+    /// issued. Closes exactly like a replay refusal, and is *not* proof of
+    /// single use.
+    TicketUnusable,
+    /// D-TM4 single use: the ticket redeemed once already. The only verdict
+    /// that proves a replayed ticket cannot open a second session.
+    TicketAlreadySpent,
+    /// The ticket was fine, but the connect-time M-LSP-1 check (tier floor,
+    /// live token family) refused the uid/sid.
+    NotAuthorized,
+    /// Authenticated, but M-LSP-4's per-uid or total cap refused a slot.
+    SessionCapFull,
+}
+
+impl std::fmt::Debug for Rejection {
+    /// A one-word name, so a test failure reads `refused for
+    /// TicketAlreadySpent` rather than a `Rejection { .. }` dump.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::FirstFrameTimeout => "FirstFrameTimeout",
+            Self::FirstFrameNotText => "FirstFrameNotText",
+            Self::NotAnAuthFrame => "NotAnAuthFrame",
+            Self::TicketUnusable => "TicketUnusable",
+            Self::TicketAlreadySpent => "TicketAlreadySpent",
+            Self::NotAuthorized => "NotAuthorized",
+            Self::SessionCapFull => "SessionCapFull",
+        };
+        f.write_str(name)
+    }
+}
+
+/// The sender half of a `/lsp` rejection ledger.
+///
+/// Unbounded on purpose. A rejection reason is the only admissible evidence
+/// that a `/lsp` test has proven its security property, so a full queue
+/// that made the server drop one would re-create the ambiguity this ledger
+/// exists to remove -- and it can never be a resource concern: only a test
+/// installs one, it holds at most one event per refused connection, and a
+/// test opens a handful of sockets.
+pub(crate) type RejectionLogSender = tokio::sync::mpsc::UnboundedSender<Rejection>;
+
+/// The receiver half, which only the test that built the ledger holds --
+/// hence `cfg(test)`: outside a test build nothing reads a ledger, and the
+/// sender half above is the only half `run_session` can see.
+#[cfg(test)]
+pub(crate) type RejectionLogReceiver = tokio::sync::mpsc::UnboundedReceiver<Rejection>;
+
 impl SessionLimiter {
+    /// How many sessions currently hold a cap slot. Test-only view of
+    /// "authenticated" (OBI-359): a slot is taken only *after* the ticket
+    /// redeemed and the connect-time authorization check passed, so a
+    /// count of 1 with two sockets connected is exactly the "exactly one
+    /// session authenticated" invariant.
+    #[cfg(test)]
+    pub(crate) fn active_sessions(&self) -> usize {
+        self.total.load(Ordering::SeqCst)
+    }
+
     fn try_acquire(&self, uid: &str) -> Option<SessionGuard> {
         // Reserve the total slot first; release it immediately if the
         // per-uid cap is what actually refuses, so the two checks can't
@@ -245,6 +413,28 @@ pub fn lsp_router() -> Router<HttpState> {
     Router::new().route("/lsp", get(lsp_handler))
 }
 
+/// Refuse `socket`, recording *why* on the test ledger **first** (OBI-365).
+///
+/// The order matters and is the whole contract: because the ledger write
+/// happens-before the `Close` is sent, a test that saw the close is
+/// guaranteed to find the reason already queued, and a test that is waiting
+/// on the reason is woken by the same event that produces the close. It is
+/// why every refusal path below calls this instead of sending the frame by
+/// hand.
+///
+/// `log` is `None` for every real connection, which leaves this as exactly
+/// the bare `Close` the route has always sent, and nothing else.
+async fn refuse(socket: &mut WebSocket, log: Option<&RejectionLogSender>, why: Rejection) {
+    if let Some(log) = log {
+        // `Err` here means the test dropped its receiver: the waiting
+        // assertion already fails with an unambiguous message for that, so a
+        // dropped verdict must never become a second problem (a refused
+        // socket that stays open).
+        let _ = log.send(why);
+    }
+    let _ = socket.send(WsMessage::Close(None)).await;
+}
+
 /// `GET /lsp` (M-LSP-1): Origin-gated WS upgrade, ticket-authenticated
 /// in the first frame, session-capped and idle-timed-out per M-LSP-4.
 async fn lsp_handler(
@@ -333,25 +523,46 @@ async fn run_session(
     struct AuthFrame {
         auth: String,
     }
+    // TEST-ONLY (OBI-359): park the first session of a gated server before
+    // it reads -- and therefore before it can redeem -- anything. Inert
+    // unless a test installed the gate; `loom-cli` never does, so real
+    // connections go straight to the `recv` below.
+    if let Some(gate) = state.lsp_first_frame_gate() {
+        gate.before_first_frame().await;
+    }
+    // Test-only (OBI-365) handle for the refusals below: a test awaits the
+    // server's own verdict instead of reading a stopwatch. Taken as a copied
+    // `Option<&Sender>`, not a borrow of `state` held across an `await`.
+    let rejection_log = state.lsp_rejection_log();
     let Ok(Some(Ok(frame))) = tokio::time::timeout(tuning.first_frame_timeout, socket.recv()).await
     else {
-        let _ = socket.send(WsMessage::Close(None)).await;
+        refuse(&mut socket, rejection_log, Rejection::FirstFrameTimeout).await;
         return;
     };
     let text = match frame {
         WsMessage::Text(t) => t,
         _ => {
-            let _ = socket.send(WsMessage::Close(None)).await;
+            refuse(&mut socket, rejection_log, Rejection::FirstFrameNotText).await;
             return;
         }
     };
     let Ok(auth_frame) = serde_json::from_str::<AuthFrame>(&text) else {
-        let _ = socket.send(WsMessage::Close(None)).await;
+        refuse(&mut socket, rejection_log, Rejection::NotAnAuthFrame).await;
         return;
     };
-    let Ok(identity) = auth.redeem_ws_ticket(&auth_frame.auth) else {
-        let _ = socket.send(WsMessage::Close(None)).await;
-        return;
+    let identity = match auth.redeem_ws_ticket_detailed(&auth_frame.auth) {
+        Ok(identity) => identity,
+        // D-TM4: both of these close the socket the same way, and must
+        // stay that way to a client. They differ to a test that means to
+        // prove *single use* rather than *unparsable credential*.
+        Err(crate::auth::WsTicketError::Invalid) => {
+            refuse(&mut socket, rejection_log, Rejection::TicketUnusable).await;
+            return;
+        }
+        Err(crate::auth::WsTicketError::AlreadyUsed) => {
+            refuse(&mut socket, rejection_log, Rejection::TicketAlreadySpent).await;
+            return;
+        }
     };
     let uid = identity.sub;
     let sid = identity.sid;
@@ -362,7 +573,7 @@ async fn run_session(
     // re-review of PR #122, must-fix B): a directory error at connect
     // must not admit a session that was never actually authorized.
     if !still_authorized(&auth, &uid, &sid, false).await {
-        let _ = socket.send(WsMessage::Close(None)).await;
+        refuse(&mut socket, rejection_log, Rejection::NotAuthorized).await;
         return;
     }
 
@@ -370,7 +581,7 @@ async fn run_session(
     // already proven valid) so an unauthenticated connection attempt can
     // never itself be used to exhaust the cap.
     let Some(_guard) = state.lsp_sessions().try_acquire(&uid) else {
-        let _ = socket.send(WsMessage::Close(None)).await;
+        refuse(&mut socket, rejection_log, Rejection::SessionCapFull).await;
         return;
     };
 
@@ -728,7 +939,9 @@ mod tests {
     async fn spawn_lsp_server(
         content: Option<(&'static str, &'static str)>,
     ) -> (std::net::SocketAddr, AuthService, FakeDirectory) {
-        spawn_lsp_server_with_tuning(content, LspTuning::default()).await
+        let (addr, auth, directory, _limiter) =
+            spawn_server(content, LspTuning::default(), ServerHarness::default()).await;
+        (addr, auth, directory)
     }
 
     /// Same as [`spawn_lsp_server`], but with `/lsp`'s timing constants
@@ -741,6 +954,40 @@ mod tests {
         content: Option<(&'static str, &'static str)>,
         tuning: LspTuning,
     ) -> (std::net::SocketAddr, AuthService, FakeDirectory) {
+        let (addr, auth, directory, _limiter) =
+            spawn_server(content, tuning, ServerHarness::default()).await;
+        (addr, auth, directory)
+    }
+
+    /// The test-only knobs a `/lsp` server can be built with: OBI-359's
+    /// ordering gate and OBI-365's rejection ledger. Default -- neither --
+    /// is what every test that does not need them keeps using.
+    #[derive(Default)]
+    struct ServerHarness {
+        first_frame_gate: Option<std::sync::Arc<FirstFrameGate>>,
+        rejection_log: Option<RejectionLogSender>,
+    }
+
+    /// A fresh rejection ledger: the half the server writes to, and the half
+    /// the test reads (OBI-365).
+    fn rejection_ledger() -> (RejectionLogSender, RejectionLogReceiver) {
+        tokio::sync::mpsc::unbounded_channel()
+    }
+
+    /// The one server builder: `/lsp`'s timing constants plus, optionally,
+    /// the test-only [`FirstFrameGate`] (OBI-359) and [`Rejection`] ledger
+    /// (OBI-365), and it hands back the process' session limiter so a test
+    /// can ask the server itself how many sessions authenticated.
+    async fn spawn_server(
+        content: Option<(&'static str, &'static str)>,
+        tuning: LspTuning,
+        harness: ServerHarness,
+    ) -> (
+        std::net::SocketAddr,
+        AuthService,
+        FakeDirectory,
+        SessionLimiter,
+    ) {
         let (ws_accept_tx, _ws_accept_rx) = tokio::sync::mpsc::channel(1);
         let directory = FakeDirectory::new();
         directory.add_staff("frodo", "hunter2", 1);
@@ -754,12 +1001,21 @@ mod tests {
         .with_staff_origins(vec![STAFF_ORIGIN.to_string()])
         .with_file_ops(spawn_fake_world(content))
         .with_lsp_tuning_for_test(tuning);
+        let state = match harness.first_frame_gate {
+            Some(gate) => state.with_lsp_first_frame_gate_for_test(gate),
+            None => state,
+        };
+        let state = match harness.rejection_log {
+            Some(sender) => state.with_lsp_rejection_log_for_test(sender),
+            None => state,
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let limiter = state.lsp_sessions().clone();
         tokio::spawn(async move {
             axum::serve(listener, app(state)).await.unwrap();
         });
-        (addr, auth, directory)
+        (addr, auth, directory, limiter)
     }
 
     fn ws_request(addr: std::net::SocketAddr, origin: Option<&str>) -> axum::http::Request<()> {
@@ -779,6 +1035,229 @@ mod tests {
         builder.body(()).unwrap()
     }
 
+    /// The harness's "the server was never scheduled at all" guard
+    /// (OBI-365).
+    ///
+    /// This is deliberately **not** a test budget, and no verdict in this
+    /// module may depend on it: every wait that decides something ends on an
+    /// event the server itself produces (a rejection-ledger write, an
+    /// `initialize` reply, the M-LSP-4 cap counter moving), and an expiry
+    /// here panics as "nothing ran", never as "the protocol behaved". It
+    /// exists only so a runner that gave the process no CPU at all fails
+    /// readably instead of hanging the `rust` job. Sized for "this machine
+    /// is broken", not for "the reject path is fast" -- the reject path is
+    /// microseconds of work once polled.
+    const HARNESS_ALIVE: Duration = Duration::from_secs(60);
+
+    /// The acceptance criterion of the replay tests, kept apart from the
+    /// wait so the ambiguity itself is testable (OBI-365).
+    ///
+    /// Before this existed the criterion was "a `Close` frame arrived", which
+    /// every refusal path in `run_session` satisfies -- including D-TM4's
+    /// first-frame timeout, so a socket that was merely *slow to speak* made
+    /// the single-use assertion pass without any replay being refused at
+    /// all. Only the server's own `TicketAlreadySpent` verdict counts.
+    fn is_proof_of_single_use_ticket(reason: Rejection) -> bool {
+        matches!(reason, Rejection::TicketAlreadySpent)
+    }
+
+    /// Await the server's own verdict that it refused a `/lsp` connection.
+    ///
+    /// `run_session` writes the reason *before* it sends the `Close`, so the
+    /// event this waits on and the frame a client used to wait for are the
+    /// same act -- and this one carries the reason. Nothing here is decided
+    /// by a race against a stopwatch.
+    async fn await_rejection(log: &mut RejectionLogReceiver, who: &str) -> Rejection {
+        tokio::time::timeout(HARNESS_ALIVE, log.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{who}: /lsp never recorded a refusal reason within {HARNESS_ALIVE:?} -- \
+                     the reject path did not run at all (starved runner, or this socket was \
+                     never refused); this is a harness failure, not a protocol verdict"
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!("{who}: the rejection ledger closed without recording a reason")
+            })
+    }
+
+    /// Pin that `loser` was refused for the one reason the replay tests
+    /// claim -- D-TM4 single use -- and that the refusal, not any reply, is
+    /// the first thing it ever received (OBI-365).
+    async fn assert_refused_as_ticket_replay(
+        log: &mut RejectionLogReceiver,
+        loser: &mut TestWs,
+        who: &str,
+    ) {
+        let reason = await_rejection(log, who).await;
+        assert!(
+            is_proof_of_single_use_ticket(reason),
+            "{who}: expected the replay refusal (TicketAlreadySpent), but /lsp refused it for \
+             {reason:?} -- that path sends the same Close, so a bare Close is not proof of \
+             single use"
+        );
+        // The ledger write happens-before this frame, so the close is either
+        // already buffered or arriving on this same event-loop turn; and
+        // `assert_closed` fails on any frame that is not a close, which is
+        // the client-side half of "this session was never authenticated".
+        assert_closed(loser, HARNESS_ALIVE, who).await;
+    }
+
+    /// A connected `/lsp` test socket.
+    type TestWs = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn connect_staff_socket(addr: std::net::SocketAddr) -> TestWs {
+        tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
+            .await
+            .unwrap()
+            .0
+    }
+
+    async fn send_ticket(ws: &mut TestWs, ticket: &str) {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({ "auth": ticket }).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// The observable sign that the server has already *consumed* this
+    /// socket's ticket: an `initialize` reply. A refused socket never gets
+    /// an LSP server started for it at all
+    /// (`an_invalid_ticket_is_refused_before_any_lsp_server_starts`), so
+    /// this can only answer if the ticket redeemed here (same round trip
+    /// `a_valid_ticket_bridges_a_real_initialize_round_trip` uses).
+    ///
+    /// It replaces the old test's assumption that the socket which *sent*
+    /// first had consumed first (OBI-359).
+    async fn prove_ticket_consumed_by(ws: &mut TestWs, who: &str) {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "id": 1,
+                "method": "initialize",
+                "params": { "capabilities": {} },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + HARNESS_ALIVE;
+        loop {
+            let next = tokio::time::timeout_at(deadline, ws.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{who}: timed out waiting for the initialize reply that proves the ticket was consumed")
+                });
+            match next {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                    let parsed: serde_json::Value = serde_json::from_str(&text)
+                        .unwrap_or_else(|e| panic!("{who}: unparsable reply {text}: {e}"));
+                    if parsed.get("id").and_then(|v| v.as_i64()) == Some(1) {
+                        assert!(
+                            parsed["result"]["capabilities"].is_object(),
+                            "{who}: reply {parsed} is not an initialize result"
+                        );
+                        return;
+                    }
+                    // Some other server-originated message: keep waiting.
+                }
+                Some(Ok(_)) => {} // Ping/Pong/Binary: not an answer, keep waiting.
+                Some(Err(e)) => {
+                    panic!("{who}: socket error before the initialize reply: {e}")
+                }
+                None => panic!(
+                    "{who}: closed before answering initialize -- this socket never redeemed the ticket"
+                ),
+            }
+        }
+    }
+
+    /// Wait for the server to close `ws`. A WS-layer error counts as closed:
+    /// the server tears the TCP connection down right after the `Close`.
+    ///
+    /// A *frame* before the close is a failure, which is how the client side
+    /// of "this socket was never treated as an authenticated session" gets
+    /// pinned. It is not, on its own, evidence of *why* the socket closed:
+    /// every refusal path in `run_session` sends the same `Close(None)`, so
+    /// pair it with [`assert_refused_as_ticket_replay`] when the reason is
+    /// the point (OBI-365).
+    async fn assert_closed(ws: &mut TestWs, within: Duration, who: &str) {
+        match tokio::time::timeout(within, ws.next()).await {
+            Err(_) => panic!("expected {who} to be closed within {within:?}; it stayed open"),
+            Ok(None) | Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => {}
+            Ok(Some(Ok(other))) => {
+                panic!("expected {who} to be closed, got the frame {other:?}")
+            }
+        }
+    }
+
+    /// Assert `ws` is not closed for `within`. Non-close frames (server
+    /// notifications, pings) are tolerated: what's pinned here is "this
+    /// session is still authenticated", not "this session is silent".
+    async fn assert_stays_open(ws: &mut TestWs, within: Duration, who: &str) {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match tokio::time::timeout(remaining, ws.next()).await {
+                // Nothing arrived by the deadline -- still open.
+                Err(_) => return,
+                Ok(None) | Ok(Some(Err(_))) => {
+                    panic!("expected {who} to stay open, but the connection ended")
+                }
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(f)))) => {
+                    panic!("expected {who} to stay open, got Close({f:?})")
+                }
+                Ok(Some(Ok(_))) => {} // some other frame: still open
+            }
+        }
+    }
+
+    /// Poll the server's own session counter until exactly `want` sessions
+    /// hold an M-LSP-4 cap slot. A slot is taken only *after* the ticket
+    /// redeemed and the connect-time checks pass, and is released when the
+    /// session ends, so this is the server-side statement of "exactly one
+    /// of the two sockets authenticated" -- independent of which socket
+    /// the test thinks won (OBI-359).
+    async fn wait_for_active_sessions(limiter: &SessionLimiter, want: usize, who: &str) {
+        let deadline = tokio::time::Instant::now() + HARNESS_ALIVE;
+        loop {
+            let active = limiter.active_sessions();
+            if active == want {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("{who}: expected {want} authenticated /lsp session(s), found {active}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The order-independent assertion OBI-359 asks the replay tests to
+    /// make, with the reason pinned the way OBI-365 asks: `loser` -- the
+    /// replay -- is refused *because its ticket had already been spent*,
+    /// `winner` keeps its session through that refusal, and the server
+    /// reports exactly one authenticated session in between them.
+    async fn assert_exactly_one_authenticated(
+        limiter: &SessionLimiter,
+        log: &mut RejectionLogReceiver,
+        winner: &mut TestWs,
+        winner_name: &str,
+        loser: &mut TestWs,
+        loser_name: &str,
+    ) {
+        wait_for_active_sessions(limiter, 1, "the replay").await;
+        assert_refused_as_ticket_replay(log, loser, loser_name).await;
+        assert_stays_open(winner, Duration::from_millis(500), winner_name).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_disallowed_origin_is_refused_before_any_upgrade() {
         let (addr, _auth, _directory) = spawn_lsp_server(None).await;
@@ -795,71 +1274,231 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_first_frame_ticket_closes_the_socket() {
-        let (addr, _auth, _directory) = spawn_lsp_server(None).await;
-        let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
-            .await
-            .unwrap();
-        // Say nothing; the server must close within FIRST_FRAME_TIMEOUT.
-        let next = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
-        match next {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => {}
-            other => panic!("expected the server to close the socket, got {other:?}"),
-        }
+        let (sender, mut log) = rejection_ledger();
+        let (addr, _auth, _directory, _limiter) = spawn_server(
+            None,
+            LspTuning::default(),
+            ServerHarness {
+                rejection_log: Some(sender),
+                ..ServerHarness::default()
+            },
+        )
+        .await;
+        let mut ws = connect_staff_socket(addr).await;
+        // Say nothing. The 5 s first-frame timeout is the *thing under
+        // test* here, so it is the one wait allowed to decide this test --
+        // and OBI-365 is about the reason, which is now pinned: this socket
+        // is refused as a timeout, not as a replay, and a test that means to
+        // prove single use must (and does: see
+        // `a_first_frame_timeout_close_is_not_proof_of_a_single_use_ticket`)
+        // reject this verdict.
+        let reason = await_rejection(&mut log, "the silent socket").await;
+        assert_eq!(
+            reason,
+            Rejection::FirstFrameTimeout,
+            "a socket that never sent its first frame must be refused as a timeout"
+        );
+        assert_closed(&mut ws, HARNESS_ALIVE, "the silent socket").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_ticket_can_only_authenticate_one_session() {
-        let (addr, auth, directory) = spawn_lsp_server(None).await;
+        let (sender, mut log) = rejection_ledger();
+        let (addr, auth, directory, limiter) = spawn_server(
+            None,
+            LspTuning::default(),
+            ServerHarness {
+                rejection_log: Some(sender),
+                ..ServerHarness::default()
+            },
+        )
+        .await;
         directory.seed_live_session_for_test("frodo", "sid-1");
         let claims = claims_for("frodo", &keys(), "sid-1");
         let ticket = auth.issue_ws_ticket(&claims).unwrap();
 
-        let (mut first, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
-            .await
-            .unwrap();
-        first
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                serde_json::json!({ "auth": ticket }).to_string().into(),
-            ))
-            .await
-            .unwrap();
+        // OBI-359: wait for the *server* to consume the ticket on `first`
+        // before replaying it. The old version sent on `first`, then
+        // immediately connected `second` and replayed, and asserted that
+        // `second` was the socket closed -- but nothing orders the two
+        // sessions' first-frame reads (`run_session` is one fresh task per
+        // upgrade), so whichever task the runtime polled first redeemed the
+        // ticket. When that was `second`, `first` was the one refused and
+        // the close expected on `second` never came: a 10 s `Elapsed`, the
+        // failure PR #156's `rust` job hit.
+        let mut first = connect_staff_socket(addr).await;
+        send_ticket(&mut first, &ticket).await;
+        prove_ticket_consumed_by(&mut first, "first").await;
 
-        let (mut second, _) =
-            tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
-                .await
-                .unwrap();
-        second
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                serde_json::json!({ "auth": ticket }).to_string().into(),
-            ))
+        let mut second = connect_staff_socket(addr).await;
+        send_ticket(&mut second, &ticket).await;
+
+        // OBI-365: the verdict is the *reason* the server refused this
+        // socket, awaited as an event. The old form -- "a `Close` arrives on
+        // the socket that connected second within 10 s" -- was satisfied by
+        // any of the refusal paths and could only expire into
+        // `Err(Elapsed(()))`, which is what PR #156's `rust` job reported.
+        //
+        // Exactly one session ended up authenticated, whatever happened to
+        // the replay: the server's own cap counter says one, the replay is
+        // refused for single use, and the winner is untouched by that
+        // refusal next to it.
+        assert_exactly_one_authenticated(
+            &limiter,
+            &mut log,
+            &mut first,
+            "first",
+            &mut second,
+            "second",
+        )
+        .await;
+    }
+
+    /// The deterministic reproduction OBI-359 asks for, and the fix's other
+    /// half: force `second`'s auth to be processed *first* and assert the
+    /// invariant the old test only satisfied by accident.
+    ///
+    /// Against the pre-fix assertion ("the socket that connected second is
+    /// the one that gets closed"), this fails deterministically at the old
+    /// head -- `second` redeems, `first` is refused, `second` stays open --
+    /// which is what proves the flake was a test-ordering race and not a
+    /// ticket-replay hole: with the order *pinned* the product still lets
+    /// exactly one session in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ticket_authenticates_one_session_whichever_order_the_sockets_arrive() {
+        let gate = std::sync::Arc::new(FirstFrameGate::default());
+        let (sender, mut log) = rejection_ledger();
+        let (addr, auth, directory, limiter) = spawn_server(
+            None,
+            LspTuning::default(),
+            ServerHarness {
+                first_frame_gate: Some(gate.clone()),
+                rejection_log: Some(sender),
+            },
+        )
+        .await;
+        directory.seed_live_session_for_test("frodo", "sid-1");
+        let claims = claims_for("frodo", &keys(), "sid-1");
+        let ticket = auth.issue_ws_ticket(&claims).unwrap();
+
+        // `first` connects and sends its ticket, but its task parks at the
+        // gate before reading -- so the ticket is demonstrably *not* yet
+        // consumed on `first`, which is the state the un-gated test could
+        // only hope for.
+        let mut first = connect_staff_socket(addr).await;
+        send_ticket(&mut first, &ticket).await;
+        tokio::time::timeout(HARNESS_ALIVE, gate.wait_parked())
             .await
-            .unwrap();
-        let next = tokio::time::timeout(Duration::from_secs(10), second.next()).await;
-        match next {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => {}
-            other => {
-                panic!("expected the second (replayed-ticket) session to be closed, got {other:?}")
-            }
-        }
-        // First session is unaffected by the replay against its own ticket.
-        first
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                serde_json::json!({
-                    "id": 1,
-                    "method": "shutdown",
-                    "params": null,
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
+            .expect("the first /lsp session never parked at the test gate");
+        assert_eq!(
+            limiter.active_sessions(),
+            0,
+            "a session parked before its first frame may not have authenticated"
+        );
+
+        let mut second = connect_staff_socket(addr).await;
+        send_ticket(&mut second, &ticket).await;
+        // The socket that arrived later is now the one that redeemed.
+        prove_ticket_consumed_by(&mut second, "second").await;
+        // The server agrees, and says so for both sockets: one
+        // authenticated session -- and `first`, still parked with its
+        // unread ticket in hand, is not it.
+        wait_for_active_sessions(&limiter, 1, "while the first session is parked").await;
+
+        // Let `first` read. Its ticket is spent, so it is refused -- and
+        // the refusal costs the live session nothing: the pinned verdict
+        // below is OBI-365's, and `first` (not `second`, the socket that
+        // happened to arrive later) is the replay this time.
+        gate.release();
+        assert_exactly_one_authenticated(
+            &limiter,
+            &mut log,
+            &mut second,
+            "second",
+            &mut first,
+            "first",
+        )
+        .await;
+    }
+
+    /// OBI-365's deterministic half: the ambiguity the flake hid in is now a
+    /// tested property, not a scheduling accident.
+    ///
+    /// The unrelated close is *induced* here -- a 50 ms first-frame timeout,
+    /// which is the thing under test, not a budget -- and pushed through the
+    /// replay tests' own acceptance criterion, which must refuse it. Before
+    /// this, "a `Close` arrived on the replayed socket" could not tell the
+    /// two apart, which is exactly how a contention flake could look like a
+    /// security-property failure and vice versa. Takes tens of milliseconds
+    /// with no load and no luck involved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_frame_timeout_close_is_not_proof_of_a_single_use_ticket() {
+        let (sender, mut log) = rejection_ledger();
+        let (addr, _auth, _directory, _limiter) = spawn_server(
+            None,
+            LspTuning {
+                first_frame_timeout: Duration::from_millis(50),
+                ..LspTuning::default()
+            },
+            ServerHarness {
+                rejection_log: Some(sender),
+                ..ServerHarness::default()
+            },
+        )
+        .await;
+
+        // Never speak: this is the timeout close, the unrelated `Close(None)`
+        // the replay assertion used to accept.
+        let mut ws = connect_staff_socket(addr).await;
+        let reason = await_rejection(&mut log, "the timed-out socket").await;
+        assert_eq!(reason, Rejection::FirstFrameTimeout);
+        assert!(
+            !is_proof_of_single_use_ticket(reason),
+            "the replay assertion must never pass on a first-frame timeout close, \
+             which is byte-identical on the wire to a replay refusal"
+        );
+        assert_closed(&mut ws, HARNESS_ALIVE, "the timed-out socket").await;
+    }
+
+    /// The same rule as the test above, without a socket in sight: no other
+    /// refusal path can be mistaken for single use. Written as an exhaustive
+    /// list so a new `Rejection` variant has to be classified before it can
+    /// be used as evidence.
+    #[test]
+    fn only_an_already_spent_ticket_refusal_proves_single_use() {
+        let all = [
+            Rejection::FirstFrameTimeout,
+            Rejection::FirstFrameNotText,
+            Rejection::NotAnAuthFrame,
+            Rejection::TicketUnusable,
+            Rejection::TicketAlreadySpent,
+            Rejection::NotAuthorized,
+            Rejection::SessionCapFull,
+        ];
+        let proofs: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|r| is_proof_of_single_use_ticket(*r))
+            .collect();
+        assert_eq!(
+            proofs,
+            vec![Rejection::TicketAlreadySpent],
+            "every refusal path sends the same Close, so exactly one verdict may count as \
+             proof of D-TM4 single use (OBI-365)"
+        );
     }
 
     /// Send `{"auth": ticket}` then an `initialize`, and assert the server
-    /// closes without ever answering it -- i.e. no LSP server was started
-    /// for this socket (OBI-319 second review, point 4).
-    async fn assert_refused_without_an_lsp_reply(addr: std::net::SocketAddr, ticket: &str) {
+    /// refuses the socket *for `expected`* without ever answering it -- i.e.
+    /// no LSP server was started for this socket (OBI-319 second review,
+    /// point 4), and the refusal is the one this test means rather than
+    /// whichever `Close(None)` happened to arrive (OBI-365).
+    async fn assert_refused_without_an_lsp_reply(
+        addr: std::net::SocketAddr,
+        ticket: &str,
+        expected: Rejection,
+        log: &mut RejectionLogReceiver,
+    ) {
         let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
             .await
             .unwrap();
@@ -880,33 +1519,60 @@ mod tests {
                 .into(),
             ))
             .await;
-        let next = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
-        match next {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
-            | Ok(None)
-            | Ok(Some(Err(_))) => {}
-            other => panic!("expected the session to be refused with no LSP reply, got {other:?}"),
-        }
+        let reason = await_rejection(log, "the refused socket").await;
+        assert_eq!(
+            reason, expected,
+            "the socket was refused for the wrong reason"
+        );
+        assert_closed(&mut ws, HARNESS_ALIVE, "the refused socket").await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_invalid_ticket_is_refused_before_any_lsp_server_starts() {
-        let (addr, _auth, directory) = spawn_lsp_server(None).await;
+        let (sender, mut log) = rejection_ledger();
+        let (addr, _auth, directory, _limiter) = spawn_server(
+            None,
+            LspTuning::default(),
+            ServerHarness {
+                rejection_log: Some(sender),
+                ..ServerHarness::default()
+            },
+        )
+        .await;
         directory.seed_live_session_for_test("frodo", "sid-1");
-        assert_refused_without_an_lsp_reply(addr, "not-a-ticket").await;
+        assert_refused_without_an_lsp_reply(
+            addr,
+            "not-a-ticket",
+            Rejection::TicketUnusable,
+            &mut log,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_ticket_for_an_already_revoked_session_family_is_refused_at_connect() {
         // OBI-319 second review, point 3: revocation is checked at connect,
         // not only by the periodic recheck. The ticket itself is valid and
-        // unused; only the token family behind it is gone.
-        let (addr, auth, directory) = spawn_lsp_server(None).await;
+        // unused; only the token family behind it is gone -- which is why
+        // the verdict here is `NotAuthorized`, not `TicketUnusable`: a
+        // refused socket must be refused for the reason the test claims
+        // (OBI-365).
+        let (sender, mut log) = rejection_ledger();
+        let (addr, auth, directory, _limiter) = spawn_server(
+            None,
+            LspTuning::default(),
+            ServerHarness {
+                rejection_log: Some(sender),
+                ..ServerHarness::default()
+            },
+        )
+        .await;
         directory.seed_live_session_for_test("frodo", "sid-1");
         let claims = claims_for("frodo", &keys(), "sid-1");
         let ticket = auth.issue_ws_ticket(&claims).unwrap();
         directory.revoke_session_family_for_test("sid-1");
-        assert_refused_without_an_lsp_reply(addr, &ticket).await;
+        assert_refused_without_an_lsp_reply(addr, &ticket, Rejection::NotAuthorized, &mut log)
+            .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
