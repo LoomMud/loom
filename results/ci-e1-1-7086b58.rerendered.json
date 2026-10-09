@@ -1,0 +1,1939 @@
+{
+  "players": 150,
+  "slow_reader_fraction": 0.1,
+  "requested_duration_secs": 90,
+  "actual_duration_secs": 90.612671001,
+  "login_failures": 0,
+  "disconnects": 0,
+  "commands_sent": 9842,
+  "sla_p99_ms": 50.0,
+  "command_latency": {
+    "count": 9842,
+    "p50_ms": 4.198,
+    "p95_ms": 27.549,
+    "p99_ms": 191.361,
+    "max_ms": 995.736,
+    "mean_ms": 13.796146819752083
+  },
+  "slow_reader_command_latency": {
+    "count": 787,
+    "p50_ms": 401.489,
+    "p95_ms": 804.635,
+    "p99_ms": 1203.192,
+    "max_ms": 1255.667,
+    "mean_ms": 495.85479796696313
+  },
+  "login_latency": {
+    "count": 150,
+    "p50_ms": 257.049,
+    "p95_ms": 483.622,
+    "p99_ms": 1769.477,
+    "max_ms": 1778.907,
+    "mean_ms": 303.67376
+  },
+  "login_auth_latency": {
+    "count": 150,
+    "p50_ms": 98.0,
+    "p95_ms": 217.0,
+    "p99_ms": 341.0,
+    "max_ms": 1573.0,
+    "mean_ms": 116.10666666666668
+  },
+  "prompt_timeouts": 0,
+  "e1_1_pass": false,
+  "notes": [
+    "server counters at the last successful scrape (cumulative for this process): 4 world-loop stall(s) totalling 1042 ms; slowest iteration 875 ms; longest between-iteration gap 78 ms",
+    "re-rendered by `loom-loadtest --rerender` from results/ci-e1-1-7086b58.json: stall windows rebuilt from the report's own scrape series (every server stall window below is a bracket: the scrape interval widened backwards by one interval plus the stall milliseconds recorded in it, because a stall is only observable one scrape after it finished. Lower `--metrics-scrape-ms` (250 ms) shrinks that bracket), tail re-attributed against them, timeline re-marked. `p99_excluding_server_stall_ms` is inherited from the archived report -- re-ranking it needs every sample, which a report does not carry. p99 and the E1.1 gate are the archived run's measurements, unchanged. Attribution before this build: 109 of 293 tail samples against a server stall, 17 unattributed. After: 20 of 20 against a stall (0 of them inside a measured window), 0 unattributed. This report carries only its 20 slowest samples, not every at-or-over-SLA one, so the sample-level figures above cover those, not the whole tail. Read together with the timeline, 271 of 293 at-or-over-SLA samples fall in a bucket the rebuilt windows overlap."
+  ],
+  "latency_timeline": [
+    {
+      "start_ms": 0,
+      "bucket_ms": 5000,
+      "count": 183,
+      "p50_ms": 4.159,
+      "p95_ms": 15.791,
+      "p99_ms": 91.948,
+      "max_ms": 98.329,
+      "mean_ms": 7.388404371584699,
+      "over_sla": 5,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 5000,
+      "bucket_ms": 5000,
+      "count": 451,
+      "p50_ms": 10.093,
+      "p95_ms": 31.01,
+      "p99_ms": 35.308,
+      "max_ms": 38.791,
+      "mean_ms": 12.339006651884702,
+      "over_sla": 0,
+      "server_stalled": true
+    },
+    {
+      "start_ms": 10000,
+      "bucket_ms": 5000,
+      "count": 518,
+      "p50_ms": 38.851,
+      "p95_ms": 861.673,
+      "p99_ms": 973.91,
+      "max_ms": 995.736,
+      "mean_ms": 147.8924922779923,
+      "over_sla": 249,
+      "server_stalled": true
+    },
+    {
+      "start_ms": 15000,
+      "bucket_ms": 5000,
+      "count": 600,
+      "p50_ms": 10.135,
+      "p95_ms": 38.422,
+      "p99_ms": 58.699,
+      "max_ms": 68.804,
+      "mean_ms": 12.951615,
+      "over_sla": 15,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 20000,
+      "bucket_ms": 5000,
+      "count": 594,
+      "p50_ms": 3.093,
+      "p95_ms": 13.746,
+      "p99_ms": 24.116,
+      "max_ms": 29.889,
+      "mean_ms": 4.403200336700336,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 25000,
+      "bucket_ms": 5000,
+      "count": 560,
+      "p50_ms": 2.977,
+      "p95_ms": 16.053,
+      "p99_ms": 25.442,
+      "max_ms": 31.415,
+      "mean_ms": 4.6314625,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 30000,
+      "bucket_ms": 5000,
+      "count": 572,
+      "p50_ms": 2.112,
+      "p95_ms": 13.061,
+      "p99_ms": 17.814,
+      "max_ms": 22.714,
+      "mean_ms": 3.5850034965034965,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 35000,
+      "bucket_ms": 5000,
+      "count": 602,
+      "p50_ms": 3.371,
+      "p95_ms": 15.017,
+      "p99_ms": 25.172,
+      "max_ms": 42.86,
+      "mean_ms": 4.778176079734219,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 40000,
+      "bucket_ms": 5000,
+      "count": 592,
+      "p50_ms": 1.518,
+      "p95_ms": 10.599,
+      "p99_ms": 16.56,
+      "max_ms": 21.63,
+      "mean_ms": 2.970565878378378,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 45000,
+      "bucket_ms": 5000,
+      "count": 586,
+      "p50_ms": 2.374,
+      "p95_ms": 12.922,
+      "p99_ms": 20.799,
+      "max_ms": 28.392,
+      "mean_ms": 4.015935153583618,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 50000,
+      "bucket_ms": 5000,
+      "count": 591,
+      "p50_ms": 2.605,
+      "p95_ms": 13.599,
+      "p99_ms": 19.932,
+      "max_ms": 28.976,
+      "mean_ms": 4.1406548223350255,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 55000,
+      "bucket_ms": 5000,
+      "count": 598,
+      "p50_ms": 4.037,
+      "p95_ms": 17.359,
+      "p99_ms": 26.713,
+      "max_ms": 30.165,
+      "mean_ms": 6.004608695652174,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 60000,
+      "bucket_ms": 5000,
+      "count": 539,
+      "p50_ms": 6.608,
+      "p95_ms": 19.464,
+      "p99_ms": 27.545,
+      "max_ms": 32.82,
+      "mean_ms": 7.431359925788497,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 65000,
+      "bucket_ms": 5000,
+      "count": 551,
+      "p50_ms": 5.867,
+      "p95_ms": 18.167,
+      "p99_ms": 35.029,
+      "max_ms": 46.056,
+      "mean_ms": 6.938459165154265,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 70000,
+      "bucket_ms": 5000,
+      "count": 570,
+      "p50_ms": 6.752,
+      "p95_ms": 25.855,
+      "p99_ms": 42.187,
+      "max_ms": 51.331,
+      "mean_ms": 8.611357894736843,
+      "over_sla": 2,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 75000,
+      "bucket_ms": 5000,
+      "count": 569,
+      "p50_ms": 3.285,
+      "p95_ms": 15.818,
+      "p99_ms": 31.637,
+      "max_ms": 45.441,
+      "mean_ms": 4.972697715289983,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 80000,
+      "bucket_ms": 5000,
+      "count": 575,
+      "p50_ms": 6.215,
+      "p95_ms": 38.381,
+      "p99_ms": 79.203,
+      "max_ms": 101.851,
+      "mean_ms": 10.357841739130436,
+      "over_sla": 22,
+      "server_stalled": true
+    },
+    {
+      "start_ms": 85000,
+      "bucket_ms": 5000,
+      "count": 591,
+      "p50_ms": 2.945,
+      "p95_ms": 15.66,
+      "p99_ms": 27.549,
+      "max_ms": 43.756,
+      "mean_ms": 4.529839255499154,
+      "over_sla": 0,
+      "server_stalled": false
+    }
+  ],
+  "tail_samples": [
+    {
+      "at_ms": 10349,
+      "latency_ms": 995.736
+    },
+    {
+      "at_ms": 10357,
+      "latency_ms": 994.378
+    },
+    {
+      "at_ms": 10342,
+      "latency_ms": 988.062
+    },
+    {
+      "at_ms": 10341,
+      "latency_ms": 987.753
+    },
+    {
+      "at_ms": 10376,
+      "latency_ms": 979.578
+    },
+    {
+      "at_ms": 10328,
+      "latency_ms": 973.91
+    },
+    {
+      "at_ms": 10393,
+      "latency_ms": 971.23
+    },
+    {
+      "at_ms": 10420,
+      "latency_ms": 961.351
+    },
+    {
+      "at_ms": 10405,
+      "latency_ms": 960.401
+    },
+    {
+      "at_ms": 10425,
+      "latency_ms": 956.611
+    },
+    {
+      "at_ms": 10311,
+      "latency_ms": 951.844
+    },
+    {
+      "at_ms": 10328,
+      "latency_ms": 943.521
+    },
+    {
+      "at_ms": 10308,
+      "latency_ms": 933.369
+    },
+    {
+      "at_ms": 10468,
+      "latency_ms": 929.617
+    },
+    {
+      "at_ms": 10452,
+      "latency_ms": 929.527
+    },
+    {
+      "at_ms": 10477,
+      "latency_ms": 924.609
+    },
+    {
+      "at_ms": 10461,
+      "latency_ms": 921.134
+    },
+    {
+      "at_ms": 10481,
+      "latency_ms": 920.284
+    },
+    {
+      "at_ms": 10482,
+      "latency_ms": 919.277
+    },
+    {
+      "at_ms": 10466,
+      "latency_ms": 916.036
+    }
+  ],
+  "tail_samples_over_sla": [],
+  "tail_attribution": {
+    "threshold_ms": 50.0,
+    "tail_count": 20,
+    "server_stall": 20,
+    "server_stall_precise": 0,
+    "bot_starvation": 0,
+    "login_ramp": 0,
+    "unattributed": 0,
+    "server_stall_pct": 100.0,
+    "p99_ms": 191.361,
+    "p99_excluding_server_stall_ms": 232.613,
+    "server_stall_windows": [
+      {
+        "start_ms": 9429,
+        "end_ms": 11304,
+        "events": 1,
+        "stall_ms": 875,
+        "approximate": true
+      },
+      {
+        "start_ms": 13195,
+        "end_ms": 14302,
+        "events": 2,
+        "stall_ms": 108,
+        "approximate": true
+      },
+      {
+        "start_ms": 82252,
+        "end_ms": 83315,
+        "events": 1,
+        "stall_ms": 59,
+        "approximate": true
+      }
+    ],
+    "bot_starvation_windows": [],
+    "login_ramp_end_ms": 12081,
+    "scrape_resolution_ms": 1000,
+    "stall_window_precision": "scrape-interval"
+  },
+  "server_timeline": [
+    {
+      "at_ms": 10304,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 104.0,
+        "iterations": 2304.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 48.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 11304,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 104.0,
+        "iterations": 2323.0,
+        "stalls": 1.0,
+        "stall_ms": 875.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 12302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 112.0,
+        "iterations": 2540.0,
+        "stalls": 1.0,
+        "stall_ms": 875.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 13303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 122.0,
+        "iterations": 2654.0,
+        "stalls": 1.0,
+        "stall_ms": 875.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 14302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 129.0,
+        "iterations": 2809.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 15304,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 140.0,
+        "iterations": 2925.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 16302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 150.0,
+        "iterations": 3062.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 17303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 160.0,
+        "iterations": 3211.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 18303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 170.0,
+        "iterations": 3352.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 19302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 180.0,
+        "iterations": 3483.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 20303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 190.0,
+        "iterations": 3628.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 21303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 200.0,
+        "iterations": 3758.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 22303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 210.0,
+        "iterations": 3909.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 23303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 220.0,
+        "iterations": 4046.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 24303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 230.0,
+        "iterations": 4179.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 25303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 240.0,
+        "iterations": 4324.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 26303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 250.0,
+        "iterations": 4439.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 27302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 260.0,
+        "iterations": 4579.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 28303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 270.0,
+        "iterations": 4717.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 29303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 280.0,
+        "iterations": 4860.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 30303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 290.0,
+        "iterations": 4977.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 31303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 300.0,
+        "iterations": 5126.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 32303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 310.0,
+        "iterations": 5233.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 68.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 33303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 320.0,
+        "iterations": 5378.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 73.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 34303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 330.0,
+        "iterations": 5507.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 73.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 35303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 340.0,
+        "iterations": 5657.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 73.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 36303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 350.0,
+        "iterations": 5784.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 73.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 37303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 360.0,
+        "iterations": 5903.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 73.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 38303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 370.0,
+        "iterations": 6056.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 73.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 39304,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 380.0,
+        "iterations": 6201.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 73.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 40302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 390.0,
+        "iterations": 6341.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 41303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 400.0,
+        "iterations": 6495.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 42303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 410.0,
+        "iterations": 6650.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 43303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 420.0,
+        "iterations": 6773.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 44302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 430.0,
+        "iterations": 6895.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 45303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 440.0,
+        "iterations": 7031.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 46303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 450.0,
+        "iterations": 7151.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 47302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 460.0,
+        "iterations": 7288.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 48303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 470.0,
+        "iterations": 7439.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 49303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 480.0,
+        "iterations": 7578.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 50302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 490.0,
+        "iterations": 7706.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 51302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 500.0,
+        "iterations": 7851.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 52303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 510.0,
+        "iterations": 7984.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 53303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 520.0,
+        "iterations": 8119.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 54303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 530.0,
+        "iterations": 8252.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 55303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 540.0,
+        "iterations": 8394.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 56303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 550.0,
+        "iterations": 8545.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 57302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 560.0,
+        "iterations": 8671.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 58305,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 570.0,
+        "iterations": 8815.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 59303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 580.0,
+        "iterations": 8950.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 60303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 590.0,
+        "iterations": 9099.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 61303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 600.0,
+        "iterations": 9230.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 62304,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 610.0,
+        "iterations": 9338.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 63303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 620.0,
+        "iterations": 9477.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 64303,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 630.0,
+        "iterations": 9591.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 65304,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 640.0,
+        "iterations": 9723.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 66305,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 650.0,
+        "iterations": 9844.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 67302,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 660.0,
+        "iterations": 9984.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 68310,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 670.0,
+        "iterations": 10110.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 69311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 680.0,
+        "iterations": 10244.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 70310,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 690.0,
+        "iterations": 10373.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 71311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 700.0,
+        "iterations": 10507.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 72311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 710.0,
+        "iterations": 10646.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 73310,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 720.0,
+        "iterations": 10777.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 74311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 730.0,
+        "iterations": 10892.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 75310,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 740.0,
+        "iterations": 11023.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 76311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 750.0,
+        "iterations": 11167.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 77311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 760.0,
+        "iterations": 11294.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 78311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 770.0,
+        "iterations": 11424.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 79311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 780.0,
+        "iterations": 11564.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 80310,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 790.0,
+        "iterations": 11691.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 81311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 800.0,
+        "iterations": 11830.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 82311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 810.0,
+        "iterations": 11970.0,
+        "stalls": 3.0,
+        "stall_ms": 983.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 83315,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 820.0,
+        "iterations": 12106.0,
+        "stalls": 4.0,
+        "stall_ms": 1042.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 84311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 830.0,
+        "iterations": 12250.0,
+        "stalls": 4.0,
+        "stall_ms": 1042.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 85311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 840.0,
+        "iterations": 12388.0,
+        "stalls": 4.0,
+        "stall_ms": 1042.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 86311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 850.0,
+        "iterations": 12525.0,
+        "stalls": 4.0,
+        "stall_ms": 1042.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 87313,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 860.0,
+        "iterations": 12659.0,
+        "stalls": 4.0,
+        "stall_ms": 1042.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 88311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 870.0,
+        "iterations": 12800.0,
+        "stalls": 4.0,
+        "stall_ms": 1042.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 89310,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 880.0,
+        "iterations": 12924.0,
+        "stalls": 4.0,
+        "stall_ms": 1042.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 90311,
+      "unix_ms": null,
+      "counters": {
+        "ticks": 889.0,
+        "iterations": 13309.0,
+        "stalls": 4.0,
+        "stall_ms": 1042.0,
+        "duration_ms_max": 875.0,
+        "gap_ms_max": 78.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    }
+  ],
+  "server_instrumented": true,
+  "bot_timer_lag": {
+    "count": 7441,
+    "p50_ms": 1.143,
+    "p95_ms": 3.641,
+    "p99_ms": 6.782,
+    "max_ms": 27.496,
+    "mean_ms": 1.3957891412444563
+  },
+  "server_metrics": "# TYPE loom_world_loop_ticks_total counter\nloom_world_loop_ticks_total 892\n\n# TYPE loom_world_loop_iterations_total counter\nloom_world_loop_iterations_total 13313\n\n# TYPE loom_world_loop_stalls_total counter\nloom_world_loop_stalls_total{kind=\"negotiation\"} 1\nloom_world_loop_stalls_total{kind=\"input\"} 3\n\n# TYPE loom_world_loop_stall_ms_total counter\nloom_world_loop_stall_ms_total 1042\n\n# TYPE loom_world_loop_last_stall_unix_ms gauge\nloom_world_loop_last_stall_unix_ms 1791517784022\n\n# TYPE loom_world_loop_duration_ms_max gauge\nloom_world_loop_duration_ms_max 875\n\n# TYPE loom_world_loop_last_stall_duration_ms gauge\nloom_world_loop_last_stall_duration_ms 59\n\n# TYPE loom_world_loop_gap_ms_max gauge\nloom_world_loop_gap_ms_max 100\n\n# TYPE loom_world_loop_last_stall_tick gauge\nloom_world_loop_last_stall_tick 816\n\n"
+}

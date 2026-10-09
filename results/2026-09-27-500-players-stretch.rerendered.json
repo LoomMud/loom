@@ -1,0 +1,64 @@
+{
+  "players": 500,
+  "slow_reader_fraction": 0.1,
+  "requested_duration_secs": 90,
+  "actual_duration_secs": 92.016789211,
+  "login_failures": 0,
+  "disconnects": 0,
+  "commands_sent": 19127,
+  "sla_p99_ms": 50.0,
+  "command_latency": {
+    "count": 19127,
+    "p50_ms": 872.758,
+    "p95_ms": 1060.67,
+    "p99_ms": 1152.993,
+    "max_ms": 1273.686,
+    "mean_ms": 753.8382260678623
+  },
+  "slow_reader_command_latency": {
+    "count": 1635,
+    "p50_ms": 1203.053,
+    "p95_ms": 2005.575,
+    "p99_ms": 2806.61,
+    "max_ms": 2808.022,
+    "mean_ms": 1299.4318685015292
+  },
+  "login_latency": {
+    "count": 500,
+    "p50_ms": 197.931,
+    "p95_ms": 4374.512,
+    "p99_ms": 5094.891,
+    "max_ms": 5465.522,
+    "mean_ms": 961.965806
+  },
+  "login_auth_latency": null,
+  "prompt_timeouts": 0,
+  "e1_1_pass": false,
+  "notes": [
+    "R3 server-side metrics (loom-http /metrics) are not scraped by this run: loom-http/loom-obs are not yet on main (OBI-28); this report is bot-side latency only.",
+    "re-rendered by `loom-loadtest --rerender` from results/2026-09-27-500-players-stretch.json: stall windows rebuilt from the report's own scrape series (no server stall window could be placed for this run, so nothing here attributes the tail to the world thread), tail re-attributed against them, timeline re-marked. `p99_excluding_server_stall_ms` is inherited from the archived report -- re-ranking it needs every sample, which a report does not carry. p99 and the E1.1 gate are the archived run's measurements, unchanged. The run did miss the SLA -- its slowest command cost 1273.69 ms -- but this archive carries no tail samples to re-attribute, so the sample-level figures are 0 of 0; neither samples nor a latency timeline were archived, so nothing here can say what the tail was. The archived run scraped no instrumented server, so no windows were rebuilt: the timeline keeps the stall marks the run wrote, and the bucket-level figures are not this re-render's claim."
+  ],
+  "latency_timeline": [],
+  "tail_samples": [],
+  "tail_samples_over_sla": [],
+  "tail_attribution": {
+    "threshold_ms": 50.0,
+    "tail_count": 0,
+    "server_stall": 0,
+    "server_stall_precise": 0,
+    "bot_starvation": 0,
+    "login_ramp": 0,
+    "unattributed": 0,
+    "server_stall_pct": 0.0,
+    "p99_ms": 1152.993,
+    "p99_excluding_server_stall_ms": 0.0,
+    "server_stall_windows": [],
+    "bot_starvation_windows": [],
+    "login_ramp_end_ms": 0,
+    "scrape_resolution_ms": 0,
+    "stall_window_precision": "not-placed"
+  },
+  "server_timeline": [],
+  "server_instrumented": false,
+  "bot_timer_lag": null
+}
