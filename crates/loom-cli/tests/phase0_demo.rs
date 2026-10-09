@@ -1,12 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
 // SPDX-License-Identifier: AGPL-3.0-only
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+
+#[path = "support/read_until.rs"]
+mod read_until;
+
+use read_until::{drain_telnet_preamble, read_until_contains};
 
 const INTRO_EXITS: &str = "Obvious exits: north.";
 const HALL_DESC: &str = "A high-ceilinged hall of pale stone.";
@@ -125,45 +130,12 @@ fn send_line(reader: &mut BufReader<TcpStream>, line: &str) {
         .unwrap_or_else(|err| panic!("flush command `{line}` failed: {err}"));
 }
 
-fn read_until_contains(
-    reader: &mut BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    let deadline = Instant::now() + timeout;
-    let mut transcript = String::new();
-
-    loop {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => {
-                let normalized = line.replace("\r\n", "\n");
-                transcript.push_str(&normalized);
-                if transcript.contains(needle) {
-                    return transcript;
-                }
-            }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
-        }
-    }
-}
-
 fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
     let deadline = Instant::now() + timeout;
     loop {
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
-                drain_telnet_preamble(&mut stream);
+                drain_telnet_preamble(&mut stream, "on connecting to the server");
                 return stream;
             }
             Err(err) if Instant::now() < deadline => {
@@ -181,19 +153,6 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
             Err(err) => panic!("failed to connect to {addr} before timeout: {err}"),
         }
     }
-}
-
-/// `loom serve` opens with startup telnet option negotiation (OBI-26: `DO
-/// NAWS`, `DO TTYPE`, `WILL GMCP`, `WILL MSSP` -- 12 bytes, none of them
-/// valid UTF-8 on their own) before anything text-protocol shows up on the
-/// wire. These tests read lines as UTF-8 text, so they don't speak telnet
-/// back; just drop the fixed-size preamble rather than negotiate.
-fn drain_telnet_preamble(stream: &mut TcpStream) {
-    use std::io::Read;
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble");
 }
 
 fn reserve_local_port() -> u16 {
