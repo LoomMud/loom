@@ -40,6 +40,25 @@
  * Types path from handing raw strings to the DOM. The advisory's actual
  * blast radius is HTML that *this* client deliberately does not render.
  * Re-checked when Monaco ships 3.4.16.
+ *
+ * ## The tree is version-stamped, and that is a security property
+ *
+ * Staged at `vendor/monaco/<version>/vs`, and `loom-http` promises that
+ * directory's contents are frozen for a year (`Cache-Control: immutable`,
+ * OBI-338) -- which is the only way 21.9 MB of editor stops being paid on
+ * every IDE load. The promise is only sound while the URL changes whenever
+ * the bytes do, so the version is *in* the URL.
+ *
+ * That makes the served documents carry a version literal (`ide.html`'s two
+ * references and `src/ide/amd-boot.ts`'s `paths.vs`), and a literal that can
+ * drift from the pin is a bug worth a gate rather than a convention: this
+ * script refuses to stage unless every reference it finds in those files
+ * names the version being staged. Bumping `monaco-editor` in
+ * `package.json` then means editing two source lines, in the same commit,
+ * or `npm run build` -- and with it CI and the image build -- fails with the
+ * file and the stale path named. The alternative (a `vendor/monaco/vs`
+ * symlink or a generated HTML file) would either move a *year*-cached URL
+ * under a new version's feet or make a served document a build artifact.
  */
 
 import {
@@ -58,7 +77,6 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const webClient = join(root, "web-client");
 const pkgDir = join(webClient, "node_modules", "monaco-editor");
 const srcRoot = join(pkgDir, "min", "vs");
-const destRoot = join(webClient, "vendor", "monaco", "vs");
 
 /** Top-level directories under `min/vs` that the default (English, `en`)
  * build never fetches. See the header comment for why nothing else is
@@ -77,8 +95,64 @@ const REQUIRED = [
 /** Monaco is MIT and ships its own third-party notices. Both belong
  * beside the code in the image, not just in `node_modules` of whoever
  * ran the build; `npm run check-licenses` audits the dependency, this
- * makes the shipped artifact carry the same paperwork. */
+ * makes the shipped artifact carry the same paperwork. Beside it
+ * literally here: inside the stamped directory, so the notices travel
+ * with the bytes they describe. */
 const NOTICES = ["LICENSE", "ThirdPartyNotices.txt"];
+
+/** The served files that name a path into the vendored tree, relative to
+ * `web-client/`. Each one must reference exactly the version being staged;
+ * see `unpinnedRefs` and the header comment. */
+const REFERENCED_BY = ["ide.html", "src/ide/amd-boot.ts"];
+
+/** The URL prefix `web-client` is served from -- the one place that spells
+ * it out, so the drift gate and the served documents cannot disagree about
+ * what they are checking. */
+export function vendorPrefix(version) {
+  return `vendor/monaco/${version}`;
+}
+
+/**
+ * The `<segment>` of every `vendor/monaco/<segment>` mention in `text` --
+ * a version when the mention is stamped, anything else (`vs`, `latest`,
+ * the empty string of a bare directory mention) when it is not.
+ *
+ * Quotation marks and backticks end a mention so that a prose reference in
+ * a comment is read the same way as an attribute or a string literal.
+ */
+export function monacoVendorRefs(text) {
+  return [...text.matchAll(/vendor\/monaco\/([^/?#\s"'`)\]]*)/g)].map((match) => match[1]);
+}
+
+/**
+ * Why `text` does not point only at the stamped path for `version`, as a
+ * list of human-readable problems -- empty when it does.
+ *
+ * Both directions are errors, for the same reason: a reference to a
+ * directory that is not staged is a 404 in a staff browser, and no
+ * reference at all means the gate is checking a file that stopped naming
+ * the tree. Pure, so a test can drive it with fixtures instead of a
+ * fixture-shaped repository.
+ */
+export function unpinnedRefs(text, version) {
+  const refs = [...new Set(monacoVendorRefs(text))];
+  const problems = [];
+  if (!refs.includes(version)) {
+    problems.push(`no reference to ${mention(version)}`);
+  }
+  for (const ref of refs) {
+    if (ref !== version) {
+      problems.push(`references ${mention(ref)} (not ${version})`);
+    }
+  }
+  return problems;
+}
+
+/** A mention as it is written in the served file: `vendor/monaco/<ref>/`,
+ * collapsing the doubled slash of a mention that named only the directory. */
+function mention(ref) {
+  return `${vendorPrefix(ref).replace(/\/+$/, "")}/`;
+}
 
 function fail(message) {
   console.error(`vendor-monaco: ${message}`);
@@ -114,14 +188,39 @@ export function stage() {
     }
   }
 
-  rmSync(join(webClient, "vendor", "monaco"), { recursive: true, force: true });
+  // The gate on the URL contract (see the header comment): the version in
+  // the served documents must be the version about to be staged, because
+  // `loom-http` promises the stamped directory's bytes for a year.
+  for (const rel of REFERENCED_BY) {
+    const file = join(webClient, rel);
+    if (!existsSync(file)) {
+      fail(`${rel} is gone; if the file that names the vendored tree moved, update REFERENCED_BY here`);
+    }
+    const problems = unpinnedRefs(readFileSync(file, "utf8"), installed);
+    if (problems.length > 0) {
+      fail(
+        `${rel} does not match monaco-editor ${installed}:\n  - ` +
+          problems.join("\n  - ") +
+          `\nEvery reference must be ${mention(installed)} -- that stamp is what makes\n` +
+          `the immutable cache entry safe, so a bump edits these files too.`,
+      );
+    }
+  }
+
+  // The whole tree is restaged, so the only version directories that exist
+  // are the one the pin names: a stale `vendor/monaco/<older>/` left behind
+  // would still be reachable, still be served `immutable`, and still be in
+  // the image -- 21.9 MB at a time.
+  const monacoDir = join(webClient, "vendor", "monaco");
+  const destRoot = join(monacoDir, installed, "vs");
+  rmSync(monacoDir, { recursive: true, force: true });
   for (const entry of readdirSync(srcRoot)) {
     if (SKIP_TOP_LEVEL.has(entry)) continue;
     cpSync(join(srcRoot, entry), join(destRoot, entry), { recursive: true });
   }
   for (const notice of NOTICES) {
     if (existsSync(join(pkgDir, notice))) {
-      cpSync(join(pkgDir, notice), join(webClient, "vendor", "monaco", notice));
+      cpSync(join(pkgDir, notice), join(monacoDir, installed, notice));
     }
   }
 
