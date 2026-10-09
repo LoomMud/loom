@@ -17,6 +17,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/read_until.rs"]
+mod read_until;
+
+use read_until::read_until_contains;
+
 #[test]
 fn supervise_hands_off_listening_sockets_to_a_standby_child() {
     let mudlib = fixture("tworoom");
@@ -727,45 +732,6 @@ fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
     );
 
     supervisor.assert_alive();
-}
-
-/// `BufReader<TcpStream>`-based line read with a needle, tolerating
-/// `\r\n`/`\n` and any leading binary noise (e.g. a fresh telnet
-/// negotiation preamble after a reclaim/readopt round trip resets codec
-/// state) ahead of real text -- same pattern as `net_tick.rs`'s own
-/// helper of the same name, duplicated here rather than shared across
-/// test binaries (each integration test file is its own crate).
-fn read_until_contains(
-    reader: &mut std::io::BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    use std::io::BufRead;
-    let deadline = Instant::now() + timeout;
-    let mut transcript = String::new();
-    loop {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
-        }
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => {
-                transcript.push_str(&line.replace("\r\n", "\n"));
-                if transcript.contains(needle) {
-                    return transcript;
-                }
-            }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) => {}
-            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
-        }
-    }
 }
 
 fn send_line(reader: &mut std::io::BufReader<TcpStream>, line: &str) {

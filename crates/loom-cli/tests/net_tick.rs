@@ -14,6 +14,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+#[path = "support/read_until.rs"]
+mod read_until;
+
+use read_until::read_until_contains;
+
 /// `WORLD_TICK_INTERVAL` in `loom-cli/src/main.rs`; kept in sync by eye
 /// (not `pub`, so not importable) since this is a black-box process test.
 const WORLD_TICK_MS: u64 = 100;
@@ -145,39 +150,6 @@ fn send_line(reader: &mut BufReader<TcpStream>, line: &str) {
     stream
         .flush()
         .unwrap_or_else(|err| panic!("flush command `{line}` failed: {err}"));
-}
-
-fn read_until_contains(
-    reader: &mut BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    let deadline = Instant::now() + timeout;
-    let mut transcript = String::new();
-
-    loop {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => {
-                let normalized = line.replace("\r\n", "\n");
-                transcript.push_str(&normalized);
-                if transcript.contains(needle) {
-                    return transcript;
-                }
-            }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
-        }
-    }
 }
 
 fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {

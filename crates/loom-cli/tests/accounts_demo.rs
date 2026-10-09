@@ -15,6 +15,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+#[path = "support/read_until.rs"]
+mod read_until;
+
+use read_until::read_until_contains;
+
 #[test]
 fn in_memory_account_backend_create_duplicate_and_bad_password() {
     let mudlib = fixture("accounts");
@@ -159,39 +164,6 @@ fn poll_until_contains(
                 "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
             ),
             Ok(_) => transcript.push_str(&line.replace("\r\n", "\n")),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
-        }
-    }
-}
-
-fn read_until_contains(
-    reader: &mut BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    let deadline = Instant::now() + timeout;
-    let mut transcript = String::new();
-
-    loop {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => {
-                let normalized = line.replace("\r\n", "\n");
-                transcript.push_str(&normalized);
-                if transcript.contains(needle) {
-                    return transcript;
-                }
-            }
             Err(err)
                 if err.kind() == std::io::ErrorKind::TimedOut
                     || err.kind() == std::io::ErrorKind::WouldBlock => {}
