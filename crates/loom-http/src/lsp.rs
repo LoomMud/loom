@@ -1065,6 +1065,15 @@ mod tests {
     ///
     /// Deliberately far larger than `HARNESS_ALIVE`: if a test ever runs for
     /// an hour, nothing here is deciding anything any more.
+    ///
+    /// This works as a lever only because the session loop's exit set is the
+    /// small one its `select!` shows. Recorded as policy on OBI-368: when a
+    /// new exit path is added to that loop -- another timer, a
+    /// server-initiated shutdown/drain, a limiter eviction -- add a
+    /// `SessionEnd` reason to the `ServerHarness` ledger instead of reaching
+    /// for another `OUT_OF_THE_WAY`. Proof by elimination stops being proof
+    /// the moment the set it eliminates over grows in the dark; and once that
+    /// event exists, the elapsed bounds in the idle-timeout test go too.
     const OUT_OF_THE_WAY: Duration = Duration::from_secs(3600);
 
     /// The acceptance criterion of the replay tests, kept apart from the
@@ -1680,13 +1689,6 @@ mod tests {
         let ticket = auth.issue_ws_ticket(&claims).unwrap();
 
         let mut ws = connect_staff_socket(addr).await;
-        send_ticket(&mut ws, &ticket).await;
-
-        // Send nothing else. The 20ms recheck tick fires ~15 times
-        // before the 300ms idle timeout should; the old per-pass
-        // `timeout(..)` bug would have let every one of those ticks
-        // re-arm a fresh window, so this would never close.
-        //
         // Timing is the property here, so this is the one place in the
         // module that keeps a wall-clock number in its verdict -- and it is
         // measured against the tuning, never against a budget the runner can
@@ -1694,18 +1696,35 @@ mod tests {
         // all is the must-fix-1 bug, and the `other =>` arm below says so),
         // while the two bounds on `elapsed` say the close that arrived *was*
         // the 300 ms deadline and not something else.
+        //
+        // The stopwatch starts *before* the ticket goes out, not after. The
+        // server arms the idle deadline when it reads the ticket, and on two
+        // workers that can happen before this task reaches `Instant::now()`, so
+        // a wait placed after `send_ticket` measures a window shorter than the
+        // one the session actually ran: this test's first cut did exactly that,
+        // and a 100 ms deschedule at that point was enough to fail the lower
+        // bound on a close that *was* the idle timeout (OBI-368 must-fix 1).
+        // Started here, "the deadline was armed at or after `started`" holds by
+        // causality, and contention can only ever stretch `elapsed`, never
+        // shrink it.
         let started = tokio::time::Instant::now();
+        send_ticket(&mut ws, &ticket).await;
+
+        // Send nothing else. The 20ms recheck tick fires ~15 times
+        // before the 300ms idle timeout should; the old per-pass
+        // `timeout(..)` bug would have let every one of those ticks
+        // re-arm a fresh window, so this would never close.
         let next = tokio::time::timeout(HARNESS_ALIVE, ws.next()).await;
         match next {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => {}
             other => panic!("expected the idle timeout to close the socket, got {other:?}"),
         }
         let elapsed = started.elapsed();
-        // Lower bound: the session sets its idle deadline only after it has
-        // read the ticket (i.e. after `started`), so a close that arrives
-        // before the deadline is due was not the idle timeout -- it is a
-        // connect-time refusal or a teardown, which would make this test
-        // green for an unrelated close. Contention can never break this.
+        // Lower bound: `started` precedes the ticket, so the deadline the
+        // session arms can only fall due at or after `started + idle_timeout`.
+        // A close arriving sooner was not the idle timeout -- it is a
+        // connect-time refusal or a teardown, and this test would have been
+        // green for an unrelated close.
         assert!(
             elapsed >= tuning.idle_timeout,
             "the socket was closed after {elapsed:?}, before the {:?} idle deadline it was \
@@ -1719,7 +1738,9 @@ mod tests {
         // `HARNESS_ALIVE` wait above; what this catches is a deadline that
         // is being pushed out by something other than an inbound frame, or
         // an idle close so late it no longer means "300 ms". If it trips on
-        // a runner that was simply starved, the message says which.
+        // a runner that was simply starved, the message says which -- and the
+        // OBI-368 ruling is to drop this bound, not widen it: the
+        // `HARNESS_ALIVE` wait is what carries the regression.
         let upper = tuning.idle_timeout * 20 + Duration::from_secs(1);
         assert!(
             elapsed <= upper,
@@ -1847,7 +1868,16 @@ mod tests {
         let (sender, mut log) = rejection_ledger();
         let (addr, auth, directory, _limiter) = spawn_server(
             None,
-            LspTuning::default(),
+            // The ledger pin means this test cannot *false-pass* on the default
+            // 5 s first-frame timeout -- it would report `FirstFrameTimeout`
+            // and fail -- but a timer that is not its subject can still redden
+            // it, which is the class of flake this ticket removes everywhere
+            // else (OBI-368 should-fix 2). Idle, ping and recheck need no
+            // handling: the refusal happens before the session loop starts.
+            LspTuning {
+                first_frame_timeout: OUT_OF_THE_WAY,
+                ..LspTuning::default()
+            },
             ServerHarness {
                 rejection_log: Some(sender),
                 ..ServerHarness::default()
