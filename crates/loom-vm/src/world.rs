@@ -45,6 +45,16 @@ fn default_save_root(mudlib_root: &Path) -> PathBuf {
     }
 }
 
+/// Wall-clock milliseconds since the Unix epoch, for the error inbox's
+/// `last_seen` stamps. `0` on a clock that predates the epoch (there is no
+/// sane fallback, and no error report is worth panicking over).
+pub(crate) fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// One [`AuditEntry`], resolved to owned strings, ready for a driver-side
 /// Postgres sink (OBI-36 D-S2.5; see [`World::drain_audit_since`]).
 /// `kind` and `apply` name the decision (`"unguarded"`,
@@ -486,6 +496,12 @@ pub struct World {
     /// Grouped runtime-error inbox (OBI-169, spec §8.3): see
     /// `crate::errors::ErrorInbox`. Fed uniformly by `World::exec`.
     errors: crate::errors::ErrorInbox,
+    /// The deferred-durability queue for `save_object` writes (OBI-348,
+    /// spec §8.1): see [`crate::save_queue`]. Owned here (one per world,
+    /// borrowed into each `RegistryHost`'s driver context exactly like
+    /// `disk_usage`/`errors` above), because the whole point is that the
+    /// *world thread* never performs the `fsync`s a save implies.
+    save_queue: crate::save_queue::SaveQueue,
     /// Per-connection session timing (OBI-237 admin query `who`): see
     /// [`ConnSession`].
     sessions: HashMap<u64, ConnSession>,
@@ -742,6 +758,7 @@ impl World {
             tick_share: HashMap::new(),
             disk_usage: crate::disk_usage::DiskUsage::default(),
             errors: crate::errors::ErrorInbox::new(),
+            save_queue: crate::save_queue::SaveQueue::default(),
             sessions: HashMap::new(),
         };
         let mut null = NullHost;
@@ -771,9 +788,18 @@ impl World {
     ///
     /// `Err` only while an `atomic fn` scope is open (see
     /// `Registry::capture`'s own docs for why).
+    ///
+    /// Takes `&mut self` and flushes the durability queue first (OBI-348):
+    /// a snapshot is the world's own idea of "what is saved", and copyover
+    /// hands live connections to the boot side, which reads save files back
+    /// off the disk -- so a save still sitting in the queue would be a save
+    /// that silently never happened. `stage_write`/`commit_write` keep an
+    /// interrupted *write* from corrupting a file; only the flush keeps a
+    /// queued write from being lost.
     pub fn begin_snapshot(
-        &self,
+        &mut self,
     ) -> Result<crate::snapshot::SnapshotJob, crate::snapshot::SnapshotError> {
+        self.flush_pending_saves();
         self.registry
             .capture()
             .map(crate::snapshot::SnapshotJob::new)
@@ -840,6 +866,7 @@ impl World {
             tick_share: HashMap::new(),
             disk_usage: crate::disk_usage::DiskUsage::default(),
             errors: crate::errors::ErrorInbox::new(),
+            save_queue: crate::save_queue::SaveQueue::default(),
             sessions: HashMap::new(),
         })
     }
@@ -979,6 +1006,79 @@ impl World {
         self.save_root = dir;
     }
 
+    // ---------------------------------------------------------------------
+    // `save_object` durability (OBI-348, spec §8.1): see [`crate::save_queue`].
+    // ---------------------------------------------------------------------
+
+    /// `Sync` restores the pre-OBI-348 contract: `save_object()` runs its
+    /// whole durable write inline on the world thread and `true` means
+    /// "durable". `Deferred` is the default (and what `serve` runs):
+    /// `save_object()` returns `true` once the content is *accepted*, and
+    /// the `fsync`/`rename`/dir-`fsync` half happens on the durability
+    /// worker. Anything already queued is flushed on the way to `Sync`, so
+    /// switching modes never strands a save. The queue's own saturation
+    /// fallback commits inline regardless of mode.
+    pub fn set_save_durability(&mut self, mode: crate::save_queue::SaveDurability) {
+        self.save_queue.set_durability(mode);
+    }
+
+    pub fn save_durability(&self) -> crate::save_queue::SaveDurability {
+        self.save_queue.durability()
+    }
+
+    /// Replace the queue's tuning wholesale. Takes effect for subsequent
+    /// saves; a queue that already started its worker keeps the worker it
+    /// has (the channel bound is fixed at spawn). Tests use
+    /// `commit_delay` to simulate a slow disk deterministically.
+    pub fn set_save_queue_config(&mut self, cfg: crate::save_queue::SaveQueueConfig) {
+        let delay = cfg.commit_delay;
+        self.save_queue.config_mut().max_pending = cfg.max_pending;
+        self.save_queue.config_mut().max_pending_bytes = cfg.max_pending_bytes;
+        self.save_queue.config_mut().poll_batch = cfg.poll_batch;
+        self.save_queue.config_mut().commit_delay = delay;
+        self.save_queue.config_mut().worker_disabled = cfg.worker_disabled;
+        self.save_queue.config_mut().flush_wait_slice = cfg.flush_wait_slice;
+        self.save_queue.config_mut().flush_deadline = cfg.flush_deadline;
+    }
+
+    /// What the durability queue has done, for the runtime to scrape
+    /// (`loom-obs` owns the counter families; this is the pull-side data,
+    /// OBI-348 interface note). `inline_commits` is the one to alert on:
+    /// every increment is an `fsync` the world thread paid for.
+    pub fn save_queue_stats(&self) -> crate::save_queue::SaveQueueStats {
+        self.save_queue.stats()
+    }
+
+    /// Reap completed durability outcomes: apply each committed write to
+    /// `disk_quota_mb` and record each deferred failure in the error inbox
+    /// (spec §8.3) against the program of the object that asked for the
+    /// save. Does no filesystem work itself. `World::tick` calls this every
+    /// tick; `save_object`/`restore_object` also drain opportunistically.
+    pub fn poll_pending_saves(&mut self) -> usize {
+        let batch = self.save_queue.config().poll_batch;
+        let outcomes = self.save_queue.poll(batch);
+        let now = unix_now_ms();
+        crate::save_queue::apply_outcomes(&outcomes, &mut self.disk_usage, &mut self.errors, now);
+        outcomes.len()
+    }
+
+    /// The durability barrier: block until every save this world has
+    /// accepted is on disk, charging each committed write against
+    /// `disk_quota_mb` and recording any failure. Returns how many saves it
+    /// waited on. Call sites that must not observe a not-yet-written save:
+    /// [`World::begin_snapshot`] (a snapshot must capture what the world
+    /// believes is saved, and copyover's boot side reads save files off the
+    /// disk), and process shutdown (the queue's own `Drop` flushes, though
+    /// by then the `DiskUsage` it would charge is going away -- so a
+    /// graceful shutdown that still cares should call this while the world
+    /// is alive).
+    pub fn flush_pending_saves(&mut self) -> usize {
+        let outcomes = self.save_queue.flush();
+        let now = unix_now_ms();
+        crate::save_queue::apply_outcomes(&outcomes, &mut self.disk_usage, &mut self.errors, now);
+        outcomes.len()
+    }
+
     /// Run `body` against a fresh [`RegistryHost`] with driver context
     /// wired up (network host, `this_player`, bound connection, master).
     /// `acting` is the object whose own euid seeds this execution's guard
@@ -1059,6 +1159,7 @@ impl World {
             input_actor,
             &mut self.disk_usage,
             &mut self.errors,
+            &mut self.save_queue,
             self.save_root.clone(),
         );
         let result = body(&mut rh);
@@ -1111,10 +1212,7 @@ impl World {
         });
         let function = crate::errors::function_of(e);
         let line = crate::errors::line_of(e);
-        let now_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now_unix_ms = unix_now_ms();
         let redacted = program.starts_with("/secure/");
         self.errors.record(
             &program,
@@ -1726,6 +1824,21 @@ impl World {
     /// end up on this exact path, so one hook covers both triggers), then
     /// unbind, then `net_dead()` on the object. Each runs as its own
     /// `exec` so an `autosave()` failure can never suppress `net_dead()`.
+    ///
+    /// **OBI-348: no durability happens here.** `autosave()` renders and
+    /// authorises the save on this thread and hands the `fsync`/`rename` half
+    /// to the world's durability worker ([`crate::save_queue`]) -- which is
+    /// the whole reason this path stopped being the world thread's worst
+    /// iteration: before it, a mass teardown cost two `fsync`s per session
+    /// inline, and the E1.1 run at `ad489db` measured 304-562 ms for a single
+    /// logout (`loom_world_loop_stalls_total{kind="disconnect"}`). Unbinding
+    /// the connection and running `net_dead()` stay inline and in order.
+    ///
+    /// The save is still *made* here: `begin_snapshot` and the queue's own
+    /// `Drop` both flush, so nothing accepted on this path can be lost by a
+    /// later snapshot, copyover, or orderly shutdown. A `SIGKILL` can only
+    /// lose the saves that were still queued at that instant -- see the
+    /// module doc's "What an unclean shutdown costs".
     pub fn disconnect(&mut self, conn: u64, host: &mut dyn Host) {
         let Some(ob) = self.registry.conns.remove(&conn) else {
             return;
@@ -1770,6 +1883,15 @@ impl World {
     /// its quota root uid is `call.quota_uid`, recorded here for tests
     /// (AC 3: "its execution reports quota uid = the apprentice's").
     pub fn tick(&mut self, host: &mut dyn Host) {
+        // OBI-348: first reap whatever the durability worker has committed
+        // since the last pass. This is what frees queue capacity (a queue
+        // that is never reaped is a queue that saturates and then commits
+        // inline on *this* thread, i.e. back to the bug being fixed), bills
+        // each committed write against `disk_quota_mb`, and records a
+        // deferred save failure in the error inbox against the program that
+        // asked for it (spec §8.3). Bounded by `poll_batch`, non-blocking,
+        // and does no filesystem work of its own.
+        self.poll_pending_saves();
         self.poll_recompiles(host);
         self.poll_recompile_sets(host);
         let due = self.scheduler.advance();

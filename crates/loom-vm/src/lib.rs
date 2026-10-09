@@ -21,6 +21,7 @@ pub mod profiler;
 pub mod quota;
 pub mod rng;
 pub mod roles;
+pub mod save_queue;
 pub mod scheduler;
 pub mod security;
 pub mod snapshot;
@@ -34,6 +35,7 @@ pub use bcvm::vm::RtError;
 pub use host::{Host, NullHost};
 pub use object::ObjectId;
 pub use roles::{DomainRole, Grant, RolesSnapshot};
+pub use save_queue::{SaveDurability, SaveQueue, SaveQueueConfig, SaveQueueStats};
 pub use snapshot::{SnapshotError, SnapshotJob};
 pub use world::{
     AccountAuth, AdminErrorGroup, AdminObjectSummary, AdminObjectVars, AdminVarEntry, AuditRow,
