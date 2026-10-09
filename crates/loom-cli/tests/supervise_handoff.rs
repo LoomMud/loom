@@ -52,6 +52,17 @@
 //! ([`booting_with_a_matching_desired_version_triggers_no_copyover`]), and
 //! binary-safe transcript reads
 //! ([`transcript_reads_survive_binary_telnet_noise_between_lines`]).
+//!
+//! Rebase note (OBI-355): this file used to carry its own `read_until_contains`.
+//! `main` landed `tests/support/read_until.rs` while OBI-292 was open, and the
+//! shared reader is the stronger of the two -- it hands back the bytes a
+//! timed-out read had already pulled off the socket instead of discarding them
+//! on the timeout arm, which is the OBI-302 lost-bytes shape this file's local
+//! copy still had. The local copy is gone, and the guard test above now covers
+//! the helper every `loom-cli` integration test uses. The preamble reads stay
+//! local ([`fill_before_deadline`]): a `supervise` startup can die for a
+//! startup-only reason and a fixed-size drain cannot report which, which is the
+//! whole point of the readiness barrier.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -59,6 +70,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[path = "support/read_until.rs"]
+mod read_until;
+
+use read_until::read_until_contains;
 
 #[test]
 fn supervise_hands_off_listening_sockets_to_a_standby_child() {
@@ -827,57 +843,6 @@ fn fill_before_deadline(
 }
 
 /// `BufReader<TcpStream>`-based line read with a needle, tolerating
-/// `\r\n`/`\n` and any leading binary noise (e.g. a fresh telnet
-/// negotiation preamble after a reclaim/readopt round trip resets codec
-/// state) ahead of real text -- same pattern as `net_tick.rs`'s own
-/// helper of the same name, duplicated here rather than shared across
-/// test binaries (each integration test file is its own crate).
-///
-/// OBI-292: reads bytes, not `String`s. A telnet stream is *not* text --
-/// an IAC sequence landing inside one `\n`-terminated chunk used to make
-/// `read_line` fail with `stream did not contain valid UTF-8 (os error
-/// 526)` and take the test down for a non-ASCII byte it was never meant
-/// to assert on. Lossy decoding keeps the transcript usable for substring
-/// matching, which is all any caller here does with it.
-fn read_until_contains(
-    reader: &mut std::io::BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    use std::io::BufRead;
-    let deadline = Instant::now() + timeout;
-    let mut transcript = String::new();
-    loop {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
-        }
-        let mut line = Vec::new();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) => panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => {
-                transcript.push_str(
-                    &String::from_utf8_lossy(&line)
-                        .to_string()
-                        .replace("\r\n", "\n"),
-                );
-                if transcript.contains(needle) {
-                    return transcript;
-                }
-            }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) => {}
-            Err(err) => panic!(
-                "socket read failed while waiting for `{needle}`: {err}. Transcript so far:\n{transcript}"
-            ),
-        }
-    }
-}
-
 fn send_line(reader: &mut std::io::BufReader<TcpStream>, line: &str) {
     let stream = reader.get_mut();
     stream
@@ -1451,13 +1416,13 @@ fn booting_with_a_matching_desired_version_triggers_no_copyover() {
 }
 
 /// OBI-292 regression guard for the `stream did not contain valid UTF-8
-/// (os error 526)` signature: a telnet stream is *not* text, and
-/// `read_until_contains` used to call `read_line` on it, which fails the
-/// whole test on an IAC byte landing inside a `\n`-terminated chunk. Feed
-/// it exactly that shape -- invalid UTF-8 (`0xFF`/`0xFE` are never valid
-/// UTF-8 lead bytes) followed by the real line -- and require the text
-/// back. Lossy decoding is all any caller here needs, since every caller
-/// only does substring matching.
+/// (os error 526)` signature: a telnet stream is *not* text, and a line
+/// reader that decodes as it goes fails the whole test on an IAC byte
+/// landing inside a `\n`-terminated chunk. Feed the shared
+/// `read_until_contains` exactly that shape -- invalid UTF-8 (`0xFF`/`0xFE`
+/// are never valid UTF-8 lead bytes) followed by the real line -- and
+/// require the text back. Lossy decoding is all any caller here needs,
+/// since every caller only does substring matching.
 #[test]
 fn transcript_reads_survive_binary_telnet_noise_between_lines() {
     let (_bind, listener) = hold_a_port("the transcript listener");
