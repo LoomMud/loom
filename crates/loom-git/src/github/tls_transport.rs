@@ -24,7 +24,7 @@ use std::time::Duration;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
 
-use super::{HttpClient, HttpError, HttpResponse};
+use super::{HttpClient, HttpError, HttpResponse, find_subslice};
 
 /// Read/write/connect timeout (matches [`super::UreqClient`]'s).
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -349,12 +349,6 @@ fn dechunk(input: &[u8]) -> Result<Vec<u8>, HttpError> {
         rest = &rest[size + 2..]; // skip the chunk's trailing CRLF
     }
     Ok(out)
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn case_insensitive_strip_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
