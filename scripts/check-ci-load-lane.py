@@ -40,7 +40,17 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      `reopened`) -- with `types:` omitted GitHub fires on *every* activity, so
      labeling a PR would cancel its own running gate -- and the narrowing may
      not drop `opened` or `synchronize`, which is how a required check gets
-     skipped under cover of "narrowing the trigger".
+     skipped under cover of "narrowing the trigger"; and
+  7. in `loadtest-e1-1`, the p99 verdict's `$status` is the *only* thing that
+     decides the job: the step ends in `exit $status`, and no diagnostic between
+     capturing it and exiting may be able to abort the step first. The step runs
+     under Actions' `bash -e {0}` *and* its own `set -uo pipefail`, so a `grep`
+     that finds nothing -- which for the stall kinds means "no world-thread
+     stall", the best result a gate can produce -- returns 1 through the
+     pipeline, `set -e` kills the step, and a passing measurement is reported as
+     a failed required check. Run 37862921160 (main, `eaf9ceb`, 2026-10-09) did
+     exactly that: `E1.1 (p99 < 50 ms): PASS`, job red. Rule 7 is why every
+     `grep` in a command substitution there carries `|| true`.
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -80,6 +90,14 @@ WF_GROUP_PREFIX = "github.workflow"
 WF_RUNID_FALLBACK = "github.run_id"
 WF_PR_SCOPED = ("github.ref", "github.head_ref", "github.event.pull_request.number")
 WF_PR_TEST = re.compile(r"github\.event_name\s*==\s*['\"]pull_request['\"]")
+# Rule 7 (OBI-329): the E1.1 verdict hand-off. `status=$?` captures the p99
+# verdict, `exit $status` is the only legitimate way for the step to end, and an
+# assignment whose command substitution runs `grep` must be `|| true` guarded --
+# under `set -e` + `set -o pipefail` a no-match grep aborts the step before the
+# verdict is honoured.
+VERDICT_CAPTURE = "status=$?"
+VERDICT_EXIT = re.compile(r"^\s*exit\s+\"?\$status\"?\s*$")
+ASSIGN_SUB = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*=\$\(")
 WF_OTHER_EVENTS = ("push", "pull_request_target", "workflow_dispatch", "workflow_call",
                    "schedule", "repository_dispatch", "merge_request_event")
 
@@ -390,6 +408,45 @@ def check_text(text):
             errors.append(f"`loadtest-e1-1` no longer passes `{flag}`: the E1.1 gate "
                           "must keep measuring 150 players and failing on an SLA miss")
 
+    errors += check_verdict_is_the_only_decision(e11)
+    return errors
+
+
+def check_verdict_is_the_only_decision(e11):
+    """Rule 7: nothing between the p99 verdict and `exit $status` may end the job.
+
+    `loadtest-e1-1` is a required check whose *measured* verdict decides it. The
+    step therefore captures `status=$?` immediately after `loom-loadtest` and
+    closes with `exit $status`, and every diagnostic in between must be unable to
+    fail: the shell is `bash -e {0}` with `set -uo pipefail` inside the script, so
+    one unguarded `grep` in a command substitution turns "no stalls recorded" -- a
+    pass -- into exit 1, and the verdict is never reported.
+    """
+    errors = []
+    try:
+        capture = next(i for i, l in enumerate(e11) if VERDICT_CAPTURE in l)
+    except StopIteration:
+        return ["`loadtest-e1-1` no longer captures the verdict as `status=$?` right "
+                "after `loom-loadtest`, so nothing can honour it at the end"]
+    tail = e11[capture + 1:]
+    end = next((i for i, l in enumerate(tail) if VERDICT_EXIT.match(l)), None)
+    if end is None:
+        return ["`loadtest-e1-1`'s verdict step no longer ends with `exit $status`: "
+                "the p99 verdict must be the only thing that decides this required "
+                "check, so a diagnostic cannot replace it and neither can an "
+                "accidental 0"]
+    for line in tail[:end]:
+        if not ASSIGN_SUB.match(line):
+            continue
+        if "grep" not in line:
+            continue
+        if "|| true" not in line:
+            errors.append(
+                f"`loadtest-e1-1` diagnostic can abort the verdict step: {line.strip()[:78]} "
+                "-- under `bash -e` + `set -o pipefail` a `grep` that matches nothing "
+                "returns 1 through the pipeline and ends the job before `exit $status`, "
+                "so a clean (zero-stall, p99-passing) run reads as a failed required "
+                "check. Guard the substitution with `|| true`.")
     return errors
 
 
@@ -412,6 +469,19 @@ def _sub(text, needle, repl, nth=0):
         else:
             out.append(line)
     assert hits > nth, f"self-test needle not found: {needle!r}"
+    return "".join(out)
+
+
+def _unguard_verdict_diagnostic(text):
+    """Strip the `|| true` from the E1.1 stall-kind substitution -- the shipped
+    bug, reproduced from the real line instead of rebuilt from memory."""
+    out, hits = [], 0
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith("kinds=$(grep") and "|| true" in line:
+            line = line.replace(" || true)", ")")
+            hits += 1
+        out.append(line)
+    assert hits == 1, f"expected one guardable E1.1 diagnostic, saw {hits}"
     return "".join(out)
 
 
@@ -491,6 +561,15 @@ MUTANTS = [
     ("supersede trigger narrowed until `opened` is gone",
      lambda t: _sub(t, "types: [opened, synchronize, reopened]",
                     "    types: [synchronize, reopened]\n")),
+    # Rule 7 (OBI-329): the false red that made main fail while *passing*. The
+    # first mutant is the shipped bug itself, reproduced by removing the guard
+    # the fix added rather than by trusting the prose.
+    ("E1.1 stall-kind diagnostic loses its `|| true`",
+     lambda t: _unguard_verdict_diagnostic(t)),
+    ("E1.1 verdict no longer decides the job",
+     lambda t: _sub(t, "exit $status", "          exit 0\n")),
+    ("E1.1 verdict status is never captured",
+     lambda t: _sub(t, "status=$?", "          status=0\n")),
 ]
 
 

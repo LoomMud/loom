@@ -600,7 +600,14 @@ jobs:
           # decide pass/fail, the p99 verdict does.
           durmax=$(awk '/^loom_world_loop_duration_ms_max/ {print $2; exit}' /tmp/loom-metrics-final.txt)
           stalls=$(awk '/^loom_world_loop_stalls_total/ {s+=$2} END {printf "%d", s+0}' /tmp/loom-metrics-final.txt)
-          kinds=$(grep -oE 'kind="[a-z_]+"' /tmp/loom-metrics-final.txt | sed 's/kind="//;s/"//' | sort -u | tr '\n' ' ')
+          # `|| true` is load-bearing, not style (OBI-329): this step runs under
+          # Actions' `bash -e {0}` plus the `set -uo pipefail` above, so a `grep`
+          # that legitimately finds nothing -- a run with zero stall events, the
+          # best possible outcome -- returns 1 through the pipeline and aborts the
+          # step before `exit $status`. That is how run 37862921160 went red on
+          # main with `E1.1 (p99 < 50 ms): PASS` at 21.47 ms. Rule 7 of
+          # scripts/check-ci-load-lane.py keeps it from coming back.
+          kinds=$(grep -oE 'kind="[a-z_]+"' /tmp/loom-metrics-final.txt | sed 's/kind="//;s/"//' | sort -u | tr '\n' ' ' || true)
           echo "world_loop: worst_iteration_ms=${durmax:-unknown} stall_events=${stalls:-0} kinds=${kinds:-none}"
           if [ -n "$durmax" ] && [ "$(awk -v d="$durmax" 'BEGIN {print (d > 50) ? 1 : 0}')" = "1" ]; then
             echo "::warning title=OBI-344 world-thread stall recorded::E1.1 recorded $stalls world-loop iteration(s) over the 50 ms stall budget, worst ${durmax} ms (kinds: ${kinds:-none}). Check whether they fall inside the sampled window before treating the p99 verdict as evidence about them."
