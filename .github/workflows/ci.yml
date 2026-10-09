@@ -160,7 +160,13 @@ jobs:
           SQL
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # OBI-354: `cargo test --workspace` stops at the first crate whose
+      # tests fail, so one flaky `loom-cli` target used to leave `loom-git`,
+      # `loom-net`, `loom-http` and the rest with no signal at all -- a PR
+      # touching them looked untested (and reviewers had to re-run CI to find
+      # out). `--no-fail-fast` runs every test target in the workspace and
+      # still exits non-zero, so the gate is unchanged, only its coverage.
+      - run: cargo test --workspace --no-fail-fast
   bench:
     # VM benchmark regression gate (OBI-25 / OBI-118 / OBI-312): this PR's
     # base vs its working tree, same runner, >15% on any workload fails.
