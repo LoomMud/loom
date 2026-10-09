@@ -31,7 +31,11 @@
 //!   100 ms `look` loop predates `NetEvent::Tick` (OBI-82), and at 10 Hz it ran
 //!   at twice `loom_net`'s per-connection input limit -- which is what actually
 //!   capped these waits at 2 s, because past the burst the driver hangs up on
-//!   the test.
+//!   the test; and
+//! * the probe window ends on "nothing left to measure" ([`next_pace`]), not on a
+//!   sample count, because `World::drain_account_results` hands the outbox over in
+//!   one batch per tick, and a tail that lands two-at-a-time used to leave the
+//!   loop unable to finish inside [`READY_DEADLINE`].
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -103,7 +107,8 @@ fn client_traffic_stays_inside_the_drivers_input_limit() {
     let on_b = FLOOR_SAMPLES + LOADED_SAMPLES;
     assert!(
         on_a <= config.rate_limit_burst as usize && on_b <= config.rate_limit_burst as usize,
-        "this test sends {on_a} lines on `a` and {on_b} on `b` against a burst of {}; widen          the burst or send less",
+        "this test sends {on_a} lines on `a` and {on_b} on `b` against a burst of {}; widen \
+         the burst or send less",
         config.rate_limit_burst,
     );
     // And the probes, if they must be paced at all, are paced on results --
@@ -497,24 +502,26 @@ fn probe_hashing_window(a: &mut BufReader<TcpStream>, b: &mut BufReader<TcpStrea
             );
         }
 
-        if let Some(sent) = probe_sent {
-            if b_lines.iter().any(|line| line == "ok") {
-                probe_rtt.push(sent.elapsed());
-                probe_sent = None;
-                if probe_rtt.len() == 1 {
-                    results_before_first_probe = result_arrivals.len();
-                }
-            }
-        } else if probe_rtt.len() < LOADED_SAMPLES
-            && results.len() < PIPELINED_CREATES
-            && should_send_next_probe(probe_rtt.len(), result_arrivals.len())
+        if let Some(sent) = probe_sent
+            && b_lines.iter().any(|line| line == "ok")
         {
-            send_line(b, PROBE);
-            probe_sent = Some(Instant::now());
+            probe_rtt.push(sent.elapsed());
+            probe_sent = None;
+            if probe_rtt.len() == 1 {
+                results_before_first_probe = result_arrivals.len();
+            }
         }
 
-        if probe_rtt.len() == LOADED_SAMPLES && results.len() == PIPELINED_CREATES {
-            break;
+        // One decision per drain, taken by the same pure function the replay test
+        // drives, so the loop's termination is a property of the counters and not
+        // of how the host happened to batch this run's deliveries.
+        match next_pace(probe_rtt.len(), results.len(), probe_sent.is_some()) {
+            Pace::Send => {
+                send_line(b, PROBE);
+                probe_sent = Some(Instant::now());
+            }
+            Pace::Done => break,
+            Pace::Wait => {}
         }
         if Instant::now() > deadline {
             panic!(
@@ -528,9 +535,16 @@ fn probe_hashing_window(a: &mut BufReader<TcpStream>, b: &mut BufReader<TcpStrea
         std::thread::sleep(Duration::from_millis(1));
     }
 
+    // Terminating early is legal only if it still leaves something to report: a
+    // window that collected no sample cannot back the timing claim, and must say
+    // so with the counts rather than silently taking the median of nothing.
     assert!(
-        !probe_rtt.is_empty() && !result_arrivals.is_empty(),
-        "the probe window collected nothing at all"
+        !probe_rtt.is_empty(),
+        "the probe window ended with no round trip sampled inside it: {} of {LOADED_SAMPLES} \
+         probes answered, {} of {PIPELINED_CREATES} results delivered\n--- connection a \
+         ---\n{transcript_a}\n--- connection b ---\n{transcript_b}",
+        probe_rtt.len(),
+        results.len(),
     );
     Window {
         loaded: median(&probe_rtt),
@@ -549,6 +563,172 @@ fn probe_hashing_window(a: &mut BufReader<TcpStream>, b: &mut BufReader<TcpStrea
 fn should_send_next_probe(probes_answered: usize, results_delivered: usize) -> bool {
     let outstanding = PIPELINED_CREATES.saturating_sub(1);
     results_delivered >= (probes_answered + 1) * outstanding / LOADED_SAMPLES
+}
+
+/// What one drain of [`probe_hashing_window`] does, as a pure function of the
+/// counters it has collected. Pure so
+/// [`batched_drains_still_terminate_the_probe_window`] can replay delivery
+/// schedules a live host only produces sometimes, instead of hoping to catch
+/// one (OBI-329 review).
+#[derive(Debug, PartialEq, Eq)]
+enum Pace {
+    /// A probe is outstanding, or the pacing threshold is not met yet: keep
+    /// reading and come back next drain.
+    Wait,
+    /// The previous sample is in and the queue still has work in it: sample again.
+    Send,
+    /// Nothing left to measure: every result has landed and no probe is waiting.
+    Done,
+}
+
+/// `World::drain_account_results` (crates/loom-vm/src/world.rs) pops the whole
+/// outbox in one tick, so results arrive in batches, not one per drain. On a host
+/// where a hash costs less than the 100 ms tick -- and on a contended runner where
+/// the world thread wakes late with two results ready -- the drain that carries
+/// result 7 can carry result 8 too. An exit condition of
+/// `samples == LOADED_SAMPLES && results == PIPELINED_CREATES` cannot survive
+/// that: the 5th probe was gated on `results < PIPELINED_CREATES`, so once the
+/// batch closed the queue no further probe could go out, the sample count could
+/// never reach 5, and the loop spun to [`READY_DEADLINE`] -- turning a host
+/// difference into the timeout this file exists to remove.
+///
+/// So termination asks only "is there anything left to measure". It stays honest
+/// about the sample count at the end of the window, where a missing sample is
+/// reported as such instead of hanging.
+fn next_pace(probes_answered: usize, results_delivered: usize, probe_in_flight: bool) -> Pace {
+    if probe_in_flight {
+        // Its answer is the next sample; taking the queue down as "done" while a
+        // probe is outstanding would throw a measurement away.
+        Pace::Wait
+    } else if results_delivered >= PIPELINED_CREATES {
+        Pace::Done
+    } else if probes_answered >= LOADED_SAMPLES {
+        // Fully sampled but still hashing: the caller asserts every create came
+        // back, so keep draining rather than exiting into a false failure.
+        Pace::Wait
+    } else if should_send_next_probe(probes_answered, results_delivered) {
+        Pace::Send
+    } else {
+        Pace::Wait
+    }
+}
+
+/// The largest number of drains a replay may run before the window is called
+/// un-terminating. [`READY_DEADLINE`] divided by the loop's 1 ms sleep is far
+/// larger, so a replay that needs more than this is a schedule no host produces.
+const REPLAY_DRAIN_CAP: usize = 100;
+
+/// What a replayed drain schedule ended up doing.
+#[derive(Debug)]
+struct Replay {
+    /// Whether the loop reached `Done`, and how many drains it took.
+    terminated: bool,
+    drains: usize,
+    /// Round trips sampled inside the window.
+    samples: usize,
+    results_delivered: usize,
+}
+
+/// Replay [`next_pace`] over a scripted delivery schedule: `per_drain[i]` results
+/// land in drain `i` (the last entry repeats once the script runs out) and a probe
+/// sent in one drain is answered in the next -- the smallest model of the socket
+/// loop that still contains batching.
+fn replay_probe_window(per_drain: &[usize]) -> Replay {
+    replay(per_drain, |answered, delivered, in_flight| {
+        next_pace(answered, delivered, in_flight)
+    })
+}
+
+/// The same replay driven by an arbitrary pacing rule, so the old exit condition
+/// can be shown failing on the same schedule the new rule finishes.
+fn replay(per_drain: &[usize], rule: impl Fn(usize, usize, bool) -> Pace) -> Replay {
+    assert!(!per_drain.is_empty(), "a replay needs at least one drain");
+    let mut answered = 0;
+    let mut delivered = 0;
+    // The window sends its first probe before the loop starts.
+    let mut in_flight = true;
+    for drain in 0..REPLAY_DRAIN_CAP {
+        delivered = (delivered + per_drain[drain.min(per_drain.len() - 1)]).min(PIPELINED_CREATES);
+        if in_flight {
+            in_flight = false;
+            answered += 1;
+        }
+        match rule(answered, delivered, in_flight) {
+            Pace::Send => in_flight = true,
+            Pace::Done => {
+                return Replay {
+                    terminated: true,
+                    drains: drain + 1,
+                    samples: answered,
+                    results_delivered: delivered,
+                };
+            }
+            Pace::Wait => {}
+        }
+    }
+    Replay {
+        terminated: false,
+        drains: REPLAY_DRAIN_CAP,
+        samples: answered,
+        results_delivered: delivered,
+    }
+}
+
+/// The termination property, decided without a host: every delivery schedule a
+/// batched outbox can produce must end the window, and end it with at least one
+/// sample. This is the regression guard for the failure mode the review found --
+/// results 7 and 8 landing in one drain used to leave the loop unable to finish,
+/// which is a 60 s timeout in the exact class this file was rewritten to remove.
+#[test]
+fn batched_drains_still_terminate_the_probe_window() {
+    for schedule in [
+        [1usize, 1, 2, 2, 2].as_slice(), // one result per tick, then batching
+        [6, 2].as_slice(),               // the tail lands in one drain
+        [4, 4].as_slice(),
+        [8].as_slice(),                      // the whole queue drains in one tick
+        [1, 1, 1, 1, 1, 1, 1, 1].as_slice(), // a slow host: one per drain
+    ] {
+        let run = replay_probe_window(schedule);
+        assert!(
+            run.terminated,
+            "{schedule:?}: the probe window never terminated in {} drains -- {} samples, {} of \
+             {PIPELINED_CREATES} results delivered",
+            run.drains, run.samples, run.results_delivered,
+        );
+        assert!(
+            run.samples >= 1,
+            "{schedule:?}: terminated with no round trip sampled inside the window, so `loaded` \
+             would be a median over nothing",
+        );
+    }
+
+    // Teeth: the same replay under the old exit condition must *not* finish on the
+    // batched tail, otherwise this test would pass against any rule at all.
+    let old_exit_only_on_a_full_sample_set = |answered, delivered, in_flight: bool| {
+        if in_flight {
+            Pace::Wait
+        } else if answered >= LOADED_SAMPLES && delivered >= PIPELINED_CREATES {
+            Pace::Done
+        } else if answered < LOADED_SAMPLES
+            && delivered < PIPELINED_CREATES
+            && should_send_next_probe(answered, delivered)
+        {
+            Pace::Send
+        } else {
+            Pace::Wait
+        }
+    };
+    for schedule in [[6, 2].as_slice(), [8].as_slice()] {
+        let old = replay(schedule, old_exit_only_on_a_full_sample_set);
+        assert!(
+            !old.terminated,
+            "{schedule:?}: the pre-OBI-329 rule finished, so the guard above proves nothing",
+        );
+        assert!(
+            replay_probe_window(schedule).terminated,
+            "{schedule:?}: the schedule the review named is not covered by the case above",
+        );
+    }
 }
 
 #[test]
