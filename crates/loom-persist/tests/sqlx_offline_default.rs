@@ -22,9 +22,18 @@
 //! - the committed `.sqlx/` cache must exist, because with no cache an offline
 //!   default turns every query edit into a build that cannot compile.
 //!
+//! OBI-328 adds a fourth thing to guard: `crates/loom-persist/build.rs`, which
+//! puts the mode switch into cargo's fingerprint so that an offline build and a
+//! live-DB build are never the same cached artifact. `force = false` is what
+//! makes a live build *possible*; the build script is what makes it *real*.
+//!
 //! The scan is deliberately not a TOML parser (no new dependency for a build
 //! config check): `[env]` is a single table, keys are matched literally, and
 //! every rejection names the reason so a human fixes the file, not the test.
+//! The build-script checks below are a tripwire against that file quietly
+//! disappearing or losing a directive -- the behaviour itself is proven by
+//! `scripts/check-sqlx-cache-modes.sh`, which runs in CI (a unit test cannot
+//! nest a `cargo check` inside the `cargo test` holding the build-dir lock).
 
 use std::path::{Path, PathBuf};
 
@@ -180,6 +189,80 @@ fn sqlx_offline_is_the_workspace_default() {
              SQLX_OFFLINE=false still opts back in to a live-DB build; found force = {force:?}"
         );
     }
+}
+
+/// Every variable that decides what `sqlx::query!` expands against, as cargo
+/// `rerun-if-env-changed` directives. `SQLX_OFFLINE` is the switch; the other
+/// two are what the macros read *once the switch is set* (`DATABASE_URL` when
+/// live, `SQLX_OFFLINE_DIR` when offline) -- see `crates/loom-persist/build.rs`
+/// for why each is watched only in the mode that reads it.
+const SQLX_MODE_DIRECTIVES: [&str; 3] = [
+    "cargo:rerun-if-env-changed=SQLX_OFFLINE",
+    "cargo:rerun-if-env-changed=DATABASE_URL",
+    "cargo:rerun-if-env-changed=SQLX_OFFLINE_DIR",
+];
+
+#[test]
+fn build_script_pins_the_sqlx_mode_into_cargos_fingerprint() {
+    // Cargo does not hash SQLX_OFFLINE into a crate's fingerprint, and a macro
+    // recompile is only forced by a source change. Without this build script,
+    // `SQLX_OFFLINE=false` on an unchanged `loom-persist` is answered from the
+    // cache: `Finished`, exit 0, and no DESCRIBE ever reaches Postgres -- a
+    // green build that proved nothing (OBI-321 verification doc, section 5;
+    // re-measured for OBI-328 as `Fresh loom-persist ... Finished in 0.14s`).
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "{} is missing ({err}). It is what makes a mode change force a re-check: cargo's \
+             fingerprint does not include SQLX_OFFLINE, so a live-DB build of an unchanged \
+             loom-persist is silently a cache hit (OBI-328). Restore it; \
+             scripts/check-sqlx-cache-modes.sh proves the behaviour.",
+            path.display()
+        )
+    });
+
+    for directive in SQLX_MODE_DIRECTIVES {
+        assert!(
+            text.contains(directive),
+            "{} must emit `{directive}`: those are the variables the sqlx macros read, and a \
+             change to one that cargo has not been told about is a cached artifact, not a \
+             rebuild",
+            path.display()
+        );
+    }
+
+    // The switch cannot itself be behind the mode test: emitting it only in one
+    // branch means the flip *out* of that branch is invisible to cargo -- which
+    // is the exact bug this file exists to prevent.
+    let switch = SQLX_MODE_DIRECTIVES[0];
+    let switch_at = text.find(switch).expect("checked above");
+    let mode_branch_at = text.find("if offline_mode()").unwrap_or(usize::MAX);
+    assert!(
+        switch_at < mode_branch_at,
+        "`{switch}` must be emitted unconditionally in {}, before the branch that picks the \
+         mode-dependent watches; found it at byte {switch_at} and `if offline_mode()` at {mode_branch_at}",
+        path.display()
+    );
+
+    // The mode has to be resolved the way the macro resolves it, or the watches
+    // below the branch are chosen for a mode that is not the one being built.
+    // sqlx 0.8: `SQLX_OFFLINE` is offline for "true" (any case) or "1", and for
+    // nothing else (`sqlx-macros-core::query::init_metadata`).
+    assert!(
+        text.contains("eq_ignore_ascii_case(\"true\")") && text.contains("== \"1\""),
+        "{} must resolve SQLX_OFFLINE with sqlx's own truthiness (\"true\" in any case, or \
+         \"1\"); a different rule picks the wrong set of watches",
+        path.display()
+    );
+
+    // sqlx also falls back to `.env`, so a mode flip can happen with no process
+    // environment change at all; the script has to watch the file instead.
+    assert!(
+        text.contains(".env") && text.contains("cargo:rerun-if-changed="),
+        "{} must watch the `.env` files sqlx falls back to (via `cargo:rerun-if-changed`), \
+         otherwise a mode set there is invisible to cargo's fingerprint",
+        path.display()
+    );
 }
 
 #[test]
