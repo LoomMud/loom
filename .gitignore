@@ -22,3 +22,6 @@
 # results/*.json,*.md are committed by hand.
 /results/ci-smoke.*
 /results/ci-e1-1.*
+
+# Python bytecode from CI-invoked checker scripts (OBI-354)
+__pycache__/

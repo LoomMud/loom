@@ -283,6 +283,19 @@ jobs:
           scripts/ci-ensure-tools.sh python3:python3-minimal
           python3 scripts/check-ci-load-lane.py .github/workflows/ci.yml
           python3 scripts/check-ci-load-lane.py --self-test .github/workflows/ci.yml
+      - name: E1.1 post-verdict shell safety (OBI-354)
+        # The E1.1 step's exit code IS the p99 verdict, so nothing that runs
+        # after `status=$?` may be able to abort the step: GitHub runs `run:`
+        # under `bash -e` and the step's own `set -uo pipefail` keeps it on.
+        # Run 37877217457 measured p99 22.91 ms (PASS) and still went red on an
+        # unguarded `grep` over the metrics scrape that matched nothing --
+        # because a run with zero world-thread stalls has nothing to match.
+        # This executes the real tail against three scrape fixtures instead of
+        # linting it, and proves the harness still catches the pre-fix shape.
+        run: |
+          set -euo pipefail
+          scripts/ci-ensure-tools.sh python3:python3-minimal
+          python3 scripts/check-ci-step-shell-safety.py --verify .github/workflows/ci.yml
       - name: bench gate comparator self-test (OBI-312)
         # The `bench` job's exit code decides whether a red gate means "this
         # code got slower" (1) or "the harness cannot measure 1.00" (3). That
@@ -604,9 +617,21 @@ jobs:
           # all -- and a green verdict would otherwise read as "the world thread
           # never blocked". Printed, and annotated as a warning; it does not
           # decide pass/fail, the p99 verdict does.
-          durmax=$(awk '/^loom_world_loop_duration_ms_max/ {print $2; exit}' /tmp/loom-metrics-final.txt)
-          stalls=$(awk '/^loom_world_loop_stalls_total/ {s+=$2} END {printf "%d", s+0}' /tmp/loom-metrics-final.txt)
-          kinds=$(grep -oE 'kind="[a-z_]+"' /tmp/loom-metrics-final.txt | sed 's/kind="//;s/"//' | sort -u | tr '\n' ' ')
+          #
+          # OBI-354: each of these carries `|| true`, because the step runs
+          # under the runner's default `bash -e` (this step's own
+          # `set -uo pipefail` does not turn it off) and `pipefail` makes the
+          # leftmost failure sticky. Run 37877217457: E1.1 measured p99 22.91 ms
+          # -- PASS -- and the job still went red, because the scrape recorded
+          # no stall `kind="..."` label to grep for, `grep` exited 1, and the
+          # step died on this very line before `exit $status` could report the
+          # verdict. A healthy run with zero world-thread stalls is exactly the
+          # case that failed: the instrumentation for a warning that should not
+          # fire was able to fail the gate it claims not to decide.
+          durmax=$(awk '/^loom_world_loop_duration_ms_max/ {print $2; exit}' /tmp/loom-metrics-final.txt) || true
+          stalls=$(awk '/^loom_world_loop_stalls_total/ {s+=$2} END {printf "%d", s+0}' /tmp/loom-metrics-final.txt) || true
+          kinds=$(grep -oE 'kind="[a-z_]+"' /tmp/loom-metrics-final.txt | sed 's/kind="//;s/"//' | sort -u | tr '\n' ' ') || true
+          cp /tmp/loom-metrics-final.txt results/loom-metrics-final.txt || true
           echo "world_loop: worst_iteration_ms=${durmax:-unknown} stall_events=${stalls:-0} kinds=${kinds:-none}"
           if [ -n "$durmax" ] && [ "$(awk -v d="$durmax" 'BEGIN {print (d > 50) ? 1 : 0}')" = "1" ]; then
             echo "::warning title=OBI-344 world-thread stall recorded::E1.1 recorded $stalls world-loop iteration(s) over the 50 ms stall budget, worst ${durmax} ms (kinds: ${kinds:-none}). Check whether they fall inside the sampled window before treating the p99 verdict as evidence about them."
