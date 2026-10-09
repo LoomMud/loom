@@ -265,6 +265,15 @@ def self_test():
         ("head build fails -> measure",
          FakeTree(head=H, revs=revs, builds={H: 101}, artifacts={B: same_art}),
          B, H, False, "head build failed"),
+        # 127 is `sh: cargo: not found` -- the shape a runner with no toolchain
+        # returns. It is the same failure as a compile error for the purposes of
+        # the lane (nothing was built, so nothing is proven), and it is easy to
+        # mistake for "the script is broken, skip the check", which is the wrong
+        # direction: a proof that cannot run must cost a lane slot, not a slot's
+        # absence. The replay hit this for real when `cargo` was off PATH.
+        ("toolchain missing (rc 127) -> measure",
+         FakeTree(head=H, revs=revs, builds={H: 127}, artifacts={B: same_art}),
+         B, H, False, "head build failed"),
         ("base build fails -> measure",
          FakeTree(head=H, revs=revs, builds={B: 2}, artifacts={H: same_art}),
          B, H, False, "base build failed"),

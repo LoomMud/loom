@@ -455,6 +455,18 @@ jobs:
           set -euo pipefail
           scripts/ci-ensure-tools.sh python3:python3-minimal
           python3 scripts/load-lane-classify.py --self-test
+      - name: load-lane identity proof self-test (OBI-397)
+        # Stage two's table is small, but the properties it depends on are not
+        # visible from the workflow: every undecided path must come out
+        # `same=false`, and the tree must be handed back the way it was found --
+        # a `classify` job that leaves HEAD parked on the merge base would feed
+        # the next step in the same job the wrong program. Cheap here, expensive
+        # to notice in the lane, where the wrong answer is a green check over an
+        # unmeasured regression.
+        run: |
+          set -euo pipefail
+          scripts/ci-ensure-tools.sh python3:python3-minimal
+          python3 scripts/load-lane-identity.py --self-test
       - name: bench gate comparator self-test (OBI-312)
         # The `bench` job's exit code decides whether a red gate means "this
         # code got slower" (1) or "the harness cannot measure 1.00" (3). That
