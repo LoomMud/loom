@@ -9,10 +9,11 @@
 //! run's timeline, the slowest samples, the server's own counter series, and
 //! the attribution computed from them (see [`crate::attribution`]).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::attribution::{TailAttribution, TailSample, Window, explaining_window};
+use crate::server_metrics::StallWindowPrecision;
 
 /// Nearest-rank percentile over an already-sorted microsecond series,
 /// returned in microseconds. `p` is `0.0..=1.0`. Empty input yields `0`;
@@ -120,7 +121,7 @@ impl Samples {
                 .map(|(_, us)| *us)
                 .collect();
             if !items.is_empty() {
-                out.push(TimelineBucket::one(start, &items, over_sla_us));
+                out.push(TimelineBucket::one(start, bucket_ms, &items, over_sla_us));
             }
             start += bucket_ms;
         }
@@ -129,9 +130,15 @@ impl Samples {
 }
 
 /// Latency percentiles within one slice of the run.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineBucket {
     pub start_ms: u64,
+    /// The width this bucket was built with. Recorded so a re-render can
+    /// re-mark `server_stalled` against new windows without being told the
+    /// flag a run was started with (OBI-371); `0` in a report written before
+    /// it existed, which re-marking skips.
+    #[serde(default)]
+    pub bucket_ms: u64,
     pub count: usize,
     pub p50_ms: f64,
     pub p95_ms: f64,
@@ -147,12 +154,13 @@ pub struct TimelineBucket {
 }
 
 impl TimelineBucket {
-    fn one(start_ms: u64, sorted_us: &[u64], over_sla_us: u64) -> Self {
+    fn one(start_ms: u64, bucket_ms: u64, sorted_us: &[u64], over_sla_us: u64) -> Self {
         let mut sorted = sorted_us.to_vec();
         sorted.sort_unstable();
         let pct = |p: f64| nearest_rank(&sorted, p) as f64 / 1000.0;
         Self {
             start_ms,
+            bucket_ms,
             count: sorted.len(),
             p50_ms: pct(0.50),
             p95_ms: pct(0.95),
@@ -166,11 +174,15 @@ impl TimelineBucket {
 
     /// Stamp each bucket with whether any of `windows` overlaps it, so the
     /// timeline table lines the latency shape up against the server's own
-    /// stall counters in one view. `bucket_ms` is the width the buckets were
-    /// built with.
-    pub fn mark_server_stalls(buckets: &mut [Self], windows: &[Window], bucket_ms: u64) {
+    /// stall counters in one view. Uses each bucket's recorded width; a
+    /// bucket from a report that predates `bucket_ms` keeps `None` ("not
+    /// observed") rather than being marked against a guessed width.
+    pub fn mark_server_stalls(buckets: &mut [Self], windows: &[Window]) {
         for b in buckets.iter_mut() {
-            let end = b.start_ms.saturating_add(bucket_ms);
+            if b.bucket_ms == 0 {
+                continue;
+            }
+            let end = b.start_ms.saturating_add(b.bucket_ms);
             b.server_stalled = Some(
                 windows
                     .iter()
@@ -180,7 +192,7 @@ impl TimelineBucket {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LatencyReport {
     pub count: usize,
     pub p50_ms: f64,
@@ -206,7 +218,16 @@ impl LatencyReport {
     }
 }
 
-#[derive(Debug, Serialize)]
+/// A run's whole result, as `--out` writes it.
+///
+/// Every field a report gained *after* the first committed run is
+/// `#[serde(default)]`, because `--rerender` reads archives that predate those
+/// fields: an old report should re-render with what it has, not fail to parse.
+/// The fields that stay required are the ones the gate's verdict is made of
+/// (`commands_sent`, `sla_p99_ms`, `command_latency`, `e1_1_pass`) -- defaulting
+/// `e1_1_pass` would let a truncated file claim a PASS, which is the one thing
+/// a re-rendering tool must never do.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RunReport {
     pub players: usize,
     pub slow_reader_fraction: f64,
@@ -220,43 +241,83 @@ pub struct RunReport {
     /// measured against. Slow-reader latency is reported separately so an
     /// intentionally-delayed cohort can't mask (or inflate) the SLA number.
     pub command_latency: Option<LatencyReport>,
+    #[serde(default)]
     pub slow_reader_command_latency: Option<LatencyReport>,
+    #[serde(default)]
     pub login_latency: Option<LatencyReport>,
     /// The account-service half of each login (Argon2id + `login_start`),
     /// split out because it is the only part of a slow login that does *not*
     /// involve the world thread (OBI-344).
+    #[serde(default)]
     pub login_auth_latency: Option<LatencyReport>,
     /// Commands that never reached the prompt within the bot's timeout and
     /// were therefore excluded from `command_latency`. A gate that reports
     /// p99 without this number cannot prove its distribution is complete.
+    #[serde(default)]
     pub prompt_timeouts: usize,
     pub e1_1_pass: bool,
+    #[serde(default)]
     pub notes: Vec<String>,
     /// Latency percentiles per fixed-width slice of the run (OBI-344).
+    #[serde(default)]
     pub latency_timeline: Vec<TimelineBucket>,
     /// The slowest command samples with the offset they were sent at
-    /// (OBI-344): the raw material behind `command_latency.max_ms`.
+    /// (OBI-344): the raw material behind `command_latency.max_ms`, and
+    /// deliberately capped so a committed report stays reviewable.
+    #[serde(default)]
     pub tail_samples: Vec<TailSample>,
+    /// Every sample at or over the SLA, in send order (OBI-371). This is the
+    /// raw material of `tail_attribution`: without it a committed report
+    /// could not be re-rendered under better window logic, because the
+    /// `tail_samples` above keeps only the 20 slowest and the timeline
+    /// buckets only counts. It is what made the `37880215784` artifact
+    /// re-renderable at all, and the reason that re-render is bucket-level
+    /// rather than sample-level is that the report it came from did not have
+    /// this field.
+    #[serde(default)]
+    pub tail_samples_over_sla: Vec<TailSample>,
     /// Where the tail came from (OBI-344). `None` when the run collected
     /// nothing to attribute against; that is reported as "not observed",
     /// never as "no stalls".
+    #[serde(default)]
     pub tail_attribution: Option<TailAttribution>,
     /// The world thread's own counters, scraped once per scrape interval
     /// during the run (OBI-344).
+    #[serde(default)]
     pub server_timeline: Vec<crate::server_metrics::ServerRow>,
     /// Whether the scraped server actually publishes `loom_world_loop_*`.
+    #[serde(default)]
     pub server_instrumented: bool,
     /// Self-measured scheduling lag of the loadtest process: how late a
     /// fixed-interval timer actually fired. The bot side of the attribution
     /// -- a starved measuring process cannot report 50 ms honestly.
+    #[serde(default)]
     pub bot_timer_lag: Option<LatencyReport>,
     /// Raw `/metrics` scrape from `loom-http` at the end of the run
     /// (OBI-177), if `--metrics-url` was given. Not parsed/aggregated here
     /// -- bot-side latency remains the E1.1 source of truth -- this is
     /// just carried through so a report has the server's own counters
     /// alongside the bot's view.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_metrics: Option<String>,
+}
+
+/// The windows attribution runs against. Split out of [`AttributionInput`]
+/// because a re-render has these and nothing else: an archived report carries
+/// its windows, its tail samples and its scrape series, but not every timed
+/// sample of the run (OBI-371).
+#[derive(Debug, Clone)]
+pub struct AttributionWindows {
+    pub server_stall_windows: Vec<Window>,
+    pub bot_starvation_windows: Vec<Window>,
+    /// Ramp end plus the slowest login: the window in which Argon2id login
+    /// work can still be competing with the command mix.
+    pub login_ramp_end_ms: u64,
+    pub scrape_resolution_ms: u64,
+    /// How the server windows above were placed. Not derivable from the
+    /// windows themselves once `main` has appended the command-channel
+    /// brackets, so it is carried in (OBI-371).
+    pub stall_window_precision: StallWindowPrecision,
 }
 
 /// Everything [`attribute_tail`] needs, assembled by `main` from the data
@@ -264,60 +325,53 @@ pub struct RunReport {
 pub struct AttributionInput<'a> {
     pub samples: &'a Samples,
     pub sla_p99_ms: f64,
-    pub server_stall_windows: Vec<Window>,
-    pub bot_starvation_windows: Vec<Window>,
-    /// Ramp end plus the slowest login: the window in which Argon2id login
-    /// work can still be competing with the command mix.
-    pub login_ramp_end_ms: u64,
-    pub scrape_resolution_ms: u64,
+    pub windows: AttributionWindows,
 }
 
-/// Classify every SLA-exceeding sample against the windows this run
-/// observed, and report the single number OBI-344 asked for: how much of the
-/// tail sits inside a server stall window.
+/// Attribute a tail set that the caller already has.
 ///
-/// Causes are ranked, so a sample is counted once: a server stall outranks
-/// bot starvation, which outranks the login ramp. The window overlap test
-/// uses the sample's whole in-flight interval (`at ..= at + latency`), see
-/// [`crate::attribution`].
-pub fn attribute_tail(input: &AttributionInput<'_>) -> Option<TailAttribution> {
-    if input.samples.is_empty() {
-        return None;
-    }
-    let tail = input.samples.exceeding(input.sla_p99_ms);
-    let p99_ms = input.samples.percentile(0.99) as f64 / 1000.0;
-
+/// [`attribute_tail`] is this over `Samples::exceeding(sla)` with the p99s
+/// measured from the same samples. Taking the tail and the p99s as arguments
+/// is what lets a re-render classify the samples an archived report carried
+/// without pretending it also has the ones it dropped (OBI-371).
+pub fn attribute_samples(
+    tail: &[TailSample],
+    sla_p99_ms: f64,
+    p99_ms: f64,
+    p99_excluding_server_stall_ms: f64,
+    windows: &AttributionWindows,
+) -> TailAttribution {
     let mut server_stall = 0usize;
+    let mut server_stall_precise = 0usize;
     let mut bot_starvation = 0usize;
     let mut login_ramp = 0usize;
     let mut unattributed = 0usize;
-    // The same pass builds the "excluding server stalls" re-rank: every
-    // sample that no stall window explains.
-    let mut rest: Vec<u64> = Vec::with_capacity(input.samples.len());
-    for (at_ms, us) in input.samples.timed() {
-        let end = at_ms.saturating_add((*us as f64 / 1000.0).ceil() as u64);
-        if explaining_window(*at_ms, end, &input.server_stall_windows).is_none() {
-            rest.push(*us);
-        }
-    }
-    rest.sort_unstable();
-    for s in &tail {
-        let end = s.at_ms.saturating_add(s.latency_ms.ceil() as u64);
-        if explaining_window(s.at_ms, end, &input.server_stall_windows).is_some() {
+    for s in tail {
+        // Causes are ranked, so a sample is counted once: a server stall
+        // outranks bot starvation, which outranks the login ramp. The
+        // overlap test uses the sample's whole in-flight interval (sent at
+        // `at_ms`, answered `latency_ms` later), because a command sent
+        // while the world thread was stuck is slow because of it even when
+        // its send time falls outside the window.
+        let end = tail_end(s);
+        if let Some(w) = explaining_window(s.at_ms, end, &windows.server_stall_windows) {
             server_stall += 1;
-        } else if explaining_window(s.at_ms, end, &input.bot_starvation_windows).is_some() {
+            if !w.approximate {
+                server_stall_precise += 1;
+            }
+        } else if explaining_window(s.at_ms, end, &windows.bot_starvation_windows).is_some() {
             bot_starvation += 1;
-        } else if s.at_ms <= input.login_ramp_end_ms {
+        } else if s.at_ms <= windows.login_ramp_end_ms {
             login_ramp += 1;
         } else {
             unattributed += 1;
         }
     }
-
-    Some(TailAttribution {
-        threshold_ms: input.sla_p99_ms,
+    TailAttribution {
+        threshold_ms: sla_p99_ms,
         tail_count: tail.len(),
         server_stall,
+        server_stall_precise,
         bot_starvation,
         login_ramp,
         unattributed,
@@ -327,12 +381,47 @@ pub fn attribute_tail(input: &AttributionInput<'_>) -> Option<TailAttribution> {
             server_stall as f64 * 100.0 / tail.len() as f64
         },
         p99_ms,
-        p99_excluding_server_stall_ms: nearest_rank(&rest, 0.99) as f64 / 1000.0,
-        server_stall_windows: input.server_stall_windows.clone(),
-        bot_starvation_windows: input.bot_starvation_windows.clone(),
-        login_ramp_end_ms: input.login_ramp_end_ms,
-        scrape_resolution_ms: input.scrape_resolution_ms,
-    })
+        p99_excluding_server_stall_ms,
+        server_stall_windows: windows.server_stall_windows.clone(),
+        bot_starvation_windows: windows.bot_starvation_windows.clone(),
+        login_ramp_end_ms: windows.login_ramp_end_ms,
+        scrape_resolution_ms: windows.scrape_resolution_ms,
+        stall_window_precision: windows.stall_window_precision,
+    }
+}
+
+/// The sample's in-flight interval's far end: sent at `at_ms`, answered
+/// `latency_ms` later.
+fn tail_end(sample: &TailSample) -> u64 {
+    sample.at_ms.saturating_add(sample.latency_ms.ceil() as u64)
+}
+
+/// Classify every SLA-exceeding sample against the windows this run
+/// observed, and report the single number OBI-344 asked for: how much of the
+/// tail sits inside a server stall window.
+pub fn attribute_tail(input: &AttributionInput<'_>) -> Option<TailAttribution> {
+    if input.samples.is_empty() {
+        return None;
+    }
+    let tail = input.samples.exceeding(input.sla_p99_ms);
+    let p99_ms = input.samples.percentile(0.99) as f64 / 1000.0;
+    // The same pass builds the "excluding server stalls" re-rank: every
+    // sample that no stall window explains.
+    let mut rest: Vec<u64> = Vec::with_capacity(input.samples.len());
+    for (at_ms, us) in input.samples.timed() {
+        let end = at_ms.saturating_add((*us as f64 / 1000.0).ceil() as u64);
+        if explaining_window(*at_ms, end, &input.windows.server_stall_windows).is_none() {
+            rest.push(*us);
+        }
+    }
+    rest.sort_unstable();
+    Some(attribute_samples(
+        &tail,
+        input.sla_p99_ms,
+        p99_ms,
+        nearest_rank(&rest, 0.99) as f64 / 1000.0,
+        &input.windows,
+    ))
 }
 
 impl RunReport {
@@ -465,8 +554,8 @@ impl RunReport {
                 a.threshold_ms, a.tail_count, self.commands_sent
             ));
             out.push_str(&format!(
-                "- overlapping a server world-loop stall window: **{}** ({:.0}% of the tail)\n",
-                a.server_stall, a.server_stall_pct
+                "- overlapping a server world-loop stall window: **{}** ({:.0}% of the tail), {} of them by a window the server measured rather than bracketed\n",
+                a.server_stall, a.server_stall_pct, a.server_stall_precise
             ));
             out.push_str(&format!(
                 "- overlapping a loadtest-process timer-starvation window: {}\n",
@@ -478,26 +567,51 @@ impl RunReport {
                 a.login_ramp
             ));
             out.push_str(&format!(
-                "- unexplained by any of the above: **{}**\n",
-                a.unattributed
+                "- unexplained by any of the above: **{}**{}\n",
+                a.unattributed,
+                if a.unattributed == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " (read the window-placement note below before treating this as \
+                         \"the server was fine at those moments\": {} of the {} stall-attributed \
+                         samples were explained by a bracket, not a measurement)",
+                        a.server_stall - a.server_stall_precise,
+                        a.server_stall
+                    )
+                }
             ));
+            if !self.tail_samples_over_sla.is_empty() {
+                out.push_str(&format!(
+                    "- Every at-or-over-SLA sample is carried in this report's JSON as `tail_samples_over_sla` ({} here, {} listed above), so the attribution can be re-rendered under new window logic without rerunning the run.\n",
+                    self.tail_samples_over_sla.len(),
+                    self.tail_samples.len()
+                ));
+            } else if a.tail_count > 0 {
+                out.push_str(&format!(
+                    "- This report carries only its {} slowest samples, not every at-or-over-SLA one, so the percentages above are over that subset and not over the run's full tail. See Notes for what the run's own attribution counted.\n",
+                    self.tail_samples.len()
+                ));
+            }
             out.push_str(&format!(
                 "- p99 as measured: {:.2} ms; p99 with server-stall-attributed slices removed: {:.2} ms. Informational only -- the gate stays the former.\n",
                 a.p99_ms, a.p99_excluding_server_stall_ms
             ));
             out.push_str(&format!(
-                "- Server stall windows are resolved to the {} ms `--metrics-scrape-ms` interval, so attribution is \"inside the same second as a recorded stall\", not per-millisecond.\n\n",
+                "- Window placement: {}. Scraped every {} ms.\n\n",
+                a.stall_window_precision.sentence(),
                 a.scrape_resolution_ms
             ));
             if !a.server_stall_windows.is_empty() {
-                out.push_str("| server stall window (t+ s) | stalls | stall ms |\n|---|---|---|\n");
+                out.push_str("| server stall window (t+ s) | stalls | stall ms | placed |\n|---|---|---|---|\n");
                 for w in &a.server_stall_windows {
                     out.push_str(&format!(
-                        "| {:.1} - {:.1} | {} | {} |\n",
+                        "| {:.1} - {:.1} | {} | {} | {} |\n",
                         w.start_ms as f64 / 1000.0,
                         w.end_ms as f64 / 1000.0,
                         w.events,
-                        w.stall_ms
+                        w.stall_ms,
+                        if w.approximate { "bracket" } else { "measured" }
                     ));
                 }
                 out.push('\n');
@@ -547,14 +661,10 @@ impl RunReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server_metrics::{ServerRow, WorldCounters};
 
     fn window(start: u64, end: u64) -> Window {
-        Window {
-            start_ms: start,
-            end_ms: end,
-            events: 1,
-            stall_ms: end.saturating_sub(start),
-        }
+        Window::exact(start, end, 1, end.saturating_sub(start))
     }
 
     #[test]
@@ -621,7 +731,7 @@ mod tests {
         s.push_at(0, Duration::from_millis(5));
         s.push_at(6_000, Duration::from_millis(5));
         let mut b = s.buckets(5_000, 50.0);
-        TimelineBucket::mark_server_stalls(&mut b, &[window(5_500, 6_500)], 5_000);
+        TimelineBucket::mark_server_stalls(&mut b, &[window(5_500, 6_500)]);
         assert_eq!(b.len(), 2);
         assert_eq!(b[0].server_stalled, Some(false));
         assert_eq!(b[1].server_stalled, Some(true));
@@ -645,14 +755,18 @@ mod tests {
         let a = attribute_tail(&AttributionInput {
             samples: &s,
             sla_p99_ms: 50.0,
-            server_stall_windows: vec![window(2_000, 3_000)],
-            bot_starvation_windows: vec![window(30_000, 30_500)],
-            login_ramp_end_ms: 10_000,
-            scrape_resolution_ms: 1_000,
+            windows: AttributionWindows {
+                server_stall_windows: vec![window(2_000, 3_000)],
+                bot_starvation_windows: vec![window(30_000, 30_500)],
+                login_ramp_end_ms: 10_000,
+                scrape_resolution_ms: 1_000,
+                stall_window_precision: StallWindowPrecision::Absolute,
+            },
         })
         .unwrap();
         assert_eq!(a.tail_count, 4);
         assert_eq!(a.server_stall, 1);
+        assert_eq!(a.server_stall_precise, 1);
         assert_eq!(a.bot_starvation, 1);
         assert_eq!(a.login_ramp, 1);
         assert_eq!(a.unattributed, 1);
@@ -669,10 +783,13 @@ mod tests {
         let a = attribute_tail(&AttributionInput {
             samples: &s,
             sla_p99_ms: 50.0,
-            server_stall_windows: vec![window(60_500, 61_000)],
-            bot_starvation_windows: vec![],
-            login_ramp_end_ms: 0,
-            scrape_resolution_ms: 500,
+            windows: AttributionWindows {
+                server_stall_windows: vec![window(60_500, 61_000)],
+                bot_starvation_windows: vec![],
+                login_ramp_end_ms: 0,
+                scrape_resolution_ms: 500,
+                stall_window_precision: StallWindowPrecision::Absolute,
+            },
         })
         .unwrap();
         assert_eq!(a.server_stall, 1);
@@ -686,10 +803,13 @@ mod tests {
         let a = attribute_tail(&AttributionInput {
             samples: &s,
             sla_p99_ms: 50.0,
-            server_stall_windows: vec![],
-            bot_starvation_windows: vec![],
-            login_ramp_end_ms: 10_000,
-            scrape_resolution_ms: 1_000,
+            windows: AttributionWindows {
+                server_stall_windows: vec![],
+                bot_starvation_windows: vec![],
+                login_ramp_end_ms: 10_000,
+                scrape_resolution_ms: 1_000,
+                stall_window_precision: StallWindowPrecision::NotPlaced,
+            },
         })
         .unwrap();
         assert_eq!(a.tail_count, 0);
@@ -703,10 +823,13 @@ mod tests {
             attribute_tail(&AttributionInput {
                 samples: &Samples::default(),
                 sla_p99_ms: 50.0,
-                server_stall_windows: vec![],
-                bot_starvation_windows: vec![],
-                login_ramp_end_ms: 0,
-                scrape_resolution_ms: 1_000,
+                windows: AttributionWindows {
+                    server_stall_windows: vec![],
+                    bot_starvation_windows: vec![],
+                    login_ramp_end_ms: 0,
+                    scrape_resolution_ms: 1_000,
+                    stall_window_precision: StallWindowPrecision::NotPlaced,
+                },
             })
             .is_none()
         );
@@ -731,6 +854,7 @@ mod tests {
             notes: vec![],
             latency_timeline: s.buckets(5_000, 50.0),
             tail_samples: s.slowest(5),
+            tail_samples_over_sla: s.exceeding(50.0),
             tail_attribution: attribution,
             server_timeline: vec![],
             server_instrumented: false,
@@ -764,10 +888,13 @@ mod tests {
         let attribution = attribute_tail(&AttributionInput {
             samples: &s,
             sla_p99_ms: 50.0,
-            server_stall_windows: vec![window(2_000, 3_000)],
-            bot_starvation_windows: vec![],
-            login_ramp_end_ms: 10_000,
-            scrape_resolution_ms: 1_000,
+            windows: AttributionWindows {
+                server_stall_windows: vec![window(2_000, 3_000)],
+                bot_starvation_windows: vec![],
+                login_ramp_end_ms: 10_000,
+                scrape_resolution_ms: 1_000,
+                stall_window_precision: StallWindowPrecision::Absolute,
+            },
         });
         let md = empty_report(&s, attribution).to_markdown();
         assert!(md.contains("Latency timeline"), "{md}");
@@ -778,6 +905,109 @@ mod tests {
             "{md}"
         );
         assert!(md.contains("2.0 - 3.0"), "{md}");
+        assert!(md.contains("| measured |"), "{md}");
+    }
+
+    /// The OBI-371 done-when, in the shape the issue asked for: a synthetic
+    /// scrape series in which the stall only *becomes visible* one interval
+    /// after it damaged the run, plus the samples a bot sent into it.
+    ///
+    /// `7086b58` is the reason: the world loop stalled for 875 ms and the
+    /// report attributed 109 of 293 tail samples, because the one window that
+    /// mattered was never built (the stall counter went from absent to `1`,
+    /// which the diff read as "no information") and because a window that
+    /// starts at the previous scrape misses the samples a long stall swallows
+    /// before that scrape. Both paths must place the stall where it happened.
+    #[test]
+    fn a_stall_scraped_one_interval_later_still_explains_the_earlier_samples() {
+        let run_start_unix = 1_767_225_600_000.0_f64;
+        // The stall the server stamps: it ran 875 ms and finished at
+        // t+10 500, i.e. it held the world thread over [9 625, 10 500].
+        let stall_finish = run_start_unix + 10_500.0;
+        let scrape_before = ServerRow {
+            at_ms: 10_304,
+            unix_ms: Some((run_start_unix + 10_304.0) as u64),
+            counters: WorldCounters {
+                ticks: Some(1_030.0),
+                ..Default::default()
+            },
+        };
+        let scrape_after = |stamped: bool| ServerRow {
+            at_ms: 11_304,
+            unix_ms: Some((run_start_unix + 11_304.0) as u64),
+            counters: WorldCounters {
+                ticks: Some(1_130.0),
+                stalls: Some(1.0),
+                stall_ms: Some(875.0),
+                duration_ms_max: Some(875.0),
+                last_stall_unix_ms: stamped.then_some(stall_finish),
+                last_stall_duration_ms: stamped.then_some(875.0),
+                ..Default::default()
+            },
+        };
+        // Two over-SLA samples, both sent into that stall. The first is the
+        // run's dominant tail: sent at t+10.3 s while the world thread was
+        // stuck, answered 916 ms later. The second was swallowed by the front
+        // of it -- sent at t+9.5 s, answered at t+9.8 s, entirely before the
+        // scrape that finally recorded the stall.
+        let mut s = Samples::default();
+        s.push_at(10_300, Duration::from_millis(916));
+        s.push_at(9_500, Duration::from_millis(300));
+
+        // The shape OBI-344 first built: the bare scrape interval, not
+        // widened. It reaches the 10.3 s sample but not the 9.5 s one -- and
+        // for this run's *first* stall it was not built at all, because the
+        // counter went from absent to `1` and the diff read that as "no
+        // information". That is the whole of the `7086b58` miss.
+        let bare = Window::exact(10_304, 11_304, 1, 875);
+        assert!(
+            explaining_window(10_300, 11_216, &[bare]).is_some(),
+            "a bare interval still catches a sample sent inside it"
+        );
+        assert!(
+            explaining_window(9_500, 9_800, &[bare]).is_none(),
+            "and misses the ones it swallowed before that scrape"
+        );
+
+        for stamped in [true, false] {
+            let rows = [scrape_before, scrape_after(stamped)];
+            let detail = crate::server_metrics::stall_windows_detail(&rows);
+            assert_eq!(detail.windows.len(), 1, "{detail:?}");
+            assert_eq!(
+                detail.windows[0].stall_ms, 875,
+                "the 875 ms stall, wherever it was placed"
+            );
+            let input = AttributionInput {
+                samples: &s,
+                sla_p99_ms: 50.0,
+                windows: AttributionWindows {
+                    server_stall_windows: detail.windows.clone(),
+                    bot_starvation_windows: vec![],
+                    login_ramp_end_ms: 8_000,
+                    scrape_resolution_ms: 1_000,
+                    stall_window_precision: detail.precision(),
+                },
+            };
+            let a = attribute_tail(&input).unwrap();
+            assert_eq!(
+                (a.tail_count, a.server_stall, a.unattributed),
+                (2, 2, 0),
+                "stamped={stamped} windows={:?}",
+                detail.windows
+            );
+            if stamped {
+                // The absolute path knows the edges; the fallback only knows
+                // the interval, and the report must not pretend otherwise.
+                assert_eq!(a.server_stall_precise, 2, "{a:?}");
+                assert_eq!(a.stall_window_precision, StallWindowPrecision::Absolute);
+            } else {
+                assert_eq!(a.server_stall_precise, 0, "{a:?}");
+                assert_eq!(
+                    a.stall_window_precision,
+                    StallWindowPrecision::ScrapeInterval
+                );
+            }
+        }
     }
 
     /// OBI-326: a number has to name its inputs. The load lane passes the pinned

@@ -18,12 +18,15 @@ mod metrics_scrape;
 mod mix;
 mod names;
 mod report;
+mod rerender;
 mod server_metrics;
 mod session;
 mod telnet;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rand::SeedableRng;
@@ -34,13 +37,41 @@ use tokio::time::Instant;
 use attribution::lag_windows;
 use bot::{BotConfig, Event, run_bot};
 use mix::Mix;
-use report::{AttributionInput, LatencyReport, RunReport, Samples, TimelineBucket, attribute_tail};
+use report::{
+    AttributionInput, AttributionWindows, LatencyReport, RunReport, Samples, TimelineBucket,
+    attribute_tail,
+};
 use server_metrics::ServerRow;
 
 /// How many of the slowest samples the report carries. Enough to see whether
 /// the tail is a handful of global stalls or a sustained shift, small enough
 /// to keep a committed report readable.
 const TAIL_SAMPLES_IN_REPORT: usize = 20;
+
+/// One `/metrics` scrape must not outlive the run. Before OBI-371 scraping
+/// happened on the collector task, so a server that stopped answering
+/// `/metrics` parked event recording too; and a scrape that merely takes
+/// longer than the interval is still worth recording rather than killing.
+/// Bounded below so a hung server is a counted failure within seconds and
+/// above so one slow scrape can't hold the scraper for a minute.
+fn scrape_timeout(interval: Duration) -> Duration {
+    interval
+        .checked_mul(4)
+        .unwrap_or(interval)
+        .clamp(Duration::from_millis(500), Duration::from_secs(5))
+}
+
+/// Wall-clock milliseconds since the epoch, stamped in the same instant as
+/// the run-relative `at_ms` so a stall the server timestamps in *its* wall
+/// clock can be mapped onto the run's `t+` axis (OBI-371). A clock the OS
+/// cannot answer is not worth guessing about: `0` maps outside the run and is
+/// rejected by the placement code rather than believed.
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 struct Args {
     addr: String,
@@ -63,6 +94,12 @@ struct Args {
     /// report can say what the world thread was doing at the moment the tail
     /// samples were in flight (OBI-344). `0` disables in-run scraping and
     /// falls back to the single end-of-run scrape.
+    ///
+    /// The default is deliberately finer than a metrics scrape usually is: a
+    /// stall shorter than the interval is invisible, and OBI-371 is about
+    /// attribution landing one interval after the stall. Starting the series
+    /// at t+0 instead of "once every bot has logged in" is the other half of
+    /// that fix -- see [`spawn_scraper`].
     metrics_scrape_ms: u64,
     /// Bucket width of the latency timeline written to the report.
     timeline_bucket_ms: u64,
@@ -97,7 +134,7 @@ impl Args {
         let mut class = "warrior".to_string();
         let mut seed = 0_u64;
         let mut metrics_url = None;
-        let mut metrics_scrape_ms = 1_000_u64;
+        let mut metrics_scrape_ms = 250_u64;
         let mut timeline_bucket_ms = 5_000_u64;
         let mut bot_lag_threshold_ms = 50.0_f64;
 
@@ -206,15 +243,28 @@ fn print_help() {
          \x20 --class warrior               Character class on creation\n\
          \x20 --seed 0                        RNG seed (0 = time-based)\n\
          \x20 --metrics-url <url>           Scrape this loom-http /metrics URL into the report (OBI-177)\n\
-         \x20 --metrics-scrape-ms 1000      Also scrape it *during* the run, this often, for tail attribution (OBI-344). 0 = end-of-run only\n\
+         \x20 --metrics-scrape-ms 250       Also scrape it *during* the run, this often, for tail attribution (OBI-344). 0 = end-of-run only\n\
          \x20 --timeline-bucket-ms 5000     Bucket width of the latency timeline\n\
          \x20 --bot-lag-threshold-ms 50     Oversleep that counts as loadtest-process starvation\n\
-         \x20 --note <text>                 Carry this provenance line into the report, repeatable (OBI-326: the CI lane stamps the pinned mudlib)\n"
+         \x20 --note <text>                 Carry this provenance line into the report, repeatable (OBI-326: the CI lane stamps the pinned mudlib)\n\n\
+         Re-render an archived report instead of running one:\n\
+         \x20 loom-loadtest --rerender <report.json> [--out <prefix>]\n\
+         \x20 Rebuilds the stall windows from the report's own scrape series and\n\
+         \x20 re-attributes its tail, for a report written before OBI-371. The\n\
+         \x20 gate numbers are carried through unchanged.\n"
     );
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    // `--rerender <report.json>` is a separate mode, not an option on a run:
+    // it needs no server, no mix and no bots, so it is dispatched before the
+    // run arguments are parsed at all (OBI-371).
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some(idx) = argv.iter().position(|a| a == "--rerender") {
+        std::process::exit(rerender::run(&argv[idx..]));
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -232,6 +282,59 @@ async fn main() {
         eprintln!("loom-loadtest failed: {e}");
         std::process::exit(1);
     }
+}
+
+/// Scrape the server's `/metrics` for the whole run, on its own task.
+///
+/// Scraping used to hang off the collector loop, which cost two things
+/// OBI-371 is about: the first scrape could not happen until every bot had
+/// been spawned *and logged in* -- in `7086b58` that was t+10.3 s, after the
+/// login ramp had already stalled the world loop for 875 ms, so the run's
+/// dominant stall sat before any server row existed -- and a scrape that hung
+/// took the task recording latency down with it, which is the opposite of
+/// "the world thread is stuck, so keep measuring". A failed or timed-out
+/// scrape is counted and reported, never silently dropped: "no stall windows"
+/// and "no data" have to stay distinguishable (OBI-344).
+fn spawn_scraper(
+    url: String,
+    interval: Duration,
+    run_until: Instant,
+    run_start: Instant,
+    rows: Arc<Mutex<Vec<ServerRow>>>,
+    failures: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(run_until) => break,
+                _ = tick.tick() => {}
+            }
+            // Both clocks are stamped here, before the request, so a row
+            // describes the instant the scrape was taken: `at_ms` is the run's
+            // `t+`, `unix_ms` is what maps the server's absolute stall stamps
+            // onto it (OBI-371).
+            let unix_ms = unix_ms_now();
+            let at_ms = run_start.elapsed().as_millis() as u64;
+            match tokio::time::timeout(scrape_timeout(interval), metrics_scrape::scrape(&url)).await
+            {
+                Ok(Ok(text)) => rows.lock().expect("scraper rows lock").push(ServerRow {
+                    at_ms,
+                    unix_ms: Some(unix_ms),
+                    counters: server_metrics::world_counters(&text),
+                }),
+                Ok(Err(e)) => {
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(url, error = %e, "in-run metrics scrape failed");
+                }
+                Err(_) => {
+                    failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(url, "in-run metrics scrape timed out");
+                }
+            }
+        }
+    })
 }
 
 async fn run(args: Args) -> Result<(), String> {
@@ -258,6 +361,16 @@ async fn run(args: Args) -> Result<(), String> {
     let start = Instant::now();
     let run_until = start + Duration::from_secs(args.duration_secs);
     let ramp_delay = Duration::from_secs_f64(1.0 / args.ramp_per_sec.max(0.01));
+    // Floor the scrape interval: below this the scraper is the load, and a CI
+    // override of `--metrics-scrape-ms 100` on a busy box would only produce
+    // timeouts. `0` keeps its documented meaning -- no in-run scraping. Attribution
+    // quotes this number as its resolution, so it is the value actually used,
+    // not the one asked for.
+    let scrape_interval_ms = if args.metrics_scrape_ms == 0 {
+        0
+    } else {
+        args.metrics_scrape_ms.max(50)
+    };
     let slow_reader_every = if args.slow_reader_fraction <= 0.0 {
         0
     } else {
@@ -265,6 +378,22 @@ async fn run(args: Args) -> Result<(), String> {
     };
 
     let mut handles = Vec::with_capacity(args.players);
+    // Server-side sampling starts *before* the first connection, so the login
+    // ramp -- the part of the run that produced `7086b58`'s biggest stall --
+    // is inside the scrape series instead of before it.
+    let server_rows: Arc<Mutex<Vec<ServerRow>>> = Arc::new(Mutex::new(Vec::new()));
+    let scrape_failures = Arc::new(AtomicUsize::new(0));
+    let scraper = match &args.metrics_url {
+        Some(url) if scrape_interval_ms > 0 => Some(spawn_scraper(
+            url.clone(),
+            Duration::from_millis(scrape_interval_ms),
+            run_until,
+            start,
+            Arc::clone(&server_rows),
+            Arc::clone(&scrape_failures),
+        )),
+        _ => None,
+    };
     for i in 0..args.players {
         let cfg = BotConfig {
             addr: args.addr.clone(),
@@ -298,35 +427,9 @@ async fn run(args: Args) -> Result<(), String> {
     let mut disconnects = 0_usize;
     let mut prompt_timeouts = 0_usize;
     let mut prompt_timeouts_slow = 0_usize;
-    // In-run scrape of the server's own counters. Runs on this same task so
-    // its rows share the collector's clock; a scrape that fails is counted
-    // and reported, never silently dropped, because "no stall windows" and
-    // "no data" have to stay distinguishable (OBI-344).
-    let mut server_rows: Vec<ServerRow> = Vec::new();
-    let mut scrape_failures = 0_usize;
-    let mut scrape = tokio::time::interval(Duration::from_millis(args.metrics_scrape_ms.max(1)));
-    scrape.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        let event = tokio::select! {
-            ev = rx.recv() => ev,
-            _ = scrape.tick(), if args.metrics_scrape_ms > 0 && args.metrics_url.is_some() => {
-                let at_ms = start.elapsed().as_millis() as u64;
-                let url = args.metrics_url.as_ref().expect("guarded by select condition");
-                match metrics_scrape::scrape(url).await {
-                    Ok(text) => server_rows.push(ServerRow {
-                        at_ms,
-                        counters: server_metrics::world_counters(&text),
-                    }),
-                    Err(e) => {
-                        scrape_failures += 1;
-                        tracing::warn!(url, error = %e, "in-run metrics scrape failed");
-                    }
-                }
-                continue;
-            }
-        };
-        let Some(event) = event else { break };
+        let Some(event) = rx.recv().await else { break };
         match event {
             Event::LoginOk {
                 latency,
@@ -367,6 +470,14 @@ async fn run(args: Args) -> Result<(), String> {
     for h in handles {
         let _ = h.await;
     }
+    // The scraper's own deadline is `run_until`; stop it here so a run whose
+    // bots finished early cannot leave a task scraping a server we are about
+    // to stop talking to.
+    if let Some(handle) = scraper {
+        handle.abort();
+    }
+    let server_rows = std::mem::take(&mut *server_rows.lock().expect("scraper rows lock"));
+    let scrape_failures = scrape_failures.load(Ordering::Relaxed);
 
     let actual_duration_secs = start.elapsed().as_secs_f64();
     let command_report = LatencyReport::from_samples(&command_latency);
@@ -393,7 +504,7 @@ async fn run(args: Args) -> Result<(), String> {
     }
     if scrape_failures > 0 {
         notes.push(format!(
-            "{scrape_failures} in-run metrics scrape(s) failed; stall windows for those intervals are unknown"
+            "{scrape_failures} in-run metrics scrape(s) failed or timed out; stall windows for those intervals are unknown"
         ));
     }
     if server_rows.len() < 2 {
@@ -441,8 +552,7 @@ async fn run(args: Args) -> Result<(), String> {
     }
 
     let server_instrumented = server_rows.iter().any(|r| r.counters.is_instrumented());
-    let mut server_windows = server_metrics::stall_windows(&server_rows);
-    server_windows.extend(server_metrics::command_blocked_windows(&server_rows));
+    let (server_windows, stall_windows) = server_metrics::server_windows(&server_rows);
     let bot_windows = lag_windows(
         &bot_lag
             .timed()
@@ -464,18 +574,45 @@ async fn run(args: Args) -> Result<(), String> {
     let attribution = attribute_tail(&AttributionInput {
         samples: &command_latency,
         sla_p99_ms: args.sla_p99_ms,
-        server_stall_windows: if server_instrumented {
-            server_windows.clone()
-        } else {
-            Vec::new()
+        windows: AttributionWindows {
+            server_stall_windows: if server_instrumented {
+                server_windows.clone()
+            } else {
+                Vec::new()
+            },
+            bot_starvation_windows: bot_windows,
+            login_ramp_end_ms,
+            scrape_resolution_ms: scrape_interval_ms,
+            stall_window_precision: stall_windows.precision(),
         },
-        bot_starvation_windows: bot_windows,
-        login_ramp_end_ms,
-        scrape_resolution_ms: args.metrics_scrape_ms,
     });
     let mut timeline = command_latency.buckets(args.timeline_bucket_ms, args.sla_p99_ms);
     if server_instrumented {
-        TimelineBucket::mark_server_stalls(&mut timeline, &server_windows, args.timeline_bucket_ms);
+        TimelineBucket::mark_server_stalls(&mut timeline, &server_windows);
+    }
+    // Say how the stall windows were placed. A report that claims "server
+    // stall" without saying whether the window is the server's own measurement
+    // or a scrape-interval guess invites the reader to trust it further than
+    // the data supports (OBI-371).
+    if server_instrumented {
+        if !stall_windows.absolute_clock {
+            notes.push(
+                "this server publishes no absolute stall timestamp (`loom_world_loop_last_stall_unix_ms`), so every stall window is a scrape-interval bracket widened backwards by the stall's own recorded length: it says 'somewhere in this interval', not 'for these milliseconds'"
+                    .to_string(),
+            );
+        }
+        if stall_windows.bracketed_events > 0 {
+            notes.push(format!(
+                "{} stall event(s) placed by the server's own timestamps, {} only inside a scrape interval",
+                stall_windows.localized_events, stall_windows.bracketed_events
+            ));
+        }
+        if stall_windows.clock_spread_ms > 1_000 {
+            notes.push(format!(
+                "the run clock and the wall clock disagree by up to {} ms across scrapes, so absolute stall stamps are mapped onto `t+` through that spread",
+                stall_windows.clock_spread_ms
+            ));
+        }
     }
 
     let server_metrics = if let Some(url) = &args.metrics_url {
@@ -508,6 +645,7 @@ async fn run(args: Args) -> Result<(), String> {
         notes,
         latency_timeline: timeline,
         tail_samples: command_latency.slowest(TAIL_SAMPLES_IN_REPORT),
+        tail_samples_over_sla: command_latency.exceeding(args.sla_p99_ms),
         tail_attribution: attribution,
         server_timeline: server_rows,
         server_instrumented,
