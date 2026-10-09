@@ -975,12 +975,27 @@ impl AuthService {
             .map_err(|_| AuthError::InvalidWsTicket)
     }
 
+    /// Redeem a D-TM4 ticket from `/lsp`'s first frame, keeping *why* it
+    /// failed ([`wsticket::WsTicketError`]) instead of folding that into
+    /// [`AuthError::InvalidWsTicket`].
+    ///
+    /// `/lsp`'s own connect path uses this so a refusal can be recorded as
+    /// "this ticket already redeemed" (D-TM4 single use) rather than "the
+    /// ticket was unusable". The answer a client sees is unchanged: both
+    /// still get the same bare `Close`, because D-TM4 deliberately keeps
+    /// those indistinguishable to whoever tried (OBI-365).
+    pub fn redeem_ws_ticket_detailed(
+        &self,
+        ticket: &str,
+    ) -> Result<wsticket::WsTicketIdentity, wsticket::WsTicketError> {
+        self.ws_tickets.redeem(ticket)
+    }
+
     /// Redeem a D-TM4 ticket from `/lsp`'s first frame: verifies the
     /// signature and expiry, and consumes it so a second redemption of
     /// the same ticket fails even within its 30s window.
     pub fn redeem_ws_ticket(&self, ticket: &str) -> Result<wsticket::WsTicketIdentity, AuthError> {
-        self.ws_tickets
-            .redeem(ticket)
+        self.redeem_ws_ticket_detailed(ticket)
             .map_err(|_| AuthError::InvalidWsTicket)
     }
 

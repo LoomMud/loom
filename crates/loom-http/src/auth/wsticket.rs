@@ -164,6 +164,52 @@ mod tests {
         assert_eq!(issuer.redeem(&ticket), Err(WsTicketError::AlreadyUsed));
     }
 
+    /// OBI-359: the single-use record is read and written under one mutex
+    /// lock (`redeem` checks `used.contains_key` and inserts before
+    /// dropping the guard), so "at most one session per ticket" is not an
+    /// ordering accident -- not even when two `/lsp` sessions redeem the
+    /// same ticket at the same instant.
+    ///
+    /// `loom-http`'s WS tests can only observe one order at a time (and
+    /// that blindness is exactly what made
+    /// `lsp::tests::a_ticket_can_only_authenticate_one_session` flake);
+    /// this pins the store itself, deterministically, with every contender
+    /// released from a barrier at once.
+    #[test]
+    fn a_concurrent_redeem_of_one_ticket_has_exactly_one_winner() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CONTENDERS: usize = 16;
+        let issuer = std::sync::Arc::new(WsTicketIssuer::new());
+        let ticket = issuer.issue("alice", "sid-1").unwrap();
+        let winners = std::sync::Arc::new(AtomicUsize::new(0));
+        let start = std::sync::Arc::new(Barrier::new(CONTENDERS));
+
+        std::thread::scope(|scope| {
+            for _ in 0..CONTENDERS {
+                let (issuer, ticket, winners, start) = (
+                    issuer.clone(),
+                    ticket.clone(),
+                    winners.clone(),
+                    start.clone(),
+                );
+                scope.spawn(move || {
+                    start.wait();
+                    if issuer.redeem(&ticket).is_ok() {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "concurrent redemptions of one ticket must have exactly one winner"
+        );
+    }
+
     #[test]
     fn issued_tickets_expire_after_thirty_seconds() {
         // D-TM4 "valid for 30 s" (OBI-319 second-review point 1): pin the
