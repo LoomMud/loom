@@ -828,6 +828,35 @@ jobs:
           # no longer fails the step; `upload-artifact` runs `if: always()` with
           # `if-no-files-found: warn`, so the missing file is still visible.
           set +e
+          # OBI-344 (salvaged from PR #157's evidence tail; the paced drain it was
+          # written for was withdrawn once #159 took character durability off the
+          # world thread): read the save count *after* giving the server a chance
+          # to finish writing. The p99 verdict is not the only thing this gate is
+          # evidence for -- the step also reports `save_path: objects_saved=N` and
+          # scrapes `loom_world_loop_stalls_total`, and both are read at a single
+          # instant while persistence is a queue that can still be draining after
+          # the last command. Without the wait, a run whose writes land late
+          # reports fewer saved objects *and* fewer stall events than happened,
+          # which would read as an improvement for a pure reporting-timing reason.
+          # Non-gating: an unfinished drain is printed, never failed, and the
+          # wait is bounded so a wedged writer cannot hang the job. Measured on a
+          # build off current `main`, where teardown is still synchronous, one of
+          # six saves had not landed when the last command finished -- the loop
+          # waited 1 s and then read the true count, so this is already
+          # load-bearing rather than a placeholder for #159.
+          settle_start=$(date +%s)
+          while [ "$(find "$SAVES" -type f -name '*.o' 2>/dev/null | wc -l)" -lt 150 ] \
+                 && [ $(( $(date +%s) - settle_start )) -lt 60 ]; do
+            sleep 1
+          done
+          settled=$(find "$SAVES" -type f -name '*.o' 2>/dev/null | wc -l)
+          settle_wait=$(( $(date +%s) - settle_start ))
+          if [ "$settled" -ge 150 ]; then
+            settle_done=yes
+          else
+            settle_done=no
+          fi
+          echo "save_settle: objects_saved=$settled waited=${settle_wait}s drain_complete=$settle_done"
           # Scrape before stopping: the previous version of this step curled
           # `/metrics` *after* `kill`, so the "final /metrics" section was
           # always empty and the artifact's only server numbers were the
