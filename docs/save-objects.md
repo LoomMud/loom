@@ -46,10 +46,13 @@ atomic *files* instead, for two reasons:
    pattern a filesystem gives you directly and a transactional
    database already gives you for free a different way — i.e. the task
    was written assuming file storage.
-2. It keeps `save_object`/`restore_object` fully synchronous and
-   World-thread-local (no async round trip through a DB connection the
-   way `account_create`/`db_query` need), which matches classic LPMud
-   driver semantics builders already expect from these two efuns.
+2. It keeps `save_object`/`restore_object` synchronous in everything that
+   decides the outcome (no async round trip through a DB connection the way
+   `account_create`/`db_query` need, and no awaiting in a Weft function),
+   which matches classic LPMud driver semantics builders already expect from
+   these two efuns. OBI-348 moved only the *durability step* (write/fsync/
+   rename/fsync) onto the driver's save worker -- see
+   [durability.md](durability.md) for what `true` means now.
 
 Migrating `object_state` to Postgres later (to get point-in-time
 recovery, replication, and a single backup story with `accounts`) is a
@@ -211,6 +214,29 @@ disk, same as an over-quota `write_file`. Unit/integration-tested at
 `crates/loom-vm/tests/quotas.rs`'s
 `disk_quota_mb_row_denies_a_save_object_that_would_exceed_the_quota`.
 
+## Return contract: accepted in order, not yet on disk (OBI-348)
+
+`save_object(path)` returning `true` means the driver has **accepted the
+content and will write it in order**. Everything that could refuse the save
+still runs on the world thread, before the call returns: render, the
+confinement check, `valid_write`, and the `disk_quota_mb` check. The disk half
+is handed to one dedicated worker thread, because `World::disconnect` runs
+`autosave()` and the thread that serves every player must not pay for two
+`fsync`s per logout (E1.1 measured 304-562 ms world-loop iterations for 150
+simultaneous logouts -- OBI-344).
+
+The **durability points** -- after which every save the world has accepted is
+on disk -- are `restore_object` (for the path it reads),
+`World::flush_pending_saves()`, `World::begin_snapshot()` (a snapshot must not
+claim durability it does not have), and process exit (`SaveQueue::drop`
+flushes; a crash or `kill -9` does not). Full contract, the crash window,
+ordering, the single-writer rule, quota accounting, and the stats a board
+operator should watch are in [durability.md](durability.md).
+
+`World::set_save_durability(SaveDurability::Sync)` puts back the old meaning
+exactly: `true` means durable, written on this thread. Deferred is the default;
+`Sync` is the escape hatch for tests and for anyone who prefers the latency.
+
 ## Atomicity: crash during write leaves the old save intact
 
 `save_object` writes through `crate::fileio::write_file_atomic`:
@@ -239,14 +265,21 @@ symlink already planted at the tmp-file's exact name, so a symlink
 planted there pointing outside `save_root` would have the write go
 through it. `create_new` fails outright on anything already at that
 path instead of following it. A stale tmp file from an earlier crashed
-attempt in the *same still-running process* (same pid, so the same tmp
-name) is cleared with a plain `remove_file` immediately before
-`create_new` — `unlink`/`remove_file` always targets the link/file entry
+attempt is cleared with a plain `remove_file` immediately before
+`create_new` -- `unlink`/`remove_file` always targets the link/file entry
 itself, never what a symlink there points to, so this clears a stale tmp
 file without ever writing through a symlink planted in its place.
+The name is unique **per write** (`.{leaf}.tmp-{pid}-{seq}`, OBI-348 CTO
+review) rather than per process: the durability step now has a thread of
+its own, and two writers sharing one temp name could unlink each other's
+in-flight file or lose `create_new` to `EEXIST` -- which is how CI run
+37869788819 lost 2 of 20 same-path saves. The sweep covers both this
+write's own name and the pre-OBI-348 `.{leaf}.tmp-{pid}` shape, so an
+older build's half-write is still cleaned up without a directory walk.
 Tested at `loom-vm::fileio::tests::
-stage_write_clears_a_stale_tmp_file_from_an_earlier_crashed_attempt`
-and `::stage_write_does_not_follow_a_symlink_planted_at_the_tmp_name`.
+stage_write_clears_a_stale_tmp_file_from_an_earlier_crashed_attempt`,
+`::stage_write_does_not_follow_a_symlink_planted_at_the_tmp_name`, and
+`::two_staged_writes_of_one_path_do_not_share_a_tmp_name`.
 
 ## Driver-side autosave hooks
 
@@ -263,4 +296,9 @@ own path convention), the driver only guarantees *when* it's called:
 
 `World::disconnect` runs `autosave()` and then `net_dead()` as two
 separate executions (each with its own tick budget and error handling),
-so an `autosave()` failure can never suppress `net_dead()`.
+so an `autosave()` failure can never suppress `net_dead()`. Since OBI-348
+the save's *durability* is not part of the disconnect cost at all: the
+render/validate/authorise half runs there, and the write lands on the
+save worker (see [durability.md](durability.md)) -- which is the whole
+point of the change, and why this hook's own queue is drained before a
+snapshot or process exit.
