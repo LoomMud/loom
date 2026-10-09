@@ -566,6 +566,13 @@ pub async fn run_server_full(
                 next_conn_id += 1;
 
                 debug!(conn_id, "accepted websocket connection");
+                // OBI-383 considered this arm too and deliberately left it alone: the
+                // telnet rule (never close an accepted connection before the startup
+                // negotiation offer) has no WebSocket equivalent. A web client's
+                // socket closing with no frames is the normal, already-handled "the
+                // server isn't there" signal -- `loom-web` reconnects on it -- whereas
+                // a telnet player reading a zero-byte FIN has no way to tell a dying
+                // driver from one that simply hung up.
                 if event_tx.send(NetEvent::Connected(conn_id)).await.is_err() {
                     break;
                 }
@@ -596,6 +603,29 @@ pub async fn run_server_full(
 
                 debug!(conn_id, %peer_addr, "accepted connection");
                 if event_tx.send(NetEvent::Connected(conn_id)).await.is_err() {
+                    // OBI-383: this used to be a bare `break`, which dropped the
+                    // freshly-accepted `stream` and closed it with a plain FIN and
+                    // *nothing* on the wire. A client that just completed the
+                    // three-way handshake reads that as a clean EOF at byte 0 --
+                    // which is exactly how `supervise_handoff`'
+                    // `version_file_change_is_detected_and_logged` red-denied CI as
+                    // an anonymous `UnexpectedEof` in its 12-byte preamble drain, and
+                    // is indistinguishable from "the driver hung up on me". It is the
+                    // only in-process path that can produce that shape, so the rule
+                    // now enforced here is: once `loom-net` has taken a connection out
+                    // of the kernel's accept queue, that player is owed the startup
+                    // negotiation offer before anything else, even when the world
+                    // thread is already gone. Loud, counted, and still stopping the
+                    // accept loop -- there is nothing behind this channel to serve.
+                    warn!(
+                        conn_id,
+                        %peer_addr,
+                        "closing an accepted connection: the world's event receiver is gone \
+                         (its thread exited or a shutdown is in flight); sending the startup \
+                         negotiation offer first"
+                    );
+                    metrics::counter!("loom_net_accept_after_world_gone_total").increment(1);
+                    write_startup_offer(stream, &config).await;
                     break;
                 }
 
@@ -634,6 +664,29 @@ pub async fn run_server_full(
     }
 
     Ok(())
+}
+
+/// Writes the startup telnet option offer to a connection that is about to be closed
+/// because there is no world left to serve it, then shuts the write half down.
+///
+/// OBI-383: never let an accepted connection die silently. Uses the same codec the
+/// connection task would have used, so the bytes on the wire are identical to a normal
+/// session's first flush; only the lifetime differs. Errors are ignored on purpose --
+/// a client that already hung up, or a socket whose buffer is full, cannot be made to
+/// receive anything, and this is a best-effort courtesy on the way out, not a
+/// protocol step the shutdown may block on.
+async fn write_startup_offer(mut stream: TcpStream, config: &NetConfig) {
+    let mut codec = TelnetCodec::new(
+        config.max_line_bytes,
+        config.rate_limit_burst,
+        config.rate_limit_per_second,
+        config.mssp_fields.clone(),
+    );
+    let start_bytes = codec.start();
+    if !start_bytes.is_empty() {
+        let _ = stream.write_all(&start_bytes).await;
+    }
+    let _ = stream.shutdown().await;
 }
 
 /// Route one [`NetCommand`] to the live connection it is keyed by, with
@@ -1479,6 +1532,73 @@ mod tests {
         let mut buf = vec![0_u8; STARTUP_PREAMBLE.len()];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, STARTUP_PREAMBLE);
+    }
+
+    /// OBI-383: reads what the server actually puts on the wire, as data, never as
+    /// `read_exact`'s anonymous `UnexpectedEof`. Returns the bytes seen plus whether
+    /// the read ended in a clean close (`"eof"`) or an error (`"err: ..."`).
+    async fn read_until_closed(client: &mut TcpStream) -> (Vec<u8>, String) {
+        let mut got = Vec::new();
+        let mut buf = [0_u8; 64];
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) => return (got, "eof".to_string()),
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(err) => return (got, format!("err: {err}")),
+            }
+        }
+    }
+
+    /// The wire contract OBI-383 found broken: once `loom-net` has taken a connection
+    /// out of the kernel's accept queue, that player is waiting on us, and the one
+    /// thing we always owe them is the startup negotiation offer. Closing instead is
+    /// indistinguishable, on the client side, from a driver that hung up silently --
+    /// and it is the only in-process path that produces a clean FIN with *zero* bytes
+    /// ever written, which is exactly the shape `supervise_handoff`'s
+    /// `version_file_change_is_detected_and_logged` red-denied CI as a bare
+    /// `UnexpectedEof` in the 12-byte preamble drain.
+    ///
+    /// Reproduces it by dropping the world's event receiver (`run_server_full`'s
+    /// `NetEvent::Connected` send fails) before the connect, which is what a child
+    /// whose world thread has already exited looks like from the outside.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_connection_always_gets_the_startup_offer_even_if_the_world_is_gone() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let config = NetConfig::default();
+        let (event_tx, event_rx) = mpsc::channel(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        // The world thread is gone: the receiver is dropped while the listener is
+        // still up and still accepting.
+        drop(event_rx);
+
+        let server = tokio::spawn(run_server(listener, config, event_tx, cmd_rx, shutdown_rx));
+        // `cmd_tx` is held by this test on purpose: dropping it would close the
+        // command channel and make `run_server_full`'s `command_rx` arm resolve to
+        // `None`, which is a different shutdown path than the one under test.
+        let _ = cmd_tx;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (bytes, shape) = read_until_closed(&mut client).await;
+
+        assert_eq!(
+            bytes,
+            STARTUP_PREAMBLE,
+            "an accepted connection must be answered with the {n}-byte startup offer before \
+             it is closed, whatever the world is doing; the client saw {bytes:02x?} and then \
+             the connection ended with {shape:?}",
+            n = STARTUP_PREAMBLE.len(),
+        );
+        assert_eq!(
+            shape, "eof",
+            "after the offer the server should close cleanly (it has no world to talk to)"
+        );
+
+        // The accept loop must still stop -- it has nothing to serve.
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
     }
 
     #[test]
