@@ -362,6 +362,7 @@ fn case_insensitive_strip_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::fake_http::{self, FakeRequest};
     use rustls_pki_types::CertificateDer;
     use rustls_pki_types::pem::PemObject;
     use std::net::TcpListener;
@@ -373,8 +374,13 @@ mod tests {
     /// self-signed certificate -- so `RustlsHttpClient` exercises a real
     /// TLS 1.2/1.3 handshake, not just the plain-HTTP path `UreqClient`'s
     /// tests use, without depending on the network or a real CA.
+    ///
+    /// The `respond` closure is handed the [`FakeRequest`] the fake is
+    /// about to answer, so a test can assert on what the fake *actually
+    /// served* (path, headers, body) instead of trusting that it saw
+    /// everything (OBI-352).
     fn spawn_tls_server(
-        mut respond: impl FnMut(&str) -> (u16, &'static str, Vec<u8>) + Send + 'static,
+        mut respond: impl FnMut(&FakeRequest) -> (u16, &'static str, Vec<u8>) + Send + 'static,
     ) -> (String, RootCertStore) {
         let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(TEST_CERT_PEM)
             .collect::<Result<_, _>>()
@@ -421,28 +427,111 @@ mod tests {
                 if header_end == 0 {
                     continue;
                 }
-                let req_text = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-                let path = req_text
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("")
-                    .to_string();
-                let (status, status_text, body) = respond(&path);
+                let head = String::from_utf8_lossy(&buf[..header_end - 4]).into_owned();
+                // Whatever body bytes happened to be in the buffer when the
+                // header terminator turned up. Nothing waits for the rest.
+                let body = String::from_utf8_lossy(&buf[header_end.min(buf.len())..]).into_owned();
+                let mut request_line = head.lines().next().unwrap_or("").split_whitespace();
+                let req = FakeRequest {
+                    raw: format!("{head}\r\n\r\n{body}"),
+                    method: request_line.next().unwrap_or("").to_string(),
+                    path: request_line.next().unwrap_or("").to_string(),
+                    body,
+                };
+                let (status, status_text, resp_body) = respond(&req);
                 let resp = format!(
                     "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
+                    resp_body.len()
                 );
                 let _ = tls.write_all(resp.as_bytes());
-                let _ = tls.write_all(&body);
+                let _ = tls.write_all(&resp_body);
             }
         });
         (addr.to_string(), trust_roots)
     }
 
+    /// A raw TLS client for the test side of [`spawn_tls_server`]: it writes
+    /// the request itself, so the *record boundaries* are what's under test
+    /// rather than whatever `RustlsHttpClient` happens to do.
+    fn connect_raw_tls(
+        roots: &RootCertStore,
+        addr: &str,
+    ) -> StreamOwned<ClientConnection, TcpStream> {
+        let config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots.clone())
+                .with_no_client_auth(),
+        );
+        let conn = ClientConnection::new(
+            config,
+            ServerName::try_from("localhost".to_string()).unwrap(),
+        )
+        .unwrap();
+        let sock = TcpStream::connect(addr).unwrap();
+        // Keep the two writes in two separate segments (no Nagle), and bound
+        // the read so a broken fake fails an assertion instead of hanging.
+        sock.set_nodelay(true).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        StreamOwned::new(conn, sock)
+    }
+
+    #[test]
+    fn fake_tls_server_serves_a_request_that_arrives_in_two_records() {
+        // The TLS shape of OBI-350's two-segment client, and not a
+        // contrived one: `RustlsHttpClient::request` writes the header block
+        // and the body as two `write_all` calls (`:143`, `:146`), so every
+        // real POST here is two TLS records. The pause is only what makes the
+        // runner schedule the fake between them -- which is exactly what a
+        // busy CI runner does to the plain-HTTP fakes.
+        let served: Arc<std::sync::Mutex<Vec<FakeRequest>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let served_clone = served.clone();
+        let (addr, roots) = spawn_tls_server(move |req| {
+            served_clone.lock().unwrap().push(req.clone());
+            (201, "Created", br#"{"created":true}"#.to_vec())
+        });
+        let body = br#"{"title":"thing"}"#;
+
+        let mut tls = connect_raw_tls(&roots, &addr);
+        tls.write_all(
+            format!(
+                "POST /repos/x/y/pulls HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer my-jwt\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        tls.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        tls.write_all(body).unwrap();
+        tls.flush().unwrap();
+
+        // `read_response` is the crate's own client-side reader, so an RST
+        // from the fake shows up here as the connection error the CI test
+        // saw -- and the assertion below shows the same bug from the fake's
+        // side: the body never reached it.
+        let resp = read_response(&mut tls).expect("the fake must answer, not reset the connection");
+        assert_eq!(resp.status, 201);
+        assert_eq!(resp.body, br#"{"created":true}"#);
+
+        let served = served.lock().unwrap();
+        assert_eq!(served.len(), 1, "the fake served {served:?}");
+        assert_eq!(
+            served[0].body, r#"{"title":"thing"}"#,
+            "the fake answered before the body arrived: {:?}",
+            served[0].raw
+        );
+        assert!(
+            served[0].raw.ends_with("\r\n\r\n{\"title\":\"thing\"}"),
+            "the fake served a truncated request: {:?}",
+            served[0].raw
+        );
+    }
+
     #[test]
     fn https_get_round_trips_status_and_body() {
-        let (addr, roots) = spawn_tls_server(|_path| (200, "OK", br#"{"ok":true}"#.to_vec()));
+        let (addr, roots) = spawn_tls_server(|_| (200, "OK", br#"{"ok":true}"#.to_vec()));
         let client = RustlsHttpClient::with_root_store(roots);
         let resp = client
             .get(
@@ -461,8 +550,8 @@ mod tests {
     fn https_post_sends_body_and_bearer_and_reports_path() {
         let seen_path = Arc::new(std::sync::Mutex::new(String::new()));
         let seen_path_clone = seen_path.clone();
-        let (addr, roots) = spawn_tls_server(move |path| {
-            *seen_path_clone.lock().unwrap() = path.to_string();
+        let (addr, roots) = spawn_tls_server(move |req| {
+            *seen_path_clone.lock().unwrap() = req.path.clone();
             (201, "Created", br#"{"created":true}"#.to_vec())
         });
         let client = RustlsHttpClient::with_root_store(roots);
@@ -482,7 +571,7 @@ mod tests {
     #[test]
     fn non_2xx_status_is_still_a_parsed_response_not_an_error() {
         let (addr, roots) =
-            spawn_tls_server(|_path| (401, "Unauthorized", br#"{"message":"bad creds"}"#.to_vec()));
+            spawn_tls_server(|_| (401, "Unauthorized", br#"{"message":"bad creds"}"#.to_vec()));
         let client = RustlsHttpClient::with_root_store(roots);
         let port = addr.rsplit(':').next().unwrap();
         let resp = client
@@ -497,7 +586,7 @@ mod tests {
         // A client with an *empty* trust store must not accept the test
         // server's self-signed certificate -- the whole point of pinning
         // `with_root_store` in the other tests.
-        let (addr, _roots) = spawn_tls_server(|_path| (200, "OK", b"{}".to_vec()));
+        let (addr, _roots) = spawn_tls_server(|_| (200, "OK", b"{}".to_vec()));
         let client = RustlsHttpClient::with_root_store(RootCertStore::empty());
         let port = addr.rsplit(':').next().unwrap();
         assert!(
