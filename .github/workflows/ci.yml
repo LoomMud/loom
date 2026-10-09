@@ -44,10 +44,31 @@ permissions:
 # every main push is its own group and there is nothing for a later run to
 # cancel: OBI-311's "5 sequential un-retried E1.1 runs" stays measurable. The
 # lane jobs keep `cancel-in-progress: false` and `queue: max` so a gate is not
-# killed inside its own run either -- a workflow-level cancel does reach into
-# jobs whose own `cancel-in-progress: false` forbids it, which is why
-# scripts/check-ci-load-lane.py pins both the group and this expression rather
-# than trusting a comment above them.
+# killed inside its own run either -- but a workflow-level cancel does reach into
+# jobs whose own `cancel-in-progress: false` forbids it (observed 2026-10-08:
+# run 37725992152's `loadtest-e1-1`, queued in the lane since 04:07:50Z and never
+# started, ended `cancelled` one second after its successor run was created),
+# which is why scripts/check-ci-load-lane.py pins both the group and this
+# expression rather than trusting a comment above them. Observed twice: run
+# 37726332056's `loadtest-e1-1` (queued since 04:12:39Z, never started) went
+# `cancelled` at 04:16:18Z, one second after run 37726682123 was created.
+#
+# COVERAGE (OBI-322): this cancels a run only if that run joined *this* group,
+# and `concurrency` is read per run from the workflow file at *its* commit. A
+# superseded commit that does not contain `45d85b6` -- the commit that adds
+# this block, on main since the `0b8ca74` merge, i.e. a PR not yet brought up to
+# date -- is in an implicit per-run group that nothing here can reach, so it is
+# cancelled by hand instead; 3 of 8 open PRs carried the block on 2026-10-08.
+# The lane queue is NOT a second gap -- it was the hypothesis this comment was
+# first written to answer, and it is disproved: a superseded run whose gate is
+# only waiting in `loom-ci-load-lane` is cancelled, one second after the
+# successor appears (run 37725992152, 2026-10-08 04:12:04Z). The two runs first
+# reported as proof of a gap (37718540063 = `7db7279`, 37717596409 = `8d160e8`)
+# both had no block in their own copy, so they show the coverage limit above.
+# Coverage is what costs lane time, because the lane is FIFO across runs -- a
+# stale run that queued first is served before a newer run that queued after it.
+# The procedure, the run ids, the citations and the `gh run cancel` commands are
+# in `results/README.md`, "Which runs may be cancelled".
 #
 # What cancellation costs: the check on the superseded commit ends `cancelled`
 # and the newer commit is measured again, so a PR gets one live E1.1
@@ -271,7 +292,8 @@ jobs:
         # check may be skipped") from rotting silently, and keep the
         # workflow-level group cancelling superseded `pull_request` runs only:
         # a workflow-level cancel reaches into jobs whose own
-        # `cancel-in-progress: false` forbids it.
+        # `cancel-in-progress: false` forbids it -- observed on 2026-10-08, see
+        # results/README.md and OBI-322.
         run: |
           set -euo pipefail
           scripts/ci-ensure-tools.sh python3:python3-minimal
