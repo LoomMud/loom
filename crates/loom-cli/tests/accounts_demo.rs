@@ -39,7 +39,13 @@
 //! * reads are line-complete ([`Lines`]): an unterminated tail is carried across
 //!   polls instead of dropped with the poll's scratch buffer, because a 2 ms poll
 //!   that loses half an `ok` is the OBI-302 lost-bytes class wearing a timing
-//!   costume ([`a_partial_line_survives_the_poll_boundary`]).
+//!   costume ([`a_partial_line_survives_the_poll_boundary`]); and
+//! * the whole-file reader is the shared one. OBI-355 landed `tests/support/read_until.rs`
+//!   while this branch was open, and this file used to carry its own
+//!   `read_until_contains` and `drain_telnet_preamble`. Both are gone: the needle
+//!   waits and the preamble drain come from the shared byte-safe module, and only
+//!   [`Lines`] stays local, because a poll loop that watches two sockets needs a
+//!   carry buffer the shared single-socket reader does not model.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -47,6 +53,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+
+#[path = "support/read_until.rs"]
+mod read_until;
+
+use read_until::{drain_telnet_preamble, read_until_contains};
 
 /// Waiting for *state* is a hang detector, not a timing assertion: no amount
 /// of runner contention should reach it, so "this CI box is busy" can never
@@ -992,44 +1003,12 @@ fn send_line(reader: &mut BufReader<TcpStream>, line: &str) {
         .unwrap_or_else(|err| panic!("flush command `{line}` failed: {err}"));
 }
 
-fn read_until_contains(
-    reader: &mut BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    let started = Instant::now();
-    let mut transcript = String::new();
-    let mut carry = Lines::default();
-
-    loop {
-        if started.elapsed() > timeout {
-            panic!(
-                "timed out waiting for `{needle}` after {timeout:?}. Transcript so far:\n\
-                 {transcript}"
-            );
-        }
-
-        let drain = carry.poll(reader);
-        note(&mut transcript, &drain.lines);
-        if transcript.contains(needle) {
-            return transcript;
-        }
-        // Only a close that left the needle unsaid is a failure: a driver that
-        // hangs up right after the line you were waiting for has answered.
-        if drain.closed {
-            panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            );
-        }
-    }
-}
-
 fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
     let deadline = Instant::now() + timeout;
     loop {
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
-                drain_telnet_preamble(&mut stream);
+                drain_telnet_preamble(&mut stream, "on connecting to the server");
                 return stream;
             }
             Err(err) if Instant::now() < deadline => {
@@ -1047,19 +1026,6 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
             Err(err) => panic!("failed to connect to {addr} before timeout: {err}"),
         }
     }
-}
-
-/// `loom serve` opens with startup telnet option negotiation (OBI-26: `DO
-/// NAWS`, `DO TTYPE`, `WILL GMCP`, `WILL MSSP` -- 12 bytes, none of them
-/// valid UTF-8 on their own) before anything text-protocol shows up on the
-/// wire. These tests read lines as UTF-8 text, so they don't speak telnet
-/// back; just drop the fixed-size preamble rather than negotiate.
-fn drain_telnet_preamble(stream: &mut TcpStream) {
-    use std::io::Read;
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble");
 }
 
 fn reserve_local_port() -> u16 {
