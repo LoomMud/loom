@@ -174,35 +174,81 @@ fn restore_waits_for_its_own_path() {
 /// `World::tick` is the reaper. Without it the queue would saturate and every
 /// later save would fall back to an inline `fsync` on the world thread -- so
 /// the reap itself must be bookkeeping only, and must actually run.
+///
+/// The worker is waited for by *polling*, never by a guessed sleep. The first
+/// version of this test slept `SLOW_DISK * 2` and then asserted the reap had
+/// happened; that failed on CI (`save_durability.rs:203`, `pending` still 1)
+/// because 400 ms is not a bound on "200 ms `commit_delay` + write + fsync +
+/// the OS scheduling the worker at all" on a contended runner -- precisely the
+/// hard-coded-budget-loses-to-contention class OBI-329 tracks. `pending` only
+/// moves when the world looks, so the honest shape is: look until it moved,
+/// and price the tick that did it.
 #[test]
 fn ticking_reaps_committed_saves_without_doing_disk_work() {
-    let (mut world, mut host, _save_root) = slow_world("durability-tick", SaveDurability::Deferred);
+    let (mut world, mut host, save_root) = slow_world("durability-tick", SaveDurability::Deferred);
     world.connect(1, &mut host);
     host.take(1);
     world.input(1, "savefile /whoever", &mut host);
     host.take(1);
 
+    // The worker is asleep for the whole of `commit_delay` before it even
+    // touches the file, so a tick issued while that save is outstanding must
+    // return without waiting for it. Bounded at half the disk's own delay, the
+    // budget every other test in this file uses.
     let at = Instant::now();
     world.tick(&mut host);
+    let first_tick = at.elapsed();
     assert!(
-        at.elapsed() < SLOW_DISK / 2,
-        "a tick that reaps must not wait for the worker: {:?}",
-        at.elapsed()
+        first_tick < SLOW_DISK / 2,
+        "a tick issued while a save is in flight must not wait for the worker: \
+         {first_tick:?} against a {SLOW_DISK:?} disk"
     );
-    assert_eq!(world.save_queue_stats().pending, 1, "nothing to reap yet");
 
-    std::thread::sleep(SLOW_DISK * 2);
-    let at = Instant::now();
-    world.tick(&mut host);
-    let elapsed = at.elapsed();
+    // Poll until a tick finds something to reap. `pending` only moves when the
+    // world looks, so this waits for the fact rather than guessing how long the
+    // worker needs; the loop is bounded so a queue that never reports fails
+    // loudly instead of hanging the suite.
+    //
+    // Timing is asserted on exactly two ticks -- the first one and the one that
+    // reaped -- which is the same number of wall-clock budgets this test always
+    // had. Asserting on every poll tick would multiply the file's exposure to
+    // unrelated runner stalls (OBI-344's tail), and it proves nothing the
+    // reaping tick does not already prove: `poll` is a non-blocking `try_recv`.
+    let started = Instant::now();
+    let mut slowest_poll_tick = Duration::ZERO;
+    let reaping_tick = loop {
+        let at = Instant::now();
+        world.tick(&mut host);
+        let elapsed = at.elapsed();
+        slowest_poll_tick = slowest_poll_tick.max(elapsed);
+        if world.save_queue_stats().pending == 0 {
+            break elapsed;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the worker never reported the queued save (stats: {:?}, {} landed \
+             on disk after {:?}; slowest poll tick {slowest_poll_tick:?})",
+            world.save_queue_stats(),
+            if save_root.join("whoever.o").exists() {
+                "it"
+            } else {
+                "nothing has"
+            },
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    // The tick that reaped did bookkeeping only: a quarter of the disk's own
+    // delay, so the bound stays meaningful if `SLOW_DISK` is retuned.
     assert!(
-        elapsed < Duration::from_millis(50),
-        "reaping a finished outcome is bookkeeping, took {elapsed:?}"
+        reaping_tick < SLOW_DISK / 4,
+        "reaping a finished outcome must be bookkeeping, not disk work: {reaping_tick:?}"
     );
     let stats = world.save_queue_stats();
     assert_eq!(stats.pending, 0);
-    assert_eq!(stats.committed, 1);
-    assert_eq!(stats.inline_commits, 0);
+    assert_eq!(stats.committed, 1, "the save is billed exactly once");
+    assert_eq!(stats.inline_commits, 0, "and never on the world thread");
 }
 
 /// A snapshot is the world's own idea of "what is saved", and copyover's boot
