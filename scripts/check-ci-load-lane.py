@@ -40,7 +40,17 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      `reopened`) -- with `types:` omitted GitHub fires on *every* activity, so
      labeling a PR would cancel its own running gate -- and the narrowing may
      not drop `opened` or `synchronize`, which is how a required check gets
-     skipped under cover of "narrowing the trigger".
+     skipped under cover of "narrowing the trigger"; and
+  7. in `loadtest-e1-1`, the p99 verdict is the only thing that fails the job:
+     the step saves the loadtest exit status, runs its post-run evidence tail
+     with errexit disabled, and re-asserts the saved status at the end. The
+     runner's default `bash --noprofile --norc -e -o pipefail` means one
+     non-zero command in that tail aborts the step *after* the verdict was
+     computed -- which is how main run 37862921160 (sha eaf9ceb) went red on a
+     p99 PASS of 21.47 ms: the world thread recorded zero stalls, so the scrape
+     had no `kind="..."` label, `grep -oE` exited 1, pipefail carried it through
+     the pipeline, and the command substitution failed the step. A gate that
+     goes red exactly when the world thread behaves is worse than no gate.
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -80,6 +90,12 @@ WF_GROUP_PREFIX = "github.workflow"
 WF_RUNID_FALLBACK = "github.run_id"
 WF_PR_SCOPED = ("github.ref", "github.head_ref", "github.event.pull_request.number")
 WF_PR_TEST = re.compile(r"github\.event_name\s*==\s*['\"]pull_request['\"]")
+# Rule 7: the E1.1 step's contract with the shell. The verdict is captured in
+# `status=$?` and re-asserted with `exit $status`; the evidence in between must
+# not be able to end the step, so it runs under `set +e`.
+E11_STATUS_CAPTURE = "status=$?"
+E11_VERDICT_EXIT = re.compile(r"^\s*exit \$status\s*$")
+E11_ERREXIT_OFF = re.compile(r"^\s*set \+e\s*$")
 WF_OTHER_EVENTS = ("push", "pull_request_target", "workflow_dispatch", "workflow_call",
                    "schedule", "repository_dispatch", "merge_request_event")
 
@@ -390,7 +406,43 @@ def check_text(text):
             errors.append(f"`loadtest-e1-1` no longer passes `{flag}`: the E1.1 gate "
                           "must keep measuring 150 players and failing on an SLA miss")
 
+    check_e11_verdict_isolation(jobs, errors)
+
     return errors
+
+
+def check_e11_verdict_isolation(jobs, errors):
+    """Rule 7: nothing but the p99 verdict may fail `loadtest-e1-1`.
+
+    Requires the three-beat shape in the gate's shell step: capture the
+    loadtest exit status, disable errexit for everything that runs after the
+    verdict, and re-assert the captured status as the step's last act. Reads
+    shell lines with comments stripped, so prose about `exit $status` or
+    `set +e` cannot satisfy it -- that is how the check notices the shape rot
+    instead of being fooled by the comment that explains it.
+    """
+    block = jobs.get("loadtest-e1-1")
+    if block is None:
+        return  # rule 4 already reported the missing required check
+    shell = [l for l in block if not l.lstrip().startswith("#")]
+    capture = next((i for i, l in enumerate(shell) if E11_STATUS_CAPTURE in l), None)
+    if capture is None:
+        errors.append("`loadtest-e1-1` no longer captures the loadtest exit status "
+                      "(`status=$?`): without it the gate cannot separate 'the world "
+                      "missed its SLA' from 'some shell command in this step failed'")
+        return
+    exits = [i for i, l in enumerate(shell) if E11_VERDICT_EXIT.match(l)]
+    if not exits:
+        errors.append("`loadtest-e1-1` no longer ends its gate step with "
+                      "`exit $status`: the captured p99 verdict is dropped, so the "
+                      "step's exit code comes from whatever command ran last")
+        return
+    guards = [i for i, l in enumerate(shell) if E11_ERREXIT_OFF.match(l)]
+    if not any(capture < g < exits[-1] for g in guards):
+        errors.append("`loadtest-e1-1` runs its post-verdict evidence tail under "
+                      "errexit: one non-zero grep/awk in the reporting section aborts "
+                      "the step after the p99 verdict was already computed (main run "
+                      "37862921160 went red on a PASS this way)")
 
 
 # --- self-test ---------------------------------------------------------------
@@ -491,6 +543,13 @@ MUTANTS = [
     ("supersede trigger narrowed until `opened` is gone",
      lambda t: _sub(t, "types: [opened, synchronize, reopened]",
                     "    types: [synchronize, reopened]\n")),
+    # Rule 7. The first two are the shape main run 37862921160 actually broke.
+    ("E1.1 evidence tail put back under errexit",
+     lambda t: _sub(t, "set +e", None)),
+    ("E1.1 gate step that drops the captured p99 verdict",
+     lambda t: _sub(t, "exit $status", "          exit 0\n")),
+    ("E1.1 gate step that stops saving the loadtest exit status",
+     lambda t: _sub(t, "status=$?", "          echo verdict-captured\n")),
 ]
 
 
