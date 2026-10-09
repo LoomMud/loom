@@ -22,7 +22,7 @@
 //! hard-fail (OBI-151's belt-and-suspenders check) if the URL still looks
 //! like the control-plane DB.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -36,7 +36,7 @@ use uuid::Uuid;
 #[path = "support/read_until.rs"]
 mod read_until;
 
-use read_until::read_until_contains;
+use read_until::{Chunk, drain_telnet_preamble, read_one, read_until_contains};
 
 /// Every test here spawns a real `loom serve` subprocess and hits the
 /// same shared Postgres instance (through its own connection pool *and*
@@ -258,10 +258,10 @@ fn mutation_from_secure_roles_reaches_sql_with_the_interactives_euid_as_actor() 
     read_until_contains(&mut conn, "ok", Duration::from_secs(2));
 
     send_line(&mut conn, &format!("settier {member_uid} 2 promotion"));
-    let out = poll_until_contains(&mut conn, "req ", Duration::from_secs(2));
+    let out = read_until_contains(&mut conn, "req ", Duration::from_secs(2));
     assert!(out.contains("req "), "{out}");
 
-    let out = poll_until_contains(&mut conn, "roles_result ", Duration::from_secs(15));
+    let out = read_until_contains(&mut conn, "roles_result ", Duration::from_secs(15));
     assert!(
         out.contains("roles_result 1 true"),
         "expected the promotion to succeed: {out}"
@@ -341,7 +341,7 @@ fn a_roles_changed_notify_swaps_the_snapshot_and_flushes_the_security_cache() {
     // reason; settle first so the test is about the notify, not a race
     // with the very first load).
     send_line(&mut conn, "writefile /roles_demo_notify.txt hi");
-    let out = poll_until_contains(&mut conn, "denied", Duration::from_secs(5));
+    let out = read_until_contains(&mut conn, "denied", Duration::from_secs(5));
     assert!(out.contains("denied"), "T1 must be denied: {out}");
 
     // Direct owner-connection UPDATE: no `roles_set_tier` call, so no
@@ -481,7 +481,7 @@ fn audit_log_has_a_row_for_a_denied_p2_plus_check() {
 
     let marker = unique_uid("denyfile");
     send_line(&mut conn, &format!("writefile /{marker}.txt hi"));
-    let out = poll_until_contains(&mut conn, "denied", Duration::from_secs(5));
+    let out = read_until_contains(&mut conn, "denied", Duration::from_secs(5));
     assert!(out.contains("denied"), "{out}");
 
     rt.block_on(async {
@@ -506,7 +506,7 @@ enum Reply {
     Line(String),
     /// Nothing arrived within the timeout; try again.
     Timeout,
-    /// The peer closed the connection (`read_line` returned `Ok(0)`).
+    /// The peer closed the connection (the socket read returned EOF).
     /// Occasionally observed in CI against a real Postgres-backed server
     /// under load, root cause not fully pinned down; callers that can
     /// reconnect and retry should treat this the same as a timeout rather
@@ -515,22 +515,36 @@ enum Reply {
 }
 
 /// Reads exactly one line (one command's reply), waiting up to `timeout`.
+///
+/// Byte-based (OBI-355): the child's socket carries telnet negotiation as well as
+/// text, so a UTF-8-validating `read_line` here would panic the test over a byte
+/// sequence that means nothing went wrong.
 fn read_one_reply(reader: &mut BufReader<TcpStream>, timeout: Duration) -> Reply {
     let deadline = Instant::now() + timeout;
     let mut line = String::new();
     loop {
-        match reader.read_line(&mut line) {
-            Ok(0) => return Reply::Closed,
-            Ok(_) => return Reply::Line(line.replace("\r\n", "\n")),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock =>
-            {
+        match read_one(reader) {
+            Chunk::Data(chunk) => {
+                line.push_str(&chunk);
+                // Line framing, not chunk framing: a reply is one command's answer.
+                if line.ends_with('\n') {
+                    return Reply::Line(line);
+                }
+            }
+            Chunk::Closed => return Reply::Closed,
+            Chunk::Idle => {
                 if Instant::now() > deadline {
                     return Reply::Timeout;
                 }
             }
-            Err(err) => panic!("socket read failed while waiting for a reply: {err}"),
+            Chunk::Failed(err) => panic!(
+                "socket read failed while waiting for a reply: {err}. Partial line so far:\n{line}"
+            ),
+        }
+        if !line.is_empty() && Instant::now() > deadline {
+            // A half-line at the deadline is the harness running out of patience,
+            // which is what `Reply::Timeout` means to callers that retry.
+            return Reply::Timeout;
         }
     }
 }
@@ -567,45 +581,12 @@ fn send_line(reader: &mut BufReader<TcpStream>, line: &str) {
         .unwrap_or_else(|err| panic!("flush command `{line}` failed: {err}"));
 }
 
-/// [`read_until_contains`], but re-sends `line`'s command itself every
-/// ~100ms while waiting (an idle connection would otherwise never re-poll
-/// an async result -- see `accounts_demo.rs`'s copy of this same helper).
-fn poll_until_contains(
-    reader: &mut BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    let deadline = Instant::now() + timeout;
-    let mut transcript = String::new();
-
-    loop {
-        if transcript.contains(needle) {
-            return transcript;
-        }
-        if Instant::now() > deadline {
-            panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => transcript.push_str(&line.replace("\r\n", "\n")),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
-        }
-    }
-}
-
 fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
     let deadline = Instant::now() + timeout;
     loop {
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
-                drain_telnet_preamble(&mut stream);
+                drain_telnet_preamble(&mut stream, "on connecting to the server");
                 return stream;
             }
             Err(err) if Instant::now() < deadline => {
@@ -623,16 +604,6 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
             Err(err) => panic!("failed to connect to {addr} before timeout: {err}"),
         }
     }
-}
-
-/// See `accounts_demo.rs`'s copy of this helper: `loom serve` negotiates a
-/// fixed 12-byte telnet preamble before any text protocol.
-fn drain_telnet_preamble(stream: &mut TcpStream) {
-    use std::io::Read;
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble");
 }
 
 fn reserve_local_port() -> u16 {

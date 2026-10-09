@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 #[path = "support/read_until.rs"]
 mod read_until;
 
-use read_until::read_until_contains;
+use read_until::{drain_telnet_preamble, read_until_contains};
 
 #[test]
 fn supervise_hands_off_listening_sockets_to_a_standby_child() {
@@ -45,10 +45,7 @@ fn supervise_hands_off_listening_sockets_to_a_standby_child() {
     // TTYPE`, `WILL GMCP`, `WILL MSSP` -- 12 bytes) is enough: proves the
     // standby child's `World`/`loom-net` stack is really the one serving
     // this connection, not a hung/empty accept.
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble from the handed-off socket");
+    drain_telnet_preamble(&mut stream, "from the handed-off socket");
 
     supervisor.assert_alive();
 }
@@ -77,10 +74,7 @@ fn sigterm_to_the_supervisor_is_forwarded_to_the_child_and_both_exit() {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before sending SIGTERM");
+    drain_telnet_preamble(&mut stream, "before sending SIGTERM");
 
     loom_supervise::signal::send_sigterm(supervisor.child.id())
         .expect("send SIGTERM to the supervisor process");
@@ -141,10 +135,7 @@ fn sigkill_the_supervisor_still_terminates_the_child_via_pdeathsig() {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before SIGKILLing the supervisor");
+    drain_telnet_preamble(&mut stream, "before SIGKILLing the supervisor");
 
     // `Child::kill()` is `SIGKILL`, not `SIGTERM` -- the supervisor gets
     // no chance to run any of its own forwarding code.
@@ -200,10 +191,7 @@ fn standby_child_crash_is_respawned_against_the_same_listener() {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before crashing the child");
+    drain_telnet_preamble(&mut stream, "before crashing the child");
 
     let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
         .expect("did not find the standby child's pid under /proc");
@@ -230,9 +218,7 @@ fn standby_child_crash_is_respawned_against_the_same_listener() {
     reconnected
         .set_read_timeout(Some(Duration::from_secs(15)))
         .unwrap();
-    reconnected
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble from the respawned child");
+    drain_telnet_preamble(&mut reconnected, "from the respawned child");
 
     supervisor.assert_alive();
 }
@@ -260,10 +246,7 @@ fn sigterm_during_crash_backoff_stops_the_supervisor_without_a_further_respawn()
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before crashing the child");
+    drain_telnet_preamble(&mut stream, "before crashing the child");
 
     let child_pid = find_child_pid(supervisor.child.id(), Duration::from_secs(5))
         .expect("did not find the standby child's pid under /proc");
@@ -410,10 +393,7 @@ fn version_file_change_is_detected_and_logged() {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before changing the version file");
+    drain_telnet_preamble(&mut stream, "before changing the version file");
 
     // A background thread drains stdout into a channel, since reading
     // it directly on this thread would block waiting for more output
@@ -492,10 +472,7 @@ fn version_change_is_forwarded_over_the_control_socket_and_acknowledged() {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before changing the version file");
+    drain_telnet_preamble(&mut stream, "before changing the version file");
 
     let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -628,10 +605,7 @@ fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble before changing the version file");
+    drain_telnet_preamble(&mut stream, "before changing the version file");
     let mut reader = std::io::BufReader::new(stream);
 
     // CTO review (OBI-266/B2): the real regression this test must be
@@ -705,20 +679,23 @@ fn reclaim_and_readopt_round_trip_keeps_the_connection_alive() {
     // same `TelnetCodec::start()` call every new `run_connection` task
     // makes) so the line-based reads below see only real text.
     // OBI-302 triage: this must read through the `BufReader`, not its
-    // underlying socket directly. `reader.get_mut().read_exact(..)` reads
-    // from the raw fd and skips whatever the `BufReader` had already
-    // buffered ahead of the last `read_line` call that found "Exits:" --
-    // on a slow/loaded CI runner the fresh preamble bytes can already be
-    // sitting in that internal buffer by the time we get here, so reading
-    // from the raw socket instead reads *past* them into real response
-    // text, desyncing every read after this one (the intermittent "stream
-    // did not contain valid UTF-8" failure). `Read::read_exact` on the
-    // `BufReader` itself drains its internal buffer first, then falls
-    // through to the socket only for whatever's left.
-    let mut fresh_preamble = [0_u8; 12];
-    reader
-        .read_exact(&mut fresh_preamble)
-        .expect("read the fresh telnet negotiation preamble the readopt triggers");
+    // underlying socket directly. Reading the raw fd skips whatever the
+    // `BufReader` had already buffered ahead of the last read that found
+    // "Exits:" -- on a slow/loaded CI runner the fresh preamble bytes can
+    // already be sitting in that internal buffer by the time we get here, so
+    // reading from the raw socket instead reads *past* them into real response
+    // text, desyncing every read after this one.
+    // `drain_telnet_preamble` takes any `Read`, so it drains the `BufReader`
+    // here (its internal buffer first, then the socket for whatever's left)
+    // and the raw `TcpStream` everywhere else. Anything the child puts in the
+    // same flush *beyond* those 12 bytes is no longer a problem either: the
+    // reads below are byte-based, so leftover negotiation lands in the
+    // transcript as replacement characters instead of panicking the test
+    // (OBI-355).
+    drain_telnet_preamble(
+        &mut reader,
+        "for the fresh preamble the readopt re-triggers",
+    );
     send_line(&mut reader, "look");
     let transcript = read_until_contains(&mut reader, "Exits:", Duration::from_secs(5));
     assert!(

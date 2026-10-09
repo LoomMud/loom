@@ -8,7 +8,7 @@
 //! real `loom-cli serve` subprocess with `DATABASE_URL` unset, so it runs
 //! the in-memory dev account backend CI/the load bot use.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 #[path = "support/read_until.rs"]
 mod read_until;
 
-use read_until::read_until_contains;
+use read_until::{Chunk, drain_telnet_preamble, read_one, read_until_contains};
 
 #[test]
 fn in_memory_account_backend_create_duplicate_and_bad_password() {
@@ -158,16 +158,18 @@ fn poll_until_contains(
             last_nudge = Instant::now();
         }
 
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
+        // Byte-based (OBI-355): the child's telnet negotiation is not UTF-8 and must
+        // not become a test failure, and bytes that arrive alongside a read timeout
+        // must not be dropped.
+        match read_one(reader) {
+            Chunk::Data(chunk) => transcript.push_str(&chunk),
+            Chunk::Closed => panic!(
                 "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
             ),
-            Ok(_) => transcript.push_str(&line.replace("\r\n", "\n")),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
+            Chunk::Idle => {}
+            Chunk::Failed(err) => panic!(
+                "socket read failed while waiting for `{needle}`: {err}\nTranscript so far:\n{transcript}"
+            ),
         }
     }
 }
@@ -177,7 +179,7 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
     loop {
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
-                drain_telnet_preamble(&mut stream);
+                drain_telnet_preamble(&mut stream, "on connecting to the server");
                 return stream;
             }
             Err(err) if Instant::now() < deadline => {
@@ -195,19 +197,6 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
             Err(err) => panic!("failed to connect to {addr} before timeout: {err}"),
         }
     }
-}
-
-/// `loom serve` opens with startup telnet option negotiation (OBI-26: `DO
-/// NAWS`, `DO TTYPE`, `WILL GMCP`, `WILL MSSP` -- 12 bytes, none of them
-/// valid UTF-8 on their own) before anything text-protocol shows up on the
-/// wire. These tests read lines as UTF-8 text, so they don't speak telnet
-/// back; just drop the fixed-size preamble rather than negotiate.
-fn drain_telnet_preamble(stream: &mut TcpStream) {
-    use std::io::Read;
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble");
 }
 
 fn reserve_local_port() -> u16 {
