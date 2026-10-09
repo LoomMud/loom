@@ -3252,6 +3252,11 @@ fn spawn_world_thread(
 
             while let Some(event) = event_rx.blocking_recv() {
                 let iter_started = std::time::Instant::now();
+                // OBI-344: `kind` (below) is only what woke the loop; these
+                // marks say where an iteration's milliseconds actually went, so
+                // a stalled `input` can be told apart from a stalled snapshot
+                // or a blocked send. Every mark costs one clock read.
+                world_probe.begin_phase(loom_obs::WorldPhase::Exec, iter_started);
                 let iter_kind = match &event {
                     NetEvent::Tick => loom_obs::WorldEventKind::Tick,
                     NetEvent::Line(..) => loom_obs::WorldEventKind::Input,
@@ -3358,12 +3363,18 @@ fn spawn_world_thread(
                 // every loop iteration (cheap: `watch::Receiver::has_changed`
                 // never awaits), so a reload from `run_roles_manager` takes
                 // effect on the very next event, not just on a tick.
+                world_probe.begin_phase(loom_obs::WorldPhase::RolesSwap, std::time::Instant::now());
                 if roles_snapshot_rx.has_changed().unwrap_or(false)
                     && let Some(snap) = roles_snapshot_rx.borrow_and_update().clone()
                 {
                     world.set_roles_snapshot(snap);
                 }
+                world_probe.begin_phase(loom_obs::WorldPhase::DbDrain, std::time::Instant::now());
                 drain_db_events(&mut world, &mut host);
+                world_probe.begin_phase(
+                    loom_obs::WorldPhase::AdminDrain,
+                    std::time::Instant::now(),
+                );
                 drain_admin_queries(&mut world, &mut host);
                 // OBI-184 (copyover-trigger slice): a snapshot request
                 // from `run_control_responder`'s control socket, drained
@@ -3371,6 +3382,7 @@ fn spawn_world_thread(
                 // loop -- `try_recv`, never blocking, so an idle (or
                 // never-sent) channel costs nothing and a request can
                 // never stall a tick waiting on it.
+                world_probe.begin_phase(loom_obs::WorldPhase::Snapshot, std::time::Instant::now());
                 while let Ok(reply_tx) = snapshot_req_rx.try_recv() {
                     let result = world
                         .begin_snapshot()
@@ -3384,6 +3396,7 @@ fn spawn_world_thread(
                 // finished since the last pass, answer the request that
                 // was waiting on it, and start that uid's queued compile
                 // (if any) next -- see `drain_finished_recompiles`'s doc.
+                world_probe.begin_phase(loom_obs::WorldPhase::FileOps, std::time::Instant::now());
                 drain_finished_recompiles(&mut world, &mut host, &mut compile_slots);
                 // OBI-180 M-FS-1: a file-op request from an `/api/v1/files/*`
                 // HTTP handler, drained the same non-blocking way as every

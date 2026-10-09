@@ -212,6 +212,33 @@ loom_world_loop_stall_ms_total 4905
 loom_world_loop_duration_ms_max 562
 ```
 
+**`kind` is not the answer to "what cost 562 ms".** It names the event that *woke*
+the loop. That same iteration also drains every side channel queued behind it (db
+results, admin queries, a snapshot request, finished recompiles, file ops, the roles
+swap), and several of those run a real `exec`. That is why run 37880215784 could hold
+an **875 ms** iteration and a scrape window carrying `negotiation` x1 + `input` x3
+stall events, and nobody could say which kind those 875 ms belonged to -- and the
+`negotiation` candidate never could have been the answer, because every negotiation
+arm in the serve loop is log-only (OBI-26 leaves the NAWS/TTYPE/GMCP hooks unmade).
+The loop now marks
+those segments (`WorldPhase`, `crates/loom-obs/src/world.rs`), so a breach says where
+its milliseconds went as well as what woke it:
+
+```text
+loom_world_loop_stall_ms_by_kind_total{kind="input"} 560
+loom_world_loop_stall_ms_by_phase_total{phase="exec"} 59
+loom_world_loop_last_stall_phase_ms{phase="snapshot"} 870
+loom_world_loop_last_stall_net_send_ms 63
+```
+
+`net_send_ms` travels *beside* the phases, never inside one: time blocked in
+`blocking_send` happens within the arm that made the send, so putting it in a bucket
+would double-count. A stalled `exec` whose `net_send_ms` equals its duration is the
+net task not draining, not mudlib compute. The non-gating `world_loop:` line carries
+`stall_ms_by_kind=` and `stall_ms_by_phase=` for the same reason -- weight stalls by
+time, not by event count, because ten 55 ms stalls and one 800 ms stall are different
+problems.
+
 All 31 landed between t+91 s and t+94 s, *after* `--duration-secs 90` had stopped
 issuing commands: that is the 150 bots logging out at once. `World::disconnect`
 (`crates/loom-vm/src/world.rs`) applies `autosave` -- which is `save_character`,
