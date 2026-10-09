@@ -317,6 +317,15 @@ impl From<AdminDirectoryError> for AdminError {
     }
 }
 
+/// The world-error -> HTTP-status contract, in one place (OBI-347): the
+/// world's answer decides the status, and nothing here invents a `500`. A name
+/// that resolves to nothing is the caller's mistake (`404`); a world that could
+/// not answer is unavailable (`503`), not broken. Pinned by
+/// `crate::admin::tests::object_vars_for_a_path_that_is_not_live_is_404_not_500`,
+/// `a_world_that_could_not_answer_is_503_not_500`, and
+/// `no_admin_error_variant_answers_500` -- the last is exhaustive over
+/// `AdminError`, so answering `500` somewhere requires adding a variant and
+/// arguing which class of failure it is.
 impl From<crate::admin_query::WorldQueryError> for AdminError {
     fn from(err: crate::admin_query::WorldQueryError) -> Self {
         use crate::admin_query::WorldQueryError;

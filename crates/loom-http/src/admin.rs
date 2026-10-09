@@ -75,6 +75,10 @@ fn error_response(code: StatusCode, error: &'static str) -> (StatusCode, Json<Er
     )
 }
 
+/// The status half of `AdminError`'s contract. Every variant lands on a 4xx, or
+/// on `503` when the directory or the world could not answer -- there is no bare
+/// `500` in this table, and `no_admin_error_variant_answers_500` keeps it that
+/// way (OBI-347).
 fn admin_error_response(error: AdminError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
         AdminError::Forbidden => error_response(StatusCode::FORBIDDEN, "forbidden"),
