@@ -32,6 +32,16 @@
 //! here: over TLS the graceful close has to emit `close_notify` *before*
 //! `shutdown(Write)`, which is rustls knowledge and belongs with that
 //! fake.
+//!
+//! Who *owns* a connection is the other half of the same flake, and it lives
+//! in [`crate::github::fake_server`] (OBI-351): the GitHub fake used to serve
+//! one request per connection from a single serial accept loop and `continue`
+//! past a failed read, so an honest client could be accepted and answered by
+//! nothing. It now takes one thread per connection, answers every connection
+//! it accepts, and records every connection it could not serve. What stays
+//! here is deliberately only the shared reading and framing, so the plain and
+//! the TLS fakes cannot drift apart on "never answer a request you have not
+//! finished reading".
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -43,6 +53,13 @@ use super::find_subslice;
 /// that connection. Long enough for a deliberate two-segment client, and
 /// short enough that a stalled one costs the accept loop a pause rather
 /// than the whole test run.
+///
+/// This is the patience of the fakes that serve connections **serially** —
+/// `tls_transport`'s (OBI-352) among them, where a long window is a tax
+/// every later connection pays. The per-connection fake GitHub server
+/// ([`crate::github::fake_server`], OBI-351) does not owe other connections
+/// anything, so it asks for its own, longer window instead of raising this
+/// constant: see [`crate::github::fake_server::ServerOptions::read_timeout`].
 pub const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long to wait for the client's remaining bytes / FIN after the
@@ -70,14 +87,30 @@ pub struct FakeRequest {
     pub body: String,
 }
 
-/// Read one complete request off a plain-HTTP fake connection.
+/// Read one complete request off a plain-HTTP fake connection, with the
+/// default patience ([`READ_TIMEOUT`]).
 ///
 /// The [`TcpStream`] wrapper around [`read_request_bytes`]: applies
 /// [`READ_TIMEOUT`] to the socket so the blocking reads the shared reader
 /// performs actually return, then hands the stream to it.
+///
+/// Returns `None` if the client hangs up, stalls past the patience window,
+/// or exceeds [`MAX_BYTES`] before the header block is complete. A caller
+/// that stops reading here still owes the client an answer -- see
+/// [`crate::github::fake_server::FakeHttpServer`] (OBI-351), which answers
+/// `400` and records the drop instead of closing in silence.
 pub fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     read_request_bytes(stream, READ_TIMEOUT, MAX_BYTES)
+}
+
+/// [`read_request`] with an explicit patience window, for the tests that
+/// need to watch the fake give up on a stalled client without waiting out
+/// [`READ_TIMEOUT`] (a test that races a constant is a coin flip), and for
+/// the per-connection server, which is patient on its own schedule.
+pub fn read_request_within(stream: &mut TcpStream, patience: Duration) -> Option<FakeRequest> {
+    let _ = stream.set_read_timeout(Some(patience));
+    read_request_bytes(stream, patience, MAX_BYTES)
 }
 
 /// Read one complete request off *any* blocking byte source -- the
@@ -87,9 +120,9 @@ pub fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
 /// This is deliberately transport-neutral: "never answer a request you
 /// have not finished reading" is one rule, and every copy of it written
 /// per-transport is one more fake that can lose a body segment (OBI-350
-/// fixed the plain-HTTP copies, OBI-352 the TLS one). `read_request` and
-/// this function are the only places in the crate that scan for the header
-/// terminator.
+/// fixed the plain-HTTP copies, OBI-352 the TLS one). `read_request`,
+/// `read_request_within` and this function are the only places in the crate
+/// that scan for the header terminator.
 ///
 /// `deadline` bounds the whole read and `max` the bytes read, so a stalled
 /// or oversized client costs the caller a dropped connection instead of a
@@ -242,10 +275,17 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    /// A listener that reads one request per connection and records what
-    /// the reader returned, so the reader can be tested directly (with no
+    /// A listener that reads one request per connection and records what the
+    /// reader returned, so the reader can be tested directly (with no
     /// `GitHubAppClient` in the way).
-    fn spawn_recorder() -> (String, Arc<Mutex<Vec<Option<FakeRequest>>>>) {
+    ///
+    /// `patience` is the reader's own deadline: `None` means the fake's normal
+    /// patience ([`read_request`], the wrapper every real fake server runs),
+    /// and the one test that proves the reader *gives up* passes a window of its
+    /// own so it neither waits 10 s nor hopes.
+    fn spawn_recorder(
+        patience: Option<Duration>,
+    ) -> (String, Arc<Mutex<Vec<Option<FakeRequest>>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let served: Arc<Mutex<Vec<Option<FakeRequest>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -256,7 +296,10 @@ mod tests {
                     Ok(s) => s,
                     Err(_) => break,
                 };
-                let req = read_request(&mut stream);
+                let req = match patience {
+                    Some(patience) => read_request_within(&mut stream, patience),
+                    None => read_request(&mut stream),
+                };
                 let body = req
                     .as_ref()
                     .map(|r| format!("path={} body={}", r.path, r.body))
@@ -289,7 +332,7 @@ mod tests {
 
     #[test]
     fn reader_waits_for_a_body_that_arrives_as_a_second_segment() {
-        let (addr, served) = spawn_recorder();
+        let (addr, served) = spawn_recorder(None);
         let mut stream = connect(&addr);
         stream
             .write_all(b"POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\n")
@@ -317,7 +360,7 @@ mod tests {
 
     #[test]
     fn reader_serves_a_request_split_across_three_segments() {
-        let (addr, served) = spawn_recorder();
+        let (addr, served) = spawn_recorder(None);
         let mut stream = connect(&addr);
         for part in [
             "POST /repos/a/b/pulls HTTP/1.1\r\nContent-Length: 17\r\n",
@@ -335,7 +378,7 @@ mod tests {
 
     #[test]
     fn reader_treats_a_get_with_no_body_as_complete() {
-        let (addr, served) = spawn_recorder();
+        let (addr, served) = spawn_recorder(None);
         let mut stream = connect(&addr);
         stream.write_all(b"GET /y HTTP/1.1\r\n\r\n").unwrap();
         stream.flush().unwrap();
@@ -350,13 +393,16 @@ mod tests {
     #[test]
     fn reader_gives_up_on_a_client_that_never_finishes_the_headers() {
         // The bound is the point: a client that sends no `\r\n\r\n` must
-        // not keep the fake reading forever.
-        let (addr, served) = spawn_recorder();
+        // not keep the fake reading forever. The fake's patience is set
+        // *here*, and the deadline below is that patience plus a wide
+        // margin, so the test measures the bound instead of racing it.
+        const PATIENCE: Duration = Duration::from_millis(200);
+        let (addr, served) = spawn_recorder(Some(PATIENCE));
         let mut stream = connect(&addr);
         stream.write_all(b"GET /z HTTP/1.1\r\n").unwrap();
         stream.flush().unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + PATIENCE + Duration::from_secs(5);
         while served.lock().unwrap().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,

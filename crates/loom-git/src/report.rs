@@ -445,8 +445,11 @@ mod tests {
     use super::*;
     use crate::github::UreqClient;
     use crate::github::fake_http;
-    use std::net::TcpListener;
+    use crate::github::fake_server;
+    use std::io::{Read, Write};
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::mpsc;
 
     fn test_pem() -> String {
         include_str!("github/testdata/test_key.pkcs8.pem").to_string()
@@ -510,9 +513,13 @@ mod tests {
         );
         assert!(results.is_empty());
         assert!(
-            server.requests.lock().unwrap().is_empty(),
+            server.served_requests().is_empty(),
             "no HTTP request may be made once the deadline has passed"
         );
+        // The fake answered every connection this exchange needed: any
+        // failure above is about what GitHub said, not about the harness
+        // losing a socket (OBI-351).
+        server.assert_healthy();
     }
 
     // --- squash-subject extraction -----------------------------------
@@ -678,48 +685,64 @@ mod tests {
     // --- fake GitHub server for commits-to-pulls + issue comments -----
 
     struct FakeGitHub {
-        addr: String,
+        server: fake_server::FakeHttpServer,
         requests: std::sync::Arc<Mutex<Vec<(String, String)>>>,
     }
 
-    /// A fake GitHub API server for the report/propose calls: one accept
-    /// loop, canned responses driven by a closure so each test controls
-    /// what a given `METHOD path` answers.
+    impl FakeGitHub {
+        fn api_base(&self) -> String {
+            self.server.api_base()
+        }
+
+        /// The fake's `host:port`, for a test that wants to be a second client.
+        fn addr(&self) -> &str {
+            self.server.addr()
+        }
+
+        /// The `(path, body)` of every request the fake served, in order.
+        fn served_requests(&self) -> Vec<(String, String)> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        /// Assert the fake answered every connection it accepted, so a red
+        /// assertion below can only mean a product bug (OBI-351).
+        fn assert_healthy(&self) {
+            self.server.assert_healthy();
+        }
+    }
+
+    /// A fake GitHub API server for the report/propose calls: `fake_server`'s
+    /// per-connection fake (OBI-351), with canned responses driven by a closure
+    /// so each test controls what a given `METHOD path` answers -- without any
+    /// test having to care how many connections that took.
     ///
-    /// Requests are read and closed through [`fake_http`] so every fake in
-    /// this crate serves a *complete* request -- headers and body -- before
-    /// it answers (OBI-350).
+    /// Requests are read complete and closed properly by the shared fake
+    /// ([`fake_http`], OBI-350). This used to run its own serial accept loop, so
+    /// one stalled connection could make the *next* one come back as a
+    /// transport error.
     fn spawn_fake_github(
-        mut respond: impl FnMut(&str, &str, &str) -> (u16, String) + Send + 'static,
+        respond: impl Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> FakeGitHub {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
         let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let requests_clone = requests.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let mut stream = match stream {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                let Some(req) = fake_http::read_request(&mut stream) else {
-                    continue;
-                };
-                requests_clone
+        let requests_in_handler = requests.clone();
+        let server = fake_server::FakeHttpServer::spawn(
+            move |_call: usize, request: fake_http::FakeRequest| {
+                requests_in_handler
                     .lock()
                     .unwrap()
-                    .push((req.path.clone(), req.body.clone()));
-                let (status, resp_body) = respond(&req.method, &req.path, &req.body);
-                fake_http::respond(&mut stream, status, &resp_body);
-            }
-        });
-        FakeGitHub { addr, requests }
+                    .push((request.path.clone(), request.body.clone()));
+                respond(&request.method, &request.path, &request.body)
+            },
+        );
+        FakeGitHub { server, requests }
     }
 
     fn client(server: &FakeGitHub) -> GitHubAppClient<UreqClient> {
-        GitHubAppClient::new("1", "2", &test_pem(), UreqClient::default())
+        // The harness budget, not the product's 10 s: the fake has already been
+        // proven to answer before this client makes its call (OBI-351).
+        GitHubAppClient::new("1", "2", &test_pem(), fake_server::test_transport())
             .unwrap()
-            .with_api_base(format!("http://{}", server.addr))
+            .with_api_base(server.api_base())
     }
 
     fn token_resp() -> (u16, String) {
@@ -759,6 +782,10 @@ mod tests {
             .map(|(p, _)| p.clone())
             .collect();
         assert!(paths.iter().any(|p| p.contains("/commits/deadbeef/pulls")));
+        // The fake answered every connection this exchange needed: any
+        // failure above is about what GitHub said, not about the harness
+        // losing a socket (OBI-351).
+        server.assert_healthy();
     }
 
     #[test]
@@ -788,6 +815,10 @@ mod tests {
             !hit_pulls_api,
             "squash subject must resolve without a commits-to-pulls call"
         );
+        // The fake answered every connection this exchange needed: any
+        // failure above is about what GitHub said, not about the harness
+        // losing a socket (OBI-351).
+        server.assert_healthy();
     }
 
     #[test]
@@ -817,6 +848,10 @@ mod tests {
             !hit_pulls_api,
             "merge-commit subject must resolve without a commits-to-pulls call"
         );
+        // The fake answered every connection this exchange needed: any
+        // failure above is about what GitHub said, not about the harness
+        // losing a socket (OBI-351).
+        server.assert_healthy();
     }
 
     #[test]
@@ -852,6 +887,10 @@ mod tests {
             far_future_deadline(),
         );
         assert!(results.is_empty());
+        // The fake answered every connection this exchange needed: any
+        // failure above is about what GitHub said, not about the harness
+        // losing a socket (OBI-351).
+        server.assert_healthy();
     }
 
     #[test]
@@ -975,6 +1014,10 @@ mod tests {
             .filter(|(p, _)| p.contains("/issues/10/comments"))
             .count();
         assert_eq!(comment_calls, 1);
+        // The fake answered every connection this exchange needed: any
+        // failure above is about what GitHub said, not about the harness
+        // losing a socket (OBI-351).
+        server.assert_healthy();
     }
 
     #[test]
@@ -1005,6 +1048,10 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, 55);
         assert!(results[0].1.is_err());
+        // The fake answered every connection this exchange needed: any
+        // failure above is about what GitHub said, not about the harness
+        // losing a socket (OBI-351).
+        server.assert_healthy();
     }
 
     #[test]
@@ -1047,6 +1094,10 @@ mod tests {
             far_future_deadline(),
         );
         assert!(results.is_empty());
+        // The fake answered every connection this exchange needed: any
+        // failure above is about what GitHub said, not about the harness
+        // losing a socket (OBI-351).
+        server.assert_healthy();
     }
 
     #[test]
@@ -1080,5 +1131,70 @@ mod tests {
             far_future_deadline(),
         );
         assert_eq!(results.len(), MAX_UNIQUE_PRS);
+        // The fake answered every connection this exchange needed: any
+        // failure above is about what GitHub said, not about the harness
+        // losing a socket (OBI-351).
+        server.assert_healthy();
+    }
+
+    /// Reporting is the multi-call path in this crate: one client, several
+    /// requests in a row (mint a token, resolve each commit's PR, comment).
+    /// With the old serial accept loop (OBI-351) one connection the fake had
+    /// given up on was enough to make *every call after it* come back as
+    /// `Transport`, so a report failed for a reason that had nothing to do with
+    /// GitHub. Nothing here sleeps against a timeout: the parked connection is
+    /// confirmed by the fake's own handler before the report is attempted.
+    #[test]
+    fn a_report_is_resolved_while_another_connection_is_held() {
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let gate = Arc::new(fake_server::Gate::default());
+        let held_by_handler = gate.clone();
+        let server = spawn_fake_github(move |_method: &str, path: &str, _body: &str| {
+            if path == "/parked" {
+                let _ = entered_tx.send(());
+                held_by_handler.wait_for_open();
+                return (204, String::new());
+            }
+            if path.contains("access_tokens") {
+                token_resp()
+            } else if path.ends_with("/pulls") {
+                (200, r#"[{"number":99}]"#.to_string())
+            } else {
+                (404, "{}".to_string())
+            }
+        });
+        let app = client(&server);
+
+        let mut parked = fake_server::connect(server.addr(), fake_server::CLIENT_PATIENCE);
+        parked
+            .write_all(fake_server::get_request("/parked").as_bytes())
+            .unwrap();
+        parked.flush().unwrap();
+        entered_rx
+            .recv_timeout(fake_server::HOLD_RENDEZVOUS)
+            .expect("the fake never started serving the connection it accepted");
+
+        let commits = vec![MergedCommit {
+            sha: "deadbeef".to_string(),
+            subject: "Rebased commit, no PR marker".to_string(),
+        }];
+        let resolved =
+            resolve_pull_requests(&app, "LoomMud", "loom", &commits, far_future_deadline());
+
+        gate.open();
+        let mut parked_response = String::new();
+        parked.read_to_string(&mut parked_response).unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].pr_number,
+            Some(99),
+            "a held connection must not change what the report resolves to"
+        );
+        assert!(
+            parked_response.contains("204"),
+            "the parked connection should be answered on release: {parked_response:?}"
+        );
+        server.assert_healthy();
     }
 }
