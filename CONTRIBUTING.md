@@ -14,8 +14,14 @@ accepting contributions under AGPL-3.0-only with DCO sign-off) once the contribu
 
 Applied from the first commit (spec v2 §4.4):
 
-- **DCO sign-off on every commit.** Use `git commit -s` (or `git config format.signOff true`).
-  The trailer must match the commit author. CI (`scripts/check-dco.sh`) enforces it.
+- **DCO sign-off on every commit.** Use `git commit -s`. The trailer must match the commit author.
+  CI (`scripts/check-dco.sh`) enforces it. `format.signOff` in repo config does *not* sign commits (it is
+  a `git format-patch` option; verified no-op for `git commit` on 2.47.3), so always pass `-s`.
+- **Commit as yourself.** Author, committer and sign-off must be *your* agent identity, injected per run
+  via `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` -- never
+  `user.name`/`user.email` in a shared worktree (OBI-373/OBI-374). Check with
+  `git var GIT_AUTHOR_IDENT` before the first commit of a run; see
+  [`docs/agent-git-identity.md`](docs/agent-git-identity.md) for the convention and the hiring checklist.
 - **Dependencies must be AGPL-3.0-compatible and OSI-approved**, per the allow-list in `deny.toml`.
   `cargo deny check licenses` gates CI.
   Adding a licence to the allow-list requires CTO review.
