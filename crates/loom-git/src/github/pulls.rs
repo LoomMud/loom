@@ -95,9 +95,8 @@ impl<C: HttpClient> PullRequestOpener for GitHubAppClient<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github::UreqClient;
     use crate::github::fake_http;
-    use std::net::TcpListener;
+    use crate::github::fake_server;
     use std::sync::{Arc, Mutex};
 
     // Shared throwaway test fixture (see `jwt`'s test module docs): not a
@@ -106,49 +105,58 @@ mod tests {
         include_str!("testdata/test_key.pkcs8.pem").to_string()
     }
 
-    /// Spawns a fake GitHub server that answers the installation-token
-    /// mint on `/app/installations/...` and the PR-create call on
-    /// `/repos/.../pulls`, recording the request bodies it sees.
-    ///
-    /// Requests are read and closed through [`fake_http`], the same
-    /// complete-request path every other loopback GitHub server in this
-    /// crate uses (OBI-350).
-    fn spawn_fake_github() -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
+    /// The fake GitHub this crate's PR tests talk to: `fake_server`'s
+    /// per-connection fake (OBI-351), answering the installation-token mint on
+    /// `/app/installations/...` and the PR create on `/repos/.../pulls`, and
+    /// recording `<path>\n<body>` for every request it served.
+    struct FakeGitHub {
+        server: fake_server::FakeHttpServer,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeGitHub {
+        fn api_base(&self) -> String {
+            self.server.api_base()
+        }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// Assert the fake answered every connection it accepted, so a red
+        /// assertion below can only mean a product bug (OBI-351).
+        fn assert_healthy(&self) {
+            self.server.assert_healthy();
+        }
+    }
+
+    fn spawn_fake_github() -> FakeGitHub {
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let seen_clone = seen.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let mut stream = match stream {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                let Some(req) = fake_http::read_request(&mut stream) else {
-                    continue;
-                };
-                seen_clone
+        let seen_in_handler = seen.clone();
+        let server = fake_server::FakeHttpServer::spawn(
+            move |_call: usize, request: fake_http::FakeRequest| {
+                seen_in_handler
                     .lock()
                     .unwrap()
-                    .push(format!("{}\n{}", req.path, req.body));
-                let resp_body = if req.path.contains("access_tokens") {
+                    .push(format!("{}\n{}", request.path, request.body));
+                let resp_body = if request.path.contains("access_tokens") {
                     r#"{"token":"ghs_abc","expires_at":"2099-01-01T00:00:00Z"}"#.to_string()
                 } else {
                     r#"{"number":42,"html_url":"https://github.com/LoomMud/warp/pull/42"}"#
                         .to_string()
                 };
-                fake_http::respond(&mut stream, 201, &resp_body);
-            }
-        });
-        (addr, seen)
+                (201, resp_body)
+            },
+        );
+        FakeGitHub { server, seen }
     }
 
     #[test]
     fn opens_pull_request_against_main() {
-        let (addr, seen) = spawn_fake_github();
-        let app = GitHubAppClient::new("1", "2", &test_pem(), UreqClient::default())
+        let server = spawn_fake_github();
+        let app = GitHubAppClient::new("1", "2", &test_pem(), fake_server::test_transport())
             .unwrap()
-            .with_api_base(format!("http://{addr}"));
+            .with_api_base(server.api_base());
         let pr = app
             .create_pull_request(
                 "LoomMud",
@@ -161,7 +169,7 @@ mod tests {
             .unwrap();
         assert_eq!(pr.number, 42);
         assert_eq!(pr.html_url, "https://github.com/LoomMud/warp/pull/42");
-        let seen = seen.lock().unwrap();
+        let seen = server.seen();
         let pulls_req = seen
             .iter()
             .find(|r| r.contains("/repos/LoomMud/warp/pulls"))
@@ -169,22 +177,14 @@ mod tests {
         assert!(pulls_req.contains("\"head\":\"propose/glorfindel/20260101-fix\""));
         assert!(pulls_req.contains("\"base\":\"main\""));
         assert!(pulls_req.contains("\"title\":\"Fix the thing\""));
+        server.assert_healthy();
     }
 
     #[test]
     fn non_2xx_pull_create_is_a_clear_error() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let mut stream = match stream {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                let Some(req) = fake_http::read_request(&mut stream) else {
-                    continue;
-                };
-                let (status, body) = if req.path.contains("access_tokens") {
+        let server =
+            fake_server::FakeHttpServer::spawn(|_call: usize, request: fake_http::FakeRequest| {
+                let (status, body) = if request.path.contains("access_tokens") {
                     (
                         201,
                         r#"{"token":"ghs_abc","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
@@ -192,12 +192,11 @@ mod tests {
                 } else {
                     (422, r#"{"message":"Validation Failed"}"#.to_string())
                 };
-                fake_http::respond(&mut stream, status, &body);
-            }
-        });
-        let app = GitHubAppClient::new("1", "2", &test_pem(), UreqClient::default())
+                (status, body)
+            });
+        let app = GitHubAppClient::new("1", "2", &test_pem(), fake_server::test_transport())
             .unwrap()
-            .with_api_base(format!("http://{addr}"));
+            .with_api_base(server.api_base());
         let err = app
             .create_pull_request("LoomMud", "warp", "propose/x/y", "main", "t", "b")
             .unwrap_err();
@@ -208,5 +207,8 @@ mod tests {
             }
             other => panic!("expected Api error, got {other:?}"),
         }
+        // A `422` is an answer. Whatever else this test concludes, it must not
+        // have been handed a closed socket dressed up as a parse failure.
+        server.assert_healthy();
     }
 }

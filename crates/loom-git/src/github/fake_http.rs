@@ -30,10 +30,17 @@ use std::net::{Shutdown, TcpStream};
 use std::time::Duration;
 
 /// How long to wait for the next segment of a request before giving up on
-/// that connection. Long enough for a deliberate two-segment client, and
-/// short enough that a stalled one costs the accept loop a pause rather
-/// than the whole test run.
-const READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// that connection.
+///
+/// This is patience the *fake* owes a client whose request is still in
+/// flight. Under the old single-threaded accept loop it was also a tax every
+/// other connection paid -- a stalled client cost the whole suite this much
+/// queue time -- which is why it was 2 s. It is now per connection
+/// ([`crate::github::fake_server`], OBI-351), so an honest two-segment POST
+/// (headers, then a body the scheduler has not handed over yet) is never
+/// answered as if it were malformed, and a stalled client costs only its own
+/// connection.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long to wait for the client's remaining bytes / FIN after the
 /// response has been written.
@@ -60,13 +67,23 @@ pub struct FakeRequest {
     pub body: String,
 }
 
-/// Read one complete request off `stream`.
+/// Read one complete request off `stream`, with the default patience
+/// ([`READ_TIMEOUT`]).
 ///
-/// Returns `None` if the client hangs up, stalls past [`READ_TIMEOUT`], or
-/// exceeds [`MAX_BYTES`] before the request is complete -- the caller
-/// drops that connection and keeps serving.
+/// Returns `None` if the client hangs up, stalls past the patience window,
+/// or exceeds [`MAX_BYTES`] before the request is complete. A caller that
+/// stops reading here still owes the client an answer -- see
+/// [`crate::github::fake_server::FakeHttpServer`] (OBI-351), which answers
+/// `400` and records the drop instead of closing in silence.
 pub fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
-    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    read_request_within(stream, READ_TIMEOUT)
+}
+
+/// [`read_request`] with an explicit patience window, for the tests that
+/// need to watch the fake give up on a stalled client without waiting out
+/// [`READ_TIMEOUT`] (a test that races a constant is a coin flip).
+pub fn read_request_within(stream: &mut TcpStream, patience: Duration) -> Option<FakeRequest> {
+    let _ = stream.set_read_timeout(Some(patience));
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
 
@@ -187,10 +204,17 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
-    /// A listener that reads one request per connection and records what
-    /// the reader returned, so the reader can be tested directly (with no
+    /// A listener that reads one request per connection and records what the
+    /// reader returned, so the reader can be tested directly (with no
     /// `GitHubAppClient` in the way).
-    fn spawn_recorder() -> (String, Arc<Mutex<Vec<Option<FakeRequest>>>>) {
+    ///
+    /// `patience` is the reader's own deadline: `None` means the fake's normal
+    /// patience ([`read_request`], the wrapper every real fake server runs),
+    /// and the one test that proves the reader *gives up* passes a window of its
+    /// own so it neither waits 10 s nor hopes.
+    fn spawn_recorder(
+        patience: Option<Duration>,
+    ) -> (String, Arc<Mutex<Vec<Option<FakeRequest>>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let served: Arc<Mutex<Vec<Option<FakeRequest>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -201,7 +225,10 @@ mod tests {
                     Ok(s) => s,
                     Err(_) => break,
                 };
-                let req = read_request(&mut stream);
+                let req = match patience {
+                    Some(patience) => read_request_within(&mut stream, patience),
+                    None => read_request(&mut stream),
+                };
                 let body = req
                     .as_ref()
                     .map(|r| format!("path={} body={}", r.path, r.body))
@@ -234,7 +261,7 @@ mod tests {
 
     #[test]
     fn reader_waits_for_a_body_that_arrives_as_a_second_segment() {
-        let (addr, served) = spawn_recorder();
+        let (addr, served) = spawn_recorder(None);
         let mut stream = connect(&addr);
         stream
             .write_all(b"POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\n")
@@ -262,7 +289,7 @@ mod tests {
 
     #[test]
     fn reader_serves_a_request_split_across_three_segments() {
-        let (addr, served) = spawn_recorder();
+        let (addr, served) = spawn_recorder(None);
         let mut stream = connect(&addr);
         for part in [
             "POST /repos/a/b/pulls HTTP/1.1\r\nContent-Length: 17\r\n",
@@ -280,7 +307,7 @@ mod tests {
 
     #[test]
     fn reader_treats_a_get_with_no_body_as_complete() {
-        let (addr, served) = spawn_recorder();
+        let (addr, served) = spawn_recorder(None);
         let mut stream = connect(&addr);
         stream.write_all(b"GET /y HTTP/1.1\r\n\r\n").unwrap();
         stream.flush().unwrap();
@@ -295,13 +322,16 @@ mod tests {
     #[test]
     fn reader_gives_up_on_a_client_that_never_finishes_the_headers() {
         // The bound is the point: a client that sends no `\r\n\r\n` must
-        // not keep the fake reading forever.
-        let (addr, served) = spawn_recorder();
+        // not keep the fake reading forever. The fake's patience is set
+        // *here*, and the deadline below is that patience plus a wide
+        // margin, so the test measures the bound instead of racing it.
+        const PATIENCE: Duration = Duration::from_millis(200);
+        let (addr, served) = spawn_recorder(Some(PATIENCE));
         let mut stream = connect(&addr);
         stream.write_all(b"GET /z HTTP/1.1\r\n").unwrap();
         stream.flush().unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + PATIENCE + Duration::from_secs(5);
         while served.lock().unwrap().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,

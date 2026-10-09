@@ -20,10 +20,14 @@ pub mod pulls;
 pub mod tls_transport;
 pub mod transport;
 
-/// Shared complete-request fake HTTP server used by this crate's loopback
-/// GitHub tests (OBI-350).
+/// The fake HTTP **reader**: how a fake reads one complete request and how it
+/// answers one (OBI-350).
 #[cfg(test)]
 pub(crate) mod fake_http;
+/// The fake HTTP **server**: who reads and answers, one connection per thread,
+/// and no accepted connection left unanswered (OBI-351).
+#[cfg(test)]
+pub(crate) mod fake_server;
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -235,8 +239,9 @@ impl<C: HttpClient> TokenProvider for GitHubAppClient<C> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::net::TcpStream;
+    use std::sync::Arc;
+    use std::sync::mpsc;
 
     // Shared throwaway test fixture (see `jwt`'s test module docs): not a
     // real GitHub App key, just something `load_private_key` accepts.
@@ -244,66 +249,76 @@ mod tests {
         include_str!("testdata/test_key.pkcs8.pem").to_string()
     }
 
-    /// A tiny fake GitHub `/app/installations/.../access_tokens` server:
-    /// one TCP accept loop, canned JSON responses driven by a closure so
-    /// each test controls status/body/expiry without a real mock-server
-    /// dependency.
+    /// The test's fake GitHub: `fake_server`'s per-connection fake, answering
+    /// whatever this test said it would.
     ///
-    /// Every request is served **complete** -- headers and body -- by
-    /// [`fake_http::read_request`], and every connection is closed the way
-    /// a real server closes one (`fake_http::respond`). Both halves are
-    /// what keep `unparseable_body_is_a_clear_error` honest about the
-    /// difference between a bad payload and a broken connection (OBI-350).
+    /// OBI-351 retired the hand-rolled accept loop that lived here. It served
+    /// one connection at a time and, when a read failed, answered that
+    /// connection with *nothing* (`Err(_) => continue`): the client's socket
+    /// closed, `ureq` reported an io error, `GitHubAppClient` mapped any io
+    /// error to [`GitHubAppError::Transport`], and a test about *response
+    /// parsing* went red as if parsing were broken. The wrapper stays because
+    /// these tests assert on the harness's own record of what it served.
     struct FakeGitHub {
-        addr: String,
-        requests: std::sync::Arc<AtomicUsize>,
-        /// The full text of every request the fake actually served, in
-        /// order. Tests assert on this to prove the fake saw the whole
-        /// request (headers *and* body), not just the first TCP segment.
-        served: std::sync::Arc<Mutex<Vec<String>>>,
+        server: fake_server::FakeHttpServer,
     }
 
     impl FakeGitHub {
+        fn addr(&self) -> &str {
+            self.server.addr()
+        }
+
+        /// The full text of every request the fake served, in the order it
+        /// served them -- headers *and* body, because each was read by
+        /// [`fake_http::read_request`].
         fn served_requests(&self) -> Vec<String> {
-            self.served.lock().unwrap().clone()
+            self.server.served_requests()
+        }
+
+        /// How many requests reached the handler. Replaces the counter this
+        /// module used to keep by hand, which its serial accept loop could only
+        /// ever fill one connection at a time.
+        fn request_count(&self) -> usize {
+            self.server.request_count()
+        }
+
+        /// Connections the fake accepted and could not serve as GitHub
+        /// requests, each with the reason. Always empty in a healthy run.
+        fn dropped_connections(&self) -> Vec<fake_server::DropRecord> {
+            self.server.dropped_connections()
+        }
+
+        /// Assert the fake answered every connection it accepted. A test that
+        /// fails here found a harness bug; one that fails anywhere else found a
+        /// product one.
+        fn assert_healthy(&self) {
+            self.server.assert_healthy();
         }
     }
 
+    /// Spawn a fake whose `respond` decides each answer from the call number
+    /// and the request path.
     fn spawn_fake_github(
-        mut respond: impl FnMut(usize, &str) -> (u16, String) + Send + 'static,
+        respond: impl Fn(usize, &str) -> (u16, String) + Send + Sync + 'static,
     ) -> FakeGitHub {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let requests = std::sync::Arc::new(AtomicUsize::new(0));
-        let requests_clone = requests.clone();
-        let served = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let served_clone = served.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let mut stream = match stream {
-                    Ok(s) => s,
-                    Err(_) => break,
-                };
-                let Some(req) = fake_http::read_request(&mut stream) else {
-                    continue;
-                };
-                served_clone.lock().unwrap().push(req.raw.clone());
-                let call_index = requests_clone.fetch_add(1, Ordering::SeqCst);
-                let (status, body) = respond(call_index, &req.path);
-                fake_http::respond(&mut stream, status, &body);
-            }
-        });
         FakeGitHub {
-            addr,
-            requests,
-            served,
+            server: fake_server::FakeHttpServer::spawn(
+                move |call: usize, request: fake_http::FakeRequest| respond(call, &request.path),
+            ),
         }
     }
 
     fn client(server: &FakeGitHub) -> GitHubAppClient<UreqClient> {
-        GitHubAppClient::new("123", "456", &test_pem(), UreqClient::default())
+        // The fake is real HTTP/1.1, so every header parse, body read and JSON
+        // decode below is the *production* code path. The transport gets the
+        // harness budget rather than the product's 10 s: the fake has already
+        // been proven to answer (the readiness barrier in
+        // `fake_server::FakeHttpServer::spawn`), so what is left of the budget
+        // is for the call under test, not for waiting the harness into
+        // existence (OBI-351).
+        GitHubAppClient::new("123", "456", &test_pem(), fake_server::test_transport())
             .unwrap()
-            .with_api_base(format!("http://{}", server.addr))
+            .with_api_base(format!("http://{}", server.addr()))
     }
 
     #[test]
@@ -320,7 +335,8 @@ mod tests {
         assert_eq!(t1, "ghs_abc");
         assert_eq!(t2, "ghs_abc");
         // Second call used the cache: only one HTTP round trip.
-        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(server.request_count(), 1);
+        server.assert_healthy();
     }
 
     #[test]
@@ -369,7 +385,8 @@ mod tests {
         // Still "now" (4 min < 5 min skew left): must remint, not reuse.
         let t2 = app.installation_token().unwrap();
         assert_eq!(t2, "ghs_fresh");
-        assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+        assert_eq!(server.request_count(), 2);
+        server.assert_healthy();
     }
 
     #[test]
@@ -393,7 +410,8 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(app.installation_token().unwrap(), "ghs_hour");
         }
-        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(server.request_count(), 1);
+        server.assert_healthy();
     }
 
     #[test]
@@ -415,10 +433,94 @@ mod tests {
     fn unparseable_body_is_a_clear_error() {
         let server = spawn_fake_github(|_, _| (201, "not json".to_string()));
         let app = client(&server);
-        assert!(matches!(
-            app.installation_token().unwrap_err(),
-            GitHubAppError::BadResponse(_)
-        ));
+        let err = app.installation_token().unwrap_err();
+        // Loud on purpose, and the harness is part of the report. This used to
+        // be `assert!(matches!(...))`, which swallowed *whatever* came back --
+        // so when the old serial fake dropped the connection, the run said
+        // "not a BadResponse" about a test that had proved the parser worked,
+        // and the actual `Transport` error was never shown (OBI-351).
+        match err {
+            // The body was unparseable and the status was 2xx: the only way to
+            // this variant is a response the fake really did send.
+            GitHubAppError::BadResponse(message) => {
+                assert!(!message.is_empty(), "a parse failure always says why");
+            }
+            other => panic!(
+                "expected BadResponse for an unparseable 201 body, got {other:?}; the fake served \
+                 {:?} and dropped {:?}",
+                server.served_requests(),
+                server.dropped_connections()
+            ),
+        }
+        assert_eq!(
+            server.request_count(),
+            1,
+            "the request under test must have reached the fake"
+        );
+        server.assert_healthy();
+    }
+
+    /// The product-level form of the OBI-351 flake: two connections open
+    /// against one fake, and the one the client measures must be answered no
+    /// matter what the other is doing.
+    ///
+    /// Under the old serial accept loop the parked connection held the whole
+    /// fake, so the client's POST either waited out its absolute 10 s budget or
+    /// was closed without an answer -- both of which `GitHubAppClient` reports
+    /// as `Transport`. Nothing here sleeps against a timeout: the test waits for
+    /// the fake to *report* that it is holding the first connection, then asks
+    /// the client a question it can only answer if connections are served
+    /// concurrently.
+    #[test]
+    fn an_installation_token_is_minted_while_another_connection_is_held() {
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let gate = Arc::new(fake_server::Gate::default());
+        let held_by_handler = gate.clone();
+        let server = spawn_fake_github(move |call, path| {
+            if path == "/held" {
+                let _ = entered_tx.send(());
+                held_by_handler.wait_for_open();
+                return (204, String::new());
+            }
+            let _ = (call,);
+            (
+                201,
+                r#"{"token":"ghs_concurrent","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
+            )
+        });
+        let app = client(&server);
+
+        let mut parked = TcpStream::connect(server.addr()).unwrap();
+        parked
+            .set_read_timeout(Some(fake_server::CLIENT_PATIENCE))
+            .unwrap();
+        parked
+            .write_all(fake_server::get_request("/held").as_bytes())
+            .unwrap();
+        parked.flush().unwrap();
+        entered_rx
+            .recv_timeout(fake_server::HOLD_RENDEZVOUS)
+            .expect("the fake never started serving the connection it accepted");
+
+        // The measured call, while that connection is still parked.
+        let token = app
+            .installation_token()
+            .expect("a held connection must not stop the fake from answering");
+        assert_eq!(token, "ghs_concurrent");
+
+        gate.open();
+        let mut held_response = String::new();
+        parked.read_to_string(&mut held_response).unwrap();
+        assert!(
+            held_response.contains("204"),
+            "the held connection should get its answer on release: {held_response:?}"
+        );
+        assert_eq!(
+            server.request_count(),
+            2,
+            "the client's mint and the parked request are two served requests"
+        );
+        server.assert_healthy();
     }
 
     /// Deterministic reproduction of the CI-only `unparseable_body` flake
@@ -442,7 +544,7 @@ mod tests {
                 r#"{"token":"ghs_segmented","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
             )
         });
-        let mut stream = TcpStream::connect(&server.addr).unwrap();
+        let mut stream = TcpStream::connect(server.addr()).unwrap();
         // `TCP_NODELAY` keeps the two writes in two segments (no Nagle
         // coalescing), and the read bound means a fake that never finishes
         // the exchange fails the assertions below instead of hanging CI.
@@ -491,6 +593,7 @@ mod tests {
             response.contains(r#""token":"ghs_segmented""#),
             "response was {response:?}"
         );
+        server.assert_healthy();
     }
 
     #[test]
@@ -501,9 +604,9 @@ mod tests {
                 r#"{"token":"ghs_ok","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
             )
         });
-        let app = GitHubAppClient::new("99", "11", &test_pem(), UreqClient::default())
+        let app = GitHubAppClient::new("99", "11", &test_pem(), fake_server::test_transport())
             .unwrap()
-            .with_api_base(format!("http://{}", server.addr));
+            .with_api_base(format!("http://{}", server.addr()));
         app.installation_token().unwrap();
 
         // The shared fake records the request it served, so this test gets
