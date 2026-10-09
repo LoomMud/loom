@@ -274,6 +274,32 @@ pub fn dir_size_bytes(root: &Path, dir: &str) -> Result<u64, String> {
     Ok(total)
 }
 
+/// Make the driver's *own* save root exist before the first save
+/// (OBI-324). `write_file_atomic`'s confinement check canonicalizes its
+/// `root`, and `std::fs::canonicalize` fails with `ENOENT` for a directory
+/// that does not exist yet -- a check that runs *before* the `create_dir_all`
+/// which would have created it. So against a save root nobody ever made (a
+/// fresh checkout, a container whose volume was never mounted), **every**
+/// `save_object` failed the same way and could never repair itself: player
+/// state silently never persisted, one `/std/player` runtime error per
+/// autosave.
+///
+/// This belongs to the driver rather than to the mudlib: the save root is
+/// driver state (spec §8.5 -- never a path a builder chooses), so the driver
+/// creates it on first use instead of depending on an operator `mkdir`. A
+/// failure is still returned, not swallowed: it means the save root
+/// genuinely cannot be created (read-only mount, `EACCES`), which is exactly
+/// the case the caller wants to surface as a save error.
+///
+/// `is_dir` first so the common (already-created) case costs one stat, not a
+/// `mkdir` that has to fail with `EEXIST`.
+pub fn ensure_save_root(root: &Path) -> Result<(), String> {
+    if root.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))
+}
+
 /// `write_file()`: only `.wf`/`.txt` suffixes are allowed; parent
 /// directories are created under the root as needed.
 pub fn write_file(root: &Path, path: &str, text: &str) -> Result<bool, String> {
@@ -639,6 +665,45 @@ mod tests {
             Some("corrupted half-written save".to_string())
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// OBI-324 regression: a save root that does not exist yet must not
+    /// stay unwritable. `confine_canonical` canonicalizes its `root`, and
+    /// `canonicalize` is `ENOENT` for a missing directory -- a check that
+    /// runs *before* the `create_dir_all` of the save file's parent, so
+    /// under a never-created root every save failed the same way and could
+    /// never repair itself (this is what made one `/std/player` runtime
+    /// error per player in `loadtest-e1-1`). `ensure_save_root` is the
+    /// driver-side step `save_object` now runs first.
+    #[test]
+    fn a_save_root_that_does_not_exist_yet_becomes_writable_after_ensuring() {
+        let parent = tmp_root("save-root-missing");
+        let root = parent.join("saves");
+        assert!(!root.exists());
+        let err = write_file_atomic(&root, "/players/bob.o", "{}").unwrap_err();
+        assert!(
+            err.contains("No such file") || err.contains("os error 2"),
+            "the pre-fix failure must be the missing-root canonicalize, got {err}"
+        );
+
+        ensure_save_root(&root).expect("the driver creates its own save root");
+        assert!(root.is_dir());
+        // Idempotent (the hot path: every later save re-checks it).
+        ensure_save_root(&root).expect("ensure is idempotent");
+        assert!(write_file_atomic(&root, "/players/bob.o", "{}").unwrap());
+        assert_eq!(
+            read_file(&root, "/players/bob.o").unwrap(),
+            Some("{}".to_string())
+        );
+
+        // A nested root is created in one call, and a root that genuinely
+        // cannot be created is an error, never a swallowed one.
+        let nested = parent.join("a/b/c");
+        ensure_save_root(&nested).expect("nested create");
+        assert!(nested.is_dir());
+        std::fs::write(parent.join("blocked"), b"x").unwrap();
+        assert!(ensure_save_root(&parent.join("blocked/saves")).is_err());
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     /// CTO review (OBI-171, PR #75, must-fix 3/4): `stage_write` must

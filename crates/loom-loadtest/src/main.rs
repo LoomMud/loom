@@ -42,6 +42,16 @@ use server_metrics::ServerRow;
 /// to keep a committed report readable.
 const TAIL_SAMPLES_IN_REPORT: usize = 20;
 
+/// OBI-324: how long to let the server settle before scraping `/metrics`.
+/// A bot's `quit` is fire-and-forget from the harness's side, and the
+/// autosave it triggers runs later on the world thread -- so a scrape issued
+/// the instant the last bot handle resolves can land *before* the errors it
+/// exists to gate on have been recorded, and read as a clean run. Measured
+/// on the pre-fix driver: 0 errors at scrape, 3 (one per player) 3 s later.
+/// Two seconds covers the full 150-player teardown on the CI runner; the
+/// wait is bounded and only taken when a `--metrics-url` was given.
+const METRICS_SETTLE: Duration = Duration::from_secs(2);
+
 struct Args {
     addr: String,
     mix_path: PathBuf,
@@ -55,6 +65,9 @@ struct Args {
     out_prefix: PathBuf,
     sla_p99_ms: f64,
     fail_on_sla_miss: bool,
+    /// OBI-324: exit non-zero when the server recorded any uncaught Weft
+    /// error during the run (`loom_runtime_errors_total`).
+    fail_on_runtime_errors: bool,
     password: String,
     class: String,
     seed: u64,
@@ -85,6 +98,7 @@ impl Args {
         let mut out_prefix = PathBuf::from("results/run");
         let mut sla_p99_ms = 50.0_f64;
         let mut fail_on_sla_miss = false;
+        let mut fail_on_runtime_errors = false;
         let mut password = "loadtest-pass".to_string();
         let mut class = "warrior".to_string();
         let mut seed = 0_u64;
@@ -127,6 +141,7 @@ impl Args {
                 "--out" => out_prefix = PathBuf::from(val!()),
                 "--sla-p99-ms" => sla_p99_ms = val!().parse().map_err(|_| "bad --sla-p99-ms")?,
                 "--fail-on-sla-miss" => fail_on_sla_miss = true,
+                "--fail-on-runtime-errors" => fail_on_runtime_errors = true,
                 "--password" => password = val!(),
                 "--class" => class = val!(),
                 "--seed" => seed = val!().parse().map_err(|_| "bad --seed")?,
@@ -164,6 +179,7 @@ impl Args {
             out_prefix,
             sla_p99_ms,
             fail_on_sla_miss,
+            fail_on_runtime_errors,
             password,
             class,
             seed,
@@ -192,6 +208,7 @@ fn print_help() {
          \x20 --out results/run             Output path prefix (.json, .md)\n\
          \x20 --sla-p99-ms 50               E1.1 threshold\n\
          \x20 --fail-on-sla-miss            Exit 1 if p99 exceeds the SLA\n\
+         \x20 --fail-on-runtime-errors      Exit 1 if the server logged an uncaught Weft error\n\
          \x20 --password <s>                 Account password for every bot\n\
          \x20 --class warrior               Character class on creation\n\
          \x20 --seed 0                        RNG seed (0 = time-based)\n\
@@ -466,6 +483,7 @@ async fn run(args: Args) -> Result<(), String> {
     }
 
     let server_metrics = if let Some(url) = &args.metrics_url {
+        tokio::time::sleep(METRICS_SETTLE).await;
         match metrics_scrape::scrape(url).await {
             Ok(text) => Some(text),
             Err(e) => {
@@ -476,6 +494,57 @@ async fn run(args: Args) -> Result<(), String> {
     } else {
         None
     };
+
+    // OBI-324: an uncaught Weft error in a live object is invisible in the
+    // latency numbers above -- a command that throws still "completes" fast.
+    // `std/player`'s autosave-on-disconnect produced exactly one per player
+    // for the whole of E1.1 without a single number here moving. Surface it
+    // in every report, and let `--fail-on-runtime-errors` gate on it.
+    let runtime_errors = server_metrics
+        .as_deref()
+        .map(metrics_scrape::runtime_errors)
+        .unwrap_or_default();
+    let runtime_error_total: u64 = runtime_errors.iter().map(|(_, n)| n).sum();
+    // `loom_runtime_errors_total` is cumulative, so the settled end-of-run
+    // scrape is the authority: the disconnect backlog lands after the last
+    // in-run sample. If that scrape failed, the last in-run counter is still
+    // worth gating on -- as a *floor*, because it predates the teardown --
+    // and only when there is no number at all is the count unmeasured, which
+    // is not the same claim as zero.
+    let in_run_errors = server_rows
+        .last()
+        .and_then(|r| r.counters.runtime_errors)
+        .map(|v| v.max(0.0).ceil() as u64);
+    let gate_errors: Option<u64> = if server_metrics.is_some() {
+        Some(runtime_error_total)
+    } else {
+        in_run_errors
+    };
+    match gate_errors {
+        Some(0) => {}
+        Some(total) if server_metrics.is_some() => {
+            let detail = runtime_errors
+                .iter()
+                .map(|(program, n)| format!("{program}: {n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            notes.push(format!(
+                "{total} server-side runtime error(s) during the run ({detail}) -- \
+                 uncaught Weft errors, read them with the `errors` efun or /api/v1/admin/errors"
+            ));
+        }
+        Some(total) => notes.push(format!(
+            "{total} server-side runtime error(s) as of the last in-run `/metrics` scrape; \
+             the end-of-run scrape failed, so errors recorded during teardown are not counted \
+             here (this number is a floor, not a total)"
+        )),
+        None if args.metrics_url.is_some() => notes.push(
+            "runtime-error count is UNKNOWN: no `/metrics` scrape succeeded, so this run cannot \
+             assert zero server-side errors"
+                .to_string(),
+        ),
+        None => {}
+    }
 
     let report = RunReport {
         players: args.players,
@@ -499,6 +568,7 @@ async fn run(args: Args) -> Result<(), String> {
         server_timeline: server_rows,
         server_instrumented,
         bot_timer_lag: LatencyReport::from_samples(&bot_lag),
+        runtime_errors,
         server_metrics,
     };
 
@@ -524,6 +594,26 @@ async fn run(args: Args) -> Result<(), String> {
             "p99 did not meet the {:.0} ms SLA",
             args.sla_p99_ms
         ));
+    }
+    if args.fail_on_runtime_errors {
+        match gate_errors {
+            Some(0) => {}
+            Some(total) => {
+                return Err(format!(
+                    "{total} uncaught Weft error(s) recorded by the server \
+                     (loom_runtime_errors_total)"
+                ));
+            }
+            // A gate that passes on an unknown count is the shape that let
+            // 150 errors per run ride through E1.1 green (OBI-324).
+            None => {
+                return Err(
+                    "runtime-error count is unmeasured: no `/metrics` scrape succeeded, so \
+                     --fail-on-runtime-errors cannot assert zero errors"
+                        .to_string(),
+                );
+            }
+        }
     }
     Ok(())
 }

@@ -244,3 +244,68 @@ fn a_save_from_an_older_program_version_migrates_through_upgrade_on_restore() {
          own create()-time default"
     );
 }
+
+/// OBI-324: one `/std/player` runtime error per player, every
+/// `loadtest-e1-1` run. `std/player`'s `autosave()` ends with a
+/// `save_object`, the driver runs `autosave()` on every disconnect (spec
+/// §8.1), and the loadtest closes all 150 connections before scraping
+/// `/metrics` -- so a save that cannot work at all shows up as exactly
+/// `loom_runtime_errors_total{program="/std/player"} 150`.
+///
+/// It could not work when the save root had never been created:
+/// `write_file_atomic`'s confinement pre-check canonicalizes the *root*,
+/// which is `ENOENT` for a missing directory, and it runs before the
+/// `create_dir_all` that would have made it -- so the failure repeated
+/// forever and no save file was ever written (`loom serve --mudlib warp`
+/// in CI, where nothing creates `saves/`). This is the shape CI has: the
+/// save root's parent exists, the root itself does not.
+#[test]
+fn an_autosave_on_disconnect_into_a_never_created_save_root_errors_nothing() {
+    const AUTOSAVING_PLAYER: &str = r#"
+persistent var hp: int = 100
+
+pub fn logon() {
+    send(self, "ok\n")
+}
+
+pub fn net_dead() {
+}
+
+pub fn autosave() {
+    let saved = save_object("/autosaved")
+}
+
+pub fn process_input(line: string) {
+    send(self, $"{hp}\n")
+}
+"#;
+    let root = fixture("persist");
+    std::fs::write(root.join(PLAYER), AUTOSAVING_PLAYER).unwrap();
+    let save_root = common::scratch("persist-saves-fresh-root").join("saves");
+    assert!(
+        !save_root.exists(),
+        "this test is only a regression if the root starts out missing"
+    );
+    let mut world = World::boot(&root).expect("boot");
+    world.set_save_root(save_root.clone());
+    let mut host = FakeHost::default();
+
+    world.connect(1, &mut host);
+    host.take(1);
+    world.disconnect(1, &mut host);
+
+    assert!(
+        save_root.join("autosaved.o").is_file(),
+        "the disconnect autosave must actually persist under the save root \
+         it just created; root contents: {:?}",
+        std::fs::read_dir(&save_root)
+            .map(|rd| rd.map(|e| e.map(|e| e.path())))
+            .ok()
+    );
+    let errors = world.errors_snapshot(None);
+    assert!(
+        errors.is_empty(),
+        "an autosave into a save root that did not exist yet must not raise \
+         a /std/player runtime error (OBI-324): {errors:?}"
+    );
+}
