@@ -46,7 +46,7 @@
 //!   no HTTP-side ACL (D-TM5).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -142,7 +142,99 @@ impl Drop for SessionGuard {
     }
 }
 
+/// TEST-ONLY (OBI-359): a rendezvous that turns "which of two `/lsp`
+/// sessions reads its first frame first" into a test input instead of a
+/// scheduling accident.
+///
+/// The bug it exists for: `a_ticket_can_only_authenticate_one_session`
+/// opened `first`, sent the ticket, then immediately opened `second` and
+/// sent the *same* ticket, and asserted that `second` is the socket that
+/// gets closed. Nothing in the server orders the two sessions' first-frame
+/// reads -- `run_session` is a fresh task per upgrade -- so whenever the
+/// runtime happened to poll `second`'s task first, `second` was the socket
+/// that redeemed the ticket, `first` was the one refused, and `second` sat
+/// open until the test's 10 s wait expired (`Elapsed`). That is a
+/// test-ordering race, not a replay hole: `WsTicketIssuer::redeem` checks
+/// and records the nonce under one mutex (see
+/// `auth::wsticket::WsTicketIssuer::redeem`, and
+/// `a_concurrent_redeem_of_one_ticket_has_exactly_one_winner`), so at most
+/// one redemption of a ticket can ever succeed.
+///
+/// When a gate is installed, the *first* session to reach
+/// [`Self::before_first_frame`] parks there before reading anything, and
+/// only continues when the test calls [`Self::release`]. Every later
+/// session goes straight through, so a test can let the socket that
+/// arrives later redeem first and still assert the invariant it actually
+/// means: exactly one session ends up authenticated, in whichever order
+/// they came in.
+#[derive(Debug)]
+pub(crate) struct FirstFrameGate {
+    /// `true` once some session has claimed the single hold.
+    claimed: AtomicBool,
+    /// Signalled by the parked session. Durable (`notify_one` keeps a
+    /// permit when nobody is waiting yet), so a test that starts waiting
+    /// after the park still completes.
+    parked: tokio::sync::Notify,
+    /// Zero permits; the test adds one to release the parked session. A
+    /// semaphore rather than a second `Notify` because the parked task may
+    /// sit here long before the test decides to let it go.
+    release: tokio::sync::Semaphore,
+}
+
+/// Built with an empty release semaphore. `Default` is hand-written because
+/// `tokio::sync::Semaphore` has no `Default` of its own.
+impl Default for FirstFrameGate {
+    fn default() -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+            parked: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+impl FirstFrameGate {
+    /// Called by `run_session` immediately before it reads the first frame.
+    /// Returns without doing anything for every session but the first one
+    /// to arrive.
+    async fn before_first_frame(&self) {
+        if self.claimed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.parked.notify_one();
+        // The semaphore is never closed, so `acquire` can only fail on a
+        // misconfigured harness -- a loud test bug, not a product one.
+        let _permit = self
+            .release
+            .acquire()
+            .await
+            .expect("first-frame gate release semaphore is never closed");
+    }
+
+    /// Resolves once a session is parked at the gate.
+    #[cfg(test)]
+    pub(crate) async fn wait_parked(&self) {
+        self.parked.notified().await;
+    }
+
+    /// Let the parked session go.
+    #[cfg(test)]
+    pub(crate) fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
 impl SessionLimiter {
+    /// How many sessions currently hold a cap slot. Test-only view of
+    /// "authenticated" (OBI-359): a slot is taken only *after* the ticket
+    /// redeemed and the connect-time authorization check passed, so a
+    /// count of 1 with two sockets connected is exactly the "exactly one
+    /// session authenticated" invariant.
+    #[cfg(test)]
+    pub(crate) fn active_sessions(&self) -> usize {
+        self.total.load(Ordering::SeqCst)
+    }
+
     fn try_acquire(&self, uid: &str) -> Option<SessionGuard> {
         // Reserve the total slot first; release it immediately if the
         // per-uid cap is what actually refuses, so the two checks can't
@@ -332,6 +424,13 @@ async fn run_session(
     #[derive(Deserialize)]
     struct AuthFrame {
         auth: String,
+    }
+    // TEST-ONLY (OBI-359): park the first session of a gated server before
+    // it reads -- and therefore before it can redeem -- anything. Inert
+    // unless a test installed the gate; `loom-cli` never does, so real
+    // connections go straight to the `recv` below.
+    if let Some(gate) = state.lsp_first_frame_gate() {
+        gate.before_first_frame().await;
     }
     let Ok(Some(Ok(frame))) = tokio::time::timeout(tuning.first_frame_timeout, socket.recv()).await
     else {
@@ -728,7 +827,9 @@ mod tests {
     async fn spawn_lsp_server(
         content: Option<(&'static str, &'static str)>,
     ) -> (std::net::SocketAddr, AuthService, FakeDirectory) {
-        spawn_lsp_server_with_tuning(content, LspTuning::default()).await
+        let (addr, auth, directory, _limiter) =
+            spawn_server(content, LspTuning::default(), None).await;
+        (addr, auth, directory)
     }
 
     /// Same as [`spawn_lsp_server`], but with `/lsp`'s timing constants
@@ -741,6 +842,24 @@ mod tests {
         content: Option<(&'static str, &'static str)>,
         tuning: LspTuning,
     ) -> (std::net::SocketAddr, AuthService, FakeDirectory) {
+        let (addr, auth, directory, _limiter) = spawn_server(content, tuning, None).await;
+        (addr, auth, directory)
+    }
+
+    /// The one server builder: `/lsp`'s timing constants plus, optionally,
+    /// the test-only [`FirstFrameGate`], and it hands back the process'
+    /// session limiter so a test can ask the server itself how many
+    /// sessions authenticated (OBI-359).
+    async fn spawn_server(
+        content: Option<(&'static str, &'static str)>,
+        tuning: LspTuning,
+        gate: Option<std::sync::Arc<FirstFrameGate>>,
+    ) -> (
+        std::net::SocketAddr,
+        AuthService,
+        FakeDirectory,
+        SessionLimiter,
+    ) {
         let (ws_accept_tx, _ws_accept_rx) = tokio::sync::mpsc::channel(1);
         let directory = FakeDirectory::new();
         directory.add_staff("frodo", "hunter2", 1);
@@ -754,12 +873,17 @@ mod tests {
         .with_staff_origins(vec![STAFF_ORIGIN.to_string()])
         .with_file_ops(spawn_fake_world(content))
         .with_lsp_tuning_for_test(tuning);
+        let state = match gate {
+            Some(gate) => state.with_lsp_first_frame_gate_for_test(gate),
+            None => state,
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let limiter = state.lsp_sessions().clone();
         tokio::spawn(async move {
             axum::serve(listener, app(state)).await.unwrap();
         });
-        (addr, auth, directory)
+        (addr, auth, directory, limiter)
     }
 
     fn ws_request(addr: std::net::SocketAddr, origin: Option<&str>) -> axum::http::Request<()> {
@@ -777,6 +901,151 @@ mod tests {
             builder = builder.header("Origin", origin);
         }
         builder.body(()).unwrap()
+    }
+
+    /// A connected `/lsp` test socket.
+    type TestWs = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn connect_staff_socket(addr: std::net::SocketAddr) -> TestWs {
+        tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
+            .await
+            .unwrap()
+            .0
+    }
+
+    async fn send_ticket(ws: &mut TestWs, ticket: &str) {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({ "auth": ticket }).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// The observable sign that the server has already *consumed* this
+    /// socket's ticket: an `initialize` reply. A refused socket never gets
+    /// an LSP server started for it at all
+    /// (`an_invalid_ticket_is_refused_before_any_lsp_server_starts`), so
+    /// this can only answer if the ticket redeemed here (same round trip
+    /// `a_valid_ticket_bridges_a_real_initialize_round_trip` uses).
+    ///
+    /// It replaces the old test's assumption that the socket which *sent*
+    /// first had consumed first (OBI-359).
+    async fn prove_ticket_consumed_by(ws: &mut TestWs, who: &str) {
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({
+                "id": 1,
+                "method": "initialize",
+                "params": { "capabilities": {} },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let next = tokio::time::timeout_at(deadline, ws.next())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{who}: timed out waiting for the initialize reply that proves the ticket was consumed")
+                });
+            match next {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                    let parsed: serde_json::Value = serde_json::from_str(&text)
+                        .unwrap_or_else(|e| panic!("{who}: unparsable reply {text}: {e}"));
+                    if parsed.get("id").and_then(|v| v.as_i64()) == Some(1) {
+                        assert!(
+                            parsed["result"]["capabilities"].is_object(),
+                            "{who}: reply {parsed} is not an initialize result"
+                        );
+                        return;
+                    }
+                    // Some other server-originated message: keep waiting.
+                }
+                Some(Ok(_)) => {} // Ping/Pong/Binary: not an answer, keep waiting.
+                Some(Err(e)) => {
+                    panic!("{who}: socket error before the initialize reply: {e}")
+                }
+                None => panic!(
+                    "{who}: closed before answering initialize -- this socket never redeemed the ticket"
+                ),
+            }
+        }
+    }
+
+    /// Wait for the server to close `ws`. A WS-layer error counts as closed:
+    /// the server tears the TCP connection down right after the `Close`.
+    async fn assert_closed(ws: &mut TestWs, within: Duration, who: &str) {
+        match tokio::time::timeout(within, ws.next()).await {
+            Err(_) => panic!("expected {who} to be closed within {within:?}; it stayed open"),
+            Ok(None) | Ok(Some(Err(_))) => {}
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) => {}
+            Ok(Some(Ok(other))) => {
+                panic!("expected {who} to be closed, got the frame {other:?}")
+            }
+        }
+    }
+
+    /// Assert `ws` is not closed for `within`. Non-close frames (server
+    /// notifications, pings) are tolerated: what's pinned here is "this
+    /// session is still authenticated", not "this session is silent".
+    async fn assert_stays_open(ws: &mut TestWs, within: Duration, who: &str) {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            match tokio::time::timeout(remaining, ws.next()).await {
+                // Nothing arrived by the deadline -- still open.
+                Err(_) => return,
+                Ok(None) | Ok(Some(Err(_))) => {
+                    panic!("expected {who} to stay open, but the connection ended")
+                }
+                Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(f)))) => {
+                    panic!("expected {who} to stay open, got Close({f:?})")
+                }
+                Ok(Some(Ok(_))) => {} // some other frame: still open
+            }
+        }
+    }
+
+    /// Poll the server's own session counter until exactly `want` sessions
+    /// hold an M-LSP-4 cap slot. A slot is taken only *after* the ticket
+    /// redeemed and the connect-time checks pass, and is released when the
+    /// session ends, so this is the server-side statement of "exactly one
+    /// of the two sockets authenticated" -- independent of which socket
+    /// the test thinks won (OBI-359).
+    async fn wait_for_active_sessions(limiter: &SessionLimiter, want: usize, who: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let active = limiter.active_sessions();
+            if active == want {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("{who}: expected {want} authenticated /lsp session(s), found {active}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The order-independent assertion OBI-359 asks the replay tests to
+    /// make: `winner` -- the socket that actually redeemed the ticket --
+    /// stays authenticated, `loser` -- the replay -- is refused, and the
+    /// server reports exactly one session in between them.
+    async fn assert_exactly_one_authenticated(
+        limiter: &SessionLimiter,
+        winner: &mut TestWs,
+        winner_name: &str,
+        loser: &mut TestWs,
+        loser_name: &str,
+    ) {
+        wait_for_active_sessions(limiter, 1, "the replay").await;
+        assert_stays_open(winner, Duration::from_millis(500), winner_name).await;
+        assert_closed(loser, Duration::from_millis(500), loser_name).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -809,51 +1078,85 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_ticket_can_only_authenticate_one_session() {
-        let (addr, auth, directory) = spawn_lsp_server(None).await;
+        let (addr, auth, directory, limiter) = spawn_server(None, LspTuning::default(), None).await;
         directory.seed_live_session_for_test("frodo", "sid-1");
         let claims = claims_for("frodo", &keys(), "sid-1");
         let ticket = auth.issue_ws_ticket(&claims).unwrap();
 
-        let (mut first, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
-            .await
-            .unwrap();
-        first
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                serde_json::json!({ "auth": ticket }).to_string().into(),
-            ))
-            .await
-            .unwrap();
+        // OBI-359: wait for the *server* to consume the ticket on `first`
+        // before replaying it. The old version sent on `first`, then
+        // immediately connected `second` and replayed, and asserted that
+        // `second` was the socket closed -- but nothing orders the two
+        // sessions' first-frame reads (`run_session` is one fresh task per
+        // upgrade), so whichever task the runtime polled first redeemed the
+        // ticket. When that was `second`, `first` was the one refused and
+        // the close expected on `second` never came: a 10 s `Elapsed`, the
+        // failure PR #156's `rust` job hit.
+        let mut first = connect_staff_socket(addr).await;
+        send_ticket(&mut first, &ticket).await;
+        prove_ticket_consumed_by(&mut first, "first").await;
 
-        let (mut second, _) =
-            tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
-                .await
-                .unwrap();
-        second
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                serde_json::json!({ "auth": ticket }).to_string().into(),
-            ))
+        let mut second = connect_staff_socket(addr).await;
+        send_ticket(&mut second, &ticket).await;
+        assert_closed(&mut second, Duration::from_secs(10), "the replay").await;
+
+        // Exactly one session ended up authenticated, whatever happened to
+        // the replay: the server's own cap counter says one, and the
+        // winner is untouched by the refused replay next to it.
+        assert_exactly_one_authenticated(&limiter, &mut first, "first", &mut second, "second")
+            .await;
+    }
+
+    /// The deterministic reproduction OBI-359 asks for, and the fix's other
+    /// half: force `second`'s auth to be processed *first* and assert the
+    /// invariant the old test only satisfied by accident.
+    ///
+    /// Against the pre-fix assertion ("the socket that connected second is
+    /// the one that gets closed"), this fails deterministically at the old
+    /// head -- `second` redeems, `first` is refused, `second` stays open --
+    /// which is what proves the flake was a test-ordering race and not a
+    /// ticket-replay hole: with the order *pinned* the product still lets
+    /// exactly one session in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ticket_authenticates_one_session_whichever_order_the_sockets_arrive() {
+        let gate = std::sync::Arc::new(FirstFrameGate::default());
+        let (addr, auth, directory, limiter) =
+            spawn_server(None, LspTuning::default(), Some(gate.clone())).await;
+        directory.seed_live_session_for_test("frodo", "sid-1");
+        let claims = claims_for("frodo", &keys(), "sid-1");
+        let ticket = auth.issue_ws_ticket(&claims).unwrap();
+
+        // `first` connects and sends its ticket, but its task parks at the
+        // gate before reading -- so the ticket is demonstrably *not* yet
+        // consumed on `first`, which is the state the un-gated test could
+        // only hope for.
+        let mut first = connect_staff_socket(addr).await;
+        send_ticket(&mut first, &ticket).await;
+        tokio::time::timeout(Duration::from_secs(10), gate.wait_parked())
             .await
-            .unwrap();
-        let next = tokio::time::timeout(Duration::from_secs(10), second.next()).await;
-        match next {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => {}
-            other => {
-                panic!("expected the second (replayed-ticket) session to be closed, got {other:?}")
-            }
-        }
-        // First session is unaffected by the replay against its own ticket.
-        first
-            .send(tokio_tungstenite::tungstenite::Message::Text(
-                serde_json::json!({
-                    "id": 1,
-                    "method": "shutdown",
-                    "params": null,
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
+            .expect("the first /lsp session never parked at the test gate");
+        assert_eq!(
+            limiter.active_sessions(),
+            0,
+            "a session parked before its first frame may not have authenticated"
+        );
+
+        let mut second = connect_staff_socket(addr).await;
+        send_ticket(&mut second, &ticket).await;
+        // The socket that arrived later is now the one that redeemed.
+        prove_ticket_consumed_by(&mut second, "second").await;
+        // The server agrees, and says so for both sockets: one
+        // authenticated session -- and `first`, still parked with its
+        // unread ticket in hand, is not it.
+        wait_for_active_sessions(&limiter, 1, "while the first session is parked").await;
+
+        // Let `first` read. Its ticket is spent, so it is refused -- and
+        // the refusal costs the live session nothing.
+        gate.release();
+        assert_closed(&mut first, Duration::from_secs(10), "the parked replay").await;
+
+        assert_exactly_one_authenticated(&limiter, &mut second, "second", &mut first, "first")
+            .await;
     }
 
     /// Send `{"auth": ticket}` then an `initialize`, and assert the server

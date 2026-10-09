@@ -87,6 +87,12 @@ pub struct HttpState {
     /// -- `None` uses the real spec values (M-LSP-1/M-LSP-4). Set via
     /// [`Self::with_lsp_tuning_for_test`], never by `loom-cli`.
     lsp_tuning: lsp::LspTuning,
+    /// Test-only first-frame rendezvous for `/lsp` (OBI-359). `None` --
+    /// the production default, and what `loom-cli` always leaves -- means
+    /// every session reads its first frame as soon as its task starts,
+    /// exactly as it did before this field existed. Set via
+    /// [`Self::with_lsp_first_frame_gate_for_test`].
+    lsp_first_frame_gate: Option<std::sync::Arc<lsp::FirstFrameGate>>,
 }
 
 impl HttpState {
@@ -110,6 +116,7 @@ impl HttpState {
             world_query: None,
             lsp_sessions: lsp::SessionLimiter::default(),
             lsp_tuning: lsp::LspTuning::default(),
+            lsp_first_frame_gate: None,
         }
     }
 
@@ -214,6 +221,10 @@ impl HttpState {
         &self.lsp_tuning
     }
 
+    pub(crate) fn lsp_first_frame_gate(&self) -> Option<&std::sync::Arc<lsp::FirstFrameGate>> {
+        self.lsp_first_frame_gate.as_ref()
+    }
+
     /// Shrink `/lsp`'s timing constants for a fast, deterministic test
     /// (idle timeout/ping interval/revocation-recheck interval all
     /// default to tens of seconds, far too slow for a test to wait out
@@ -223,6 +234,20 @@ impl HttpState {
     #[cfg(test)]
     pub(crate) fn with_lsp_tuning_for_test(mut self, tuning: lsp::LspTuning) -> Self {
         self.lsp_tuning = tuning;
+        self
+    }
+
+    /// Install `/lsp`'s test-only first-frame rendezvous (OBI-359) so a
+    /// test can decide which session gets to read -- and therefore to
+    /// redeem a ticket -- first. Test-only for the same reason as
+    /// [`Self::with_lsp_tuning_for_test`]: `loom-cli` never calls it, so
+    /// no real connection ever parks.
+    #[cfg(test)]
+    pub(crate) fn with_lsp_first_frame_gate_for_test(
+        mut self,
+        gate: std::sync::Arc<lsp::FirstFrameGate>,
+    ) -> Self {
+        self.lsp_first_frame_gate = Some(gate);
         self
     }
 }
