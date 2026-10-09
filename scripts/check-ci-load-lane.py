@@ -105,11 +105,32 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      first night and stays red, because merged history contains commits whose
      sign-off names the agent who wrote them rather than the author (run
      37752599276). A permanently red backstop is not a backstop; it is a
-     notification nobody reads.
+     notification nobody reads; and
+ 14. the stage-two identity proof (OBI-397) must predict `loadtest-e1-1`, not
+     merely resemble a build. The classifier's path table decides which diffs are
+     *worth asking*; the answer to "did the measured program move" comes from
+     building both ends of the range and hashing the artifacts. That is only
+     evidence about E1.1 if the proof runs the gate's own build under the gate's
+     own toolchain, cache action, host and timeouts -- so this rule reads
+     `BUILD_CMD`, `ARTIFACTS` and the action pins out of `scripts/load-lane-identity.py`
+     and compares them, string for string, against the steps of `loadtest-e1-1`.
+     A proof built differently is a hash of some other program; and
+ 15. the proof may only ever *lower* a verdict, and only where it has standing.
+     It runs on `pull_request` when the table said "relevant" and every relevant
+     path is buildable Rust source (`steps.decide.outputs.identity`), never on a
+     `main` push, where spec 8.12 requires a real p99 per release; the merge step
+     re-reads the table's own output and can only write `runtime=false`, so a
+     table skip stays a skip and no docs PR can buy itself a lane place by failing
+     to build. Scope is asserted against the classifier as code (importing it and
+     asking `identity_candidate`), including that every source file which
+     `include!`s a build-generated path is named in `IDENTITY_NEVER` -- the one
+     shape where "same bytes at both ends" would not mean "same program".
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
 
+import argparse
+import ast
 import importlib.util
 import re
 import sys
@@ -203,6 +224,41 @@ PIN_REV_SHA = re.compile(r"^[0-9a-f]{40}$")
 # so `classify` falls closed to `runtime=true` and the run measures -- the only
 # paths to a number when every diff in between was correctly skipped.
 BACKSTOP_EVENTS = ("schedule", "workflow_dispatch")
+
+# Rules 14 and 15 (OBI-397): the stage-two identity proof, which decides a lane
+# place by building `loadtest-e1-1`'s own command at both ends of the range and
+# comparing the bytes. It is worth as much as its agreement with the gate, so
+# every constant below is *compared against the gate's steps* rather than
+# restated: a proof that drifts to a different rustc, a different `-p` set or a
+# different feature env is a proof about some other program.
+IDENTITY_SCRIPT = "scripts/load-lane-identity.py"
+PROOF_STEP_ID = "prove"
+VERDICT_STEP_ID = "verdict"
+E1_BUILD_MARK = "cargo build --release -p loom-cli -p loom-loadtest"
+E1_ARTIFACTS = ("loom-cli", "loom-loadtest")
+E1_PARITY_ACTIONS = ("dtolnay/rust-toolchain@", "Swatinem/rust-cache@")
+E1_TOOLS_MARK = "scripts/ci-ensure-tools.sh"
+# The candidate guard, spelled once per stage-two step. Two halves, each stopping
+# a different failure: `identity` keeps the proof off diffs the table cannot
+# settle by path alone, and `pull_request` keeps a `main` push -- where the
+# Phase 1 exit criterion wants a real p99 (rule 8) -- unskippable.
+CANDIDATE_GUARD = ("steps.decide.outputs.identity", "github.event_name == 'pull_request'")
+# Paths that are gate inputs the hash of two binaries cannot speak for. Each is a
+# different way the lane can move without touching `loom-cli` or `loom-loadtest`:
+# what gets compiled (manifests, lockfile, `.cargo/`, the toolchain, a build
+# script), what the *driver reads* (the pinned mudlib rev, `mudlib/**`, the mix
+# mirror), and the criterion gate that shares this lane. Rule 15 asserts each one
+# makes a source diff ineligible, which is the mechanical version of "the proof
+# may only judge what the proof can judge".
+UNHASHABLE_WITNESSES = (
+    "Cargo.lock", "crates/loom-cli/Cargo.toml", ".cargo/config.toml",
+    "rust-toolchain.toml", "crates/loom-vm/build.rs",
+    MUDLIB_PIN, "mudlib/room/lobby.c",
+    "crates/loom-loadtest/tests/fixtures/mix.tsv",
+    "crates/loom-vm/benches/vm_bench.rs", "scripts/bench-gate.sh",
+    "scripts/bench_compare.py",
+)
+SOURCE_WITNESS = "crates/loom-vm/src/world.rs"
 
 
 def job_blocks(text):
@@ -406,9 +462,24 @@ def check_classifier(jobs):
     # to satisfy it. (It did: a comment explaining the fallback kept the mutant
     # "fallback deleted" passing.)
     text = "\n".join(l for l in block if not l.lstrip().startswith("#"))
-    if "runtime: ${{ steps.decide.outputs.runtime }}" not in text:
-        errors.append(f"`{CLASSIFIER}` does not publish `outputs.runtime` from the `decide` step: "
-                      "the lane verdict must have exactly one source")
+    # The verdict must have exactly one source step, and that step must be either
+    # the classifier or -- since OBI-397 -- the merge that can only *downgrade*
+    # the classifier's answer toward "skip". Rule 14 pins the merge itself;
+    # anything else reading a lane decision out of thin air is rejected here.
+    src = re.search(r"runtime: \$\{\{ steps\.([a-z0-9-]+)\.outputs\.runtime \}\}", text)
+    if not src:
+        errors.append(f"`{CLASSIFIER}` does not publish `outputs.runtime` from a step in this "
+                      "job: the lane verdict must have exactly one source")
+    elif src.group(1) != "decide":
+        merge = [s for s in steps_of(block)
+                 if step_key(s, "id") == src.group(1)]
+        if not merge:
+            errors.append(f"`{CLASSIFIER}` publishes outputs.runtime from step "
+                          f"`{src.group(1)}`, which does not exist")
+        elif "steps.decide.outputs.runtime" not in step_code(merge[0]):
+            errors.append(f"`{CLASSIFIER}`'s verdict comes from `{src.group(1)}`, which never "
+                          "reads the classifier's own `runtime=`: a second decider must be "
+                          "grounded in the table's verdict, not replace it")
     if "runtime=true" not in text:
         errors.append(f"`{CLASSIFIER}` has no fail-closed fallback value: without writing "
                       "`runtime=true` when the classifier cannot answer, an undecided diff "
@@ -429,10 +500,21 @@ def check_classifier(jobs):
                           "gate would run with an empty verdict instead of the written "
                           "fail-closed one -- reading the diff has to fall back to "
                           "`runtime=true`, not to a missing output")
-    if "exit 0" not in text:
-        errors.append(f"`{CLASSIFIER}` ends on whatever its last command returned: a non-zero "
-                      "step leaves no verdict written for the gate to read; it has to default "
-                      "the verdict and then `exit 0`")
+    # Every step of the decider, not just the one that calls the table: a step
+    # that can fail the job leaves the *later* steps -- including the merge that
+    # writes the published verdict -- unrun, which is the same missing-output
+    # failure this rule has always been about, just one step further along.
+    for step in steps_of(block):
+        if step_key(step, "run") is None:
+            continue          # an action step: `uses:` cannot fail on a shell status
+        if step_key(step, "continue-on-error") == "true":
+            continue
+        if "exit 0" not in step_code(step).splitlines()[-1]:
+            errors.append(f"`{CLASSIFIER}`'s step `"
+                          + (step_key(step, "name") or "?")
+                          + "` ends on whatever its last command returned: a non-zero step "
+                            "leaves no verdict written for the gate to read; the decider has to "
+                            "default the verdict and then `exit 0`")
     for step in steps_of(block):
         if "ci-ensure-tools.sh" in step_code(step) and step_key(step, "continue-on-error") != "true":
             errors.append(f"`{CLASSIFIER}`'s package step is fatal: a runner that cannot "
@@ -771,8 +853,13 @@ def read_mudlib_pin(root):
     return rev, None
 
 
-def classifier_relevance(root, path):
-    """Ask the real classifier whether `path` takes a lane place (None = cannot tell)."""
+def classifier_module(root):
+    """Import the real classifier so a rule can ask it, not paraphrase it.
+
+    None when it cannot be imported: these checks then report the gap instead of
+    passing silently (the same reasoning the classifier itself applies to a diff
+    it cannot read).
+    """
     script = Path(root) / "scripts" / "load-lane-classify.py"
     if not script.is_file():
         return None
@@ -784,11 +871,22 @@ def classifier_relevance(root, path):
         spec = importlib.util.spec_from_file_location("load_lane_classify", script)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return bool(module.classify([path])[0])
+        return module
     except Exception:
         return None
     finally:
         sys.dont_write_bytecode = dont_write
+
+
+def classifier_relevance(root, path):
+    """Ask the real classifier whether `path` takes a lane place (None = cannot tell)."""
+    module = classifier_module(root)
+    if module is None:
+        return None
+    try:
+        return bool(module.classify([path])[0])
+    except Exception:
+        return None
 
 
 def check_mudlib_pin(text, root):
@@ -946,6 +1044,297 @@ def check_rangeless_audit(text):
     return errors
 
 
+def _py_literal(root, name):
+    """A module-level `NAME = <literal>` in the proof script, or None."""
+    path = Path(root) / IDENTITY_SCRIPT
+    if not path.is_file():
+        return None
+    m = re.search(rf"^{name}\s*=\s*(.+?)\s*$", path.read_text(), re.M)
+    if not m:
+        return None
+    try:
+        return ast.literal_eval(m.group(1))
+    except (ValueError, SyntaxError):
+        return None
+
+
+def _uses_of(steps, prefix):
+    """The first `uses:` value starting with `prefix` among these steps."""
+    for step in steps:
+        for line in step:
+            m = re.search(rf"uses:\s*({re.escape(prefix)}[^\s]+)", line)
+            if m and not line.lstrip().startswith("#"):
+                return m.group(1)
+    return None
+
+
+def check_identity_stage(jobs, text, root):
+    """Rules 14 and 15 (OBI-397): the identity proof must predict the gate, and
+    may only be asked about what a content hash can settle.
+
+    Two distinct failures are being prevented, and each needs its own half:
+
+    14. *drift*. The proof is evidence about `loadtest-e1-1`, so it has to be the
+        same build: same command string, same toolchain action and pin, same
+        cache action, same artefacts. A proof that builds `-p loom-cli` alone, or
+        under a different rustc, is silent about the load bot -- and the failure
+        is invisible, because the verdict still reads `same=true`. The job must
+        also outlive its own caps: `classify` has no `timeout-minutes` slack left
+        by the two builds means Actions kills the *decider*, which writes no
+        output, and the gate queues on an empty verdict -- correct direction, but
+        paid for with 30 minutes of somebody's queue. And the merge may run in
+        only one direction: a matching hash clears a "relevant", nothing turns a
+        table "skip" into a measurement.
+    15. *scope*. `crates/*/src/**` is where the table is blind, so it is also the
+        only place a hash is allowed to answer -- and a hash answers only for the
+        two binaries. Any of `UNHASHABLE_WITNESSES` beside a source file must make
+        the whole diff ineligible. These are assertions about the *shipped*
+        classifier module, imported and called, so a widening of its source glob
+        that swallows `warp.ref` fails `hygiene` instead of quietly retiring the
+        OBI-326 pin from the lane.
+    """
+    errors = []
+    block = jobs.get(CLASSIFIER)
+    if block is None:
+        return [f"`{CLASSIFIER}` job is missing: rule 14 has no stage-two proof to check"]
+    try:
+        src = (root / IDENTITY_SCRIPT).read_text()
+    except OSError as exc:
+        src = ""
+        errors.append(f"cannot read {IDENTITY_SCRIPT}: {exc}")
+    steps = steps_of(block)
+    code = "\n".join(l for l in block if not l.lstrip().startswith("#"))
+    proof = [s for s in steps if IDENTITY_SCRIPT in step_code(s)]
+    if not proof:
+        return [f"`{CLASSIFIER}` never calls {IDENTITY_SCRIPT}: the workflow says the lane may "
+                "be skipped on a build-identity proof, and no job runs that proof -- which is "
+                "the same claim with no evidence behind it"]
+    step = proof[0]
+    pcode = step_code(step)
+    if step_key(step, "id") != PROOF_STEP_ID:
+        errors.append(f"the identity proof step is `{step_key(step, 'id')}`, expected "
+                      f"`{PROOF_STEP_ID}`: the merge reads its answer from that id")
+    # The proof must not be able to fail the decider: it is either tolerated or
+    # ends by writing its own verdict. (`classify` failing = no output = the gate
+    # queues blind, which is expensive and unexplained.)
+    last = [l.strip() for l in pcode.splitlines() if l.strip()][-1:]
+    if step_key(step, "continue-on-error") != "true" and last != ["exit 0"]:
+        errors.append("the identity proof step can fail the `classify` job: a proof that cannot "
+                      "run must leave `same` unset so the merge takes the lane, not kill the "
+                      "job that writes the verdict")
+    # Which steps belong to stage two: the proof itself, the toolchain and cache it
+    # needs, and anything already gated on the scope flag. All of them must carry
+    # both halves of the candidate guard, and the *table* step must carry neither
+    # -- a push to `main` needs a verdict from stage one even though stage two is
+    # not allowed to speak there.
+    stage2 = [s for s in steps if s is step
+              or "outputs.identity" in (step_if(s) or "")
+              or any(_uses_of([s], a) for a in E1_PARITY_ACTIONS)]
+    for s in stage2:
+        guard = step_if(s) or ""
+        for half in CANDIDATE_GUARD:
+            if half not in guard:
+                errors.append(f"a stage-two step in `{CLASSIFIER}` (`"
+                              + (step_key(s, "name") or step_key(s, "uses") or "?")
+                              + f"`) is not limited by `{half}`: the proof would run on a diff "
+                                "it is not allowed to judge, or on a `main` push, where rule 8 "
+                                "requires a real measured p99")
+    table = [s for s in steps if "load-lane-classify.py" in step_code(s)]
+    for s in table:
+        if step_if(s) is not None:
+            errors.append(f"`{CLASSIFIER}`'s table step is gated by `if: {step_if(s)}`: a run "
+                          "that skips it publishes no verdict, and the gate would then queue on "
+                          "an empty answer instead of a written one")
+    if "--base" not in pcode or "--head" not in pcode:
+        errors.append(f"the identity proof does not name both ends of the range: comparing the "
+                      f"working tree to itself is not a proof")
+    if "github.event.pull_request.base.sha" not in code or \
+            "github.event.pull_request.head.sha" not in code:
+        errors.append("the identity proof's range does not come from the event's base and head "
+                      "SHA: a ref name can move underneath a run, and `base...head` computed "
+                      "from `origin/main` is not this PR's merge base")
+
+    e11 = jobs.get("loadtest-e1-1") or []
+    e11_code = "\n".join(l for l in e11 if not l.lstrip().startswith("#"))
+    build_cmd = _py_literal(root, "BUILD_CMD")
+    if build_cmd is None:
+        errors.append(f"cannot read `BUILD_CMD` from {IDENTITY_SCRIPT}: the proof's build is "
+                      "unpinned, so it proves nothing about what was measured")
+    elif build_cmd.strip() not in e11_code:
+        errors.append(f"the identity proof builds `{build_cmd}`, which is not what "
+                      "`loadtest-e1-1` builds: a hash over a different command says nothing "
+                      "about the binary the lane runs")
+    if E1_BUILD_MARK not in e11_code:
+        errors.append(f"`loadtest-e1-1` no longer runs `{E1_BUILD_MARK}`: rule 14's parity check "
+                      "is comparing the proof to a gate that changed")
+    hashed_list = list(_py_literal(root, "ARTIFACTS") or ())
+    hashed = {str(a).rsplit("/", 1)[-1] for a in hashed_list}
+    for art in E1_ARTIFACTS:
+        if art not in hashed:
+            errors.append(f"the identity proof hashes {hashed_list}, which omits `{art}` "
+                          "-- a program E1.1 runs and no job compared")
+    for prefix in E1_PARITY_ACTIONS:
+        want, got = _uses_of(steps_of(e11), prefix), _uses_of(steps, prefix)
+        if got is None:
+            errors.append(f"the identity proof runs without `{prefix}`: the same build command "
+                          "under a different toolchain or no dependency cache is not the same "
+                          "build the gate performed")
+        elif want is not None and want != got:
+            errors.append(f"the identity proof uses `{got}` but `loadtest-e1-1` uses `{want}`: "
+                          "the proof must run the gate's own action pin, not a nearby one")
+    # The runner image is not a build image. `loadtest-e1-1` installs its own C
+    # toolchain before building; the proof must run the same invocation, or its
+    # first `cc` call dies (`libc` build script, rc=101) and stage two returns
+    # `same=false` forever -- safe, silent, and indistinguishable from "this repo
+    # has no test-only diffs", which is the false conclusion the first live run
+    # (PR #175, job 113823165936) would have led to.
+    def tools_line(step):
+        """The tool bootstrap a step runs, or None. Compared as the invocation
+        rather than the YAML line: one job writes `- run: scripts/…`, the other
+        `run: scripts/…`, and that difference is indentation, not tools."""
+        m = re.search(E1_TOOLS_MARK + r".*", step_code(step) or "")
+        return m.group(0).strip() if m else None
+
+    gate_tools = [tools_line(s) for s in steps_of(e11) if tools_line(s)]
+    if gate_tools:
+        want = gate_tools[0]
+        if want not in {tools_line(s) for s in stage2}:
+            errors.append(f"the identity proof does not run the gate's own tool bootstrap "
+                          f"(`{want}`): a build environment the gate had to install is not a "
+                          "build environment the proof can assume")
+
+    # A hash is only evidence about the binary *this build wrote*. Cargo decides
+    # freshness from mtimes, so a shared or restored cache can leave a crate
+    # unbuilt and the two ends compare as copies of one file -- a wrong `same=true`
+    # that skips a required measurement. The proof must therefore clear the two
+    # artefacts first and witness that each build re-created them. `--release` is
+    # load-bearing: `cargo clean -p x` with no profile cleans the dev artifacts
+    # and reports "Removed 0 files" on a release tree -- exit 0, nothing removed.
+    clean_cmd = _py_literal(root, "CLEAN_CMD")
+    if clean_cmd is None:
+        errors.append(f"{IDENTITY_SCRIPT} has no `CLEAN_CMD`: it hashes whatever is already in "
+                      "`target/` without proving this build wrote it, and a cached artefact "
+                      "makes two ends of one file look like evidence")
+    else:
+        if "--release" not in clean_cmd and "--profile release" not in clean_cmd:
+            errors.append(f"the proof's clean is `{clean_cmd}`: with no profile, cargo cleans "
+                          "the dev artifacts, reports \"Removed 0 files\", exits 0, and leaves "
+                          "both release artefacts stale -- and a stale file at both ends hashes "
+                          "as `same=true`, which is a wrong pass")
+        for art in hashed_list:
+            name = str(art).rsplit("/", 1)[-1]
+            if f"-p {name}" not in clean_cmd:
+                errors.append(f"the proof hashes `{art}` but its clean (`{clean_cmd}`) never "
+                              f"names `{name}`: that artefact can survive from an earlier build "
+                              "and be reported as this end's output")
+        body = re.search(r"def build_and_hash(?:.|\n)*?\n    (?:head_art|def |return )", src)
+        seg = body.group(0) if body else ""
+        if not seg:
+            errors.append(f"cannot read `build_and_hash` from {IDENTITY_SCRIPT}: the check that "
+                          "each artefact was rewritten by the build it is attributed to cannot "
+                          "be verified, so the hash is unattributed")
+        elif seg.find("clean_cmd") < 0 or seg.find("build_cmd") < 0 \
+                or seg.find("clean_cmd") > seg.find("build_cmd") or seg.count("mtime") < 2:
+            errors.append("the proof must clear the artefacts, assert they are absent, build, "
+                          "and assert each was written (mtime witness before and after) -- in "
+                          "that order; otherwise `same=true` can describe a binary nobody built")
+    cap = _py_literal(root, "BUILD_TIMEOUT")
+    job_to = scalar(block, "timeout-minutes")
+    m = re.search(r"\btimeout\s+(?:-k\s+\d+\s+)?(\d+)\s+python3", pcode)
+    if not cap or not m or not (job_to or "").isdigit():
+        errors.append("the identity proof's timeouts cannot be verified: it needs a per-build "
+                      "cap in the script and a `timeout` around it in the step, inside a "
+                      "`timeout-minutes` budget that exceeds both")
+    elif 2 * cap > int(m.group(1)):
+        errors.append(f"the identity proof step is capped at {m.group(1)} s, which is less than "
+                      f"2 x the script's own {cap} s per-build cap: the outer kill fires first "
+                      "and the answer is 'not proven' for a diff that only needed patience")
+    elif int(m.group(1)) + 300 > 60 * int(job_to):
+        errors.append(f"`{CLASSIFIER}`'s timeout-minutes ({job_to}) does not exceed the proof's "
+                      f"{m.group(1)} s cap plus setup: Actions would then kill the *decider*, "
+                      "leaving no output and a gate queueing on an empty verdict")
+
+    verdict = [s for s in steps if step_key(s, "id") == VERDICT_STEP_ID]
+    if not verdict:
+        errors.append(f"`{CLASSIFIER}` has no `{VERDICT_STEP_ID}` step: stage one and stage two "
+                      "need one place where the lane verdict is decided, or the proof output is "
+                      "a number nobody reads")
+    else:
+        vcode = step_code(verdict[0])
+        if step_if(verdict[0]) is not None:
+            errors.append(f"`{CLASSIFIER}`'s `{VERDICT_STEP_ID}` step carries an `if:`: when it "
+                          "is skipped the job publishes no verdict at all, and an absent output "
+                          "is a worse answer than a written 'not proven'")
+        for needle in ('"$SAME" = true', '"$SCOPE" = true', '"$EVENT" = pull_request',
+                       '"$runtime" != false'):
+            if needle not in vcode:
+                errors.append(f"the `{VERDICT_STEP_ID}` merge no longer requires `{needle}`: "
+                              "the proof could then skip the lane on an answer it was not "
+                              "entitled to give (a missing output, an out-of-scope diff, a "
+                              "table skip, or a `main` push)")
+        if "runtime=$runtime" not in vcode:
+            errors.append(f"`{CLASSIFIER}`'s `{VERDICT_STEP_ID}` step does not write the merged "
+                          "verdict to its outputs")
+        if "runtime=true" in vcode:
+            errors.append(f"`{CLASSIFIER}`'s `{VERDICT_STEP_ID}` step can write `runtime=true`: "
+                          "stage two is allowed to *clear* a lane verdict a build cannot move, "
+                          "never to force a measurement the table already waved through -- an "
+                          "upgrade would make every docs PR pay for a build to earn a lane place "
+                          "it does not need")
+
+    module = classifier_module(root)
+    if module is None:
+        errors.append(f"cannot import scripts/load-lane-classify.py to verify stage-two scope "
+                      f"(rule 15): the {IDENTITY_SCRIPT} proof's eligibility set is unchecked")
+    else:
+        try:
+            if not module.identity_candidate([SOURCE_WITNESS]):
+                errors.append("the classifier refuses to let a pure-source diff be proven: "
+                              "stage two would never run, and the lane would still be paid for "
+                              "by test-only changes")
+        except AttributeError:
+            errors.append("scripts/load-lane-classify.py has no `identity_candidate`: the "
+                          "workflow gates on an eligibility rule the classifier does not have")
+        for w in UNHASHABLE_WITNESSES:
+            try:
+                ask = module.identity_candidate([SOURCE_WITNESS, w])
+            except AttributeError:
+                break
+            if ask:
+                errors.append(f"`{w}` is hash-judgeable beside a source file: the proof would "
+                              "clear the lane on two binaries while this path changes what the "
+                              "gate measures")
+            if not classifier_relevance(root, w):
+                errors.append(f"`{w}` is on the irrelevance allow-list *and* excluded from "
+                              "stage two: check which of the two is right")
+        # The scope rule's `IDENTITY_NEVER` is the list of source files whose
+        # bytes do not all come from the file itself. That list is only sound if
+        # it is *complete*, and completeness is not a thing you can remember -- so
+        # it is looked up: every `include!`/`include_str!` of something the build
+        # generates (`OUT_DIR`) in any crate source must be named, or the proof
+        # would hash two checkouts that differ in a file neither one contains.
+        try:
+            never = set(module.IDENTITY_NEVER)
+        except AttributeError:
+            errors.append(f"{CLASSIFIER} has no `IDENTITY_NEVER`: rule 15 cannot check the "
+                          "generated-source exclusions")
+            never = set()
+        if never:
+            for path in sorted(root.glob("crates/*/src/**/*.rs")):
+                rel = path.relative_to(root).as_posix()
+                try:
+                    txt = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if re.search(r'include!\s*\(\s*concat!\s*\(\s*env!\s*\(\s*"OUT_DIR"', txt):
+                    if rel not in never:
+                        errors.append(f"`{rel}` `include!`s a build-generated file and is not "
+                                      f"in `IDENTITY_NEVER`: the identity proof would compare "
+                                      "two checkouts whose generated bytes come from outside "
+                                      "the range it is hashing")
+    return errors
+
+
 def check_text(text, root="."):
     jobs = job_blocks(text)
     wc = workflow_concurrency(text)
@@ -1034,6 +1423,7 @@ def check_text(text, root="."):
             errors.append(f"required check `{job}` sets continue-on-error: true")
 
     errors += check_classifier(jobs)
+    errors += check_identity_stage(jobs, text, root)
     errors += check_toolchain_pins(text, root)
     errors += check_run_block_expressions(text)
     check_e11_verdict_isolation(jobs, errors)
@@ -1282,7 +1672,7 @@ MUTANTS = [
     ("classifier made advisory",
      lambda t: _prepend(t, CLASSIFIER, "    continue-on-error: true\n")),
     ("classifier verdict published from another step",
-     lambda t: _sub(t, "runtime: ${{ steps.decide.outputs.runtime }}",
+     lambda t: _sub(t, "runtime: ${{ steps.verdict.outputs.runtime }}",
                     "      runtime: ${{ steps.other.outputs.runtime }}\n")),
     ("classifier fail-closed fallback deleted",
      lambda t: _sub(t, "echo 'runtime=true' >>", "            true\n")),
@@ -1356,6 +1746,36 @@ MUTANTS = [
     ("range-less path has no bound at all",
      lambda t: _sub(t, 'elif git rev-parse -q --verify "$AFTER^" >/dev/null 2>&1; then',
                     'elif true; then')),
+
+    # OBI-397 rules 14 and 15. Each mutant is a way the identity proof stops being
+    # evidence about `loadtest-e1-1` while still printing `same=true` -- or a way it
+    # speaks where it has no standing.
+    ("identity proof deleted from the decider",
+     lambda t: _sub(t, "timeout -k 30 1980 python3 scripts/load-lane-identity.py",
+                    "          true \\\n")),
+    ("stage two allowed to speak on a main push",
+     lambda t: _sub(t, "&& steps.decide.outputs.identity == 'true' && github.event_name == 'pull_request' }}",
+                    "&& steps.decide.outputs.identity == 'true' }}")),
+    ("proof toolchain pin differs from the gate's",
+     lambda t: _replace(t, "        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de",
+                        "        uses: dtolnay/rust-toolchain@0000000000000000000000000000000000000000")),
+    ("gate build command changes under the proof",
+     lambda t: _sub(t, "- run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest",
+                    "      - run: SQLX_OFFLINE=true cargo build --release -p loom-cli\n", nth=1)),
+    ("decider timeout below the proof's own cap",
+     lambda t: _sub(t, "    timeout-minutes: 45", "    timeout-minutes: 10")),
+    ("merge may raise the verdict instead of only clearing it",
+     lambda t: _replace(t, "runtime=false", "runtime=true")),
+    # The two shapes of the gap the first live run actually hit (PR #175: the
+    # proof died on `libc`'s build script because the runner had no `cc`). Either
+    # mutant leaves stage two *silently inert* -- every proof returns `same=false`
+    # -- which reads as "this repo has no test-only diffs" and is the false
+    # conclusion a reviewer would never see fail.
+    ("proof loses the gate's tool bootstrap entirely",
+     lambda t: _sub(t, "        run: scripts/ci-ensure-tools.sh", None)),
+    ("proof's tool bootstrap drifts from the gate's",
+     lambda t: _replace(t, "        run: scripts/ci-ensure-tools.sh cc:build-essential python3:python3-minimal",
+                        "scripts/ci-ensure-tools.sh python3:python3-minimal")),
 ]
 
 
