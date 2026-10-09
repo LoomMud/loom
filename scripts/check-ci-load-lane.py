@@ -105,7 +105,25 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      first night and stays red, because merged history contains commits whose
      sign-off names the agent who wrote them rather than the author (run
      37752599276). A permanently red backstop is not a backstop; it is a
-     notification nobody reads.
+     notification nobody reads; and
+ 14. every lane job waits for a quiet host *before its first step that produces a
+     number* (OBI-403). The lane group makes the job exclusive; it makes no claim
+     about the machine, and `loadtest-e1-1` carries one `needs:` -- `classify`,
+     which takes seconds -- so the same run's `rust` job, a workspace release
+     build on all eight cores, is routinely in flight while the p99 window is
+     open. On 2026-10-09 that overlap was the entire "intermittent" red: main
+     runs 37925921869 and 37927307391 went red at p99 177 ms and 821 ms with
+     `rust` in flight and load average 6.63 / 19.41, and the two PR runs that
+     measured on an idling host went green at 22.6 ms and 23.5 ms with 6.20 /
+     5.38. So `scripts/ci-wait-quiet-lane.py wait` must appear in all three lane
+     jobs, guarded by that job's own lane verdict, ahead of any step holding a
+     measuring needle, with no `continue-on-error` (a grant it cannot refuse is a
+     log line, not a gate), with a `--deadline-secs` long enough to outlast a
+     starved build and short enough to fit inside `timeout-minutes` (rule 4: a
+     *cancelled* gate is indistinguishable from a missing one), labelling its
+     grant with `--stage <job>`, and with `actions: read` in force -- because the
+     half of the calibration that separates a 6.63 red from a 6.20 green is this
+     run's own job list, which no `/proc` file can supply.
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -152,6 +170,26 @@ SLA_FLAGS = ["--players 150", "--fail-on-sla-miss"]
 # mid-build and the required check was `cancelled`, which blocks a PR exactly
 # like a miss while saying nothing at all about p99.
 MIN_TIMEOUT = {"loadtest-e1-1": 30, "loadtest-smoke": 20}
+# OBI-403 rule 14: the quiet-host gate. `MEASURING_NEEDLES` includes
+# `cargo build --release` because a build is what *makes* the host noisy; this
+# narrower list is the thing the gate has to precede -- the step that produces a
+# number. The gate deliberately runs *after* this job's own release build: the
+# question is what the host looks like at the instant the clock starts, and a
+# build that ended 20 s ago is still inside the 1-minute load average.
+MEASURING_ONLY_NEEDLES = ["--fail-on-sla-miss", "--players", "scripts/bench-gate.sh",
+                          "loom-cli serve"]
+QUIET_GATE = "ci-wait-quiet-lane.py wait"
+QUIET_GATE_SCRIPT = "scripts/ci-wait-quiet-lane.py"
+# How long each gate may wait for the lane to go idle. Floors, not targets: the
+# observed wait needed to outlast a run's own `rust` at the E1.1 gate is ~9 min
+# (run 37925921869), and the two advisory gates start while the *previous* lane
+# job's load is still decaying, which is minutes rather than tens of minutes.
+MIN_QUIET_DEADLINE = {"loadtest-e1-1": 600, "loadtest-smoke": 300, "bench": 300}
+# Headroom the wait must still leave inside `timeout-minutes` for the build, the
+# measurement, the save drain and the upload. A wait that can outlive its own job
+# converts rule 14's "inconclusive" into rule 4's "cancelled", which is the
+# failure mode this whole file exists to make impossible.
+QUIET_WAIT_HEADROOM_SECS = 600
 # The `pull_request` activity types that change the commit under test, and the
 # two that a required check cannot afford to lose (OBI-313).
 COMMIT_TYPES = {"opened", "synchronize", "reopened"}
@@ -946,6 +984,124 @@ def check_rangeless_audit(text):
     return errors
 
 
+def workflow_permissions(text):
+    """The workflow-level `permissions:` mapping, if there is one (indent 0).
+
+    Rule 14 accepts `actions: read` at either level. A *job*-level block replaces
+    the workflow default rather than adding to it, so the job's own block is
+    checked first by the caller and this is only the fallback.
+    """
+    out, seen = {}, False
+    for line in text.splitlines():
+        if not seen:
+            if re.match(r"^permissions:\s*$", line):
+                seen = True
+            continue
+        if re.match(r"^\S", line):
+            break
+        m = re.match(r"^\s+([A-Za-z_-]+):\s*(\S.*?)\s*$", line)
+        if m:
+            out[m.group(1)] = m.group(2).strip("'\"")
+    return out
+
+
+def check_quiet_host_gate(jobs, text, root="."):
+    """Rule 14 (OBI-403): the lane must be quiet before it is allowed to measure.
+
+    Every check here is about a shape that *silently* stops being a gate: the
+    step deleted, the step moved below the measurement, the step unable to fail
+    the job, the step running on the skip path, the wait so short it never
+    outlasts a build or so long the job gets cancelled instead, and the
+    permission that makes the job-list half of the signal disappear.
+    """
+    errors = []
+    if not (Path(root) / QUIET_GATE_SCRIPT).exists():
+        errors.append(f"`{QUIET_GATE_SCRIPT}` is missing: rule 14 is only a comment "
+                      "without the gate it names (the checker reads the workflow, "
+                      "the script is what reads the host)")
+    wf_perms = workflow_permissions(text)
+    for job in LANE_JOBS:
+        block = jobs.get(job)
+        if block is None:
+            continue  # rule 4 / rule 1 already report a missing lane job
+        steps = steps_of(block)
+        gates = [k for k, s in enumerate(steps) if QUIET_GATE in step_code(s)]
+        if not gates:
+            errors.append(f"`{job}` has no `{QUIET_GATE}` step: `concurrency` makes "
+                          "the job exclusive, not the host, so this run's own `rust` "
+                          "build can be in flight while it measures (OBI-403)")
+            continue
+        if len(gates) > 1:
+            errors.append(f"`{job}` runs the quiet-host gate {len(gates)} times: one "
+                          "grant per job, or a second gate can be placed after the "
+                          "measurement and still satisfy the needle")
+        gi = gates[0]
+        gate, code = steps[gi], step_code(steps[gi])
+        test = escape_test(job)
+        if test not in (step_if(steps[gi]) or ""):
+            errors.append(f"`{job}`'s quiet-host gate has no `{test}` guard: on the "
+                          "runtime-irrelevant path it would queue for a lane place it "
+                          "was told not to take, and poll the API for nothing")
+        if step_key(steps[gi], "continue-on-error") == "true":
+            errors.append(f"`{job}`'s quiet-host gate sets continue-on-error: it can no "
+                          "longer refuse a measurement, so 'inconclusive' degrades back "
+                          "into a p99 number nobody can interpret")
+        meas = [k for k, s in enumerate(steps)
+                if any(n in step_code(s) for n in MEASURING_ONLY_NEEDLES)]
+        if not meas:
+            errors.append(f"`{job}` has no step holding any of {MEASURING_ONLY_NEEDLES}: "
+                          "rule 14 cannot order a gate against a measurement that is "
+                          "not there")
+        elif gi > meas[0]:
+            errors.append(f"`{job}` waits for a quiet host *after* it measures: the gate "
+                          "runs too late to keep the noisy job off the host while the "
+                          "number is being taken (OBI-403)")
+        else:
+            m_guard = step_if(steps[meas[0]]) or ""
+            if "always()" in m_guard:
+                errors.append(f"`{job}`'s measuring step is guarded with `always()`: a "
+                              "refused quiet-host grant would be followed by the "
+                              "measurement anyway, on the hot host the gate rejected")
+        dl = re.search(r"--deadline-secs\s+(\d+)", code)
+        if not dl:
+            errors.append(f"`{job}`'s quiet-host gate sets no `--deadline-secs`: with the "
+                          "default wait this job's budget is whatever the script's author "
+                          "guessed, not what the timeout can pay for")
+        else:
+            secs = int(dl.group(1))
+            want = MIN_QUIET_DEADLINE.get(job)
+            if want is not None and secs < want:
+                errors.append(f"`{job}` gives the lane {secs}s to go quiet, expected >= "
+                              f"{want}: a starved release build in the same run outlasts "
+                              "that, and the gate would answer 'inconclusive' to a host "
+                              "that was going to idle in two more minutes")
+            raw = scalar(block, "timeout-minutes")
+            if raw is not None and raw.isdigit():
+                budget = int(raw) * 60 - QUIET_WAIT_HEADROOM_SECS
+                if secs >= budget:
+                    errors.append(f"`{job}` can wait {secs}s inside a {raw}-minute job: "
+                                  f"the wait needs a {QUIET_WAIT_HEADROOM_SECS}s margin "
+                                  "for build + measurement + upload, or the gate is cut "
+                                  "short by a cancellation instead of an answer")
+        st = re.search(r"--stage\s+(\S+)", code)
+        if not st:
+            errors.append(f"`{job}`'s quiet-host gate passes no `--stage`: the grant "
+                          "artifact has to name the job that produced it")
+        elif st.group(1) != job:
+            errors.append(f"`{job}` labels its quiet-host grant `{st.group(1)}`: "
+                          "three jobs share one artifact name and the record says "
+                          "nothing about which measurement was authorised")
+        perms = submapping(block, "permissions")
+        if not perms:
+            perms = wf_perms
+        if perms.get("actions") != "read":
+            errors.append(f"`{job}` has no `actions: read`: the quiet-host gate cannot "
+                          "read this run's own job list, which is the half of the "
+                          "calibration that separates a 6.63-load red from a 6.20-load "
+                          "green; load average alone cannot (OBI-403)")
+    return errors
+
+
 def check_text(text, root="."):
     jobs = job_blocks(text)
     wc = workflow_concurrency(text)
@@ -1040,6 +1196,7 @@ def check_text(text, root="."):
     errors += check_mudlib_pin(text, root)
     errors += check_drift_backstop(text)
     errors += check_rangeless_audit(text)
+    errors += check_quiet_host_gate(jobs, text, root)
 
     e11 = [l for l in jobs.get("loadtest-e1-1", []) if not l.lstrip().startswith("#")]
     body = "\n".join(e11)  # comments excluded: the flags must be in the command
@@ -1155,6 +1312,107 @@ def _prepend(text, job, prop):
     return text.replace(f"  {job}:\n", f"  {job}:\n{prop}", 1)
 
 
+def _job_span(lines, job):
+    """(start, end) line indices of `job`'s block, end exclusive."""
+    i = next(k for k, l in enumerate(lines) if l == f"  {job}:\n")
+    j = next((k for k in range(i + 1, len(lines))
+              if re.match(r"  [A-Za-z0-9_-]+:$", lines[k])), len(lines))
+    return i, j
+
+
+def _step_span(lines, job, needle):
+    """(start, end) line indices of the step of `job` that contains `needle`.
+
+    The comment lines above a step are *not* part of it: a mutant that moves or
+    deletes a command has to be caught while the prose explaining why the command
+    exists is still in place. That is the whole point -- rule 14 asks whether the
+    gate runs, not whether the gate is described.
+    """
+    i, j = _job_span(lines, job)
+    h = next((k for k in range(i, j)
+              if needle in lines[k] and not lines[k].lstrip().startswith("#")), None)
+    if h is None:
+        raise AssertionError(f"_step_span: {needle!r} not found in {job}")
+    s = max(k for k in range(i, h + 1) if re.match(r"      - ", lines[k]))
+    e = next((k for k in range(h + 1, j) if re.match(r"      - ", lines[k])), j)
+    return s, e
+
+
+def _drop_step(text, job, needle):
+    lines = text.splitlines(keepends=True)
+    s, e = _step_span(lines, job, needle)
+    return "".join(lines[:s] + lines[e:])
+
+
+def _move_step(text, job, needle, dst_needle):
+    """Move the step containing `needle` to just after the step holding
+    `dst_needle` -- the 'we do wait for a quiet host' shape that waits *after*
+    taking the number."""
+    lines = text.splitlines(keepends=True)
+    s, e = _step_span(lines, job, needle)
+    ds, de = _step_span(lines, job, dst_needle)
+    block = lines[s:e]
+    rest = lines[:s] + lines[e:]
+    if ds >= e:
+        de -= len(block)
+    return "".join(rest[:de] + block + rest[de:])
+
+
+def _append_to_step(text, job, needle, line):
+    """Insert `line` as the last key of the step containing `needle`."""
+    lines = text.splitlines(keepends=True)
+    s, e = _step_span(lines, job, needle)
+    return "".join(lines[:e] + [line] + lines[e:])
+
+
+def _dup_step(text, job, needle):
+    """Repeat a step immediately after itself."""
+    lines = text.splitlines(keepends=True)
+    s, e = _step_span(lines, job, needle)
+    return "".join(lines[:e] + lines[s:e] + lines[e:])
+
+
+def _sub_in_step(text, job, step_needle, needle, repl):
+    """Replace the first line holding `needle` inside the step holding
+    `step_needle`. Keeps the mutation local to one step, which a file-wide
+    `_sub` cannot promise once two steps share a guard."""
+    lines = text.splitlines(keepends=True)
+    s, e = _step_span(lines, job, step_needle)
+    hit = next((k for k in range(s, e)
+                if needle in lines[k] and not lines[k].lstrip().startswith("#")), None)
+    if hit is None:
+        raise AssertionError(f"_sub_in_step: {needle!r} not in the {job} step "
+                             f"holding {step_needle!r}")
+    return "".join(lines[:hit] + [repl] + lines[hit + 1:])
+
+
+def _drop_line_in_job(text, job, needle):
+    lines = text.splitlines(keepends=True)
+    i, j = _job_span(lines, job)
+    k = next((k for k in range(i, j)
+              if needle in lines[k] and not lines[k].lstrip().startswith("#")), None)
+    if k is None:
+        raise AssertionError(f"_drop_line_in_job: {needle!r} not found in {job}")
+    return "".join(lines[:k] + lines[k + 1:])
+
+
+def _timeout_line(text, job, value):
+    """Rewrite one lane job's `timeout-minutes`, leaving the others alone.
+
+    The mutant used to needle the literal `timeout-minutes: 30`, which was only
+    unambiguous while each gate carried a different number and the required
+    gate's was the only 30 in the file. OBI-403 moved all three (45 / 25 / 30)
+    and a bare 30 now belongs to `bench`, which rule 4 does not bound: the old
+    needle would have cut the wrong job and still passed the self-test.
+    """
+    lines = text.splitlines(keepends=True)
+    i, j = _job_span(lines, job)
+    k = next((k for k in range(i, j) if re.match(r"    timeout-minutes:", lines[k])), None)
+    if k is None:
+        raise AssertionError(f"_timeout_line: {job} has no timeout-minutes")
+    return "".join(lines[:k] + [f"    timeout-minutes: {value}\n"] + lines[k + 1:])
+
+
 # The three lane groups, in file order (`bench`, `loadtest-smoke`,
 # `loadtest-e1-1`), each keyed on the verdict of the job it depends on.
 LANE_GROUPS = ["needs.loadtest-smoke.outputs.runtime != 'false'",
@@ -1202,8 +1460,12 @@ MUTANTS = [
     ("a non-lane required check gains !cancelled()",
      lambda t: _prepend(t, "rust", "    if: ${{ !cancelled() }}\n")),
     ("SLA flag dropped", lambda t: _sub(t, "--fail-on-sla-miss", None)),
-    ("gate timeout cut back to 15",
-     lambda t: _sub(t, "timeout-minutes: 30", "    timeout-minutes: 15\n")),
+    ("required gate timeout cut back to 15",
+     lambda t: _timeout_line(t, "loadtest-e1-1", 15)),
+    ("smoke gate timeout cut back to 10",
+     lambda t: _timeout_line(t, "loadtest-smoke", 10)),
+    ("smoke gate cannot pay for its quiet-host wait",
+     lambda t: _timeout_line(t, "loadtest-smoke", 20)),
     ("population lowered", lambda t: _sub(t, "--players 150", "            --players 20 \\\n")),
     ("unrelated job joins the lane",
      lambda t: t.replace("jobs:\n", "jobs:\n  noise:\n    concurrency:\n"
@@ -1356,6 +1618,44 @@ MUTANTS = [
     ("range-less path has no bound at all",
      lambda t: _sub(t, 'elif git rev-parse -q --verify "$AFTER^" >/dev/null 2>&1; then',
                     'elif true; then')),
+    # Rule 14 (OBI-403). Each of these is a way the quiet-host gate stops being a
+    # gate while the workflow still reads as if it has one -- which is exactly the
+    # state the lane was in for two weeks: a guarantee about jobs, documented as a
+    # guarantee about hosts.
+    ("quiet-host gate removed from the required gate",
+     lambda t: _drop_step(t, "loadtest-e1-1", QUIET_GATE)),
+    ("quiet-host gate removed from the smoke gate",
+     lambda t: _drop_step(t, "loadtest-smoke", QUIET_GATE)),
+    ("quiet-host gate removed from bench",
+     lambda t: _drop_step(t, "bench", QUIET_GATE)),
+    ("quiet-host gate runs outside the lane verdict",
+     lambda t: _unguard(t, "loadtest-e1-1", QUIET_GATE)),
+    ("quiet-host gate moved after the measurement",
+     lambda t: _move_step(t, "loadtest-e1-1", QUIET_GATE, "--fail-on-sla-miss")),
+    ("quiet-host gate cannot refuse the measurement",
+     lambda t: _append_to_step(t, "loadtest-e1-1", QUIET_GATE,
+                               "        continue-on-error: true\n")),
+    ("a refused grant is followed by the measurement anyway",
+     lambda t: _sub_in_step(t, "loadtest-e1-1", "--fail-on-sla-miss",
+                            "if: needs.classify.outputs.runtime != 'false'",
+                            "        if: always() && needs.classify.outputs.runtime "
+                            "!= 'false'\n")),
+    ("quiet-host wait budget cut to a minute",
+     lambda t: _replace(t, "--stage loadtest-e1-1 --deadline-secs 1800",
+                        "--stage loadtest-e1-1 --deadline-secs 60")),
+    ("quiet-host wait budget longer than the job can survive",
+     lambda t: _replace(t, "--stage loadtest-e1-1 --deadline-secs 1800",
+                        "--stage loadtest-e1-1 --deadline-secs 3000")),
+    ("quiet-host grant stops naming its job",
+     lambda t: _replace(t, "--stage loadtest-e1-1 --deadline-secs",
+                        "--stage lane --deadline-secs")),
+    ("the lane job loses the permission its gate reads",
+     lambda t: _drop_line_in_job(t, "loadtest-e1-1", "actions: read")),
+    # Not a shape anyone intends, but the shape that *looks* safest: two grants in
+    # one job, the second of which can sit after the measurement while the first
+    # keeps the ordering check happy. Rule 14 asks for exactly one per job.
+    ("the quiet-host gate is duplicated in one job",
+     lambda t: _dup_step(t, "loadtest-e1-1", QUIET_GATE)),
 ]
 
 
@@ -1365,6 +1665,16 @@ def self_test(path):
     failed = 0
     if check_text(text, root):
         print(f"FAIL baseline: {path} does not satisfy its own lane invariants")
+        failed += 1
+    # Not a text mutant: rule 14 names a script, and a check that only reads the
+    # workflow cannot tell a gate that exists from a gate that is prose. Point it
+    # at a repository root without the file and insist it says so.
+    absent = check_text(text, str(Path(root) / "no-such-root"))
+    if any(QUIET_GATE_SCRIPT in e for e in absent):
+        print(f"ok   {QUIET_GATE_SCRIPT} absent: reported")
+    else:
+        print(f"FAIL {QUIET_GATE_SCRIPT} absent: the check accepts a gate it "
+              "cannot find on disk")
         failed += 1
     for name, mutate in MUTANTS:
         errors = check_text(mutate(text), root)

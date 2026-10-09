@@ -290,6 +290,16 @@ jobs:
     # run occupies the lane.
     needs: loadtest-smoke
     if: github.event_name == 'pull_request' && success()
+    # OBI-403: a job-level `permissions` block *replaces* the workflow default,
+    # so `contents: read` has to be restated here. `actions: read` is what lets
+    # the quiet-host gate below read this run's own job list -- the one signal
+    # that separates a 6.63-load red from a 6.20-load green. Rule 14 of
+    # scripts/check-ci-load-lane.py pins it in all three lane jobs, and `hygiene`
+    # runs that checker, so dropping it is a red rather than a silent
+    # degradation to load average alone.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       runtime: ${{ needs.loadtest-smoke.outputs.runtime }}
       reason: ${{ needs.loadtest-smoke.outputs.reason }}
@@ -304,11 +314,17 @@ jobs:
     # OBI-118 prose assumed: meta.env in the bench-rounds artifact measures an
     # i7-6700T container, 8 CPUs visible, no cgroup CPU quota, cpufreq governor
     # `powersave`, load average 4.98 at gate start. Headroom so host load can
-    # only make the gate slow, never hang the lane. Keep this value distinct
-    # from the loadtest gates' 20/30: the check-ci-load-lane self-test mutates
-    # the first `timeout-minutes: 30` in the file, which must stay
-    # loadtest-e1-1's.
-    timeout-minutes: 20
+    # only make the gate slow, never hang the lane.
+    #
+    # OBI-403: 30, not 20. The quiet-host gate may wait up to 420 s for the lane
+    # to go idle, and the 1-minute average still carries `loadtest-e1-1`'s build
+    # and its 150 sessions when this job starts. A wait that runs into the job
+    # timeout produces a *cancelled* gate, which blocks a PR exactly like a miss
+    # while saying nothing about the number -- the failure mode rule 4 exists to
+    # prevent. The three lane timeouts no longer have to be distinct: the
+    # checker's timeout mutants are job-scoped (`_timeout_line()` in
+    # scripts/check-ci-load-lane.py).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -321,16 +337,40 @@ jobs:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: needs.loadtest-smoke.outputs.runtime != 'false'
+      # OBI-403: the lane group makes this *job* exclusive, not the host. The
+      # header of scripts/ci-wait-quiet-lane.py carries the calibration; the short
+      # version is that a run's own `rust` job is a workspace release build on all
+      # eight cores and nothing in the DAG stops it from overlapping a measurement.
+      #
+      # `bench` is the weakest of the three, and honestly so: `bench-gate.sh`
+      # builds both arms *inside* its own measured window, so this gate cannot
+      # quarantine the job from itself. What it removes is the neighbour. The
+      # OBI-312 byte-identical control arm is still what catches the residue, by
+      # declaring the harness invalid rather than reporting a regression. Not a
+      # required check, so a refused grant here is an inconclusive benchmark, not
+      # a blocked PR.
+      - run: python3 scripts/ci-wait-quiet-lane.py wait --stage bench --deadline-secs 420
+        if: needs.loadtest-smoke.outputs.runtime != 'false'
+        env:
+          # Actions does not put `GITHUB_TOKEN` in a `run:` step's environment by
+          # itself; it has to be mapped. This is the run-scoped default token, and
+          # the gate only ever GETs with it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: scripts/bench-gate.sh "${{ github.event.pull_request.base.sha }}"
         if: needs.loadtest-smoke.outputs.runtime != 'false'
       - name: Upload raw round data
         # The verdict is a min-of-medians; OBI-312 could not be diagnosed from
         # CI because the per-round numbers were thrown away. Keep them.
+        # OBI-403: and keep what the host looked like when the gate granted leave
+        # to measure, so a red round reads as noise or as code instead of as a
+        # mystery.
         if: always() && needs.loadtest-smoke.outputs.runtime != 'false'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-rounds-${{ github.run_id }}
-          path: target/bench-gate/logs/
+          path: |
+            target/bench-gate/logs/
+            results/quiet-host.json
           if-no-files-found: warn
   deny:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
@@ -636,6 +676,11 @@ jobs:
     # entered on -- and a runtime-irrelevant run leaves the group immediately
     # instead of queueing behind another PR's measurement.
     needs: loadtest-e1-1
+    # OBI-403: `actions: read` for the quiet-host gate; see the `bench` job for
+    # why `contents: read` is repeated alongside it.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       runtime: ${{ needs.loadtest-e1-1.outputs.runtime }}
       reason: ${{ needs.loadtest-e1-1.outputs.reason }}
@@ -644,7 +689,11 @@ jobs:
       cancel-in-progress: false
       queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
-    timeout-minutes: 20
+    # OBI-403: 25, not 20, and for the same reason as `bench` -- the wait has to
+    # fit inside the job. This job starts seconds after `loadtest-e1-1` releases
+    # the lane, while the 1-minute average still holds that job's build and its
+    # 150 sessions, so a wait here is routine rather than exceptional.
+    timeout-minutes: 25
     continue-on-error: true
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -718,6 +767,14 @@ jobs:
           echo "mudlib: \`LoomMud/warp@$got\` (pinned in \`warp.ref\`)" >> "$GITHUB_STEP_SUMMARY"
       - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
         if: needs.loadtest-e1-1.outputs.runtime != 'false'
+      # OBI-403: quiet-host gate, the same contract as `loadtest-e1-1`'s (see the
+      # comment there and the header of scripts/ci-wait-quiet-lane.py). It is not
+      # a duplicate: the contention this job mostly has to wait out is the decay
+      # of the job before it in the same lane.
+      - run: python3 scripts/ci-wait-quiet-lane.py wait --stage loadtest-smoke --deadline-secs 600
+        if: needs.loadtest-e1-1.outputs.runtime != 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: run loom serve + loadtest smoke
         if: needs.loadtest-e1-1.outputs.runtime != 'false'
         env:
@@ -760,6 +817,7 @@ jobs:
           path: |
             results/ci-smoke.*
             results/loom-serve-smoke.log
+            results/quiet-host.json
   loadtest-e1-1:
     # E1.1 regression gate (150 players, p99 < 50 ms, OBI-177): a required
     # check. Scales up loadtest-smoke's same real `loom serve` + warp mudlib
@@ -795,6 +853,18 @@ jobs:
     # after a cancel, which produces a number nobody can interpret.
     needs: classify
     if: ${{ !cancelled() }}
+    # OBI-403: the quiet-host gate has to read *this run's* job list to know
+    # whether the heaviest job in the pool -- `rust`, a workspace release build --
+    # is still in flight while we would be measuring. That is a read-only
+    # `actions: read` on the default token. A job-level `permissions` block
+    # replaces the workflow default, hence `contents: read` again. Rule 14 of
+    # scripts/check-ci-load-lane.py goes red if either line disappears: without
+    # `actions: read` the gate degrades to load average alone, and the
+    # calibration in scripts/ci-wait-quiet-lane.py shows that is not enough (a
+    # 6.63-load red and a 6.20-load green are the same load average).
+    permissions:
+      contents: read
+      actions: read
     outputs:
       runtime: ${{ needs.classify.outputs.runtime }}
       reason: ${{ needs.classify.outputs.reason }}
@@ -803,14 +873,32 @@ jobs:
       cancel-in-progress: false
       queue: max
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
-    # 30, not 15: the lane keeps a second *gate* off the host, but the same
-    # run's `rust` job and another PR's build still share it, and a starved
-    # release build then blows the budget. When that happened on this PR's
-    # first attempt (run 37663331238, 2026-10-07 18:01:00 -> 18:16) the job
+    # 45, not 30 and long ago not 15: the lane keeps a second *gate* off the host,
+    # but the same run's `rust` job and another PR's build still share it, and a
+    # starved release build then blows the budget. When that happened on this
+    # gate's first attempt (run 37663331238, 2026-10-07 18:01:00 -> 18:16) the job
     # did not fail, it was *cancelled* at the timeout -- which blocks a PR
     # exactly like a miss and says nothing about p99. A gate that can be
     # cancelled by load is not a gate; slow is survivable, cancelled is not.
-    timeout-minutes: 30
+    #
+    # OBI-403: the 55, and the reason it is not 45. The same argument applies to
+    # the *wait*, not just the build: the quiet-host gate may spend up to 1800 s
+    # getting the lane to idle, and a budget that lets that wait run into the
+    # timeout produces a cancelled required check, which is the failure mode the
+    # paragraph above forbids. The arithmetic: build <= 15 min starved (run
+    # 37663331238 needed that much), wait <= 30 min, 90 s of load + a 60 s save
+    # drain + teardown ~4 min, upload ~1 min. Rule 14 pins `--deadline-secs`
+    # against `timeout-minutes`, so the two cannot drift apart.
+    #
+    # Why the wait gets 30 min and not 9: build and wait are anti-correlated (a
+    # starved own-build means this run's `rust` is near its end), so the worst
+    # case is roughly max(own build, `rust` end + loadavg decay), and cold-cache
+    # trunk pushes set that bar high - run 37929376168 measured `rust` at
+    # 12:20:59 -> 12:47:03, 26 minutes. A 900 s deadline would have made every
+    # cold-cache trunk push INCONCLUSIVE *by construction*, which is the same
+    # failure as a red that says nothing about p99. 1800 s < 55*60 - 600, so rule
+    # 14's headroom still holds.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # Always runs, on both paths: a green check that measured nothing has to
@@ -903,6 +991,38 @@ jobs:
           echo "mudlib: \`LoomMud/warp@$got\` (pinned in \`warp.ref\`)" >> "$GITHUB_STEP_SUMMARY"
       - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
         if: needs.classify.outputs.runtime != 'false'
+      # OBI-403: the reason the "intermittent" E1.1 reds were intermittent. The
+      # lane group makes this *job* exclusive; it says nothing about the host.
+      # This job carries exactly one `needs:` -- `classify`, which takes seconds --
+      # so `rust`, a workspace release build on all eight cores of the same pod,
+      # is routinely still running when the p99 window opens, and on a `push` to
+      # `main` it is running every time (OBI-400 drained the lane, which removed
+      # the queueing that had been accidentally covering this up: both push runs
+      # after it went red on the first attempt). Calibration, exit codes, and why
+      # `pgrep` is only a backstop on this topology: the header of
+      # scripts/ci-wait-quiet-lane.py.
+      #
+      # On timeout it fails as "the lane never got quiet" and says INCONCLUSIVE --
+      # never as a p99 miss. It carries no `continue-on-error`, so a refused grant
+      # stops the job *before* the measurement instead of measuring on a hot host
+      # and printing a number nobody can interpret. And it runs after this job's
+      # own `cargo build --release` on purpose: the question is what the host
+      # looks like at the instant the clock starts, and a release build that ended
+      # 20 s ago is still inside the 1-minute average.
+      #
+      # Two clocks on purpose (the defaults inside the script): the host signals are
+      # read every 10 s, the run's job list every 30 s. A 30-minute wait at one
+      # cadence would be 180 calls against the pool's shared 1000/hour token, and a
+      # quota 403 is transient, not a permission block - the gate keeps waiting for a
+      # good read rather than falling back to host-only and granting a measurement
+      # while `rust` runs. `rust` does not start and finish inside 30 s.
+      - run: python3 scripts/ci-wait-quiet-lane.py wait --stage loadtest-e1-1 --deadline-secs 1800
+        if: needs.classify.outputs.runtime != 'false'
+        env:
+          # Actions does not export `GITHUB_TOKEN` into a `run:` step's
+          # environment on its own; it has to be mapped. This is the run-scoped
+          # default token, and the gate only ever GETs with it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: capture runner context
         # OBI-344: E1.1 measures wall-clock latency on a *shared* self-hosted
         # runner set, and the lane only guarantees one gate at a time -- the
@@ -947,6 +1067,17 @@ jobs:
           LOOM_SERVE_ERROR_LOG: "1"
         run: |
           set -uo pipefail
+          # OBI-403: the gate above decides *whether* to measure; this decides what
+          # a red means afterwards. The sampler records the host every 5 s -- the
+          # same width as the report's `--timeline-bucket-ms 5000` -- so `correlate`
+          # at the bottom of this step can say "the tail is in the bucket at t+35 s,
+          # when this container was at 98% CPU" instead of leaving the attribution
+          # to argument. Read-only /proc reads, no load worth naming; killed in the
+          # non-gating tail below, and bounded by --max-secs if the step ever dies.
+          date +%s > /tmp/loom-measure-t0
+          python3 scripts/ci-wait-quiet-lane.py sample --out results/host-samples.tsv \
+            --interval-secs 5 --max-secs 900 &
+          host_sampler=$!
           # OBI-344: give the run a save root that exists. Every E1.1 run so
           # far recorded `loom_runtime_errors_total{program="/std/player"}
           # = 150` -- one per connected player -- because `save_character`
@@ -978,6 +1109,8 @@ jobs:
             --note "mudlib LoomMud/warp@${{ steps.warp-pin.outputs.rev }} (pinned in warp.ref)" \
             --fail-on-sla-miss
           status=$?
+          kill "$host_sampler" 2>/dev/null || true
+          wait "$host_sampler" 2>/dev/null || true
           # OBI-344 follow-up (main run 37862921160 on eaf9ceb): everything
           # below this line collects evidence; none of it decides the verdict,
           # and `exit $status` at the bottom is the only thing that does. The
@@ -1079,6 +1212,17 @@ jobs:
           if [ -n "$durmax" ] && [ "$(awk -v d="$durmax" 'BEGIN {print (d > 50) ? 1 : 0}')" = "1" ]; then
             echo "::warning title=OBI-344 world-thread stall recorded::E1.1 recorded $stalls world-loop iteration(s) over the 50 ms stall budget, worst ${durmax} ms (kinds: ${kinds:-none}). Check whether they fall inside the sampled window before treating the p99 verdict as evidence about them."
           fi
+          # OBI-403: join the host samples to the latency timeline and print the
+          # table. This is the half of the fix that stops the next red from being an
+          # argument: a bucket over the SLA that coincides with a saturated
+          # container is annotated as host contention, and one that does not is
+          # annotated as a world-thread finding worth a bug hunt. It never decides
+          # the verdict -- `correlate` always exits 0, and `exit $status` below is
+          # still the only thing that can fail this step (rule 7).
+          python3 scripts/ci-wait-quiet-lane.py correlate --stage loadtest-e1-1 \
+            --report results/ci-e1-1.json --samples results/host-samples.tsv \
+            --t0-file /tmp/loom-measure-t0 --out results/host-vs-latency.md \
+            --quiet-host-file results/quiet-host.json || true
           exit $status
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always() && needs.classify.outputs.runtime != 'false'
@@ -1089,4 +1233,7 @@ jobs:
             results/loom-serve.log
             results/loom-metrics-final.txt
             results/runner-context-before.txt
+            results/quiet-host.json
+            results/host-samples.tsv
+            results/host-vs-latency.md
 
