@@ -96,7 +96,7 @@ impl<C: HttpClient> PullRequestOpener for GitHubAppClient<C> {
 mod tests {
     use super::*;
     use crate::github::UreqClient;
-    use std::io::{Read, Write};
+    use crate::github::fake_http;
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
@@ -109,6 +109,10 @@ mod tests {
     /// Spawns a fake GitHub server that answers the installation-token
     /// mint on `/app/installations/...` and the PR-create call on
     /// `/repos/.../pulls`, recording the request bodies it sees.
+    ///
+    /// Requests are read and closed through [`fake_http`], the same
+    /// complete-request path every other loopback GitHub server in this
+    /// crate uses (OBI-350).
     fn spawn_fake_github() -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -120,88 +124,23 @@ mod tests {
                     Ok(s) => s,
                     Err(_) => break,
                 };
-                let req = match read_full_request(&mut stream) {
-                    Some(r) => r,
-                    None => continue,
+                let Some(req) = fake_http::read_request(&mut stream) else {
+                    continue;
                 };
-                let (head, body) = req.split_once("\r\n\r\n").unwrap_or((&req, ""));
-                let path = head
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("")
-                    .to_string();
-                seen_clone.lock().unwrap().push(format!("{path}\n{body}"));
-                let (status, status_text, resp_body) = if path.contains("access_tokens") {
-                    (
-                        201,
-                        "Created",
-                        r#"{"token":"ghs_abc","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
-                    )
+                seen_clone
+                    .lock()
+                    .unwrap()
+                    .push(format!("{}\n{}", req.path, req.body));
+                let resp_body = if req.path.contains("access_tokens") {
+                    r#"{"token":"ghs_abc","expires_at":"2099-01-01T00:00:00Z"}"#.to_string()
                 } else {
-                    (
-                        201,
-                        "Created",
-                        r#"{"number":42,"html_url":"https://github.com/LoomMud/warp/pull/42"}"#
-                            .to_string(),
-                    )
+                    r#"{"number":42,"html_url":"https://github.com/LoomMud/warp/pull/42"}"#
+                        .to_string()
                 };
-                let resp = format!(
-                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    resp_body.len()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.write_all(resp_body.as_bytes());
+                fake_http::respond(&mut stream, 201, &resp_body);
             }
         });
         (addr, seen)
-    }
-
-    /// Reads a full HTTP/1.1 request (headers + `Content-Length` body)
-    /// off `stream`, looping until both are complete -- a single `read`
-    /// call is **not** guaranteed to return the whole request in one
-    /// shot (the headers and body can legitimately arrive as separate
-    /// TCP segments/reads under load), which a fixed single-`read` fake
-    /// server silently truncates instead of failing loudly.
-    fn read_full_request(stream: &mut std::net::TcpStream) -> Option<String> {
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let headers_end = find_subslice(&buf, b"\r\n\r\n");
-            if let Some(end) = headers_end {
-                let header_text = String::from_utf8_lossy(&buf[..end]);
-                let content_length: usize = header_text
-                    .lines()
-                    .find_map(|l| l.strip_prefix("Content-Length: "))
-                    .or_else(|| {
-                        header_text
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length: "))
-                    })
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(0);
-                let have_body = buf.len().saturating_sub(end + 4);
-                if have_body >= content_length {
-                    break;
-                }
-            }
-            let n = stream.read(&mut chunk).ok()?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        if buf.is_empty() {
-            None
-        } else {
-            Some(String::from_utf8_lossy(&buf).into_owned())
-        }
-    }
-
-    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|window| window == needle)
     }
 
     #[test]
@@ -242,16 +181,10 @@ mod tests {
                     Ok(s) => s,
                     Err(_) => break,
                 };
-                let mut buf = [0u8; 8192];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let path = req
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("")
-                    .to_string();
-                let (status, body) = if path.contains("access_tokens") {
+                let Some(req) = fake_http::read_request(&mut stream) else {
+                    continue;
+                };
+                let (status, body) = if req.path.contains("access_tokens") {
                     (
                         201,
                         r#"{"token":"ghs_abc","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
@@ -259,12 +192,7 @@ mod tests {
                 } else {
                     (422, r#"{"message":"Validation Failed"}"#.to_string())
                 };
-                let resp = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.write_all(body.as_bytes());
+                fake_http::respond(&mut stream, status, &body);
             }
         });
         let app = GitHubAppClient::new("1", "2", &test_pem(), UreqClient::default())
