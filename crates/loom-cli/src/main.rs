@@ -32,11 +32,12 @@ const COMMAND_CHANNEL_CAPACITY: usize = 1024;
 const DB_QUEUE_DEPTH: usize = 256;
 /// Bound on audit rows in flight between the world thread and
 /// [`run_audit_sink`] (OBI-36 D-S2.5/OBI-123): the world thread's
-/// `try_send` drops a batch (with a warning) rather than ever blocking on
-/// a slow/stalled Postgres connection -- the in-memory ring is still the
-/// source of truth and the batch is only a handful of ticks' worth of
-/// entries (see `World::drain_audit_since`'s doc for what a fallen-behind
-/// sink loses instead: the ring's own bound, not this queue's).
+/// `try_send` never blocks on a slow/stalled Postgres connection -- when
+/// the queue is full [`AuditHandoff`] holds the batch and retries it on the
+/// next tick (OBI-354; it used to drop it with a warning). What a sink that
+/// stays fallen behind for a full ring's worth of decisions still loses is
+/// the ring's own bound, not this queue's (see
+/// `World::drain_audit_since`'s doc).
 const AUDIT_QUEUE_DEPTH: usize = 64;
 
 /// Bound on `reclaim_tx`/`adopt_tx` (OBI-184 copyover-trigger slice): a
@@ -2958,6 +2959,14 @@ async fn run_roles_manager(
 /// dropped -- the audit ring itself is still the source of truth and keeps
 /// its own bounded history, so losing one batch to a transient DB error is
 /// preferable to blocking the world thread or retrying forever.
+///
+/// **OBI-354:** this insert-side drop is the one path left on which a
+/// recorded decision can still fail to reach `audit_log`. Making it retry is
+/// an at-least-once/duplicate-rows policy call (a security-model change), so
+/// it goes to the CTO rather than being decided here. A successful write is
+/// now logged at `debug!` so a failed assertion in `tests/roles_demo.rs` can
+/// distinguish "the row was never written" from "the row was written after
+/// the watcher gave up".
 async fn run_audit_sink(
     persist: Persist,
     mut audit_rx: mpsc::Receiver<Vec<loom_vm::AuditRow>>,
@@ -2968,10 +2977,144 @@ async fn run_audit_sink(
             _ = shutdown_rx.changed() => break,
             batch = audit_rx.recv() => {
                 let Some(batch) = batch else { break };
+                let count = batch.len();
+                let first_kind = batch.first().map(|r| r.kind).unwrap_or("-");
                 let rows: Vec<loom_persist::AuditRow> = batch.into_iter().map(to_persist_audit_row).collect();
-                if let Err(err) = persist.insert_audit_batch(&rows).await {
-                    warn!(error = %err, dropped = rows.len(), "audit_log insert failed; batch dropped");
+                match persist.insert_audit_batch(&rows).await {
+                    Ok(()) => {
+                        debug!(
+                            rows = count,
+                            kind = first_kind,
+                            "audit_log batch written to Postgres"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            rows = count,
+                            kind = first_kind,
+                            error = %err,
+                            "audit_log insert failed; batch dropped"
+                        );
+                    }
                 }
+            }
+        }
+    }
+}
+
+/// One `audit_log` batch, paired with the cursor that describes it: the unit
+/// the world thread retries on (OBI-354).
+type AuditBatch = (Vec<loom_vm::AuditRow>, u64);
+
+/// Result of one world-thread audit flush attempt -- see [`AuditHandoff`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuditFlush {
+    /// Nothing had been recorded since the last batch the sink took.
+    Empty,
+    /// The sink took the batch; the cursor moved past it.
+    Accepted(usize),
+    /// The sink could not take the batch this time. It stays held here and is
+    /// retried on the next tick -- the world thread never blocks (OBI-354).
+    Deferred(usize),
+    /// The sink task is gone (its receiver was dropped, i.e. the process is
+    /// shutting down), so nothing more can reach Postgres. Terminal: the
+    /// handoff says so once, loudly, instead of re-draining forever.
+    SinkGone(usize),
+}
+
+/// The world thread's half of the `audit_log` pipeline (OBI-354).
+///
+/// Before OBI-354 the flush advanced the drain cursor *before* handing the
+/// batch to `run_audit_sink`, and a `try_send` that failed (queue `Full`
+/// behind a backed-up sink) only logged. Those decisions were then
+/// unreachable by the consumer, because the cursor claimed the sink already
+/// had them: a denied `/secure` or P2+ builder check could vanish from the
+/// audit trail while the server kept running and looking healthy. The cursor
+/// now moves only once the sink has actually taken the batch, and a batch the
+/// sink refused is held here and retried on the next tick.
+///
+/// Holding the batch -- instead of re-draining from the old cursor every tick
+/// -- is what keeps this non-blocking *and* cheap: a retry costs one
+/// `try_send`, not a fresh clone of every pending row, and the batch in hand
+/// is immune to ring eviction while it waits. Delivering a held batch moves
+/// the cursor to that batch's own position, so no row is ever sent twice and
+/// no row between the two positions is skipped.
+struct AuditHandoff {
+    /// `SecurityState::audit_total` as of the last batch the sink took.
+    cursor: u64,
+    /// A batch the sink has not taken yet, with the cursor it belongs to.
+    pending: Option<AuditBatch>,
+    /// Sticky: the sink's receiver is gone, so the pipeline is over.
+    sink_gone: bool,
+}
+
+impl AuditHandoff {
+    fn new() -> Self {
+        Self {
+            cursor: 0,
+            pending: None,
+            sink_gone: false,
+        }
+    }
+
+    /// Move everything the world has recorded toward Postgres, without ever
+    /// blocking. `drain` is `World::drain_audit_since`; `tx` is the bounded
+    /// channel `run_audit_sink` reads. World thread only.
+    fn flush<D>(&mut self, mut drain: D, tx: &mpsc::Sender<Vec<loom_vm::AuditRow>>) -> AuditFlush
+    where
+        D: FnMut(u64) -> AuditBatch,
+    {
+        // A refused `try_send` gives the batch back -- that is what makes the
+        // retry possible without re-reading the ring.
+        if self.sink_gone {
+            return AuditFlush::SinkGone(self.pending.as_ref().map_or(0, |b| b.0.len()));
+        }
+        // Rows handed to the sink by this call, before anything new is drained.
+        let mut delivered = 0usize;
+        // 1. Retry whatever the sink already refused; delivering it settles
+        //    the cursor at *that* batch's position.
+        if let Some((rows, next)) = self.pending.take() {
+            let count = rows.len();
+            match tx.try_send(rows) {
+                Ok(()) => {
+                    self.cursor = next;
+                    delivered = count;
+                }
+                Err(mpsc::error::TrySendError::Full(rows)) => {
+                    self.pending = Some((rows, next));
+                    return AuditFlush::Deferred(count);
+                }
+                Err(mpsc::error::TrySendError::Closed(rows)) => {
+                    self.pending = Some((rows, next));
+                    self.sink_gone = true;
+                    return AuditFlush::SinkGone(count);
+                }
+            }
+        }
+        // 2. Then anything recorded since.
+        let (rows, next) = drain(self.cursor);
+        let count = rows.len();
+        if count == 0 {
+            self.cursor = next;
+            return if delivered > 0 {
+                AuditFlush::Accepted(delivered)
+            } else {
+                AuditFlush::Empty
+            };
+        }
+        match tx.try_send(rows) {
+            Ok(()) => {
+                self.cursor = next;
+                AuditFlush::Accepted(delivered + count)
+            }
+            Err(mpsc::error::TrySendError::Full(rows)) => {
+                self.pending = Some((rows, next));
+                AuditFlush::Deferred(count)
+            }
+            Err(mpsc::error::TrySendError::Closed(rows)) => {
+                self.pending = Some((rows, next));
+                self.sink_gone = true;
+                AuditFlush::SinkGone(count)
             }
         }
     }
@@ -3059,7 +3202,8 @@ fn spawn_world_thread(
                 command_tx,
                 cmd_probe: loom_obs::NetCommandProbe::from_env(),
             };
-            let mut audit_cursor: u64 = 0;
+            let mut audit_handoff = AuditHandoff::new();
+            let mut audit_sink_gone_logged = false;
             // OBI-180 M-FS-5 (CTO review of PR #119, must-fix 2): per-uid
             // compile queue state -- see `CompileSlot`'s doc comment.
             let mut compile_slots: std::collections::HashMap<String, CompileSlot> =
@@ -3179,9 +3323,7 @@ fn spawn_world_thread(
                                         })
                                         .collect(),
                                 }),
-                                Ok(None) => {
-                                    Err(loom_http::admin_query::WorldQueryError::NotFound)
-                                }
+                                Ok(None) => Err(loom_http::admin_query::WorldQueryError::NotFound),
                                 Err(e) => Err(loom_http::admin_query::WorldQueryError::Internal(
                                     e.message,
                                 )),
@@ -3224,8 +3366,7 @@ fn spawn_world_thread(
                         // testable without a live net thread; see that
                         // function for the recipient rule.
                         WorldQueryRequest::Broadcast { text, reply } => {
-                            let count =
-                                broadcast_to_interactive_sessions(world, host, &text);
+                            let count = broadcast_to_interactive_sessions(world, host, &text);
                             let _ = reply.send(Ok(count));
                         }
                     }
@@ -3298,29 +3439,49 @@ fn spawn_world_thread(
                         // "received" acknowledgement.
                         tick_pending.store(false, Ordering::Release);
 
-                        // OBI-123 D-S2.5: once per world tick, flush any
-                        // audit entries recorded since the last flush.
-                        // Skipped entirely when there is no sink at all
-                        // (`has_audit_sink` false: no `DATABASE_URL`) --
-                        // nothing would ever drain `audit_tx` anyway (CTO
-                        // review N1). A full/closed `audit_tx` with a real
-                        // sink (the sink task fell behind, or the process
-                        // is shutting down) drops this batch, logged at a
-                        // rate limit -- the audit ring itself still has it,
-                        // up to its own bound.
+                        // OBI-123 D-S2.5 / OBI-354: once per world tick,
+                        // flush any audit entries recorded since the last
+                        // batch the sink *took*. Skipped entirely when there
+                        // is no sink at all (`has_audit_sink` false: no
+                        // `DATABASE_URL`) -- nothing would ever drain
+                        // `audit_tx` anyway (CTO review N1). A full
+                        // `audit_tx` now holds the batch and retries it next
+                        // tick instead of dropping it; a gone sink is a
+                        // terminal, loudly logged state. Either way the world
+                        // thread never blocks and the drain cursor never runs
+                        // ahead of what the sink actually received.
                         if has_audit_sink {
-                            let (rows, cursor) = world.drain_audit_since(audit_cursor);
-                            audit_cursor = cursor;
-                            if !rows.is_empty() && audit_tx.try_send(rows).is_err() {
-                                let now = std::time::Instant::now();
-                                if last_audit_drop_warn
-                                    .is_none_or(|t| now.duration_since(t) >= AUDIT_DROP_WARN_INTERVAL)
-                                {
-                                    warn!(
-                                        "audit_log batch dropped: run_audit_sink is full or gone \
-                                         (further drops suppressed for {AUDIT_DROP_WARN_INTERVAL:?})"
-                                    );
-                                    last_audit_drop_warn = Some(now);
+                            match audit_handoff
+                                .flush(|cursor| world.drain_audit_since(cursor), &audit_tx)
+                            {
+                                AuditFlush::Empty | AuditFlush::Accepted(_) => {}
+                                AuditFlush::Deferred(count) => {
+                                    let now = std::time::Instant::now();
+                                    if last_audit_drop_warn.is_none_or(|t| {
+                                        now.duration_since(t) >= AUDIT_DROP_WARN_INTERVAL
+                                    }) {
+                                        warn!(
+                                            rows = count,
+                                            queue_capacity = audit_tx.capacity(),
+                                            "audit_log sink is behind: holding the batch and \
+                                             retrying next tick (further warnings suppressed \
+                                             for {AUDIT_DROP_WARN_INTERVAL:?})"
+                                        );
+                                        last_audit_drop_warn = Some(now);
+                                    }
+                                }
+                                AuditFlush::SinkGone(count) => {
+                                    // Sticky in the handoff, so this fires on
+                                    // every tick from now on: log the loss once.
+                                    if !audit_sink_gone_logged {
+                                        audit_sink_gone_logged = true;
+                                        error!(
+                                            rows = count,
+                                            queue_capacity = audit_tx.capacity(),
+                                            "audit_log sink task is gone: these decisions cannot \
+                                             reach Postgres and no further flush will be drained"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -3419,33 +3580,34 @@ fn spawn_world_thread(
                         enqueue_compile(&mut world, &mut host, &mut compile_slots, req);
                         continue;
                     }
-                    let result: Result<loom_http::files::FileOpValue, loom_http::files::FileOpError> =
-                        match &req.kind {
-                            loom_http::files::FileOpKind::Read => world
-                                .call_file_efun(
-                                    &req.uid,
-                                    "read_file",
-                                    vec![Value::str(&req.path)],
-                                    &mut host,
-                                )
-                                .map_err(loom_http::files::FileOpError::Refused)
-                                .and_then(|v| {
-                                    file_op_value_from_read(v)
-                                        .map_err(loom_http::files::FileOpError::Refused)
-                                }),
-                            loom_http::files::FileOpKind::WriteIfMatch { precondition, text } => world
-                                .call_file_write_if_match(
-                                    &req.uid,
-                                    &req.path,
-                                    vm_precondition_from_http(precondition),
-                                    text,
-                                    &mut host,
-                                )
-                                .map(file_op_value_from_cas)
-                                .map_err(loom_http::files::FileOpError::Refused),
-                            loom_http::files::FileOpKind::List => match world
-                                .list_dir(&req.uid, &req.path, &mut host)
-                            {
+                    let result: Result<
+                        loom_http::files::FileOpValue,
+                        loom_http::files::FileOpError,
+                    > = match &req.kind {
+                        loom_http::files::FileOpKind::Read => world
+                            .call_file_efun(
+                                &req.uid,
+                                "read_file",
+                                vec![Value::str(&req.path)],
+                                &mut host,
+                            )
+                            .map_err(loom_http::files::FileOpError::Refused)
+                            .and_then(|v| {
+                                file_op_value_from_read(v)
+                                    .map_err(loom_http::files::FileOpError::Refused)
+                            }),
+                        loom_http::files::FileOpKind::WriteIfMatch { precondition, text } => world
+                            .call_file_write_if_match(
+                                &req.uid,
+                                &req.path,
+                                vm_precondition_from_http(precondition),
+                                text,
+                                &mut host,
+                            )
+                            .map(file_op_value_from_cas)
+                            .map_err(loom_http::files::FileOpError::Refused),
+                        loom_http::files::FileOpKind::List => {
+                            match world.list_dir(&req.uid, &req.path, &mut host) {
                                 Ok(Some(result)) => Ok(loom_http::files::FileOpValue::Entries {
                                     names: result.names,
                                     truncated: result.truncated,
@@ -3459,11 +3621,12 @@ fn spawn_world_thread(
                                 Err(loom_vm::world::ListDirError::Internal(msg)) => {
                                     Err(loom_http::files::FileOpError::Internal(msg))
                                 }
-                            },
-                            loom_http::files::FileOpKind::Compile => {
-                                unreachable!("handled above, before this match")
                             }
-                        };
+                        }
+                        loom_http::files::FileOpKind::Compile => {
+                            unreachable!("handled above, before this match")
+                        }
+                    };
                     req.respond(result);
                 }
 
@@ -3862,5 +4025,263 @@ mod roles_manager_tests {
             _ = tokio::time::sleep(Duration::from_secs(3600)) => "timer won",
         };
         assert_eq!(raced, "timer won");
+    }
+}
+
+#[cfg(test)]
+mod audit_handoff_tests {
+    use super::*;
+
+    /// One denied `/secure` write, as the world thread would hand it over.
+    fn row(argument: &str) -> loom_vm::AuditRow {
+        loom_vm::AuditRow {
+            kind: "write_file",
+            caller: Some("/std/player.c".into()),
+            effective_principal: Some("guest".into()),
+            apply: "roles_actor",
+            class: 0,
+            argument: argument.to_string(),
+            guard_set: vec!["valid_write".into()],
+            allowed: false,
+            detail: Some("tier 0".into()),
+            at_unix_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn arguments(batch: &[loom_vm::AuditRow]) -> Vec<String> {
+        batch.iter().map(|r| r.argument.clone()).collect()
+    }
+
+    /// `World::drain_audit_since`'s contract without a booted `World`: every
+    /// row recorded since `cursor`, plus the new total. `drain_calls` is what
+    /// the world thread pays per tick -- a retry must not re-read the ring.
+    #[derive(Default)]
+    struct MockRing {
+        rows: Vec<loom_vm::AuditRow>,
+        drain_calls: usize,
+    }
+
+    impl MockRing {
+        fn with(arguments: &[&str]) -> Self {
+            Self {
+                rows: arguments.iter().map(|a| row(a)).collect(),
+                drain_calls: 0,
+            }
+        }
+
+        fn push(&mut self, argument: &str) {
+            self.rows.push(row(argument));
+        }
+
+        fn drain(&mut self, cursor: u64) -> AuditBatch {
+            self.drain_calls += 1;
+            let start = cursor as usize;
+            (self.rows[start..].to_vec(), self.rows.len() as u64)
+        }
+    }
+
+    /// Occupy the single slot of a depth-1 queue, the way a sink that has
+    /// fallen behind does to the world thread's `try_send`.
+    fn queue_behind_one_batch() -> (
+        mpsc::Sender<Vec<loom_vm::AuditRow>>,
+        mpsc::Receiver<Vec<loom_vm::AuditRow>>,
+    ) {
+        let (tx, rx) = mpsc::channel::<Vec<loom_vm::AuditRow>>(1);
+        tx.try_send(vec![row("already in flight")])
+            .expect("prime the bounded queue");
+        (tx, rx)
+    }
+
+    /// The OBI-354 regression: a denied P2+ `/secure` write whose batch finds
+    /// the sink queue full must still reach the sink. Before the fix, the
+    /// flush advanced the drain cursor first, so the batch was dropped with a
+    /// warning and nothing ever asked for it again -- the audit trail silently
+    /// lost the decision.
+    #[test]
+    fn a_full_sink_queue_defers_the_batch_instead_of_losing_it() {
+        let (tx, mut rx) = queue_behind_one_batch();
+        let mut ring = MockRing::with(&["/secure/plan.txt"]);
+        let mut handoff = AuditHandoff::new();
+
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::Deferred(1)
+        );
+        // The batch is held, not gone...
+        assert!(handoff.pending.is_some(), "the refused batch was dropped");
+        // ...and the consumer has not seen it (only its own earlier batch).
+        assert_eq!(
+            arguments(&rx.try_recv().expect("the in-flight batch")),
+            vec!["already in flight"]
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing else may reach the sink yet"
+        );
+
+        // The sink catches up: the held decision must arrive.
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::Accepted(1)
+        );
+        assert_eq!(
+            arguments(&rx.try_recv().expect("the deferred batch")),
+            vec!["/secure/plan.txt"],
+            "a deferred audit batch must still reach Postgres"
+        );
+        assert_eq!(handoff.cursor, 1, "the cursor tracks the sink");
+        assert!(handoff.pending.is_none());
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::Empty
+        );
+    }
+
+    /// Retrying from the held batch, not from the ring: a sink that stays
+    /// behind costs the world thread one `try_send` per tick, never a fresh
+    /// clone of every pending decision.
+    #[test]
+    fn a_held_batch_is_retried_without_re_reading_the_ring() {
+        let (tx, mut rx) = queue_behind_one_batch();
+        let mut ring = MockRing::with(&["one", "two"]);
+        let mut handoff = AuditHandoff::new();
+
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::Deferred(2)
+        );
+        let drains = ring.drain_calls;
+        for _ in 0..3 {
+            assert_eq!(
+                handoff.flush(|cursor| ring.drain(cursor), &tx),
+                AuditFlush::Deferred(2)
+            );
+        }
+        assert_eq!(
+            ring.drain_calls, drains,
+            "a deferred batch must not re-drain the audit ring"
+        );
+
+        rx.try_recv().expect("the in-flight batch");
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::Accepted(2)
+        );
+        assert_eq!(
+            arguments(&rx.try_recv().expect("the held batch")),
+            vec!["one", "two"]
+        );
+        assert_eq!(ring.drain_calls, drains + 1, "one drain after delivery");
+    }
+
+    /// Nothing recorded is skipped, nothing is sent twice, and order holds --
+    /// decisions recorded *while* the sink was behind still follow the batch
+    /// the handoff was holding.
+    #[test]
+    fn every_decision_reaches_the_sink_exactly_once_and_in_order() {
+        let (tx, mut rx) = queue_behind_one_batch();
+        let mut ring = MockRing::with(&["first"]);
+        let mut handoff = AuditHandoff::new();
+
+        // `first` is refused, and a second decision lands while the sink is
+        // still behind: it stays in the ring, behind the held batch.
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::Deferred(1)
+        );
+        ring.push("second");
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::Deferred(1)
+        );
+
+        // The sink takes `first`; the queue is immediately full again, so
+        // `second` goes into the held batch rather than being dropped.
+        rx.try_recv().expect("the in-flight batch");
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::Deferred(1)
+        );
+        assert_eq!(arguments(&rx.try_recv().expect("`first`")), vec!["first"]);
+
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::Accepted(1)
+        );
+        assert_eq!(arguments(&rx.try_recv().expect("`second`")), vec!["second"]);
+
+        // Settled: nothing in flight, the cursor is at the ring's end, and a
+        // further flush sends nothing at all.
+        assert_eq!(handoff.cursor, 2);
+        assert!(handoff.pending.is_none());
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::Empty
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no duplicate batch may reach Postgres"
+        );
+    }
+
+    /// A sink whose receiver is gone (shutdown) is terminal: the handoff stops
+    /// instead of draining the ring every tick forever, and says so.
+    #[test]
+    fn a_gone_sink_stops_the_handoff_instead_of_spinning() {
+        let (tx, rx) = mpsc::channel::<Vec<loom_vm::AuditRow>>(4);
+        drop(rx);
+        let mut ring = MockRing::with(&["/secure/plan.txt"]);
+        let mut handoff = AuditHandoff::new();
+
+        assert_eq!(
+            handoff.flush(|cursor| ring.drain(cursor), &tx),
+            AuditFlush::SinkGone(1)
+        );
+        let drains = ring.drain_calls;
+        for _ in 0..3 {
+            assert_eq!(
+                handoff.flush(|cursor| ring.drain(cursor), &tx),
+                AuditFlush::SinkGone(1)
+            );
+        }
+        assert_eq!(
+            ring.drain_calls, drains,
+            "a gone sink must not keep draining the ring"
+        );
+        assert!(
+            handoff.pending.is_some(),
+            "the loss is reported, not hidden"
+        );
+    }
+
+    /// Characterises the bug OBI-354 fixes: a cursor that moves before the
+    /// send leaves the consumer unable to ask for the batch again. Kept as an
+    /// executable note on why [`AuditHandoff`] holds a batch at all.
+    #[test]
+    fn advancing_the_cursor_before_the_send_loses_the_batch() {
+        let (tx, mut rx) = queue_behind_one_batch();
+        let mut ring = MockRing::with(&["/secure/plan.txt"]);
+        let mut cursor: u64 = 0;
+
+        // The pre-OBI-354 flush, verbatim: drain, move the cursor, then send.
+        let (rows, next) = ring.drain(cursor);
+        cursor = next; // <-- the bug: before the sink has taken anything.
+        assert!(
+            tx.try_send(rows).is_err(),
+            "the queue is full, so this batch is dropped"
+        );
+
+        // The consumer only ever drains from `cursor`: with the cursor already
+        // at the ring's end, the denied decision is unreachable.
+        let (retry, _) = ring.drain(cursor);
+        assert!(retry.is_empty(), "the flush thinks the sink has them");
+        assert_eq!(
+            arguments(&rx.try_recv().unwrap()),
+            vec!["already in flight"]
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the denied write never reaches Postgres"
+        );
     }
 }
