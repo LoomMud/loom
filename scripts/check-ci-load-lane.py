@@ -14,22 +14,26 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      with `cancel-in-progress: false` (never kill a running measurement) and
      `queue: max` (a *cancelled* required check blocks a PR as hard as a
      failed one, so waiting runs must queue in FIFO, not replace each other);
+     or is in an OBI-325 escape group, which rule 8 pins to exactly the shape
+     that still puts every runtime-relevant run in the lane;
   2. no other job may take that group -- unrelated work must not hold the
      lane that the latency gates are waiting on;
   3. the three load jobs are chained with `needs`
      (loadtest-e1-1 -> loadtest-smoke -> bench) so they never overlap inside
      one run either;
   4. the required checks (rust, deny, dco, hygiene, loadtest-e1-1) cannot be
-     skipped or downgraded: no `needs`, no `if`, no `continue-on-error`, and
-     `loadtest-e1-1` still runs `loom-loadtest` with `--players 150` and
-     `--fail-on-sla-miss`, with enough `timeout-minutes` that host load can
-     only make the measurement slow, never get the job cancelled; and
+     skipped or downgraded: no `needs`, no `if`, no `continue-on-error` -- except
+     that `loadtest-e1-1` may `needs: classify` *only* beside the exact
+     `if: ${{ !cancelled() }}`, because GitHub counts a *skipped* required check
+     as passing and a gate that an upstream job can skip is a gate that can be
+     green without measuring. `loadtest-e1-1` still runs `loom-loadtest` with
+     `--players 150` and `--fail-on-sla-miss`, with enough `timeout-minutes` that
+     host load can only make the measurement slow, never get the job cancelled.
   5. if the workflow has a *workflow-level* `concurrency` block (OBI-313), it
      cancels superseded `pull_request` runs and nothing else. The rule the CTO
      accepted (2026-10-08) is that no required check on a *mergeable candidate*
      may be cancelled; a superseded PR SHA is not a mergeable candidate under
-     `strict: true` + `required_linear_history: true`, which is what makes the
-     cancel legal. `group` must be
+     `strict: true`, which is what makes the cancel legal. `group` must be
      PR-scoped and carry `github.run_id` as the non-PR fallback, and
      `cancel-in-progress` must be an expression that is true only for
      `pull_request`. Rule 5 exists because a workflow-level cancel reaches into
@@ -40,7 +44,40 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      `reopened`) -- with `types:` omitted GitHub fires on *every* activity, so
      labeling a PR would cancel its own running gate -- and the narrowing may
      not drop `opened` or `synchronize`, which is how a required check gets
-     skipped under cover of "narrowing the trigger".
+     skipped under cover of "narrowing the trigger"; and
+  7. in `loadtest-e1-1`, the p99 verdict is the only thing that fails the job:
+     the step saves the loadtest exit status, runs its post-run evidence tail
+     with errexit disabled, and re-asserts the saved status at the end. The
+     runner's default `bash --noprofile --norc -e -o pipefail` means one
+     non-zero command in that tail aborts the step *after* the verdict was
+     computed -- which is how main run 37862921160 (sha eaf9ceb) went red on a
+     p99 PASS of 21.47 ms: the world thread recorded zero stalls, so the scrape
+     had no `kind="..."` label, `grep -oE` exited 1, pipefail carried it through
+     the pipeline, and the command substitution failed the step. A gate that
+     goes red exactly when the world thread behaves is worse than no gate; and
+  8. the OBI-325 lane escape (`needs: classify` + a conditional
+     `concurrency.group`) is only allowed in the shape that keeps the gate
+     fail-closed: the `classify` job has nothing upstream of it, can never be
+     skipped, and writes a verdict on every path (a job that dies mid-decision
+     must still leave `runtime=true` behind, because rule 4's `if:` then makes
+     the gate queue and measure rather than be skipped-and-counted-as-passing),
+     and can never report "irrelevant" on a diff it could not read
+     (`runtime != 'false'` everywhere, never `== 'true'`), the escape group is
+     run-scoped (`github.run_id`) so skipped runs do not serialise behind each
+     other, each lane job reads the verdict from its own place in the `needs`
+     chain, and every step that could touch the measurement host is guarded by
+     that same test -- an escaped group with unguarded steps is precisely the
+     contention OBI-308 was written to stop; and
+  9. every `toolchain:` a job installs equals the channel `rust-toolchain.toml`
+     declares. Rule 9 is what makes `.github/**` safe to put on the skip list:
+     the compiler is one of the inputs the lane measures, so the workflow may
+     not be a second, unsynced place to change it; and
+ 10. no `${{ ... }}` that calls a status function (`cancelled()`, `always()`,
+     `failure()`, `success()`) may appear inside a `run:` block -- including
+     inside a shell comment there, because Actions expands expressions before
+     the shell sees them. One is a workflow file GitHub cannot compile: no job
+     runs, and on `pull_request` not even a check run appears, so required
+     checks do not go red, they vanish. PR #144 lost its CI to exactly this.
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -55,6 +92,27 @@ LANE_GROUP = "loom-ci-load-lane"
 LANE_JOBS = ["loadtest-e1-1", "loadtest-smoke", "bench"]
 LANE_CHAIN = {"loadtest-smoke": "loadtest-e1-1", "bench": "loadtest-smoke"}
 REQUIRED_JOBS = ["rust", "deny", "dco", "hygiene", "loadtest-e1-1"]
+# OBI-325 review: the one job-level `if:` the required gate may carry. GitHub
+# counts a *skipped* required check as passing, so `needs: classify` without this
+# expression is a fail-open: a dead classifier buys a green with no measurement.
+# `${{ !cancelled() }}` makes the gate run whenever the run itself was not
+# cancelled, so an unreadable verdict costs a lane run instead of a fake green.
+# `always()` is deliberately not allowed -- it would start a 150-player
+# measurement on a host GitHub is already tearing down after a cancel.
+GATE_IF = "!cancelled()"
+# OBI-325: which job's output each lane job is allowed to read its lane verdict
+# from. `loadtest-e1-1` asks the classifier; the other two inherit the verdict
+# the gate already acted on, so one run cannot half-occupy the lane.
+CLASSIFIER = "classify"
+ESCAPE_SOURCE = {"loadtest-e1-1": CLASSIFIER,
+                 "loadtest-smoke": "loadtest-e1-1",
+                 "bench": "loadtest-smoke"}
+# The verdict test, spelled exactly once per guarded step and per group.
+ESCAPE_TEST = "{src}.outputs.runtime != 'false'"
+# A step that can put load on the lane host. If the group escapes and one of
+# these is unguarded, the run measures *outside* the lane: worst case, not best.
+MEASURING_NEEDLES = ["cargo build --release", "--fail-on-sla-miss", "--players",
+                     "scripts/bench-gate.sh", "loom-cli serve"]
 # The E1.1 exit criterion (spec v2 section 10): 150 players, p99 < 50 ms,
 # and an SLA miss must fail the job.
 SLA_FLAGS = ["--players 150", "--fail-on-sla-miss"]
@@ -80,6 +138,12 @@ WF_GROUP_PREFIX = "github.workflow"
 WF_RUNID_FALLBACK = "github.run_id"
 WF_PR_SCOPED = ("github.ref", "github.head_ref", "github.event.pull_request.number")
 WF_PR_TEST = re.compile(r"github\.event_name\s*==\s*['\"]pull_request['\"]")
+# Rule 7: the E1.1 step's contract with the shell. The verdict is captured in
+# `status=$?` and re-asserted with `exit $status`; the evidence in between must
+# not be able to end the step, so it runs under `set +e`.
+E11_STATUS_CAPTURE = "status=$?"
+E11_VERDICT_EXIT = re.compile(r"^\s*exit \$status\s*$")
+E11_ERREXIT_OFF = re.compile(r"^\s*set \+e\s*$")
 WF_OTHER_EVENTS = ("push", "pull_request_target", "workflow_dispatch", "workflow_call",
                    "schedule", "repository_dispatch", "merge_request_event")
 
@@ -155,6 +219,18 @@ def scalar(block, key):
     return None
 
 
+def if_expression(value):
+    """`"${{ !cancelled() }}"` -> `"!cancelled()"`; anything else as written.
+
+    GitHub accepts an `if:` with or without the `${{ }}` wrapper, and this file
+    uses both. The rule is about the *expression*, so compare expressions.
+    """
+    if value is None:
+        return None
+    m = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", value)
+    return m.group(1) if m else value
+
+
 def needs_of(block):
     raw = scalar(block, "needs")
     if raw is not None:
@@ -162,6 +238,178 @@ def needs_of(block):
             return [n.strip().strip("'\"") for n in raw.strip("[]").split(",") if n.strip()]
         return [raw.strip().strip("'\"")]
     return [l.strip("- ").strip() for l in child(block, "needs") if l.strip()]
+
+
+def steps_of(block):
+    """The job's `steps:` entries, each as its list of lines.
+
+    A step starts at an indent-6 `- ` and its own keys sit at indent 8, which is
+    also how `step_if()` finds its guard. Block-scalar script bodies are deeper
+    still, so they cannot be mistaken for a step key.
+    """
+    out, cur = [], None
+    for line in block:
+        if re.match(r"      - ", line):
+            if cur is not None:
+                out.append(cur)
+            cur = [line]
+            continue
+        if cur is not None:
+            cur.append(line)
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
+def step_key(step, key):
+    """A step's own scalar key (indent 8), or None.
+
+    Quoting is removed only when the whole value is a quoted scalar: an `if:`
+    expression ends in `'false'`, and stripping quote characters off both ends
+    would mangle it.
+    """
+    for line in step:
+        m = re.match(rf"        {key}:\s*(.*?)\s*$", line)
+        if m:
+            val = m.group(1)
+            if len(val) >= 2 and val[0] in "'\"" and val[-1] == val[0]:
+                val = val[1:-1]
+            return val
+    return None
+
+
+def step_if(step):
+    return step_key(step, "if")
+
+
+def step_code(step):
+    return "\n".join(l for l in step if not l.lstrip().startswith("#"))
+
+
+def escape_test(job):
+    return ESCAPE_TEST.format(src="needs." + ESCAPE_SOURCE[job])
+
+
+def lane_group_error(job, group):
+    """Rules 1 and 7a: the group is either the lane, or an escape *to* the lane.
+
+    Both halves of the OBI-325 decision have to be pinned here. The group is the
+    half that decides whether a run waits 40 minutes for a place it will not
+    use; the step guards in `check_classifier()` are the half that decides
+    whether a run that skipped the queue then measured on a loaded host.
+    """
+    if group == LANE_GROUP:
+        return []
+    test = escape_test(job)
+    g = (group or "").strip()
+    if not (g.startswith("${{") and g.endswith("}}")):
+        return [f"`{job}` concurrency.group is {group!r}: expected {LANE_GROUP!r}, or an "
+                f"OBI-325 escape keyed on `{test}`"]
+    errs = []
+    if test not in g:
+        if "outputs.runtime" in g and "== 'true'" in g:
+            errs.append(f"`{job}` concurrency.group keys the escape on `== 'true'`: a missing or "
+                        "unreadable classifier verdict must mean 'take the lane and measure', so "
+                        f"it has to be `{test}`")
+        else:
+            errs.append(f"`{job}` concurrency.group is not keyed on `{test}`: each lane job reads "
+                        f"the verdict from its own place in the needs chain (`{ESCAPE_SOURCE[job]}`), "
+                        "so one run cannot half-occupy the lane")
+    if f"'{LANE_GROUP}'" not in g:
+        errs.append(f"`{job}` concurrency.group can never resolve to {LANE_GROUP!r}: a "
+                    "runtime-relevant run must take the lane")
+    arms = g.split("||")
+    if len(arms) < 2 or "github.run_id" not in arms[-1] or "format(" not in arms[-1]:
+        errs.append(f"`{job}` concurrency.group's escape arm is not run-scoped: it must be "
+                    "`format('...-{0}', github.run_id)`, or skipped runs serialise behind one "
+                    "constant group and re-create the queue OBI-325 exists to remove")
+    return errs
+
+
+def check_classifier(jobs):
+    """Rule 8. The escape hatch is only safe while the classifier can fail
+    *toward the lane* and every step that could load the host is guarded."""
+    errors = []
+    if CLASSIFIER not in jobs:
+        return [f"`{CLASSIFIER}` job is missing: the lane escape has nothing to read its "
+                "verdict from"]
+    block = jobs[CLASSIFIER]
+    if needs_of(block):
+        errors.append(f"`{CLASSIFIER}` has `needs:` -- a classifier that is itself skipped "
+                      "has no verdict, and the gate's `if:` would still run it into the lane "
+                      "on an empty answer; the decision must come from reading this run's diff")
+    if scalar(block, "if") is not None:
+        errors.append(f"`{CLASSIFIER}` has a job-level `if:` -- it can be skipped, same failure "
+                      "as giving it `needs:`")
+    if scalar(block, "continue-on-error") == "true":
+        errors.append(f"`{CLASSIFIER}` sets continue-on-error: true -- its output would then be "
+                      "empty on a real failure instead of failing loudly")
+    # Comments excluded throughout: this rule asks whether the *code* writes a
+    # verdict, and a prose mention of `runtime=true` or `exit 0` must not be able
+    # to satisfy it. (It did: a comment explaining the fallback kept the mutant
+    # "fallback deleted" passing.)
+    text = "\n".join(l for l in block if not l.lstrip().startswith("#"))
+    if "runtime: ${{ steps.decide.outputs.runtime }}" not in text:
+        errors.append(f"`{CLASSIFIER}` does not publish `outputs.runtime` from the `decide` step: "
+                      "the lane verdict must have exactly one source")
+    if "runtime=true" not in text:
+        errors.append(f"`{CLASSIFIER}` has no fail-closed fallback value: without writing "
+                      "`runtime=true` when the classifier cannot answer, an undecided diff "
+                      "escapes the lane unmeasured")
+    # The classifier call itself must be tolerated, whatever else in the job is
+    # not: find the invocation and check its last continuation line.
+    inv = [k for k, l in enumerate(block)
+           if "load-lane-classify.py" in l and not l.lstrip().startswith("#")]
+    if not inv:
+        errors.append(f"`{CLASSIFIER}` never calls scripts/load-lane-classify.py: the lane "
+                      "verdict has to come from the table, not from a hand-written condition")
+    for k in inv:
+        j = k
+        while j + 1 < len(block) and block[j].rstrip().endswith("\\"):
+            j += 1
+        if "|| true" not in block[j]:
+            errors.append(f"`{CLASSIFIER}` can fail on the classifier itself (line {k + 1}): the "
+                          "gate would run with an empty verdict instead of the written "
+                          "fail-closed one -- reading the diff has to fall back to "
+                          "`runtime=true`, not to a missing output")
+    if "exit 0" not in text:
+        errors.append(f"`{CLASSIFIER}` ends on whatever its last command returned: a non-zero "
+                      "step leaves no verdict written for the gate to read; it has to default "
+                      "the verdict and then `exit 0`")
+    for step in steps_of(block):
+        if "ci-ensure-tools.sh" in step_code(step) and step_key(step, "continue-on-error") != "true":
+            errors.append(f"`{CLASSIFIER}`'s package step is fatal: a runner that cannot "
+                          "apt-install python3 would fail the job before the fallback line "
+                          "runs, and the gate would queue on an empty verdict instead of a "
+                          "written one -- tolerate it and let the fallback take the lane")
+
+    for job in LANE_JOBS:
+        block = jobs.get(job) or []
+        test = escape_test(job)
+        escaped = (submapping(block, "concurrency").get("group") or "") != LANE_GROUP
+        for step in steps_of(block):
+            code = step_code(step)
+            if not any(n in code for n in MEASURING_NEEDLES):
+                continue
+            guard = step_if(step)
+            if guard is None or test not in guard:
+                errors.append(f"`{job}` runs a step that can load the lane host (`"
+                              + "`, `".join(n for n in MEASURING_NEEDLES if n in code)
+                              + f"`) without the `if: {test}` guard"
+                              + (" -- and its group escapes the lane, so this measures under "
+                                 "contention instead of not measuring" if escaped else ""))
+
+    e11 = jobs.get("loadtest-e1-1") or []
+    reporting = [s for s in steps_of(e11) if "load-lane decision" in step_code(s)]
+    if not reporting:
+        errors.append("`loadtest-e1-1` has no `load-lane decision` step: a green check that "
+                      "measured nothing must say so in the run, not in a comment later")
+    else:
+        guard = step_if(reporting[0])
+        if guard is not None and "always()" not in guard:
+            errors.append("`loadtest-e1-1`'s decision step is gated by an `if:` -- on the skip "
+                          "path the run would then say nothing about why nothing was measured")
+    return errors
 
 
 def workflow_concurrency(text):
@@ -313,7 +561,111 @@ def check_supersede_scope(text, wc):
     return errs
 
 
-def check_text(text):
+def repo_root(workflow_path):
+    """Repo root as seen from `.github/workflows/<file>`; falls back to cwd."""
+    p = Path(workflow_path).resolve()
+    try:
+        return p.parents[2]
+    except IndexError:
+        return Path.cwd()
+
+
+def declared_toolchain(root):
+    """The channel `rust-toolchain.toml` pins, or None if the repo declares none."""
+    for name in ("rust-toolchain.toml", "rust-toolchain"):
+        cand = Path(root) / name
+        if cand.is_file():
+            m = re.search(r'^\s*channel\s*=\s*"([^"]+)"', cand.read_text(), re.M)
+            if m:
+                return m.group(1)
+    return None
+
+
+def check_toolchain_pins(text, root):
+    """Rule 9: a job may not install a compiler the repo does not declare.
+
+    The toolchain is an input to what the lane measures, and OBI-325 put
+    `.github/**` on the runtime-irrelevant list. Both are only true together if
+    the workflow is not a *second*, unsynced place to change the compiler: with
+    this rule a toolchain bump has to touch `rust-toolchain.toml`, which the
+    classifier counts as runtime-relevant, so the bump is measured.
+    """
+    pins = {}
+    for job, block in job_blocks(text).items():
+        for line in block:
+            if line.lstrip().startswith("#"):
+                continue
+            m = re.search(r'^\s*toolchain:\s*"?([0-9][^"\s]+)"?\s*$', line)
+            if m:
+                pins.setdefault(m.group(1), []).append(job)
+    errors = []
+    want = declared_toolchain(root)
+    for got, where in sorted(pins.items()):
+        where = ", ".join(f"`{j}`" for j in sorted(set(where)))
+        if want is None:
+            errors.append(f"{where} install toolchain {got!r} but rust-toolchain.toml "
+                          "declares no channel: the measured compiler is pinned only in CI")
+        elif got != want:
+            errors.append(f"{where} install toolchain {got!r} while rust-toolchain.toml "
+                          f"declares {want!r}: CI would measure a compiler nothing in the "
+                          "repo pins, and `.github/**` is on the skip list (OBI-325) so the "
+                          "bump would never be measured -- change rust-toolchain.toml instead")
+    return errors
+
+
+# Expressions inside a `run:` block are substituted *before the shell sees the
+# script* -- including inside shell comments, which the shell never reads but
+# Actions already has. `cancelled()`, `always()`, `failure()`, `success()` and
+# `no_status()` are only available in `if:` conditions, so writing one in a
+# `run:` block is not a wrong step, it is a workflow file that does not compile:
+# no job in it runs, and on a `pull_request` event no check run appears at all,
+# which is indistinguishable from "CI is stuck". Observed 2026-10-09 on PR #144:
+# heads 18fc7ab/c114681 got only `push`-placeholder runs (0 jobs, named after the
+# file path, no logs) and `gh pr checks` reported nothing. A comment mentioning
+# `if: ${{ !cancelled() }}` inside the classifier's `run:` block was the whole
+# cause. Write the expression bare (`if: !cancelled()`) in a script instead --
+# rule 4 accepts both forms because GitHub itself does. This is rule 10.
+STATUS_FUNCS = ("cancelled(", "always(", "failure(", "success(", "no_status(")
+
+
+def run_block_lines(text):
+    """Line numbers (1-based) that sit inside a `run:` block scalar."""
+    lines = text.splitlines()
+    inside, indent, out = False, 0, []
+    for i, line in enumerate(lines, 1):
+        head = re.match(r"^(\s*)(?:-\s+)?\w[^:\n]*:\s*[|>][-+]?\s*$", line)
+        if head and re.search(r"\brun:", line):
+            inside, indent = True, len(head.group(1))
+            continue
+        if not inside:
+            continue
+        if not line.strip():
+            out.append(i)
+            continue
+        if len(line) - len(line.lstrip()) <= indent:
+            inside = False
+            continue
+        out.append(i)
+    return out
+
+
+def check_run_block_expressions(text):
+    errors = []
+    for lineno in run_block_lines(text):
+        line = text.splitlines()[lineno - 1]
+        for expr in re.findall(r"\$\{\{(.+?)\}\}", line):
+            hit = next((f[:-1] for f in STATUS_FUNCS if f in expr), None)
+            if hit:
+                errors.append(
+                    f"line {lineno}: a `run:` block contains `${{{{ {expr.strip()} }}}}`. "
+                    f"`{hit}()` is only available in an `if:` condition, so this is not a "
+                    "comment -- it is a workflow file GitHub cannot compile: no job runs, and "
+                    "on a pull_request no check run is created at all. Write the expression "
+                    "bare in scripts (`if: !cancelled()`) instead of wrapping it.")
+    return errors
+
+
+def check_text(text, root="."):
     jobs = job_blocks(text)
     wc = workflow_concurrency(text)
     errors = check_workflow_concurrency(wc) + check_supersede_scope(text, wc)
@@ -328,9 +680,7 @@ def check_text(text):
         if not got and "concurrency" not in code:
             errors.append(f"`{job}` has no job-level `concurrency:` -- it can run "
                           "against a loaded host and its latency numbers are noise")
-        if got.get("group") != LANE_GROUP:
-            errors.append(f"`{job}` concurrency.group is {got.get('group')!r}, "
-                          f"expected {LANE_GROUP!r}")
+        errors += lane_group_error(job, got.get("group"))
         if got.get("cancel-in-progress") != "false":
             errors.append(f"`{job}` concurrency.cancel-in-progress is "
                           f"{got.get('cancel-in-progress')!r}, expected 'false' "
@@ -365,7 +715,8 @@ def check_text(text):
         if job in LANE_JOBS:
             continue
         code = "\n".join(l for l in block if not l.lstrip().startswith("#"))
-        if holder_group.search(code):
+        val = submapping(block, "concurrency").get("group") or ""
+        if holder_group.search(code) or LANE_GROUP in val:
             errors.append(f"`{job}` must not join {LANE_GROUP!r}: unrelated work would "
                           "hold up the latency gates")
 
@@ -375,13 +726,36 @@ def check_text(text):
                           "(branch protection lists it)")
             continue
         block = jobs[job]
-        if needs_of(block):
-            errors.append(f"required check `{job}` has `needs:` -- an upstream failure "
-                          "would skip it, which blocks the PR like a failure")
-        if scalar(block, "if") is not None:
-            errors.append(f"required check `{job}` has `if:` -- it can be skipped")
+        allowed = [CLASSIFIER] if job == "loadtest-e1-1" else []
+        deps = needs_of(block)
+        if deps != allowed:
+            errors.append(f"required check `{job}` has `needs: {deps}`, expected `{allowed or []}`: "
+                          "an upstream failure would *skip* it, and GitHub counts a skipped "
+                          "required check as passing -- a green that measured nothing. "
+                          f"`{CLASSIFIER}` is the one exception, and only beside the "
+                          f"`if: ${{ GATE_IF }}` below plus rule 8.")
+        cond = if_expression(scalar(block, "if"))
+        if job == "loadtest-e1-1":
+            # The gate needs `needs: classify` and `if: !cancelled()` as a pair.
+            # Either half alone is the fail-open: no `if:` means a dead classifier
+            # skips it, any other expression can skip it too.
+            if cond != GATE_IF:
+                errors.append(f"required check `loadtest-e1-1` has `if: {cond}`, expected "
+                              f"`{GATE_IF}`: anything else (including no `if:` at all, which "
+                              "is GitHub's `success()`) lets an upstream job *skip* the gate, "
+                              "and a skipped required check is counted as passing")
+        elif cond is not None:
+            errors.append(f"required check `{job}` has `if:` -- it can be skipped, and a "
+                          "skipped required check counts as passing; only `loadtest-e1-1` may "
+                          f"carry `{GATE_IF}`, and only because rule 8 keeps its `needs:` "
+                          "unable to change the verdict")
         if scalar(block, "continue-on-error") == "true":
             errors.append(f"required check `{job}` sets continue-on-error: true")
+
+    errors += check_classifier(jobs)
+    errors += check_toolchain_pins(text, root)
+    errors += check_run_block_expressions(text)
+    check_e11_verdict_isolation(jobs, errors)
 
     e11 = [l for l in jobs.get("loadtest-e1-1", []) if not l.lstrip().startswith("#")]
     body = "\n".join(e11)  # comments excluded: the flags must be in the command
@@ -391,6 +765,40 @@ def check_text(text):
                           "must keep measuring 150 players and failing on an SLA miss")
 
     return errors
+
+
+def check_e11_verdict_isolation(jobs, errors):
+    """Rule 7: nothing but the p99 verdict may fail `loadtest-e1-1`.
+
+    Requires the three-beat shape in the gate's shell step: capture the
+    loadtest exit status, disable errexit for everything that runs after the
+    verdict, and re-assert the captured status as the step's last act. Reads
+    shell lines with comments stripped, so prose about `exit $status` or
+    `set +e` cannot satisfy it -- that is how the check notices the shape rot
+    instead of being fooled by the comment that explains it.
+    """
+    block = jobs.get("loadtest-e1-1")
+    if block is None:
+        return  # rule 4 already reported the missing required check
+    shell = [l for l in block if not l.lstrip().startswith("#")]
+    capture = next((i for i, l in enumerate(shell) if E11_STATUS_CAPTURE in l), None)
+    if capture is None:
+        errors.append("`loadtest-e1-1` no longer captures the loadtest exit status "
+                      "(`status=$?`): without it the gate cannot separate 'the world "
+                      "missed its SLA' from 'some shell command in this step failed'")
+        return
+    exits = [i for i, l in enumerate(shell) if E11_VERDICT_EXIT.match(l)]
+    if not exits:
+        errors.append("`loadtest-e1-1` no longer ends its gate step with "
+                      "`exit $status`: the captured p99 verdict is dropped, so the "
+                      "step's exit code comes from whatever command ran last")
+        return
+    guards = [i for i, l in enumerate(shell) if E11_ERREXIT_OFF.match(l)]
+    if not any(capture < g < exits[-1] for g in guards):
+        errors.append("`loadtest-e1-1` runs its post-verdict evidence tail under "
+                      "errexit: one non-zero grep/awk in the reporting section aborts "
+                      "the step after the p99 verdict was already computed (main run "
+                      "37862921160 went red on a PASS this way)")
 
 
 # --- self-test ---------------------------------------------------------------
@@ -415,6 +823,23 @@ def _sub(text, needle, repl, nth=0):
     return "".join(out)
 
 
+def _replace(text, needle, repl, nth=0):
+    """Replace `needle` *inside* the nth non-comment line that holds it.
+
+    Unlike `_sub` this keeps the line's indentation, so a value mutation cannot
+    pass the self-test merely by corrupting the document structure.
+    """
+    out, hits = [], 0
+    for line in text.splitlines(keepends=True):
+        if needle in line and not line.lstrip().startswith("#"):
+            if hits == nth:
+                line = line.replace(needle, repl)
+            hits += 1
+        out.append(line)
+    assert hits > nth, f"self-test needle not found: {needle!r}"
+    return "".join(out)
+
+
 def _drop_concurrency(text, job):
     lines = text.splitlines(keepends=True)
     i = next(k for k, l in enumerate(lines) if l == f"  {job}:\n")
@@ -422,8 +847,41 @@ def _drop_concurrency(text, job):
     return "".join(lines[:j] + lines[j + 4:])
 
 
+def _unguard(text, job, needle):
+    """Delete the step-level `if:` guard of the first step of `job` naming `needle`.
+
+    `needle` must be on the step's own first line (`- name:`/`- run:`), because
+    the guard is a line of that same step, and step keys sit at indent 8.
+    """
+    lines = text.splitlines(keepends=True)
+    i = next(k for k, l in enumerate(lines) if l == f"  {job}:\n")
+    j = next((k for k in range(i + 1, len(lines))
+              if re.match(r"  [A-Za-z0-9_-]+:$", lines[k])), len(lines))
+    h = next((k for k in range(i, j)
+              if needle in lines[k] and not lines[k].lstrip().startswith("#")), None)
+    if h is None:
+        raise AssertionError(f"_unguard: {needle!r} not found in {job}")
+    for k in range(h + 1, min(h + 4, j)):
+        if re.match(r"        if:\s*needs\.", lines[k]):
+            return "".join(lines[:k] + lines[k + 1:])
+    raise AssertionError(f"_unguard: no lane guard under {needle!r} in {job}")
+
+
 def _prepend(text, job, prop):
     return text.replace(f"  {job}:\n", f"  {job}:\n{prop}", 1)
+
+
+# The three lane groups, in file order (`bench`, `loadtest-smoke`,
+# `loadtest-e1-1`), each keyed on the verdict of the job it depends on.
+LANE_GROUPS = ["needs.loadtest-smoke.outputs.runtime != 'false'",
+               "needs.loadtest-e1-1.outputs.runtime != 'false'",
+               "needs.classify.outputs.runtime != 'false'"]
+
+
+def _group_line(src):
+    return ("      group: ${{ needs." + src + ".outputs.runtime != 'false' && "
+            "'loom-ci-load-lane' || format('loom-ci-load-lane-not-required-{0}', "
+            "github.run_id) }}\n")
 
 
 MUTANTS = [
@@ -433,16 +891,32 @@ MUTANTS = [
      lambda t: _sub(t, "cancel-in-progress: false",
                     "      cancel-in-progress: ${{ github.event_name != 'pull_request' }}\n")),
     ("queue: max dropped", lambda t: _sub(t, "queue: max", None)),
-    ("group made per-ref", lambda t: _sub(t, "group: loom-ci-load-lane",
+    ("group made per-ref", lambda t: _sub(t, f"&& '{LANE_GROUP}' ||",
                                           "      group: ci-${{ github.ref }}\n")),
     ("e1-1 concurrency dropped", lambda t: _drop_concurrency(t, "loadtest-e1-1")),
     ("smoke unchained", lambda t: _sub(t, "needs: loadtest-e1-1", None)),
     ("bench unchained", lambda t: _sub(t, "needs: loadtest-smoke", None)),
     ("bench loses success()", lambda t: _sub(t, "if: github.event_name == 'pull_request' && success()",
                                              "    if: github.event_name == 'pull_request'\n")),
-    ("required gate gains needs", lambda t: _prepend(t, "loadtest-e1-1", "    needs: rust\n")),
+    ("required gate gains needs", lambda t: _sub(t, "needs: classify", "    needs: rust\n")),
     ("required gate made optional",
      lambda t: _prepend(t, "loadtest-e1-1", "    continue-on-error: true\n")),
+    # The OBI-325 review's fail-open: `needs: classify` + GitHub's default
+    # `success()` means a dead classifier *skips* the gate, and a skipped required
+    # check is counted as passing. Only `${{ !cancelled() }}` is allowed.
+    ("required gate loses its !cancelled()",
+     lambda t: _sub(t, "if: ${{ !cancelled() }}", None)),
+    ("required gate if: becomes always()",
+     lambda t: _sub(t, "if: ${{ !cancelled() }}", "    if: ${{ always() }}\n")),
+    ("required gate if: becomes a needs-condition",
+     lambda t: _sub(t, "if: ${{ !cancelled() }}",
+                    "    if: ${{ needs.classify.result == 'success' }}\n")),
+    ("required gate if: written as success()",
+     lambda t: _sub(t, "if: ${{ !cancelled() }}", "    if: success()\n")),
+    ("required gate !cancelled() loses its braces",
+     lambda t: _sub(t, "if: ${{ !cancelled() }}", "    if: !cancelled\n")),
+    ("a non-lane required check gains !cancelled()",
+     lambda t: _prepend(t, "rust", "    if: ${{ !cancelled() }}\n")),
     ("SLA flag dropped", lambda t: _sub(t, "--fail-on-sla-miss", None)),
     ("gate timeout cut back to 15",
      lambda t: _sub(t, "timeout-minutes: 30", "    timeout-minutes: 15\n")),
@@ -491,17 +965,86 @@ MUTANTS = [
     ("supersede trigger narrowed until `opened` is gone",
      lambda t: _sub(t, "types: [opened, synchronize, reopened]",
                     "    types: [synchronize, reopened]\n")),
+    # Rule 7 (#154/OBI-344). The first two are the shape main run 37862921160
+    # actually broke.
+    ("E1.1 evidence tail put back under errexit",
+     lambda t: _sub(t, "set +e", None)),
+    ("E1.1 gate step that drops the captured p99 verdict",
+     lambda t: _sub(t, "exit $status", "          exit 0\n")),
+    ("E1.1 gate step that stops saving the loadtest exit status",
+     lambda t: _sub(t, "status=$?", "          echo verdict-captured\n")),
+    # Rule 8: the lane escape. Each of these turns "this run cannot change what
+    # the gate measures" into either an unmeasured regression (fail open), a
+    # queue that skipped runs still sit in, or -- the worst -- a run that
+    # skipped the queue and then measured on a loaded host anyway.
+    ("lane escape compares == 'true'",
+     lambda t: _sub(t, LANE_GROUPS[2],
+                    "      group: ${{ needs.classify.outputs.runtime == 'true' && "
+                    "'loom-ci-load-lane' || format('loom-ci-load-lane-not-required-{0}', "
+                    "github.run_id) }}\n")),
+    ("lane escape arm is not run-scoped",
+     lambda t: _sub(t, LANE_GROUPS[2],
+                    "      group: ${{ needs.classify.outputs.runtime != 'false' && "
+                    "'loom-ci-load-lane' || 'loom-ci-load-lane-skipped' }}\n")),
+    ("lane escape never names the lane",
+     lambda t: _sub(t, LANE_GROUPS[2],
+                    "      group: ${{ needs.classify.outputs.runtime != 'false' && "
+                    "'nope' || format('nope-{0}', github.run_id) }}\n")),
+    ("lane escape reads a verdict it does not depend on",
+     lambda t: _sub(t, LANE_GROUPS[1], _group_line(CLASSIFIER))),
+    ("classifier gains needs", lambda t: _prepend(t, CLASSIFIER, "    needs: hygiene\n")),
+    ("classifier gains a job-level if",
+     lambda t: _prepend(t, CLASSIFIER, "    if: github.event_name == 'pull_request'\n")),
+    ("classifier made advisory",
+     lambda t: _prepend(t, CLASSIFIER, "    continue-on-error: true\n")),
+    ("classifier verdict published from another step",
+     lambda t: _sub(t, "runtime: ${{ steps.decide.outputs.runtime }}",
+                    "      runtime: ${{ steps.other.outputs.runtime }}\n")),
+    ("classifier fail-closed fallback deleted",
+     lambda t: _sub(t, "echo 'runtime=true' >>", "            true\n")),
+    ("classifier allowed to fail the job",
+     lambda t: _sub(t, "--output-file \"$verdict\" --summary || true", None)),
+    ("classifier ends on its shell status",
+     lambda t: _sub(t, "exit 0", None)),
+    ("a lane job installs a toolchain the repo does not declare",
+     lambda t: _replace(t, '"1.98.1"', '"1.97.0"', nth=2)),
+    ("classifier's package step made fatal",
+     lambda t: _sub(t, "continue-on-error: true", None, 0)),
+    ("build step loses its lane guard",
+     lambda t: _unguard(t, "loadtest-e1-1", "SQLX_OFFLINE=true cargo build")),
+    ("bench gate step loses its lane guard",
+     lambda t: _unguard(t, "bench", "run: scripts/bench-gate.sh")),
+    ("smoke load step loses its lane guard",
+     lambda t: _unguard(t, "loadtest-smoke", "run loom serve + loadtest smoke")),
+    ("decision step gated away",
+     lambda t: _sub(t, "- name: load-lane decision",
+                    "      - name: load-lane decision\n"
+                    "        if: needs.classify.outputs.runtime == 'false'\n")),
+    ("unrelated job joins the lane through an expression",
+     lambda t: _prepend(t, "web-client",
+                        "    concurrency:\n      group: ${{ true && 'loom-ci-load-lane' "
+                        "|| format('x-{0}', github.run_id) }}\n")),
+    # Both of these are the 2026-10-09 shape: a *comment* inside a script, which
+    # the shell never reads and Actions substitutes anyway. The second one is the
+    # exact text that cost PR #144 its check suite.
+    ("a status function called inside a run block",
+     lambda t: _replace(t, "echo 'runtime=true' >> \"$verdict\"",
+                        'echo \'runtime=true\' >> "$verdict"  # the gate uses ${{ !cancelled() }}')),
+    ("always() written into a script line",
+     lambda t: _replace(t, 'cat "$verdict" >> "$GITHUB_OUTPUT"',
+                        'cat "$verdict" >> "$GITHUB_OUTPUT"  # and ${{ always() }} elsewhere')),
 ]
 
 
 def self_test(path):
     text = Path(path).read_text()
+    root = repo_root(path)
     failed = 0
-    if check_text(text):
+    if check_text(text, root):
         print(f"FAIL baseline: {path} does not satisfy its own lane invariants")
         failed += 1
     for name, mutate in MUTANTS:
-        errors = check_text(mutate(text))
+        errors = check_text(mutate(text), root)
         if errors:
             print(f"ok   {name}: caught ({errors[0][:90]})")
         else:
@@ -516,7 +1059,7 @@ def main(argv):
     if "--self-test" in argv:
         return self_test(argv[-1] if argv[-1].endswith(".yml") else DEFAULT)
     path = argv[1] if len(argv) > 1 else DEFAULT
-    errors = check_text(Path(path).read_text())
+    errors = check_text(Path(path).read_text(), repo_root(path))
     if errors:
         print(f"check-ci-load-lane: {len(errors)} problem(s) in {path}")
         for e in errors:

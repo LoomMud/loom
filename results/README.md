@@ -233,6 +233,18 @@ closes first. Two consequences, both recorded so nobody has to rediscover them:
   (`STALL_LOG_INTERVAL` in `crates/loom-obs/src/world.rs`), so 31 events print as 3
   lines. The counters are the census; the log is a sample. Read
   `loom_world_loop_stalls_total`, not `grep -c`.
+- A **red** `loadtest-e1-1` whose report says `E1.1 (p99 < 50 ms): PASS` is a broken
+  harness, not a missed SLA. The evidence tail that prints the `world_loop:` line ran
+  under the runner's default `bash -e -o pipefail`, so on main run 37862921160
+  (`eaf9ceb`) the third bullet's own census aborted the step: the world thread
+  recorded **zero** stalls, the scrape therefore carried no `kind="…"` label, `grep -oE`
+  exited 1, `pipefail` carried that through the pipeline, and the command substitution
+  failed the step *after* `exit $status` would have returned 0 -- p99 21.47 ms, PASS.
+  The tail now runs under `set +e` and rule 7 of `scripts/check-ci-load-lane.py` keeps
+  it there, with a mutant for each beat (`set +e` removed, `exit $status` dropped,
+  `status=$?` gone). Reproduced deterministically against both archived scrapes, and the
+  rule states the invariant plainly: the p99 verdict is the only thing that can turn
+  this check red, and the evidence below it can only ever inform, never decide.
 
 This is also why the historical tail is still open. Before PR #151 the same
 disconnect path failed instantly on ENOENT and the worst iteration in a green run
@@ -297,9 +309,11 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   required check blocks a PR exactly like a failed one, so queueing (not
   replacing) is part of not weakening the gate.
 - The jobs are also chained with `needs` inside a run:
-  `loadtest-e1-1` -> `loadtest-smoke` -> `bench`. The required gate goes
-  first and has no `needs:`/`if:` of its own, so nothing upstream can skip
-  it; the two non-required gates wait for it instead of competing with it.
+  `classify` -> `loadtest-e1-1` -> `loadtest-smoke` -> `bench`. The required
+  gate has exactly one `needs:` -- `classify`, the job that decides whether this
+  diff has to be measured at all (OBI-325, below) -- and no `if:` of its own,
+  so nothing upstream can skip it; the two non-required gates wait for it
+  instead of competing with it.
 - Each gate carries wall-clock headroom (`timeout-minutes` 30 for E1.1, 20
   for the smoke run). The lane removes a second *gate* from the host, not
   this run's own `rust` job or another PR's builds, and a release build
@@ -317,9 +331,13 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
   headroom, that no required check became skippable or optional, and that the
   workflow-level block can only ever cancel a superseded `pull_request` run),
-  plus a `--self-test` of 26 mutations. Both run in the required `hygiene`
-  job, so the lane cannot rot silently and the comment here cannot drift from
-  the workflow.
+  plus a `--self-test` of 55 mutations (56 cases, among them the gate losing its
+  `if: ${{ !cancelled() }}`, the three verdict-isolation beats #154 added, and a
+  `${{ }}` written inside a `run:` block). Both run in the required `hygiene`
+  job, with the classifier's own path table (`scripts/load-lane-classify.py
+  --self-test`, 36 cases: 30 classification rows plus 6 that build a throwaway
+  git repo), so the lane cannot rot silently and the comment here
+  cannot drift from the workflow.
 
 **What the lane does *not* claim.** GitHub scopes a job-level concurrency
 group per workflow *and job*, so the hard guarantee is "the same gate never
@@ -343,6 +361,166 @@ another, by raising the threshold, dropping the population, marking the check
 optional, or re-running it into a quiet window by hand -- `hygiene` fails
 those changes.
 
+### Who has to wait for the lane at all (OBI-325)
+
+Serialising the lane made the numbers honest and made *every merge* wait for
+one. With `strict: true` a queued gate is invalidated each time `main` moves, so
+the queue is not a cost you pay once, it is a cost you pay until you win. PR
+#124 is the case study: rebased four times in about five hours (`b3a9998` 02:09,
+`7db7279` 02:28, `db18202` 03:30), each push re-queued `loadtest-e1-1` for
+35-60 minutes, and when the gate finally went green on `db18202` (run
+37723058077, ~04:50Z) `main` had advanced to `7bb86ce` (PR #122) and the PR
+flipped back to `BEHIND`. What all that waiting measured was a commit whose
+diff from its base was one file, `crates/loom-cli/tests/supervise_handoff.rs`
+-- a test file the release build does not even compile.
+
+So the gate now asks a narrower question first, in
+`scripts/load-lane-classify.py`: **could this diff change what E1.1 measures at
+all?** E1.1 builds `cargo build --release -p loom-cli -p loom-loadtest` from the
+checkout and drives `loom serve --mudlib warp` over telnet, so the inputs are
+the two crates' source, their manifests and features, `Cargo.lock`,
+`rust-toolchain.toml`, `.cargo/` config, `build.rs`, `mudlib/` content (kept
+relevant even though today it is only a Docker mount point -- being unsure
+costs a lane run, it never hides a regression), the `tests/fixtures/**` mirror of
+the mix the gate replays, and the bench workloads and harness that `bench`
+measures in the same lane.
+
+The fixture rule's reason was wrong in the first cut of this PR, and the OBI-327
+review caught it: `loom-loadtest`'s `src/mix.rs` does
+`include_str!("../tests/fixtures/mix.tsv")`, but inside `#[cfg(test)]`: the
+fixture is a unit-test guard that the in-repo copy of the mix still parses, not a
+byte of the release binary `cargo build --release` produces. The rule stays, for
+the honest reason: E1.1 replays `--mix warp/loadbot/mix.tsv` at runtime, and that
+in-repo file is its mirror, kept in sync by the contract's "same PR" rule. An
+edit to the mirror is an argument about the mix being measured, so it pays for a
+lane run rather than getting a path-based exemption. The real blind spot is the
+unpinned `warp` checkout that supplies the measured mix, not this rule -- that is
+OBI-326, and the corrected premise raises its priority: the mix E1.1 measures is
+not compiled in, not pinned, and not in this repo.
+
+One thing the classifier cannot see: the `warp` mudlib E1.1 serves is checked
+out of `LoomMud/warp`, unpinned, inside the job. A warp-side change can move
+the p99 while every loom PR skips the lane. That is a property of the existing
+un-pinned checkout, not of the skip decision -- pinning warp (or measuring it
+as an input) is OBI-326.
+
+A cheap `classify` job answers it, and the three lane jobs read the verdict
+twice: through a conditional `concurrency.group` (runtime-relevant, or
+undecided, takes `loom-ci-load-lane`; irrelevant takes a `github.run_id`-scoped
+group no other run is in) and through the same test on every step that could put
+load on the host. Both halves are keyed on `!= 'false'` and never `== 'true'`,
+so a missing or unreadable verdict means "take the lane and measure". Rule 8 of
+`scripts/check-ci-load-lane.py` pins the whole shape -- the expression, its
+run-scoped arm, the classifier's inability to be skipped or to fail the job, and
+a step guard beside every measurement -- because each of those has a fail-open
+mutation: 55 of them now, all run in `hygiene`.
+
+Putting `.github/**` on the irrelevant list is only safe because of rule 9: the
+workflow may not install a `toolchain:` that `rust-toolchain.toml` does not
+declare. The compiler is an input the lane measures, so it may have exactly one
+place where it is pinned -- and that file is runtime-relevant, which means a
+toolchain bump is measured instead of skipped. Before rule 9, bumping the
+version in `ci.yml` alone would have changed what every later run builds and
+never entered the lane.
+
+**How the paths are read is part of the decision (OBI-325 review).**
+`git_paths` passes `--no-renames`. Git detects renames by default and reports a
+detected one as its *destination* only, so moving
+`crates/loom-loadtest/tests/fixtures/mix.tsv` -- the mirror of the mix E1.1
+replays, therefore runtime-relevant -- into `crates/loom-cli/tests/` would have
+listed one allow-listed path and skipped the lane. Both ends of a move are inputs
+now; `--self-test` builds a throwaway repo to prove it, and asserts the
+counterfactual (`-M` lists only the two destinations
+and classifies as skip) so the case cannot rot into vacuity. 30 table rows became
+36 cases.
+
+**Two deliberate over-measures, so nobody "fixes" them into a hole.** A
+`Cargo.lock` delta counts as runtime-relevant even when it only touches
+dev-dependencies, which `cargo build --release -p loom-cli -p loom-loadtest`
+never links -- that lane run measures a byte-identical binary. Asked on OBI-325
+whether that is a wasted slot: yes, on purpose. The alternative is a rule about
+"lockfile deltas whose resolved set reaches the release build graph", which reads
+a resolver's behaviour off a text file and can fail *open*; one wasted slot is the
+cheaper mistake. And `mudlib/**` counts as relevant even though nothing there
+reaches `loom serve --mudlib warp` today. The general shape: where a rule could
+be made cheaper by reading something dynamic, the cheap-but-structural rule wins.
+
+**First live skip (PR #144, run 37736253093, 2026-10-08).** The PR that
+introduces this decides its own diff irrelevant, and the numbers are what the
+case study was about: `classify` 7 s end to end, `loadtest-e1-1` **12 s** with
+`run loom serve + E1.1 load test (150 players)`, the release build, the warp
+checkout, the toolchain install and the artifact upload all reported *skipped:*
+`loadtest-smoke` 8 s and `bench` 7 s behind it. The whole required chain went
+from a 35-60 minute lane wait to about 90 seconds of nothing, and the only
+classifier verdict that ever produced a warning was the local drill where
+`python3` was missing.
+
+**What OBI-325 does *not* fix, and what it does.** This is a throughput change,
+not a measurement-integrity change. The board's own root-cause note on PR #124
+is that a gate miss there came from *the same run's* `rust` job
+(`cargo clippy --workspace --all-targets`, still going 35 minutes into the
+measurement window) while the lane had given the gate the host to itself -- so a
+path filter cannot fix that mechanism, and nobody should read this section as if
+it did. The mechanism fix is a quiet runner (`CI_LOAD_RUNS_ON`, PR #131 /
+OBI-311) or serialising `rust`/`fuzz` against the gate inside a run.
+
+What it does change, besides the queue, is *who may be the neighbour*. Everything
+in the lane builds the release binary, and a second release build beside a
+measuring run is exactly what turned 46.91 ms into 593 ms in the table above
+(37658696127 against 37658252388). An irrelevant run that skips no longer starts
+that build, so it stops being a disturber as well as a queue place -- but the
+same-run `rust` and `fuzz-smoke*` jobs still overlap an E1.1 measurement that
+*does* take the lane, and `release-image.yml` stays outside all of it.
+
+Both changes edit the same three files as PR #131 (`.github/workflows/ci.yml`,
+`scripts/check-ci-load-lane.py`, `results/README.md`), so whichever lands second
+rebases; the overlap is textual, not semantic (#131 swaps the lane jobs'
+`runs-on:` for a configurable runner set, this adds a job and rules 7-8).
+
+**What a green `loadtest-e1-1` means now.** Two different greens. On a
+runtime-relevant diff it is the 150-player measurement, unchanged. On a
+runtime-irrelevant one it means "not applicable": no release build, no players,
+no p99, and the job writes a step summary saying so and naming the rule that
+decided it. The gate is never `if:`-ed away except by `if: ${{ !cancelled() }}`,
+and that one expression is not a convenience: GitHub counts a *skipped* required
+check as **passing**, so `needs: classify` without it meant a classifier that
+dies in infrastructure would skip the gate and hand the PR a green that had never
+measured -- the fail-open the OBI-325 review caught, and the reason rule 4 checks
+`needs:` and `if:` as a pair (and rejects `always()`, which would run 150 players
+on a host GitHub is already cancelling). If a p99 regression is ever found on a
+commit that skipped, the classifier was wrong: fix the rule (`--self-test` is the
+test), not the threshold, the population, or the check.
+
+### A workflow file that does not compile looks exactly like a stuck queue (2026-10-09)
+
+PR #144 rebased, pushed, and then reported nothing: `gh pr checks 144` said "no
+checks reported on the branch", and the only runs for the head SHAs were two
+`push` entries named `.github/workflows/ci.yml` (37865259655, 37865793025) with
+**0 jobs** and no downloadable logs. The reading was "Actions has stopped
+scheduling this PR", and there is nothing in that shape to argue with: no check
+suite, no run, no annotation. It was not a queue problem -- other PRs were being
+scheduled and running at the same minutes. The cause was one line of mine inside
+the `classify` job's `run: |` block:
+
+```sh
+# `loadtest-e1-1` runs `if: ${{ !cancelled() }}` now, so that hole is
+```
+
+A `#` in a script stops the shell, not Actions: `${{ ... }}` is substituted
+before the script is handed over, and `cancelled()` is only available in an `if:`
+condition, so the expression is invalid and the *whole file* fails to compile.
+A workflow that cannot compile produces no jobs and, for `pull_request`, no check
+run at all -- a required check that never posts is what branch protection reports
+as "waiting for status", which is why the merge order appeared to stall on a PR
+with five green checks an hour earlier. Fix (`cfef45e`): the bare expression in a
+script (`if: !cancelled()`), `${{ }}` kept only where GitHub evaluates it as a
+condition. Rule 10 of `check-ci-load-lane.py` now fails any `${{ }}` inside a
+`run:` block that calls a status function, so the next time it is a red `hygiene`
+check with a sentence instead of an absent suite, and `actionlint` (1.7.7) flags
+the same class -- its `queue:` complaints are a schema lag behind the lane's own
+`concurrency.queue: max`, which `main` runs with, so the parity check is
+"same complaints as main, no expression errors".
+
 ### Which runs may be cancelled, and which may never be (OBI-313)
 
 Queueing is not the only way the lane gets stuck. Because
@@ -361,10 +539,10 @@ the policy is written down rather than inferred from YAML.
 **The rule, accepted by the CTO on 2026-10-08: no required check on a
 *mergeable candidate* may be cancelled.** A mergeable candidate is the commit
 branch protection actually evaluates. For a pull request that is its newest
-commit, because `strict: true` + `required_linear_history: true` mean a stale
-SHA never satisfies the branch; for `main` every push is a mergeable candidate,
-and so is any run already in flight. A superseded PR SHA is therefore the only
-measurement the block is allowed to throw away.
+commit, because `strict: true` means a stale SHA never satisfies the branch;
+for `main` every push is a mergeable candidate, and so is any run already in
+flight. A superseded PR SHA is therefore the only measurement the block is
+allowed to throw away.
 
 | Run | Cancellation | Why |
 |---|---|---|
