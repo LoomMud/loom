@@ -381,9 +381,22 @@ checkout and drives `loom serve --mudlib warp` over telnet, so the inputs are
 the two crates' source, their manifests and features, `Cargo.lock`,
 `rust-toolchain.toml`, `.cargo/` config, `build.rs`, `mudlib/` content (kept
 relevant even though today it is only a Docker mount point -- being unsure
-costs a lane run, it never hides a regression), a `tests/fixtures/**` that
-`include_str!` compiles into the load bot, and the bench workloads and harness
-that `bench` measures in the same lane.
+costs a lane run, it never hides a regression), the `tests/fixtures/**` mirror of
+the mix the gate replays, and the bench workloads and harness that `bench`
+measures in the same lane.
+
+The fixture rule's reason was wrong in the first cut of this PR, and the OBI-327
+review caught it: `loom-loadtest`'s `src/mix.rs` does
+`include_str!("../tests/fixtures/mix.tsv")`, but inside `#[cfg(test)]`: the
+fixture is a unit-test guard that the in-repo copy of the mix still parses, not a
+byte of the release binary `cargo build --release` produces. The rule stays, for
+the honest reason: E1.1 replays `--mix warp/loadbot/mix.tsv` at runtime, and that
+in-repo file is its mirror, kept in sync by the contract's "same PR" rule. An
+edit to the mirror is an argument about the mix being measured, so it pays for a
+lane run rather than getting a path-based exemption. The real blind spot is the
+unpinned `warp` checkout that supplies the measured mix, not this rule -- that is
+OBI-326, and the corrected premise raises its priority: the mix E1.1 measures is
+not compiled in, not pinned, and not in this repo.
 
 One thing the classifier cannot see: the `warp` mudlib E1.1 serves is checked
 out of `LoomMud/warp`, unpinned, inside the job. A warp-side change can move
@@ -412,14 +425,25 @@ never entered the lane.
 
 **How the paths are read is part of the decision (OBI-325 review).**
 `git_paths` passes `--no-renames`. Git detects renames by default and reports a
- detected one as its *destination* only, so moving
-`crates/loom-loadtest/tests/fixtures/mix.tsv` -- compiled in with `include_str!`,
-and therefore the most runtime-relevant path in the repo -- into
-`crates/loom-cli/tests/` would have listed one allow-listed path and skipped the
-lane. Both ends of a move are inputs now; `--self-test` builds a throwaway repo
-to prove it, and asserts the counterfactual (`-M` lists only the two destinations
+detected one as its *destination* only, so moving
+`crates/loom-loadtest/tests/fixtures/mix.tsv` -- the mirror of the mix E1.1
+replays, therefore runtime-relevant -- into `crates/loom-cli/tests/` would have
+listed one allow-listed path and skipped the lane. Both ends of a move are inputs
+now; `--self-test` builds a throwaway repo to prove it, and asserts the
+counterfactual (`-M` lists only the two destinations
 and classifies as skip) so the case cannot rot into vacuity. 30 table rows became
 36 cases.
+
+**Two deliberate over-measures, so nobody "fixes" them into a hole.** A
+`Cargo.lock` delta counts as runtime-relevant even when it only touches
+dev-dependencies, which `cargo build --release -p loom-cli -p loom-loadtest`
+never links -- that lane run measures a byte-identical binary. Asked on OBI-325
+whether that is a wasted slot: yes, on purpose. The alternative is a rule about
+"lockfile deltas whose resolved set reaches the release build graph", which reads
+a resolver's behaviour off a text file and can fail *open*; one wasted slot is the
+cheaper mistake. And `mudlib/**` counts as relevant even though nothing there
+reaches `loom serve --mudlib warp` today. The general shape: where a rule could
+be made cheaper by reading something dynamic, the cheap-but-structural rule wins.
 
 **First live skip (PR #144, run 37736253093, 2026-10-08).** The PR that
 introduces this decides its own diff irrelevant, and the numbers are what the

@@ -126,14 +126,17 @@ concurrency:
 #     means nothing runs on the host: the job is checkout + summary.
 #
 # Two edges of that table are easy to get backwards, so they are cases in the
-# classifier's own --self-test: `crates/*/tests/fixtures/**` is compiled into
-# the load bot by include_str!, which makes a path under tests/ part of the
-# measured binary; and bench workloads and harness files are relevant because
-# `bench` measures them inside this same lane, and skipping would silently
-# retire the only bench regression gate. What the classifier cannot see is the
-# mudlib the gate serves: `warp` is checked out of LoomMud/warp, unpinned,
-# inside the job -- a warp-side change can move p99 while every loom PR skips.
-# That is a property of the un-pinned checkout, not of the decision; pinning it
+# classifier's own --self-test: `crates/*/tests/fixtures/**` is the in-repo
+# mirror of `warp/loadbot/mix.tsv`, the mix E1.1 replays at runtime (it is *not*
+# compiled in -- `src/mix.rs`'s `include_str!` is `#[cfg(test)]`-only, as the
+# OBI-327 review pointed out), which is what makes a path under tests/ relevant
+# while the test code around it is not; and bench workloads and harness files are
+# relevant because `bench` measures them inside this same lane, and skipping
+# would silently retire the only bench regression gate. What the classifier
+# cannot see is the mudlib the gate serves: `warp` is checked out of
+# LoomMud/warp, unpinned, inside the job -- a warp-side change can move p99 while
+# every loom PR skips. That is a property of the un-pinned checkout, not of the
+# decision; pinning it
 # (or treating it as an input) is OBI-326.
 #
 # `.github/**` itself is on the irrelevant list, and that is only honest because
@@ -347,8 +350,9 @@ jobs:
         # gate measures, so it lives in a table -- and the table is tested here,
         # not in the lane, where a wrong answer costs 40 minutes to notice. The
         # cases are the real diffs from the case studies plus the overlaps that
-        # are easy to get backwards (`tests/fixtures/**` is compiled in by
-        # include_str!), and every unrecognised or unreadable diff must come out
+        # are easy to get backwards (`tests/fixtures/**` mirrors the mix the gate
+        # replays, so it is relevant even though it lives under `tests/`), and
+        # every unrecognised or unreadable diff must come out
         # runtime-relevant.
         run: |
           set -euo pipefail

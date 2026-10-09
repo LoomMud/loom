@@ -82,17 +82,23 @@ follow:
   workloads `bench` measures in the same lane. Docs, tests, CI config, scripts,
   `ops/`, the web client and committed reports get green in seconds and never
   enter the group. Anything under `crates/*/src/**`, any `Cargo.toml` or
-  `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `build.rs`, `mudlib/`, a
-  `tests/fixtures/**` that is compiled in with `include_str!`, or a bench
+  `Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `build.rs`, `mudlib/`, the
+  `tests/fixtures/**` mirror of the mix the gate replays, or a bench
   workload/harness file takes the lane and is measured. Unknown paths take the
   lane too: the list is an *irrelevance allow-list*, and being unsure costs a
   lane run rather than hiding a regression. A rename is read as **both** its old
   and its new path (`git diff --name-only --no-renames`), because git's default
   reports a detected rename as its destination only -- so a file moving *out* of
-  `mudlib/` or a compiled-in `tests/fixtures/**` into an allow-listed path would
-  otherwise look like a docs change. `load-lane-classify.py --self-test` builds a
-  throwaway repo and asserts both halves, including the counterfactual that `-M`
-  alone would have skipped it.
+  `mudlib/` or the mix mirror under `tests/fixtures/**` into an allow-listed path
+  would otherwise look like a docs change. `load-lane-classify.py --self-test`
+  builds a throwaway repo and asserts both halves, including the counterfactual
+  that `-M` alone would have skipped it.
+  Two over-measures are deliberate: a `Cargo.lock` delta counts even when it only
+  touches dev-dependencies a release build never links (the alternative is a rule
+  that reads the resolver's output and can fail open), and `tests/fixtures/**`
+  counts as the *mirror* of the mix E1.1 replays from `warp/loadbot/mix.tsv` --
+  not because it is compiled in (`src/mix.rs`'s `include_str!` is `#[cfg(test)]`
+  only, corrected in review).
 - **CI does not get to pick its own compiler.** `.github/**` counts as
   irrelevant, so `scripts/check-ci-load-lane.py` (rule 9, run by `hygiene`) also
   requires every `toolchain:` the workflow installs to equal the channel in

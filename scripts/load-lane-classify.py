@@ -22,10 +22,18 @@ that never enters the group.
 The table is deliberately an *irrelevance allow-list with a fail-closed
 default*: a path nobody has thought about is runtime-relevant. Being wrong in
 that direction costs one lane run; the other direction costs an unmeasured
-regression. Three overlaps are resolved that way rather than by file type:
+regression. Four overlaps are resolved that way rather than by file type:
 
-  * `crates/*/tests/**` is dev-only, *except* `tests/fixtures/**`, which
-    `include_str!` compiles into `loom-loadtest` (its session mix is measured);
+  * `crates/*/tests/**` is dev-only, *except* `tests/fixtures/**` -- and not for
+    the reason this docstring first gave. `loom-loadtest`'s `src/mix.rs` does
+    `include_str!("../tests/fixtures/mix.tsv")`, but inside `#[cfg(test)]`: it is
+    a unit test asserting the in-repo copy of the mix still parses, not an input
+    to the binary the gate builds (the OBI-327 review caught that). The fixture
+    stays runtime-relevant on the real grounds: it is the mirror of
+    `warp/loadbot/mix.tsv`, which is what E1.1 replays at runtime
+    (`--mix warp/loadbot/mix.tsv`), and the contract says the mirror moves in the
+    same PR as the mix -- so an edit there is an argument about the measured mix,
+    which deserves a lane run rather than a path-based exemption;
   * `crates/*/benches/*.rs` and the bench harness scripts are irrelevant to
     E1.1's p99 but are exactly what the `bench` gate measures -- and `bench`
     shares this lane, so "needs a lane place" is the union, not just E1.1;
@@ -36,7 +44,14 @@ regression. Three overlaps are resolved that way rather than by file type:
     the gate fails CI instead of sailing past it unmeasured. The same script's
     rule 9 keeps the one input the flags do not cover, the `toolchain:` the
     workflow installs, equal to the channel `rust-toolchain.toml` declares --
-    and that file *is* runtime-relevant, so a compiler bump is measured.
+    and that file *is* runtime-relevant, so a compiler bump is measured;
+  * `Cargo.lock` is relevant even for a delta that only touches dev-dependencies,
+    which `cargo build --release -p loom-cli -p loom-loadtest` never links. Asked
+    on OBI-325 whether that is a wasted slot -- yes, deliberately. The
+    alternative is a rule about "lockfile deltas whose resolved set reaches the
+    release build graph", which means reading a resolver's behaviour off a text
+    file, and a rule like that can fail *open*. One lane run is the cheaper
+    mistake; recorded here so nobody optimises it into a hole.
 
 Usage:
   load-lane-classify.py --range BASE...HEAD [--github-output] [--summary]
@@ -82,11 +97,14 @@ RULES = [
     ("crates/*/src/**", True, "driver or load-bot source"),
     ("crates/*/build.rs", True, "build script output"),
     ("mudlib/**", True, "runtime mudlib content"),
-    # A `tests/` file is normally dev-only, but `include_str!` pulls it into the
-    # binary the gate builds -- loom-loadtest's src/mix.rs embeds
-    # ../tests/fixtures/mix.tsv, which is the session mix E1.1 replays. So
-    # fixtures are relevant even though the test *code* around them is not.
-    ("crates/*/tests/fixtures/**", True, "fixture compiled into the binary (include_str!)"),
+    # Normally dev-only, but this is the in-repo mirror of `warp/loadbot/mix.tsv`
+    # -- the mix E1.1 actually replays (`--mix warp/loadbot/mix.tsv`), which the
+    # contract keeps moving in the same PR. It is *not* compiled in:
+    # `src/mix.rs`'s `include_str!` sits inside `#[cfg(test)]` (OBI-327 review
+    # corrected this comment). Relevant anyway: an edit here is an argument about
+    # the measured mix, and the unpinned warp checkout means OBI-326, not this
+    # rule, is the real guard.
+    ("crates/*/tests/fixtures/**", True, "mirror of the mix E1.1 replays (warp/loadbot/mix.tsv)"),
     # The `bench` gate measures these inside the same lane, so "can move what
     # the lane measures" has to include them: marking them irrelevant would
     # have skipped the only gate that catches a criterion workload regression.
@@ -167,8 +185,8 @@ TABLE = [
      "criterion workload source"),
     ("bench harness", ["scripts/bench-gate.sh"], True, "the bench harness itself"),
     ("bench comparator", ["scripts/bench_compare.py"], True, "the bench comparator itself"),
-    ("compiled-in test fixture", ["crates/loom-loadtest/tests/fixtures/mix.tsv"], True,
-     "fixture compiled into the binary"),
+    ("the mix mirror under tests/", ["crates/loom-loadtest/tests/fixtures/mix.tsv"], True,
+     "mirror of the mix E1.1 replays"),
     ("fuzz targets only", ["crates/loom-syntax/fuzz/fuzz_targets/parse.rs"], False,
      "fuzz targets"),
     ("CI only", [".github/workflows/ci.yml", ".github/workflows/release-image.yml"],
@@ -233,9 +251,9 @@ def git_self_test():
 
     The OBI-325 review's second defect. `git diff --name-only` detects renames by
     default, and a detected rename is reported as its destination only -- so
-    moving `crates/loom-loadtest/tests/fixtures/mix.tsv` (compiled in by
-    `include_str!`, therefore runtime-relevant) next to the integration tests it
-    is no longer compiled from would list one allow-listed path and classify as
+    moving `crates/loom-loadtest/tests/fixtures/mix.tsv` (the mirror of the mix
+    E1.1 replays, therefore runtime-relevant) next to the integration tests it is
+    no longer read from would list one allow-listed path and classify as
     *skip*. `git_paths` passes `--no-renames`, so both ends are read and the
     relevant source still decides. Builds a throwaway repo, changes nothing in
     this one. Returns (cases, failures).
