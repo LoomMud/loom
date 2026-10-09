@@ -209,6 +209,15 @@ so each pair reproduces with
   instrumented server and archived no samples, which must say "not this
   re-render's claim" instead of inventing either.
 
+Neither CI run above stalled, so the server never published a stall stamp and
+both re-renders are `bracket`-only by necessity. The `measured` side of the path
+-- a stamp inside the run's own axis becoming `[finish - duration, finish]`, and
+a second stall whose stamp was already consumed falling back to a bracket -- is
+held by `rerender::tests::a_stamped_series_is_placed_by_the_server_s_own_clock`,
+which drives a stamped series through the same `re_render` the `--rerender`
+command calls. The first CI run that actually stalls will show the same thing in
+the uploaded artifact without anyone adding a step.
+
 The first finding that visibility produced: the
 `loom_runtime_errors_total{program="/std/player"}` count of exactly 150 that
 every CI run carried is `/std/player::save_character` (line 251) failing as

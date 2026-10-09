@@ -600,6 +600,95 @@ mod tests {
         assert_eq!(outcome.unattributed, 0);
     }
 
+    /// The other half of OBI-371, and the half no CI run has shown yet: both
+    /// real E1.1 runs had zero stalls, so `loom_world_loop_last_stall_unix_ms`
+    /// was never even created. This drives a *stamped* series through the same
+    /// re-render the CLI runs, which is what a live stalling run will hit: the
+    /// stamped stall must land at `[finish - duration, finish]` and be labelled
+    /// `measured`, while a second stall that only appears in the counter family
+    /// -- the gauge still naming the first one -- stays an honest `bracket`.
+    #[test]
+    fn a_stamped_series_is_placed_by_the_server_s_own_clock() {
+        // Wall clock at `t+ = 0` of the archived run. One anchor for the whole
+        // series is the same-host assumption the module documents; the re-render
+        // checks the spread and would reject a series that broke it.
+        const ANCHOR: u64 = 1_700_000_000_000;
+        let mut report = archived_report();
+        report.server_timeline.push(ServerRow {
+            at_ms: 12_304,
+            unix_ms: Some(ANCHOR + 12_304),
+            counters: crate::server_metrics::WorldCounters {
+                ticks: Some(1_230.0),
+                // A second stall, 60 ms, visible only as a counter delta: the
+                // gauge still names the 875 ms one, which is already placed.
+                stalls: Some(2.0),
+                stall_ms: Some(935.0),
+                duration_ms_max: Some(875.0),
+                last_stall_unix_ms: Some((ANCHOR + 11_180) as f64),
+                last_stall_duration_ms: Some(875.0),
+                ..Default::default()
+            },
+        });
+        for row in report.server_timeline.iter_mut() {
+            row.unix_ms = Some(ANCHOR + row.at_ms);
+        }
+        // The server finished an 875 ms iteration at t+11.180 s, 124 ms before
+        // the scrape that revealed it at t+11.304 s. It named both the finish
+        // and the length, so the window is the stall, not the scrape interval.
+        let revealed = &mut report.server_timeline[1];
+        revealed.counters.last_stall_unix_ms = Some((ANCHOR + 11_180) as f64);
+        revealed.counters.last_stall_duration_ms = Some(875.0);
+        revealed.counters.last_stall_tick = Some(1_118.0);
+
+        let outcome = re_render(&mut report, "stamped-run.json");
+        let a = report.tail_attribution.clone().unwrap();
+        assert_eq!(
+            a.server_stall_windows,
+            vec![
+                Window::exact(10_305, 11_180, 1, 875),
+                Window::bracket(11_244, 12_304, 1, 60),
+            ],
+            "the stamped stall is placed at the stall; the counter-only one is a backwards bracket"
+        );
+        assert_eq!(
+            outcome.precision,
+            StallWindowPrecision::Mixed,
+            "one measured window and one bracket is neither"
+        );
+        // Every sample the archive carried was sent during the 875 ms stall, and
+        // now the report can say it *measured* that rather than bracketed it.
+        assert_eq!((outcome.server_stall, outcome.tail_count), (20, 20));
+        assert_eq!(
+            outcome.server_stall_precise, 20,
+            "all of them inside a window the server itself placed"
+        );
+        assert_eq!(outcome.unattributed, 0);
+        assert_eq!(a.server_stall_precise, 20);
+        // The window table distinguishes them, in the report a human reads.
+        let md = report.to_markdown();
+        assert!(md.contains("| measured |"), "{md}");
+        assert!(md.contains("| bracket |"), "{md}");
+        assert!(md.contains("20 of them inside a measured window"), "{md}");
+        assert!(
+            md.contains("| 10.3 - 11.2 | 1 | 875 | measured |"),
+            "the measured window is the stall, not the scrape interval:\n{md}"
+        );
+        assert!(
+            !outcome.sample_level_complete,
+            "the archive carried its 20 slowest, not every over-SLA sample"
+        );
+        assert!(
+            outcome
+                .summary()
+                .contains("20/20 carried samples attributed to a stall"),
+            "{}",
+            outcome.summary()
+        );
+        // And the gate is still the archived run's, stamp or no stamp.
+        assert_eq!(report.command_latency.as_ref().unwrap().p99_ms, 980.0);
+        assert!(!report.e1_1_pass);
+    }
+
     #[test]
     fn an_uninstrumented_archive_is_said_so_not_so() {
         let mut report = archived_report();
