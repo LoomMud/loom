@@ -28,6 +28,10 @@ import { el } from "../admin/dom.js";
 import { FilesApi } from "./files-api.js";
 import { LoomIde, type IdeDom } from "./app.js";
 import { createMonacoEditor } from "./editor.js";
+import { bridgeForSession } from "./lsp-bridge.js";
+import type { LspHooks } from "./lsp-bridge.js";
+import { registerLspProviders } from "./lsp-monaco.js";
+import { browserSocketOpener, fetchWsTicket, lspSocketUrl } from "./lsp-transport.js";
 
 /** The AMD global `./amd-boot.ts` waited for. Typed as the same narrow
  * surface `./editor.ts` uses -- it is passed straight through. */
@@ -85,7 +89,54 @@ export function mountIde(monaco: MonacoGlobal): void {
   const showSignedIn = (): void => {
     auth.remove();
     const editor = createMonacoEditor({ monaco, container: dom.editor, onSave: () => {} });
-    const ide = new LoomIde({ files, editor, dom });
+    // Live analysis (OBI-180): one socket, one synced document, and a bridge
+    // that decides what `loom-lsp` is told and when. Every part of it is
+    // optional -- `lspSocketUrl` answers null for an origin that cannot hold a
+    // WebSocket, and that path is the same IDE minus the squiggles, because
+    // the save-compile round trip in `./app.ts` remains the authoritative one.
+    let lsp: LspHooks | undefined;
+    const socketUrl = lspSocketUrl(window.location.href);
+    if (socketUrl !== null) {
+      const bridge = bridgeForSession(
+        {
+          url: socketUrl,
+          openSocket: browserSocketOpener,
+          getTicket: () => fetchWsTicket(admin),
+          clientInfo: { name: "loom-ide", version: "dev" },
+        },
+        {
+          // The analyser's squiggles get their own marker owner. A save's
+          // compile result is the driver's answer about the file on disk and
+          // lands under `loom-ide`; these are the analyser's answer about the
+          // text on screen, and neither may erase the other (M-IDE-5).
+          setMarkers: (_path, markers) => editor.setMarkers(markers, "loom-lsp"),
+          // The status label belongs to the controller; the bridge only
+          // writes it when live analysis stops working, and never when the
+          // server closed an idle session on purpose (`./lsp-bridge.ts`).
+          onStatus: (message) => {
+            dom.status.textContent = message;
+          },
+        },
+      );
+      const providers = registerLspProviders(monaco, bridge.providers);
+      // An object literal rather than the bridge itself, for the one line
+      // below: Monaco's language features are registered per language id, not
+      // per editor, so they outlive `#ide-editor` unless something disposes
+      // them with it. A provider left pointing at a dead socket is the failure
+      // mode where hover quietly stops working after a sign-out.
+      lsp = {
+        documentOpened: (path, text) => bridge.documentOpened(path, text),
+        documentChanged: (path, text) => bridge.documentChanged(path, text),
+        documentClosed: (path) => bridge.documentClosed(path),
+        dispose: () => {
+          for (const provider of providers) {
+            provider.dispose();
+          }
+          bridge.dispose();
+        },
+      };
+    }
+    const ide = new LoomIde({ files, editor, dom, lsp });
     ide.start();
   };
 

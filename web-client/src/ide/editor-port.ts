@@ -27,6 +27,12 @@
 
 export type MarkerSeverity = "error" | "warning" | "info";
 
+/** The two marker owners in the IDE, and no others: `loom-ide` is the
+ * result of a save-and-compile round trip, `loom-lsp` is the live
+ * analyser's `publishDiagnostics`. A third owner would be a third
+ * unread set of squiggles on the same line. */
+export type MarkerOwner = "loom-ide" | "loom-lsp";
+
 export interface EditorMarker {
   /** 1-based, as the compiler renders it (`loom-syntax`'s
    * `Diagnostic::render`), so no adjustment happens at the boundary. */
@@ -49,8 +55,13 @@ export interface EditorPort {
   currentText(): string;
   /** The path `openText` last loaded, or `null` when nothing is open. */
   currentPath(): string | null;
-  /** Replace all markers (a save/compile round trip's result). */
-  setMarkers(markers: EditorMarker[]): void;
+  /** Replace all markers this editor owns (a save/compile round trip's
+   * result). `owner` is Monaco's marker namespace: the live analyser
+   * (`./lsp-bridge.ts`) and the save path write to different ones so
+   * neither can erase the other's squiggles, and a builder can tell
+   * "what the driver thinks of the file on disk" apart from "what the
+   * analyser thinks of the text on screen". Defaults to `"loom-ide"`. */
+  setMarkers(markers: EditorMarker[], owner?: MarkerOwner): void;
   /** Scroll/reveal a 1-based line, for "click a diagnostic, go there". */
   revealLine(line: number): void;
   /** Focus the editor. */

@@ -4,6 +4,12 @@
 .env.*
 /web-client/node_modules
 /web-client/dist
+# CI-only diagnostics from the load jobs (OBI-344): the serve log, the final
+# /metrics scrape and the runner context are uploaded as artifacts and must
+# never be committed -- they carry per-run timing numbers and nothing else.
+/results/loom-serve*.log
+/results/loom-metrics-final.txt
+/results/runner-context*.txt
 # The vendored Monaco build (M-IDE-3, OBI-180). A *build artifact*, not
 # source: `npm run vendor` copies it out of `node_modules/monaco-editor`
 # -- whose exact version the lockfile pins and `npm audit` scans -- so the

@@ -18,6 +18,12 @@ cohort size/delay, think-time range, SLA threshold, `--fail-on-sla-miss`
 for CI/scripted gating, `--metrics-url` to scrape `loom-http`'s `/metrics`
 into the committed report, OBI-177).
 
+For attributing a p99 tail (OBI-344), pass `--metrics-url` and, optionally,
+`--metrics-scrape-ms` (default 1000: `/metrics` is polled *during* the run, so
+server-side stall counters can be lined up against the slow samples instead of
+only being read after the fact) and `--timeline-bucket-ms` (default 5000, the
+width of the report's latency-over-time buckets).
+
 ## Design notes
 
 - `telnet.rs`: client-side telnet option negotiation (NAWS, TTYPE, CHARSET,
@@ -33,9 +39,30 @@ into the committed report, OBI-177).
   / class) and the run loop (pick a mix entry, run its steps, think, repeat
   until the deadline).
 - `report.rs`: nearest-rank percentiles and the committed report format
-  (JSON + Markdown).
+  (JSON + Markdown). Every latency sample also carries its offset from the
+  start of the run, which is what makes the timeline and the attribution
+  below possible.
+- `server_metrics.rs`: parses the scraped `/metrics` text into a per-scrape
+  timeline of `loom-obs`'s world-loop counters, and turns a counter that
+  *increased between two scrapes* into the interval it covers. Absent series
+  are `None`, never `Some(0.0)`: "this server records no world-loop metrics"
+  and "this server had no stalls" are different findings and must not render
+  the same way.
+- `attribution.rs`: given the tail (samples at or over the SLA) and the
+  candidate cause windows -- server world-loop stalls, loadtest-process timer
+  starvation, the login ramp -- ranks each sample's cause and reports the
+  split, plus p99 with server-stall-attributed slices removed as an
+  *informational* number only. The gate remains the measured p99.
 
 ## Known gaps (tracked, not blocking this issue)
 
 - 500-player run is a stretch target with findings, not a second SLA gate;
   see `../../results/README.md`.
+- Tail attribution resolves server-side stalls to the scrape interval
+  (`--metrics-scrape-ms`, default 1 s), not to the millisecond. A stall that
+  starts and ends inside one interval is attributed to that whole interval --
+  which is why attribution says "overlapped a stall window", not "caused by".
+- The loadtest measures the bot's own scheduling lag (think-pause overshoot,
+  reported as "Loadtest process timer lag") but the bot process and the server
+  share the CI runner, so a starved bot and a stalled world can look alike in
+  a single run. Read both sections together.
