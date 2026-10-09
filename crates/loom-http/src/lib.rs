@@ -893,6 +893,72 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// OBI-347: `/mudcfg/<key>` is not a route loom-http registers, and it is
+    /// not going to be until the world side can answer for a key at all
+    /// (registering runtime-config keys is the work OBI-333 deferred, and that
+    /// seam is Gimli's). What loom-http *does* owe, and what this pins, is the
+    /// floor the ticket is really about: a path with nothing behind it is a
+    /// client error, for GET and for PUT, whether `LOOM_WEB_ROOT` is set (the
+    /// fallback is `ServeDir`) or not (the fallback is axum's own `404`). A
+    /// `500` here is precisely the symptom this ticket was written about, and it
+    /// would mean the fallback started blaming the driver for a routing
+    /// decision.
+    ///
+    /// Observed on `eaf9ceb`, both shapes, both methods:
+    ///
+    /// | `LOOM_WEB_ROOT` | GET | PUT |
+    /// | --- | --- | --- |
+    /// | unset (axum's fallback) | `404` | `404` |
+    /// | set (`ServeDir`) | `404` | `405` |
+    ///
+    /// The `405` is `ServeDir`'s GET/HEAD-only rule, not a decision by anything
+    /// of ours, so the assertion pins the *class* rather than the number: the
+    /// answer must come from routing. Pinning `405` itself would make a
+    /// tower-http upgrade able to redden this gate for no reason.
+    #[tokio::test]
+    async fn an_unregistered_mudcfg_key_is_answered_by_routing_never_by_a_5xx() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<html>loom</html>").unwrap();
+        let (ws_accept_tx, _ws_accept_rx) = mpsc::channel(16);
+        let static_app = app(HttpState::new(
+            ws_accept_tx.clone(),
+            Readiness::new(),
+            PrometheusMetrics::new_unregistered(),
+        )
+        .with_web_root(dir.path().to_path_buf()));
+        let bare_app = app(HttpState::new(
+            ws_accept_tx,
+            Readiness::new(),
+            PrometheusMetrics::new_unregistered(),
+        ));
+
+        for (shape, app) in [("no web root", bare_app), ("web root set", static_app)] {
+            for method in [axum::http::Method::GET, axum::http::Method::PUT] {
+                let is_put = method == axum::http::Method::PUT;
+                let body = if is_put {
+                    axum::body::Body::from("{\"value\":\"100\"}")
+                } else {
+                    axum::body::Body::empty()
+                };
+                let request = axum::http::Request::builder()
+                    .method(method.clone())
+                    .uri("/mudcfg/synchronizer_enabled")
+                    .body(body)
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                let status = response.status();
+                let says = format!("{method} /mudcfg/synchronizer_enabled, {shape}");
+                assert!(
+                    matches!(
+                        status,
+                        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+                    ),
+                    "{says}: got {status}; routing must answer an unregistered path (404, or 405 because the static fallback does not take PUT) -- never a handler, never the driver (OBI-347)"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn root_serves_index_html_with_a_web_root_set() {
         let dir = tempfile::tempdir().unwrap();

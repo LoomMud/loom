@@ -233,6 +233,18 @@ closes first. Two consequences, both recorded so nobody has to rediscover them:
   (`STALL_LOG_INTERVAL` in `crates/loom-obs/src/world.rs`), so 31 events print as 3
   lines. The counters are the census; the log is a sample. Read
   `loom_world_loop_stalls_total`, not `grep -c`.
+- A **red** `loadtest-e1-1` whose report says `E1.1 (p99 < 50 ms): PASS` is a broken
+  harness, not a missed SLA. The evidence tail that prints the `world_loop:` line ran
+  under the runner's default `bash -e -o pipefail`, so on main run 37862921160
+  (`eaf9ceb`) the third bullet's own census aborted the step: the world thread
+  recorded **zero** stalls, the scrape therefore carried no `kind="…"` label, `grep -oE`
+  exited 1, `pipefail` carried that through the pipeline, and the command substitution
+  failed the step *after* `exit $status` would have returned 0 -- p99 21.47 ms, PASS.
+  The tail now runs under `set +e` and rule 7 of `scripts/check-ci-load-lane.py` keeps
+  it there, with a mutant for each beat (`set +e` removed, `exit $status` dropped,
+  `status=$?` gone). Reproduced deterministically against both archived scrapes, and the
+  rule states the invariant plainly: the p99 verdict is the only thing that can turn
+  this check red, and the evidence below it can only ever inform, never decide.
 
 This is also why the historical tail is still open. Before PR #151 the same
 disconnect path failed instantly on ENOENT and the worst iteration in a green run
