@@ -546,6 +546,19 @@ jobs:
             --out results/ci-e1-1 \
             --fail-on-sla-miss
           status=$?
+          # OBI-344 follow-up (main run 37862921160 on eaf9ceb): everything
+          # below this line collects evidence; none of it decides the verdict,
+          # and `exit $status` at the bottom is the only thing that does. The
+          # runner's default `bash -e -o pipefail` meant one non-zero command in
+          # this tail aborted the step *after* the p99 verdict had passed: on
+          # that run the world thread recorded zero stalls, so no `kind="..."`
+          # label existed, `grep -oE` exited 1, pipefail propagated it through
+          # the pipeline, and the command substitution failed the step -- a gate
+          # that goes red exactly when the world thread behaves. Turn errexit
+          # off here. Cost: a failed `cp` of the serve log/metrics into results/
+          # no longer fails the step; `upload-artifact` runs `if: always()` with
+          # `if-no-files-found: warn`, so the missing file is still visible.
+          set +e
           # Scrape before stopping: the previous version of this step curled
           # `/metrics` *after* `kill`, so the "final /metrics" section was
           # always empty and the artifact's only server numbers were the
