@@ -189,4 +189,9 @@ at 1 MiB and whole messages at 4 MiB (spec M-LSP-4).
   fixture tree in `tests/fixtures/warp/` (same convention as
   `loom-cli/tests/fixtures/warp-phase0`: a small, self-contained mudlib
   shaped like warp, not a copy of the real repo).
+  The M-LSP-4 **G1** thread-count guard lives in its own binary,
+  `tests/lsp_thread_count.rs`, because it measures `/proc/self/task` -- a
+  process-wide thread list, which parallel session-starting tests in the same
+  binary would move for reasons unrelated to the server (OBI-317). Both
+  binaries share their harness through `tests/support/mod.rs`.
 - `cargo clippy -p loom-lsp --all-targets`.
