@@ -219,15 +219,24 @@ pub type ReclaimRequest = (ConnId, oneshot::Sender<Option<TcpStream>>);
 /// player.
 type HandoffOutbox = HashMap<ConnId, VecDeque<ConnControl>>;
 
-/// Test-only witness for the `closed_rx` arm of [`run_server_full`].
+/// Test-only witness for the three arms of [`run_server_full`] that move a
+/// [`HandoffOutbox`] marker.
 ///
-/// That arm's only effect is forgetting a [`HandoffOutbox`] marker, and the
-/// outbox has exactly one other reader -- the `adopt_rx` arm, which *consumes*
-/// whatever it finds. So nothing outside the loop can tell "the marker for a
-/// dead session was dropped with it" apart from "the marker is still there and
-/// the next `select!` will pick whichever arm it picks", and a test that wants
-/// the first must otherwise settle for a wall-clock sleep standing in for a
-/// happens-before edge. This list is that edge, reported by the loop itself.
+/// The `closed_rx` arm's only effect is forgetting a marker, and the outbox has
+/// exactly one other reader -- the `adopt_rx` arm, which *consumes* whatever it
+/// finds -- while the `reclaim_rx` arm is the only writer that opens one. So
+/// nothing outside the loop can tell "the marker for a dead session was dropped
+/// with it" apart from "the marker is still there and the next `select!` will
+/// pick whichever arm it picks", and a test that wants one of those orderings
+/// must otherwise settle for a wall-clock sleep standing in for a happens-before
+/// edge. This list is that edge, reported by the loop itself.
+///
+/// OBI-405 widened it from the `closed_rx` arm to all three: the three
+/// handoff-window tests (`readopt_delivers_output_queued_during_the_handoff_
+/// window`, `close_parked_during_the_handoff_window_still_closes_the_session`,
+/// `close_survives_a_full_handoff_outbox`) each need to know the loop had *taken
+/// the commands into the outbox* before they re-adopt, and the only honest
+/// witness of that is the arm that replays them.
 ///
 /// Compiled only into this crate's own test binary (`#[cfg(test)]` is not set
 /// when `loom-net` is built for `loom-cli`/`loom-http` or for a release), so
@@ -252,6 +261,16 @@ mod handoff_witness {
         /// The `closed_rx` arm dropped the marker, with how many commands were
         /// still parked behind it.
         Forgotten { parked: usize },
+        /// The `adopt_rx` arm closed the marker by replaying it into the
+        /// re-adopted session's control channel, `parked` commands deep.
+        ///
+        /// This is the handoff window *ending*, and the depth is the premise the
+        /// re-adopt tests used to assume: a queue replayed `0` deep means the
+        /// commands the test sent were never parked at all (they went to a live
+        /// `ConnEntry`, or were dropped), and every byte-level assertion after
+        /// it is then checking a path that has nothing to do with
+        /// [`HandoffOutbox`].
+        Replayed { parked: usize },
     }
 
     static EVENTS: OnceLock<Mutex<Vec<(ConnId, Event)>>> = OnceLock::new();
@@ -284,6 +303,20 @@ mod handoff_witness {
             .iter()
             .find_map(|(id, event)| match (id == &conn, event) {
                 (true, Event::Forgotten { parked }) => Some(*parked),
+                _ => None,
+            })
+    }
+
+    /// `Some(parked)` once the loop has reported re-adopting this id, and how
+    /// much it had to replay (see [`Event::Replayed`]).
+    pub(super) fn replayed(conn: ConnId) -> Option<usize> {
+        EVENTS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("handoff witness lock")
+            .iter()
+            .find_map(|(id, event)| match (id == &conn, event) {
+                (true, Event::Replayed { parked }) => Some(*parked),
                 _ => None,
             })
     }
@@ -603,6 +636,18 @@ pub async fn run_server_full(
                 // polls `control_rx`, so the player sees preamble -> output
                 // they had already been "sent".
                 let mut parked = handoff.remove(&conn_id).unwrap_or_default();
+                // OBI-405: report the replay before spawning anything, so a
+                // test that has read this session's fresh preamble (which the
+                // task below writes) knows this line already happened. It is
+                // the only witness of "the window closed with N commands parked";
+                // see [`handoff_witness`].
+                #[cfg(test)]
+                handoff_witness::note(
+                    conn_id,
+                    handoff_witness::Event::Replayed {
+                        parked: parked.len(),
+                    },
+                );
                 while let Some(control) = parked.pop_front() {
                     if let Err(mpsc::error::TrySendError::Full(control)) = tx.try_send(control) {
                         // Reachable by design since OBI-304/B1: a parked
@@ -1553,6 +1598,31 @@ mod tests {
         let mut buf = vec![0_u8; STARTUP_PREAMBLE.len()];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(buf, STARTUP_PREAMBLE);
+    }
+
+    /// Give this test a conn-id range no other test's loop can produce.
+    ///
+    /// [`handoff_witness`] is process-global while conn ids are only unique per
+    /// `run_server_full`, and `cargo test` runs this crate's tests in one
+    /// process with several loops live at once -- so a test that reads the
+    /// witness has to make sure the id it asks about is *its* id. Adopting a
+    /// session the test never reads pushes the loop's auto-increment counter
+    /// past `base` (the `adopt_rx` arm keeps `next_conn_id` clear of adopted
+    /// ids), so the subject the caller accepts afterwards is `base + 1`.
+    ///
+    /// Returns the seed session's client end; keep it alive for as long as the
+    /// test needs the loop to stay unaware of it.
+    async fn claim_conn_ids(
+        adopt_tx: &mpsc::Sender<(ConnId, TcpStream)>,
+        base: ConnId,
+    ) -> TcpStream {
+        let (mut seed_client, seed_socket) = loopback_pair().await;
+        adopt_tx.send((base, seed_socket)).await.unwrap();
+        // The bump happens in the adopt arm *before* it spawns the task, so
+        // seeing that task's preamble is proof the counter is already clear of
+        // `base` -- i.e. that the accept below cannot collide.
+        drain_preamble(&mut seed_client).await;
+        seed_client
     }
 
     /// A connected loopback pair: `(client end, socket to hand the loop)`. The
@@ -3022,8 +3092,24 @@ mod tests {
     /// `call_out`/heartbeat reply can land) must be buffered and
     /// delivered once the connection is adopted -- not dropped because
     /// the id had no `ConnEntry` for a few milliseconds.
+    ///
+    /// OBI-405 replaced the `sleep(50 ms)` between "emit for the handed-off id"
+    /// and "adopt" with the two orderings it was standing in for, because it was
+    /// not merely slow, it was optional: a command the loop picks up *after* the
+    /// adopt is delivered through the fresh `ConnEntry` and lands on the same
+    /// socket in the same order, byte-for-byte what the outbox replay produces.
+    /// So the sleep-free version goes green having exercised the routing path
+    /// this test does not claim to cover, and the mutation "park_for_handoff
+    /// drops instead of parking" stays green with it. What is asserted now is
+    /// that the window was open when the commands were applied (two
+    /// [`fence_reclaim`]s plus the loop's own [`handoff_witness`]) and that the
+    /// adopt closed it with both of them in the replay.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn readopt_delivers_output_queued_during_the_handoff_window() {
+        // The witness is process-global and ids are only unique per loop, so
+        // take a range of this test's own before reading it.
+        const WINDOW_SEED: ConnId = 7_100_000;
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -3046,6 +3132,8 @@ mod tests {
             reclaim_rx,
         ));
 
+        let _seed_client = claim_conn_ids(&adopt_tx, WINDOW_SEED).await;
+
         let mut client = TcpStream::connect(addr).await.unwrap();
         let conn = loop {
             match event_rx.recv().await.expect("event channel closed") {
@@ -3053,6 +3141,12 @@ mod tests {
                 _ => continue,
             }
         };
+        assert_eq!(
+            conn,
+            WINDOW_SEED + 1,
+            "the subject must hold an id no other test's loop can produce, or the \
+             process-global handoff witness says nothing about *this* session"
+        );
         drain_preamble(&mut client).await;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -3061,6 +3155,20 @@ mod tests {
             .await
             .expect("reclaim reply channel dropped")
             .expect("reclaim should succeed for a live connection");
+
+        // Premise 1: the window is open. The reclaim arm opens the marker
+        // *last* in its body, after the spawn that answered the request, so
+        // holding the socket back is no proof it has been opened yet. A reclaim
+        // queued behind it is: `reclaim_rx` is FIFO and the loop runs one
+        // `select!` arm at a time, so this fence answering proves the arm under
+        // test ran to its end.
+        fence_reclaim(&reclaim_tx, conn).await;
+        assert!(
+            handoff_witness::saw(conn, handoff_witness::Event::Installed),
+            "the reclaim under test opened no handoff marker for {conn}: the two lines below \
+             then have no window to be parked in, and whatever they assert is about the live \
+             `ConnEntry` path rather than `HandoffOutbox`"
+        );
 
         // The handoff window: the world is still running and emits for
         // this session. `conns` no longer has an entry for `conn`, so
@@ -3073,17 +3181,35 @@ mod tests {
             .send(NetCommand::Send(conn, "during-handoff-2\n".to_string()))
             .await
             .unwrap();
-        // Give `run_server_full` a chance to actually process both (it
-        // would drop them here rather than later, so this makes the test
-        // fail for the right reason instead of passing by luck).
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Premise 2: both are *inside* the outbox, not merely sent. The fence
+        // goes onto `reclaim_rx` behind them, and a reclaim arm's first act is
+        // `drain_commands_before_reclaim`, so this resolving proves both were
+        // applied by an arm that ran after them -- and the `None` answer
+        // `fence_reclaim` checks for is what proves there was no `ConnEntry` to
+        // apply either of them to. Parked, or dropped by a regression: those are
+        // the remaining options, which is the case under test.
+        fence_reclaim(&reclaim_tx, conn).await;
 
         adopt_tx.send((conn, reclaimed)).await.unwrap();
 
         // A re-adopted connection always starts with a fresh negotiation
         // preamble (the codec state reset documented since OBI-227), then
-        // whatever was parked for it, in order.
+        // whatever was parked for it, in order. The preamble is written by the
+        // task the adopt arm spawns *after* it reports the replay below, so
+        // having read it, that report is visible to this test.
         drain_preamble(&mut client).await;
+        // What the sleep used to assume, now asserted: the replay that reopened
+        // this session carried both lines, so the bytes checked next can only
+        // have come out of `HandoffOutbox`.
+        let replayed = handoff_witness::replayed(conn);
+        assert_eq!(
+            replayed,
+            Some(2),
+            "the adopt replayed {replayed:?} command(s) for {conn}, not the 2 queued in the \
+             window: those lines reached the socket some other way, so this test is not \
+             exercising the handoff outbox at all"
+        );
+
         let got = read_lines(&mut client, 2).await;
         assert_eq!(
             got,
@@ -3102,8 +3228,24 @@ mod tests {
     /// nothing re-sends the close -- so the world keeps a live binding for
     /// a player who is gone. Anything queued *after* the parked `Close`
     /// must not displace it, either.
+    ///
+    /// OBI-405: the `sleep(50 ms)` that used to separate "park the three
+    /// commands" from "adopt" is replaced by the same two [`fence_reclaim`]s as
+    /// `readopt_delivers_output_queued_during_the_handoff_window`, plus the
+    /// loop's own report of what the replay held. Without them the outcome being
+    /// asserted is a coin toss on which `select!` arm ran: a `Close` picked up
+    /// *after* the adopt goes to the live `ConnEntry`, closes the socket all the
+    /// same, and the test passes without the parked-close path ever running --
+    /// green through the mutation "park_for_handoff drops instead of parking".
+    /// `Some(2)` is the premise that this does not happen: the replay is what
+    /// closed the session, and it held exactly the line queued before the close
+    /// and the close, nothing queued after it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_parked_during_the_handoff_window_still_closes_the_session() {
+        // The witness is process-global and ids are only unique per loop, so
+        // take a range of this test's own before reading it.
+        const CLOSE_WINDOW_SEED: ConnId = 7_200_000;
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -3126,6 +3268,8 @@ mod tests {
             reclaim_rx,
         ));
 
+        let _seed_client = claim_conn_ids(&adopt_tx, CLOSE_WINDOW_SEED).await;
+
         let mut client = TcpStream::connect(addr).await.unwrap();
         let conn = loop {
             match event_rx.recv().await.expect("event channel closed") {
@@ -3133,6 +3277,12 @@ mod tests {
                 _ => continue,
             }
         };
+        assert_eq!(
+            conn,
+            CLOSE_WINDOW_SEED + 1,
+            "the subject must hold an id no other test's loop can produce, or the \
+             process-global handoff witness says nothing about *this* session"
+        );
         drain_preamble(&mut client).await;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -3141,6 +3291,15 @@ mod tests {
             .await
             .expect("reclaim reply channel dropped")
             .expect("reclaim should succeed for a live connection");
+
+        // Premise 1: the window is open (see the same fence in
+        // `readopt_delivers_output_queued_during_the_handoff_window`).
+        fence_reclaim(&reclaim_tx, conn).await;
+        assert!(
+            handoff_witness::saw(conn, handoff_witness::Event::Installed),
+            "the reclaim under test opened no handoff marker for {conn}, so the `Close` parked \
+             below has no window to be parked in and is not the close this test claims to check"
+        );
 
         cmd_tx
             .send(NetCommand::Send(conn, "before-close\n".to_string()))
@@ -3153,10 +3312,28 @@ mod tests {
             .send(NetCommand::Send(conn, "after-close\n".to_string()))
             .await
             .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Premise 2: all three were applied inside the window -- the reclaim
+        // arm drains the command channel before it answers, and answers `None`
+        // because there is no `ConnEntry`, so the `Close` can only have gone to
+        // `park_for_handoff`.
+        fence_reclaim(&reclaim_tx, conn).await;
 
         adopt_tx.send((conn, reclaimed)).await.unwrap();
         drain_preamble(&mut client).await;
+        // The replay that reopened this session held two commands and not
+        // three: `before-close`, then the `Close` (which is why the socket goes
+        // to EOF below), and *not* `after-close` -- a third would mean the
+        // parked-close guard stopped nothing, a `Some(0)` that nothing was
+        // parked at all.
+        let replayed = handoff_witness::replayed(conn);
+        assert_eq!(
+            replayed,
+            Some(2),
+            "the adopt replayed {replayed:?} command(s) for {conn}, not the parked line plus \
+             the parked Close: the close that ended this session did not come out of \
+             `HandoffOutbox`"
+        );
+
         let got = read_lines(&mut client, 1).await;
         assert_eq!(
             got,
@@ -3188,6 +3365,11 @@ mod tests {
             matches!(event, NetEvent::Disconnected(id) if id == conn),
             "expected Disconnected({conn}), got {event:?}"
         );
+        // The one genuinely negative window in this test: "no second
+        // `Disconnected`" is an absence, so there is nothing to wait *for* --
+        // it stays a bounded wait, and it is bounded because the close above is
+        // already proven delivered (that is what the EOF and the `Some(2)` are
+        // for), so this can only ever fire late, never early.
         let extra =
             tokio::time::timeout(std::time::Duration::from_millis(200), event_rx.recv()).await;
         assert!(
@@ -3204,9 +3386,24 @@ mod tests {
     /// and was then closed still closes. This is also the case where the
     /// parked queue is one entry deeper than the adopted connection's
     /// control channel, i.e. the `adopt_rx` arm's spawned-remainder path.
+    ///
+    /// OBI-405: same two [`fence_reclaim`]s as the other two handoff-window
+    /// tests, because here the sleep was standing in for something the test
+    /// cannot see any other way. If any flood line or the `Close` is picked up
+    /// after the adopt instead of before it, it is routed to the live
+    /// `ConnEntry`, the bound the outbox is supposed to have applied never
+    /// applies to it, and the byte assertions below still pass -- including the
+    /// "exactly `DEPTH` lines then EOF" that is supposed to be the bound. So the
+    /// bound is asserted on the loop's own report of the replay, `Some(DEPTH +
+    /// 1)`: six lines were queued into the window and only `DEPTH` of them fit,
+    /// which is only possible if they went through `park_for_handoff`, and the
+    /// extra entry is the exempt `Close`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_survives_a_full_handoff_outbox() {
         const DEPTH: usize = 4;
+        // The witness is process-global and ids are only unique per loop, so
+        // take a range of this test's own before reading it.
+        const FLOOD_SEED: ConnId = 7_300_000;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3233,6 +3430,8 @@ mod tests {
             reclaim_rx,
         ));
 
+        let _seed_client = claim_conn_ids(&adopt_tx, FLOOD_SEED).await;
+
         let mut client = TcpStream::connect(addr).await.unwrap();
         let conn = loop {
             match event_rx.recv().await.expect("event channel closed") {
@@ -3240,6 +3439,12 @@ mod tests {
                 _ => continue,
             }
         };
+        assert_eq!(
+            conn,
+            FLOOD_SEED + 1,
+            "the subject must hold an id no other test's loop can produce, or the \
+             process-global handoff witness says nothing about *this* session"
+        );
         drain_preamble(&mut client).await;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -3249,18 +3454,44 @@ mod tests {
             .expect("reclaim reply channel dropped")
             .expect("reclaim should succeed for a live connection");
 
+        // Premise 1: the window is open, and `DEPTH` is the bound it parks
+        // behind (see the same fence in
+        // `readopt_delivers_output_queued_during_the_handoff_window`).
+        fence_reclaim(&reclaim_tx, conn).await;
+        assert!(
+            handoff_witness::saw(conn, handoff_witness::Event::Installed),
+            "the reclaim under test opened no handoff marker for {conn}: the flood below is \
+             then not parked behind anything, so nothing can report whether the bound dropped \
+             the lines it was supposed to"
+        );
+
         // More output than the per-session bound holds, then the close.
-        for idx in 0..DEPTH + 2 {
+        let queued = DEPTH + 2;
+        for idx in 0..queued {
             cmd_tx
                 .send(NetCommand::Send(conn, format!("flood-{idx}\n")))
                 .await
                 .unwrap();
         }
         cmd_tx.send(NetCommand::Close(conn)).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Premise 2: all seven were applied inside the window, by an arm that
+        // ran after them and found no `ConnEntry` to route them to.
+        fence_reclaim(&reclaim_tx, conn).await;
 
         adopt_tx.send((conn, reclaimed)).await.unwrap();
         drain_preamble(&mut client).await;
+        let replayed = handoff_witness::replayed(conn);
+        assert_eq!(
+            replayed,
+            Some(DEPTH + 1),
+            "the adopt replayed {replayed:?} command(s) for {conn}, but the bound takes the \
+             {queued} flood lines down to `output_queue_depth` ({DEPTH}) with the exempt `Close` \
+             parked past them: `Some(0)` means nothing was parked at all, `Some({})` that the \
+             bound never applied to the flood, and either way this session was not driven \
+             through `HandoffOutbox`",
+            queued + 1
+        );
+
         let got = read_lines(&mut client, DEPTH).await;
         let expected: Vec<String> = (0..DEPTH).map(|idx| format!("flood-{idx}\r\n")).collect();
         assert_eq!(
