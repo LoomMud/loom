@@ -103,6 +103,20 @@ pub(super) fn truncate_body(body: &[u8]) -> String {
     }
 }
 
+/// The crate's one "does this byte buffer contain this needle, and where"
+/// scan, shared by the HTTP framing readers in `tls_transport` and
+/// `fake_http` (OBI-352).
+///
+/// Both readers need it and neither owns it: production code (the response
+/// reader) cannot reach into a `#[cfg(test)]` module, and a test helper
+/// living in one transport module would be the third copy the moment
+/// another transport appears.
+pub(crate) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 pub struct GitHubAppClient<C: HttpClient = RustlsHttpClient> {
     app_id: String,
     installation_id: String,

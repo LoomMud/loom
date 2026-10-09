@@ -80,6 +80,17 @@ const READY_RETRY: Duration = Duration::from_millis(10);
 /// than an unbounded number of threads.
 pub const DEFAULT_MAX_INFLIGHT: usize = 32;
 
+/// How long one connection's read may take before the fake gives up on *it*.
+///
+/// Longer than [`crate::github::fake_http::READ_TIMEOUT`] on purpose, and safe
+/// to be: that constant bounds the fakes which accept serially, where one
+/// stalled client pauses every client behind it. Here each connection is
+/// served on its own thread, so patience costs the connection that needed it
+/// and nothing else -- which is the whole point of OBI-351. A two-segment POST
+/// whose second segment is merely scheduled out must not be answered as if it
+/// were malformed, and a busy runner is exactly when that happens.
+pub const READ_PATIENCE: Duration = Duration::from_secs(10);
+
 /// How many consecutive `accept()` errors the loop takes before it stops rather
 /// than spins. One is a hiccup; this many means the listener is dead.
 const MAX_ACCEPT_FAILURES: usize = 64;
@@ -139,7 +150,7 @@ where
 
 /// Tunables for [`FakeHttpServer::spawn_with`]. Both exist because a test needs
 /// to set them: patience, to watch the fake give up on a stalled client without
-/// waiting out [`fake_http::READ_TIMEOUT`], and the ceiling, to watch what it
+/// waiting out [`READ_PATIENCE`], and the ceiling, to watch what it
 /// does when it is full.
 #[derive(Clone, Debug)]
 pub struct ServerOptions {
@@ -152,7 +163,7 @@ pub struct ServerOptions {
 impl Default for ServerOptions {
     fn default() -> Self {
         Self {
-            read_timeout: fake_http::READ_TIMEOUT,
+            read_timeout: READ_PATIENCE,
             max_inflight: DEFAULT_MAX_INFLIGHT,
         }
     }

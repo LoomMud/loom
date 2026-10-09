@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Oberfield
 
 //! Shared plumbing for the loopback fake GitHub servers every `loom-git`
-//! test uses (OBI-350).
+//! test uses (OBI-350, OBI-352).
 //!
 //! Each fake used to do **one `read()` per connection** and answer from
 //! whatever that read returned. A GitHub POST is a request line plus a
@@ -24,23 +24,43 @@
 //! `shutdown(Write)` and drain to the client's FIN. Everything is bounded
 //! (read timeout, byte caps) so a misbehaving or silent client costs one
 //! dropped connection instead of a wedged accept loop.
+//!
+//! The reading and response-framing halves are generic over the transport
+//! ([`read_request_bytes`], [`write_response`]) because `tls_transport`'s
+//! fake speaks through a `StreamOwned<ServerConnection, TcpStream>`, not a
+//! bare socket (OBI-352). Only the closing half stays `TcpStream`-specific
+//! here: over TLS the graceful close has to emit `close_notify` *before*
+//! `shutdown(Write)`, which is rustls knowledge and belongs with that
+//! fake.
+//!
+//! Who *owns* a connection is the other half of the same flake, and it lives
+//! in [`crate::github::fake_server`] (OBI-351): the GitHub fake used to serve
+//! one request per connection from a single serial accept loop and `continue`
+//! past a failed read, so an honest client could be accepted and answered by
+//! nothing. It now takes one thread per connection, answers every connection
+//! it accepts, and records every connection it could not serve. What stays
+//! here is deliberately only the shared reading and framing, so the plain and
+//! the TLS fakes cannot drift apart on "never answer a request you have not
+//! finished reading".
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use super::find_subslice;
 
 /// How long to wait for the next segment of a request before giving up on
-/// that connection.
+/// that connection. Long enough for a deliberate two-segment client, and
+/// short enough that a stalled one costs the accept loop a pause rather
+/// than the whole test run.
 ///
-/// This is patience the *fake* owes a client whose request is still in
-/// flight. Under the old single-threaded accept loop it was also a tax every
-/// other connection paid -- a stalled client cost the whole suite this much
-/// queue time -- which is why it was 2 s. It is now per connection
-/// ([`crate::github::fake_server`], OBI-351), so an honest two-segment POST
-/// (headers, then a body the scheduler has not handed over yet) is never
-/// answered as if it were malformed, and a stalled client costs only its own
-/// connection.
-pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// This is the patience of the fakes that serve connections **serially** —
+/// `tls_transport`'s (OBI-352) among them, where a long window is a tax
+/// every later connection pays. The per-connection fake GitHub server
+/// ([`crate::github::fake_server`], OBI-351) does not owe other connections
+/// anything, so it asks for its own, longer window instead of raising this
+/// constant: see [`crate::github::fake_server::ServerOptions::read_timeout`].
+pub const READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long to wait for the client's remaining bytes / FIN after the
 /// response has been written.
@@ -49,7 +69,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 /// Ceiling on the bytes read for one request (and on the bytes drained
 /// after the response), so no client can make the fake spin or allocate
 /// without limit.
-const MAX_BYTES: usize = 1 << 20;
+pub const MAX_BYTES: usize = 1 << 20;
 
 /// One complete HTTP/1.1 request as the fake served it.
 #[derive(Debug, Clone)]
@@ -67,23 +87,62 @@ pub struct FakeRequest {
     pub body: String,
 }
 
-/// Read one complete request off `stream`, with the default patience
-/// ([`READ_TIMEOUT`]).
+/// Read one complete request off a plain-HTTP fake connection, with the
+/// default patience ([`READ_TIMEOUT`]).
+///
+/// The [`TcpStream`] wrapper around [`read_request_bytes`]: applies
+/// [`READ_TIMEOUT`] to the socket so the blocking reads the shared reader
+/// performs actually return, then hands the stream to it.
 ///
 /// Returns `None` if the client hangs up, stalls past the patience window,
-/// or exceeds [`MAX_BYTES`] before the request is complete. A caller that
-/// stops reading here still owes the client an answer -- see
+/// or exceeds [`MAX_BYTES`] before the header block is complete. A caller
+/// that stops reading here still owes the client an answer -- see
 /// [`crate::github::fake_server::FakeHttpServer`] (OBI-351), which answers
 /// `400` and records the drop instead of closing in silence.
 pub fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
-    read_request_within(stream, READ_TIMEOUT)
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    read_request_bytes(stream, READ_TIMEOUT, MAX_BYTES)
 }
 
 /// [`read_request`] with an explicit patience window, for the tests that
 /// need to watch the fake give up on a stalled client without waiting out
-/// [`READ_TIMEOUT`] (a test that races a constant is a coin flip).
+/// [`READ_TIMEOUT`] (a test that races a constant is a coin flip), and for
+/// the per-connection server, which is patient on its own schedule.
 pub fn read_request_within(stream: &mut TcpStream, patience: Duration) -> Option<FakeRequest> {
     let _ = stream.set_read_timeout(Some(patience));
+    read_request_bytes(stream, patience, MAX_BYTES)
+}
+
+/// Read one complete request off *any* blocking byte source -- the
+/// plain-HTTP fakes pass a `&mut TcpStream`, `tls_transport`'s fake passes
+/// a `&mut StreamOwned<ServerConnection, TcpStream>` (OBI-352).
+///
+/// This is deliberately transport-neutral: "never answer a request you
+/// have not finished reading" is one rule, and every copy of it written
+/// per-transport is one more fake that can lose a body segment (OBI-350
+/// fixed the plain-HTTP copies, OBI-352 the TLS one). `read_request`,
+/// `read_request_within` and this function are the only places in the crate
+/// that scan for the header terminator.
+///
+/// `deadline` bounds the whole read and `max` the bytes read, so a stalled
+/// or oversized client costs the caller a dropped connection instead of a
+/// wedged accept loop. `deadline` is checked *between* reads, so the
+/// caller must also put a timeout on the underlying socket (as
+/// [`read_request`] does) -- a source that blocks forever would make the
+/// deadline unreachable.
+///
+/// Returns `None` if the client hangs up, stalls, or exceeds `max` before
+/// the **header block** is complete. A client that completes the headers
+/// but never sends the body it promised is served what arrived (recorded
+/// in [`FakeRequest::body`]) rather than dropped: that is what a real
+/// server does with a truncated request, and it keeps the fake's answer
+/// driven by the path the test chose.
+pub fn read_request_bytes<R: Read>(
+    read: &mut R,
+    deadline: Duration,
+    max: usize,
+) -> Option<FakeRequest> {
+    let started = Instant::now();
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
 
@@ -93,10 +152,10 @@ pub fn read_request_within(stream: &mut TcpStream, patience: Duration) -> Option
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
             break pos + 4;
         }
-        if buf.len() >= MAX_BYTES {
+        if buf.len() >= max || started.elapsed() > deadline {
             return None;
         }
-        match stream.read(&mut chunk) {
+        match read.read(&mut chunk) {
             Ok(0) | Err(_) => return None,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
@@ -106,8 +165,11 @@ pub fn read_request_within(stream: &mut TcpStream, patience: Duration) -> Option
     //    arrive in. Truncating here is the bug this module exists to fix.
     let head = String::from_utf8_lossy(&buf[..headers_end - 4]).into_owned();
     let content_length = content_length_of(&head);
-    while buf.len() < headers_end + content_length && buf.len() < MAX_BYTES {
-        match stream.read(&mut chunk) {
+    while buf.len() < headers_end + content_length
+        && buf.len() < max
+        && started.elapsed() <= deadline
+    {
+        match read.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
@@ -123,27 +185,42 @@ pub fn read_request_within(stream: &mut TcpStream, patience: Duration) -> Option
     })
 }
 
+/// Write `body` as an HTTP/1.1 response with `status` to any byte sink --
+/// framing only, no closing. Transport-neutral for the same reason as
+/// [`read_request_bytes`]: the plain-HTTP fake writes it to a `TcpStream`,
+/// the TLS fake writes it through a `StreamOwned` and then has its own
+/// alert to send before the socket half-closes.
+pub fn write_response<W: Write>(sink: &mut W, status: u16, body: &[u8]) -> std::io::Result<()> {
+    let resp = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status_text(status),
+        body.len(),
+    );
+    sink.write_all(resp.as_bytes())?;
+    sink.write_all(body)?;
+    sink.flush()
+}
+
 /// Write `body` as an HTTP/1.1 response with `status`, then close the way
 /// a real server does. The closing half matters as much as the reading
 /// half: see the module docs.
 pub fn respond(stream: &mut TcpStream, status: u16, body: &str) {
-    let status_text = status_text(status);
-    let resp = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len(),
-    );
-    if stream.write_all(resp.as_bytes()).is_err() {
+    if write_response(stream, status, body.as_bytes()).is_err() {
         return;
     }
-    if stream.write_all(body.as_bytes()).is_err() {
-        return;
-    }
-    let _ = stream.flush();
     let _ = stream.shutdown(Shutdown::Write);
-    // Drain to the client's FIN. Anything still in flight (or still queued
-    // unread on our side) is what would earn the client an RST instead of a
-    // clean close; the bound means a client that never closes costs one
-    // timeout, not a hung suite.
+    drain_to_fin(stream);
+}
+
+/// Read and discard whatever the client sends until it closes, [`DRAIN_TIMEOUT`]
+/// expires, or [`MAX_BYTES`] arrive.
+///
+/// Second half of the rule, not a nicety: bytes left queued *unread in our
+/// own receive queue* at close time are what make the kernel answer the
+/// client's FIN with an RST. The bound means a client that never closes
+/// costs one timeout, not a hung suite. The TLS fake drains its inner
+/// socket with this after sending `close_notify`.
+pub fn drain_to_fin(stream: &mut TcpStream) {
     let _ = stream.set_read_timeout(Some(DRAIN_TIMEOUT));
     let mut sink = [0u8; 1024];
     let mut drained = 0usize;
@@ -190,12 +267,6 @@ fn content_length_of(head: &str) -> usize {
         // so taking the last one is enough for a test fake.
         .last()
         .unwrap_or(0)
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 #[cfg(test)]
