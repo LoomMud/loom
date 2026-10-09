@@ -206,3 +206,81 @@ S1 guard model this table already includes) will trip the gate. Land them
 with the justification in the PR and an updated row in this file; while the
 job is non-required, a red `bench` job with a documented reason is
 acceptable.
+
+## Save durability: `save_durability_bench` (OBI-348) — **not** gate-compared
+
+`cargo run --release -p loom-vm --example save_durability_bench [saves]`
+
+The `bench` job compares `vm_bench` rows against the base commit, so this
+second binary is deliberately outside the gate (adding rows to a gate the
+comparator does not know is how PR #131's phantom `priv_control` regression
+happened). Its numbers go in the PR/OBI-344 thread instead.
+
+It answers a different question than `vm_bench`: not "is the interpreter
+slower", but "how long does the thread that serves every player spend making a
+save durable". OBI-344's E1.1 run measured world-loop iterations of **304–562
+ms** for `loom_world_loop_stalls_total{kind="disconnect"}` at 150 simultaneous
+logouts, because `World::disconnect` → `autosave()` → `save_object()` →
+`write_file_atomic()` did write + `fsync` + `rename` + parent-dir `fsync`
+inline. OBI-348 hands the durable half to one worker thread.
+
+60 sequential logouts, dev box, `target/` and the temp dir on one filesystem
+(two runs agreed to within ~5%):
+
+| arm | world-thread ms/logout | wall ms/logout |
+|---|---|---|
+| `disconnect`, `Sync` (the pre-OBI-348 shape) | **1.42** | 1.43 |
+| `disconnect`, `Deferred` (shipped) | **0.004** | 1.44 |
+| `Sync`, disk simulated at 5 ms | 6.74 | 6.76 |
+| `Deferred`, disk simulated at 5 ms | **0.004** | 6.69 |
+
+* **What improved:** the world thread's own cost per logout, ~350× on this host
+  (1.42 ms → 0.004 ms), and it stops scaling with disk latency entirely (5 ms
+  of simulated `fsync` lands on the worker, not on the loop). `inline_commits`
+  is the field that proves it: 60 in the `Sync` arm, 0 in the deferred arm.
+* **What did not:** `wall ms/logout` is the same, because the bytes still have
+  to reach the disk — the work moved off the critical path, it did not get
+  cheaper. 150 logouts × 1.4 ms ≈ 215 ms is roughly the shape of OBI-344's
+  stall on a healthy disk; a loaded CI lane and bigger save files account for
+  the rest, so the before/after on the real number belongs on OBI-344's run,
+  not here (board directive OBI-306/307: no synthetic 150-session load from a
+  dev box).
+
+### The parent-dir `fsync` question, measured and parked
+
+`write_file_atomic` costs 1.45 ms/save here, split: content `fsync` **0.67 ms**,
+parent-dir `fsync` **0.016 ms** — the dir sync is ~2% of the two, so coalescing
+it to one per batch (the obvious next "cheap win") buys nothing on this host and
+is **not** worth the durability argument it would require. Re-measure on the E1.1
+runner before revisiting: a network-backed or journaling FS changes that ratio,
+and the deferred queue makes any remaining per-save syscall invisible to the
+world thread regardless.
+
+### Review round: one writer, and what the counters mean now (CTO, blocking 1)
+
+The first version fell back to an inline commit when the queue was full or a
+flush deadline had passed. That is a second writer beside the worker on the
+same path, and CI priced it: `same_path_commits_in_order_so_the_newest_wins`
+lost 2 of 20 saves on run 37869788819 (`committed` 18, `failed` 2) because the
+inline commit and the worker both used `fileio`'s per-process temp name
+`.leaf.tmp-{pid}` -- one lost `create_new` to `EEXIST`, the other's cleanup
+`remove_file` unlinked its in-flight temp file. It reproduced deterministically
+in a worktree at the pre-fix commit (final content `v8` where `v9` was due).
+
+* A full queue now **waits for one slot** (`backpressure_waits`) instead of
+  writing beside the worker, and `flush_deadline` became a **reporting**
+  threshold (`flush_deadline_exceeded` plus an `errors` inbox entry) with the
+  flush still waiting. Inline commits remain only where there is provably no
+  other writer: `Sync` mode, no worker, a worker whose *exit* was confirmed,
+  `outstanding` empty, or an item that could never fit even an empty queue.
+* Temp names are unique per write (`.leaf.tmp-{pid}-{seq}`), the legacy
+  `{pid}`-only shape still swept. Defence in depth -- the VM guarantees one
+  writer, but `stage_write` is `pub`.
+* The measured cost is unchanged, which is the point: both fixes only *remove*
+  world-thread work. Re-run after the fix
+  (`cargo run --release -p loom-vm --example save_durability_bench 60`):
+  world-thread **0.004 ms/logout** deferred against **1.42 ms** `Sync`, with
+  `inline_commits 0` and `backpressure_waits 0`. The extra per-write `unlink`
+  of the legacy name is a worker-side syscall in the noise of an `fsync`.
+* `inline_commits` keeps its alerting meaning ("the world thread just paid for
+  an `fsync`"); `backpressure_waits` and `flush_deadline_exceeded` say *why*.

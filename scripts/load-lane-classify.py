@@ -53,6 +53,14 @@ regression. Four overlaps are resolved that way rather than by file type:
     file, and a rule like that can fail *open*. One lane run is the cheaper
     mistake; recorded here so nobody optimises it into a hole.
 
+The mudlib is a second repository, and it is an input too, so it is pinned in
+this one: `warp.ref` names the warp commit the load jobs check out (OBI-326),
+and is listed below as runtime-relevant, which means a warp bump takes a lane
+place and is measured exactly like a `Cargo.lock` bump -- instead of moving p99
+underneath a queue of PRs that skipped it. Rule 11 of
+scripts/check-ci-load-lane.py is what keeps the workflow honest about reading
+that file.
+
 Usage:
   load-lane-classify.py --range BASE...HEAD [--github-output] [--summary]
   load-lane-classify.py --path P [--path P2 ...] [--github-output] [--summary]
@@ -96,6 +104,18 @@ RULES = [
     (".cargo/**", True, "cargo config (flags, targets, profiles)"),
     ("crates/*/src/**", True, "driver or load-bot source"),
     ("crates/*/build.rs", True, "build script output"),
+    # OBI-326: the mudlib the load lane serves lives in another repository, and
+    # this file is the single place that says which commit of it the gate measures
+    # (`warp.ref`: one 40-character SHA), so bumping the world under test has to
+    # take a lane place like a `Cargo.lock` bump does.
+    #
+    # An unlisted path already falls closed to relevant, and `warp.ref` is a root
+    # path so nothing else claims it. The explicit rule is not what makes the pin
+    # measured; it is what makes the *reason* exact and the property deliberate, so
+    # a later widening (a root `*.ref` -> metadata rule, say) cannot quietly turn a
+    # world bump into a skip. Rule 11 of scripts/check-ci-load-lane.py asserts the
+    # classification either way.
+    ("warp.ref", True, "pinned mudlib rev (the world the gate serves)"),
     ("mudlib/**", True, "runtime mudlib content"),
     # Normally dev-only, but this is the in-repo mirror of `warp/loadbot/mix.tsv`
     # -- the mix E1.1 actually replays (`--mix warp/loadbot/mix.tsv`), which the
@@ -207,6 +227,16 @@ TABLE = [
     ("toolchain", ["rust-toolchain.toml"], True, "compiler version"),
     ("cargo config", [".cargo/config.toml"], True, "cargo config"),
     ("mudlib content", ["mudlib/room/lobby.c"], True, "runtime mudlib content"),
+    ("pinned mudlib rev", ["warp.ref"], True, "pinned mudlib rev"),
+    ("pin bump is a lane run", ["warp.ref", "results/README.md"], True,
+     "pinned mudlib rev"),
+    # The pin lives at the repo root, beside `Cargo.lock`, and not under
+    # `mudlib/`: `mudlib/` is a directory developers populate by hand and
+    # `docker compose` mounts read-only, so a CI input does not belong in it.
+    ("pin is not mudlib content", ["mudlib/README.md"], True,
+     "runtime mudlib content"),
+    ("warp.ref is not swept by a glob", ["warp.ref", "README.md"], True,
+     "pinned mudlib rev"),
     ("build script", ["crates/loom-vm/build.rs"], True, "build script output"),
     ("overlap stays relevant", ["crates/loom-vm/src/README.md"], True,
      "driver or load-bot source"),
