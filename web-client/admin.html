@@ -11,6 +11,13 @@
       `src/admin/` only ever builds DOM via `createElement`/`textContent`
       (`src/admin/dom.ts`), so there is no inline-script/style need this
       CSP would have to carve an exception for.
+
+      Unlike `index.html` and `ide.html`, this page keeps a standalone
+      `default-src 'self'`: the admin UI only ever does same-origin
+      `fetch` (`src/admin/api.ts`), and `connect-src 'self'` covers that in
+      every browser. If an admin screen ever gains a WebSocket, this page
+      must join `SOCKET_PAGES` in `scripts/check-static-csp.mjs` and drop
+      both directives -- a `<meta>` cannot name the host it is served from.
     -->
     <meta
       http-equiv="Content-Security-Policy"

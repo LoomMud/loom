@@ -959,6 +959,26 @@ impl Persist {
         Ok(())
     }
 
+    /// `true` iff at least one unrevoked, unexpired `staff_sessions` row
+    /// shares `sid` (OBI-180 M-LSP-1, CTO review of PR #122 must-fix 2):
+    /// lets a long-lived `/lsp` session's periodic recheck notice its
+    /// own token family got revoked (M-AUTH-5) even though no tier
+    /// change happened. A plain read, no row lock -- the same staleness
+    /// window every periodic recheck already has (see `lsp.rs`'s module
+    /// doc on the recheck cadence).
+    pub async fn session_family_live(&self, sid: &str) -> Result<bool> {
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM staff_sessions
+                WHERE sid = $1 AND revoked_at IS NULL AND expires_at > NOW()
+            )",
+        )
+        .bind(sid)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(live)
+    }
+
     /// Atomically rotate the session identified by `old_token_hash` to a
     /// fresh `new_token_hash` (OBI-198 re-review, must-fix 1 and 2):
     ///

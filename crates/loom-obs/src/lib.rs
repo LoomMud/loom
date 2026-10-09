@@ -17,6 +17,9 @@
 //! - [`Readiness`]: a shared, cheaply-cloned gate the world thread flips
 //!   once startup (mudlib compiled, DB backend reachable) is done, read
 //!   by `loom-http`'s `/readyz` route.
+//! - [`world`]: the world thread's own stall counters and high-water marks
+//!   (OBI-344), so a latency tail measured by a client can be attributed
+//!   to a server-side stall window instead of being called a flake.
 //!
 //! None of this blocks the world thread: tracing/metrics recording is
 //! synchronous and in-memory (the OTLP exporter batches and flushes on a
@@ -31,6 +34,10 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+pub mod world;
+
+pub use world::{DEFAULT_STALL_THRESHOLD_MS, NetCommandProbe, WorldEventKind, WorldLoopProbe};
 
 /// Env var read by [`init_tracing`]: when set to an OTLP/gRPC collector
 /// endpoint (e.g. `http://otel-collector:4317`), spans are exported there

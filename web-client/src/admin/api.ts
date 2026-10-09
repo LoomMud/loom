@@ -168,13 +168,35 @@ export interface LoginResponse {
  * "this came from a sign-in". */
 export type RefreshResponse = LoginResponse;
 
+/** An authenticated round trip with the body already read as text (see
+ * [`AdminApi.requestRaw`]). `headers` is kept because
+ * `GET /api/v1/files/content`'s `ETag` is the caller's concurrency
+ * precondition (M-FS-6), not something a parsed body can carry. */
+export interface RawResponse {
+  status: number;
+  ok: boolean;
+  headers: Headers;
+  body: string;
+}
+
 export class AdminApi {
   constructor(private readonly options: AdminApiOptions) {}
 
-  private async request<T>(
-    path: string,
-    init?: RequestInit,
-  ): Promise<T> {
+  /**
+   * The authenticated-fetch seam every non-admin HTTP client uses too:
+   * the IDE's file client (`../ide/files-api.ts`, OBI-180) talks to
+   * `/api/v1/files/*`, which shares this exact bearer + silent-refresh
+   * contract (`bearer_uid` in `loom-http`'s `files.rs` accepts the same
+   * access token `/api/v1/admin/*` does), and a second copy of that
+   * logic would be a second place to get OBI-297's refresh handling
+   * wrong. Returns the response rather than throwing on a non-2xx: a
+   * file read's `404` and a write's `412` are results the caller acts
+   * on, not errors to unwind to.
+   *
+   * Throws [`NoAccessTokenError`] when no token is stored, so callers
+   * know to show sign-in instead of firing an unauthenticated request.
+   */
+  async requestRaw(path: string, init?: RequestInit): Promise<RawResponse> {
     const attempt = async (): Promise<Response> => {
       const token = this.options.getAccessToken();
       if (token === null) {
@@ -197,8 +219,13 @@ export class AdminApi {
     if (response.status === 401 && (await this.refresh())) {
       response = await attempt();
     }
-    const text = await response.text();
-    const body = text.length > 0 ? safeJsonParse(text) : null;
+    const body = await response.text();
+    return { status: response.status, ok: response.ok, headers: response.headers, body };
+  }
+
+  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const response = await this.requestRaw(path, init);
+    const body = response.body.length > 0 ? safeJsonParse(response.body) : null;
     if (!response.ok) {
       throw new AdminApiError(response.status, body);
     }

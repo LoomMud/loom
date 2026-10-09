@@ -444,7 +444,7 @@ pub fn report_recompile(
 mod tests {
     use super::*;
     use crate::github::UreqClient;
-    use std::io::{Read, Write};
+    use crate::github::fake_http;
     use std::net::TcpListener;
     use std::sync::Mutex;
 
@@ -682,6 +682,13 @@ mod tests {
         requests: std::sync::Arc<Mutex<Vec<(String, String)>>>,
     }
 
+    /// A fake GitHub API server for the report/propose calls: one accept
+    /// loop, canned responses driven by a closure so each test controls
+    /// what a given `METHOD path` answers.
+    ///
+    /// Requests are read and closed through [`fake_http`] so every fake in
+    /// this crate serves a *complete* request -- headers and body -- before
+    /// it answers (OBI-350).
     fn spawn_fake_github(
         mut respond: impl FnMut(&str, &str, &str) -> (u16, String) + Send + 'static,
     ) -> FakeGitHub {
@@ -695,35 +702,15 @@ mod tests {
                     Ok(s) => s,
                     Err(_) => break,
                 };
-                let mut buf = [0u8; 16384];
-                let n = match stream.read(&mut buf) {
-                    Ok(n) => n,
-                    Err(_) => continue,
+                let Some(req) = fake_http::read_request(&mut stream) else {
+                    continue;
                 };
-                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                let mut lines = req.lines();
-                let first = lines.next().unwrap_or("");
-                let mut parts = first.split_whitespace();
-                let method = parts.next().unwrap_or("").to_string();
-                let path = parts.next().unwrap_or("").to_string();
-                let body = req.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
                 requests_clone
                     .lock()
                     .unwrap()
-                    .push((path.clone(), body.clone()));
-                let (status, resp_body) = respond(&method, &path, &body);
-                let status_text = match status {
-                    201 => "Created",
-                    401 => "Unauthorized",
-                    404 => "Not Found",
-                    _ => "OK",
-                };
-                let resp = format!(
-                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    resp_body.len()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.write_all(resp_body.as_bytes());
+                    .push((req.path.clone(), req.body.clone()));
+                let (status, resp_body) = respond(&req.method, &req.path, &req.body);
+                fake_http::respond(&mut stream, status, &resp_body);
             }
         });
         FakeGitHub { addr, requests }

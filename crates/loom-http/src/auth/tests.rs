@@ -43,6 +43,13 @@ struct FakeDirectoryInner {
     /// (CTO review on PR #98: proving the deny path is audited too, not
     /// just the tier-floor refusal).
     fail_admin_audit: bool,
+    /// When `true`, [`StaffDirectory::auth_status_for`] and
+    /// [`StaffDirectory::session_family_live`] both fail outright
+    /// (OBI-301, CTO re-review of PR #122, must-fix B): simulates a
+    /// directory outage so a test can prove `/lsp`'s connect-time
+    /// `still_authorized` check fails *closed* while its periodic
+    /// recheck still fails open.
+    fail_directory: bool,
 }
 
 #[derive(Clone)]
@@ -98,6 +105,13 @@ impl FakeDirectory {
         self.inner.lock().unwrap().fail_admin_audit = true;
     }
 
+    /// Make every subsequent `auth_status_for`/`session_family_live`
+    /// call fail with [`DirectoryError`] (OBI-301, CTO re-review of PR
+    /// #122, must-fix B).
+    pub(crate) fn fail_directory_for_test(&self) {
+        self.inner.lock().unwrap().fail_directory = true;
+    }
+
     pub(crate) fn link_github(&self, github_id: i64, uid: &str) {
         self.inner
             .lock()
@@ -143,6 +157,39 @@ impl FakeDirectory {
         let mut inner = self.inner.lock().unwrap();
         for session in inner.sessions.values_mut() {
             if session.staff_uid == uid {
+                session.revoked_at = Some(now());
+            }
+        }
+    }
+
+    /// Seed a `staff_sessions`-shaped row directly (bypassing login/
+    /// refresh entirely), so a test can mint claims with a known `sid`
+    /// via [`crate::auth::AccessClaims`] directly and have
+    /// [`StaffDirectory::session_family_live`] see it as live, the way a
+    /// real login would have inserted one (OBI-180, `/lsp`'s M-LSP-1
+    /// revocation recheck).
+    pub(crate) fn seed_live_session_for_test(&self, uid: &str, sid: &str) {
+        self.inner.lock().unwrap().sessions.insert(
+            format!("test-session-{sid}"),
+            FakeSession {
+                staff_uid: uid.to_string(),
+                expires_at: now() + Duration::from_secs(3600),
+                revoked_at: None,
+                sid: sid.to_string(),
+                amr: vec!["pwd".to_string()],
+                mfa_at: None,
+                last_used_at: now(),
+            },
+        );
+    }
+
+    /// Revoke every session sharing `sid` directly by family id, the way
+    /// [`Self::revoke_all_for_uid_for_test`] does by uid -- used to
+    /// simulate an M-AUTH-5 logout/revocation without a tier change.
+    pub(crate) fn revoke_session_family_for_test(&self, sid: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        for session in inner.sessions.values_mut() {
+            if session.sid == sid {
                 session.revoked_at = Some(now());
             }
         }
@@ -215,17 +262,15 @@ impl StaffDirectory for FakeDirectory {
     }
 
     async fn auth_status_for(&self, uid: &str) -> Result<Option<StaffAuthStatus>, DirectoryError> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .staff
-            .get(uid)
-            .map(|s| StaffAuthStatus {
-                tier: s.tier,
-                totp_secret: s.totp_secret.clone(),
-                totp_confirmed: s.totp_confirmed,
-            }))
+        let inner = self.inner.lock().unwrap();
+        if inner.fail_directory {
+            return Err(DirectoryError);
+        }
+        Ok(inner.staff.get(uid).map(|s| StaffAuthStatus {
+            tier: s.tier,
+            totp_secret: s.totp_secret.clone(),
+            totp_confirmed: s.totp_confirmed,
+        }))
     }
 
     async fn totp_consume_step(&self, uid: &str, step: u64) -> Result<bool, DirectoryError> {
@@ -341,6 +386,18 @@ impl StaffDirectory for FakeDirectory {
             }
         }
         Ok(())
+    }
+
+    async fn session_family_live(&self, sid: &str) -> Result<bool, DirectoryError> {
+        let now = now();
+        let inner = self.inner.lock().unwrap();
+        if inner.fail_directory {
+            return Err(DirectoryError);
+        }
+        Ok(inner
+            .sessions
+            .values()
+            .any(|s| s.sid == sid && s.revoked_at.is_none() && s.expires_at > now))
     }
 
     async fn session_rotate(
@@ -1792,4 +1849,54 @@ fn is_or_might_be_secure_normalizes_and_fails_closed() {
         is_or_might_be_secure("/std/x/../../secure/y"),
         "multiple .. segments must still fail closed"
     );
+}
+
+/// OBI-319 second review, point 2 (D-TM4 HMAC domain separation): a
+/// token in the *exact* ws-ticket claim shape, but signed with the
+/// OAuth-state/pending-TOTP key, must not redeem as a `/lsp` ticket --
+/// and neither must a real access token or an OAuth state cookie. Only
+/// the ws-ticket issuer's own key is accepted.
+#[test]
+fn ws_ticket_redemption_rejects_tokens_from_every_other_signing_domain() {
+    let service = test_service(FakeDirectory::new());
+    let exp = OffsetDateTime::now_utc().unix_timestamp() + 30;
+    let ticket_shaped = serde_json::json!({
+        "sub": "alice",
+        "sid": "sid-1",
+        "nonce": "n",
+        "exp": exp,
+    });
+
+    // Same claims, OAuth-state/pending-TOTP HMAC key.
+    let state_signed = service.state_key.encode(&ticket_shaped).unwrap();
+    assert!(matches!(
+        service.redeem_ws_ticket(&state_signed),
+        Err(AuthError::InvalidWsTicket)
+    ));
+
+    // An EdDSA access token for the same sub/sid.
+    let access = service.sign_for_test(&AccessClaims {
+        sub: "alice".to_string(),
+        tier: 1,
+        scopes: vec!["builder".to_string()],
+        iss: "https://build.loommud.com/".to_string(),
+        aud: jwt::AUDIENCE.to_string(),
+        iat: exp - 30,
+        nbf: exp - 30,
+        exp,
+        sid: "sid-1".to_string(),
+        amr: vec!["pwd".to_string()],
+        mfa_at: None,
+    });
+    assert!(matches!(
+        service.redeem_ws_ticket(&access),
+        Err(AuthError::InvalidWsTicket)
+    ));
+
+    // And the converse: a genuine ws ticket is not an access token.
+    let real_ticket = service
+        .issue_ws_ticket(&service.verify_access_token(&access).unwrap())
+        .unwrap();
+    assert!(service.verify_access_token(&real_ticket).is_err());
+    assert!(service.verify_oauth_state(&real_ticket).is_err());
 }

@@ -80,6 +80,7 @@ pub mod jwt;
 pub mod ratelimit;
 mod statetoken;
 mod totp;
+mod wsticket;
 
 pub use claims::{AccessClaims, GITHUB_PENDING_PURPOSE, GithubPendingClaims, scopes_for_tier};
 pub use cookie::{
@@ -102,6 +103,7 @@ pub use statetoken::StateTokenKey;
 pub use totp::{
     TotpEnrollment, generate_totp_secret, totp_for_secret, totp_step_for_code, verify_totp_code,
 };
+pub use wsticket::{WsTicketError, WsTicketIdentity};
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -180,6 +182,9 @@ pub enum AuthError {
     InvalidRefreshToken,
     /// The backing directory (Postgres) failed.
     DirectoryUnavailable,
+    /// A D-TM4 WebSocket ticket (`/lsp`'s first frame) was malformed,
+    /// unsigned, expired, or already redeemed once before.
+    InvalidWsTicket,
     /// The per-IP token bucket is empty (M-AUTH-1). Distinct from
     /// [`AuthError::InvalidCredentials`] -- unlike an account lockout,
     /// which must look exactly like a wrong password, an IP-level
@@ -207,6 +212,7 @@ impl std::fmt::Display for AuthError {
             AuthError::RateLimited => "rate limited",
             AuthError::InvalidPendingToken => "invalid pending token",
             AuthError::InvalidOAuthState => "invalid oauth state",
+            AuthError::InvalidWsTicket => "invalid ws ticket",
         };
         f.write_str(s)
     }
@@ -244,10 +250,27 @@ pub const SECURE_VARS_MIN_TIER: i16 = 5;
 /// `crate::admin_query::WorldAdminQuery::errors`); this is only the HTTP
 /// edge's cheap floor.
 pub const ERROR_INBOX_MIN_TIER: i16 = 3;
+/// Tier floor for the server-wide staff broadcast (OBI-233, M-ADM-2):
+/// strictly higher than role changes -- a domain lead (T3) can promote
+/// within their own narrower SQL rules, but every connected session
+/// seeing a message is a bigger blast radius, so this wants an
+/// arch/root-equivalent tier.
+pub const ADMIN_BROADCAST_MIN_TIER: i16 = 4;
 /// Step-up MFA freshness window for role changes, grants, another user's
 /// TOTP reset, and broadcast (M-ADM-2): `mfa_at` must be within this many
 /// seconds of "now".
 pub const STEP_UP_WINDOW_SECS: i64 = 5 * 60;
+/// Hard cap on a broadcast body, in bytes (OBI-233, M-ADM-5): measured
+/// *before* sanitization, on the UTF-8 byte length of the request's
+/// `text` field.
+pub const BROADCAST_MAX_BYTES: usize = 1024;
+/// Driver-fixed prefix (CTO review, OBI-233) prepended to every line of
+/// a broadcast, so a player can tell a staff broadcast apart from
+/// ordinary game output. Never caller-configurable -- the request body
+/// has no field for it, and [`sanitize_broadcast_text`]'s output never
+/// contains it either, so there's no way for broadcast text to forge
+/// this marker.
+pub const BROADCAST_PREFIX: &str = "[Broadcast] ";
 
 /// A failure from one of the admin (OBI-185) actions on [`AuthService`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,6 +304,8 @@ pub enum AdminError {
     /// see [`crate::admin_query::WorldAdminQuery::object_vars`]'s doc
     /// comment).
     NotFound,
+    /// The broadcast body was over [`BROADCAST_MAX_BYTES`] (M-ADM-5).
+    BodyTooLarge,
 }
 
 impl From<AdminDirectoryError> for AdminError {
@@ -292,6 +317,15 @@ impl From<AdminDirectoryError> for AdminError {
     }
 }
 
+/// The world-error -> HTTP-status contract, in one place (OBI-347): the
+/// world's answer decides the status, and nothing here invents a `500`. A name
+/// that resolves to nothing is the caller's mistake (`404`); a world that could
+/// not answer is unavailable (`503`), not broken. Pinned by
+/// `crate::admin::tests::object_vars_for_a_path_that_is_not_live_is_404_not_500`,
+/// `a_world_that_could_not_answer_is_503_not_500`, and
+/// `no_admin_error_variant_answers_500` -- the last is exhaustive over
+/// `AdminError`, so answering `500` somewhere requires adding a variant and
+/// arguing which class of failure it is.
 impl From<crate::admin_query::WorldQueryError> for AdminError {
     fn from(err: crate::admin_query::WorldQueryError) -> Self {
         use crate::admin_query::WorldQueryError;
@@ -334,6 +368,12 @@ pub struct AuthService {
     /// doc for why. Generated fresh per process; never the same key
     /// across a restart.
     state_key: statetoken::StateTokenKey,
+    /// D-TM4's single-use `/lsp` WebSocket ticket (OBI-180): its own
+    /// signing domain and its own (small, TTL-swept) used-ticket set,
+    /// kept separate from `state_key` even though both are
+    /// `StateTokenKey`-shaped, since a ticket needs single-use tracking
+    /// the OAuth-state/pending-TOTP tokens don't.
+    ws_tickets: Arc<wsticket::WsTicketIssuer>,
 }
 
 impl AuthService {
@@ -346,6 +386,7 @@ impl AuthService {
             idle_ttl: IDLE_SESSION_TTL,
             rate_limiter: Arc::new(RateLimiter::new()),
             state_key: statetoken::StateTokenKey::generate(),
+            ws_tickets: Arc::new(wsticket::WsTicketIssuer::new()),
         }
     }
 
@@ -925,6 +966,46 @@ impl AuthService {
             .map_err(|_| AuthError::InvalidRefreshToken)
     }
 
+    /// `POST /api/v1/ws-ticket` (D-TM4): mint a single-use, 30s ticket
+    /// bound to `claims.sub`+`claims.sid`, for the caller to send as
+    /// `/lsp`'s first WS frame.
+    pub fn issue_ws_ticket(&self, claims: &AccessClaims) -> Result<String, AuthError> {
+        self.ws_tickets
+            .issue(&claims.sub, &claims.sid)
+            .map_err(|_| AuthError::InvalidWsTicket)
+    }
+
+    /// Redeem a D-TM4 ticket from `/lsp`'s first frame: verifies the
+    /// signature and expiry, and consumes it so a second redemption of
+    /// the same ticket fails even within its 30s window.
+    pub fn redeem_ws_ticket(&self, ticket: &str) -> Result<wsticket::WsTicketIdentity, AuthError> {
+        self.ws_tickets
+            .redeem(ticket)
+            .map_err(|_| AuthError::InvalidWsTicket)
+    }
+
+    /// Fresh tier for `uid` (OBI-180, M-LSP-1): `/lsp`'s connect-time
+    /// check and its periodic demotion/removal recheck both use this.
+    /// `Ok(None)` means no `staff` row at all (removed staff). A
+    /// directory error is surfaced as `Err` rather than folded into
+    /// `Ok(None)`, so a caller doing a *periodic* recheck can choose not
+    /// to treat a transient Postgres outage as a demotion.
+    pub async fn current_tier(&self, uid: &str) -> Result<Option<i16>, AuthError> {
+        Ok(self.directory.auth_status_for(uid).await?.map(|s| s.tier))
+    }
+
+    /// `true` iff `sid`'s token family is still live -- not revoked, not
+    /// expired (OBI-180 M-LSP-1, CTO review of PR #122 must-fix 2):
+    /// `/lsp`'s connect-time check and its periodic recheck both use
+    /// this, the same way they both use [`Self::current_tier`] for the
+    /// tier/removal check. A directory error surfaces as `Err` for the
+    /// same reason `current_tier`'s doc gives: a periodic recheck must
+    /// be able to tell a transient outage apart from a confirmed
+    /// revocation.
+    pub async fn session_family_live(&self, sid: &str) -> Result<bool, AuthError> {
+        Ok(self.directory.session_family_live(sid).await?)
+    }
+
     /// Sign arbitrary claims directly, bypassing `login`/`refresh`
     /// entirely -- test-only, so `loom-http`'s HTTP-wire admin tests
     /// (`admin.rs`) can mint a token with a specific tier/`mfa_at`
@@ -1448,6 +1529,124 @@ impl AuthService {
         }
     }
 
+    /// `POST /api/v1/admin/broadcast` (OBI-233, M-ADM-2/4/5): tier >=
+    /// [`ADMIN_BROADCAST_MIN_TIER`] and step-up fresh, exactly like
+    /// [`Self::admin_set_tier`]'s checks, but gated at a higher tier
+    /// floor given the blast radius (every interactive session). The
+    /// size cap (M-ADM-5) is enforced on the *raw* body, before
+    /// sanitization -- rejecting an oversized body rather than silently
+    /// truncating it. The body is then sanitized
+    /// ([`sanitize_broadcast_text`]) and, per line, given the
+    /// driver-fixed [`BROADCAST_PREFIX`] (CTO review, OBI-233) -- a
+    /// body that sanitizes to nothing (blank/whitespace-only) is a
+    /// [`AdminError::BadRequest`], not a blank broadcast. The *exact*
+    /// string this method hands to `query.broadcast` is also the
+    /// audited `detail` (M-IDE-2: never raw input, never re-derived --
+    /// the two can't drift). Delivery itself -- fan-out to interactive
+    /// sessions only -- is `query.broadcast`'s job
+    /// (`crate::admin_query::WorldAdminQuery::broadcast`'s doc comment);
+    /// this method never talks to `loom-net` directly. Every outcome --
+    /// forbidden, step-up required, too large, empty, or allowed/denied
+    /// by the world side -- is audited. A *denied* delivery row also
+    /// carries an `outcome=` saying whether delivery can be ruled out at
+    /// all (`Busy` never left this process, so `not_delivered`; a
+    /// `Timeout`/`Closed` was already queued to the world thread, so
+    /// `unknown` -- see `delivery_outcome_label`).
+    pub async fn admin_broadcast(
+        &self,
+        claims: &AccessClaims,
+        ctx: &AuthContext,
+        query: &dyn crate::admin_query::WorldAdminQuery,
+        text: &str,
+    ) -> Result<usize, AdminError> {
+        if claims.tier < ADMIN_BROADCAST_MIN_TIER {
+            self.audit(
+                "admin.broadcast",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some("reason=forbidden".to_string()),
+            )
+            .await;
+            return Err(AdminError::Forbidden);
+        }
+        if !self.has_fresh_step_up(claims) {
+            self.audit(
+                "admin.broadcast",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some("reason=step_up_required".to_string()),
+            )
+            .await;
+            return Err(AdminError::StepUpRequired);
+        }
+        if text.len() > BROADCAST_MAX_BYTES {
+            self.audit(
+                "admin.broadcast",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some(format!("reason=body_too_large bytes={}", text.len())),
+            )
+            .await;
+            return Err(AdminError::BodyTooLarge);
+        }
+        let sanitized = sanitize_broadcast_text(text);
+        if sanitized.trim().is_empty() {
+            self.audit(
+                "admin.broadcast",
+                Some(claims.sub.clone()),
+                ctx,
+                "deny",
+                Some("reason=empty_after_sanitizing".to_string()),
+            )
+            .await;
+            return Err(AdminError::BadRequest);
+        }
+        let delivered = prefix_broadcast_lines(&sanitized);
+        match query.broadcast(&delivered).await {
+            Ok(count) => {
+                // M-IDE-2/M-ADM-4: the audited `detail` is the exact
+                // string delivered to sessions -- never raw,
+                // unsanitized input, and never rendered as HTML by the
+                // admin UI.
+                self.audit(
+                    "admin.broadcast",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "allow",
+                    Some(format!("recipients={count} text={delivered}")),
+                )
+                .await;
+                Ok(count)
+            }
+            Err(err) => {
+                // CTO review (OBI-233, third pass, optional item 1): a
+                // `Timeout`/`Closed` here means the request was already
+                // handed to the world thread and we simply stopped hearing
+                // about it, so the broadcast *may* have gone out. Audit it
+                // as a deny (the operator got a 503), but say plainly that
+                // the delivery outcome is unknown instead of implying it
+                // definitely did not land -- an operator who retries after
+                // a blind failure can otherwise duplicate a message that
+                // was already delivered, with no record of the first one.
+                self.audit(
+                    "admin.broadcast",
+                    Some(claims.sub.clone()),
+                    ctx,
+                    "deny",
+                    Some(format!(
+                        "reason={err:?} outcome={} text={delivered}",
+                        delivery_outcome_label(&err)
+                    )),
+                )
+                .await;
+                Err(err.into())
+            }
+        }
+    }
+
     /// M-ADM-2: a session is "stepped up" if its `mfa_at` is within the
     /// last 5 minutes. A session that never completed a second factor
     /// (`mfa_at: None`, e.g. a sub-T3 password-only login) is never
@@ -1527,6 +1726,111 @@ fn is_or_might_be_secure(path: &str) -> bool {
         }
     }
     false
+}
+
+/// M-ADM-5: strip every C0 (`U+0000..=U+001F`) and C1 (`U+0080..=U+009F`)
+/// control character except `\n`, plus DEL (`U+007F`) -- not strictly C0/C1,
+/// but still a control character with no safe plain-text rendering, and
+/// the same category the design note's "strip control characters" is
+/// guarding against (M-IDE-2: plain-text only, no escape-sequence or
+/// terminal-control smuggling through the admin UI or any client's
+/// terminal). `\r` is deliberately stripped too (not excepted like
+/// `\n`): the only line terminator a broadcast body needs is `\n`, and
+/// `loom-net`'s own wire framing (`to_wire`) already turns every `\n`
+/// into `\r\n` for telnet -- letting a client-supplied `\r` through
+/// would risk a raw, unescaped carriage return reaching the wire via the
+/// WebSocket path (which does not go through `to_wire`).
+///
+/// CTO review (OBI-233, second pass): also strip the bidi/format and
+/// zero-width characters a broadcast body has no legitimate use for and
+/// that can otherwise be used to visually reorder or hide text in a
+/// terminal or the admin UI -- explicit bidi embedding/override/isolate
+/// controls (`U+202A..=U+202E`, `U+2066..=U+2069`), zero-width
+/// space/non-joiner/joiner and the left-to-right/right-to-left marks
+/// (`U+200B..=U+200F`), and the BOM/zero-width no-break space
+/// (`U+FEFF`).
+///
+/// CTO review (OBI-233, third pass, optional item 2): also `U+2028` LINE
+/// SEPARATOR, `U+2029` PARAGRAPH SEPARATOR and `U+061C` ARABIC LETTER
+/// MARK. The first two are line breaks a JSON body can carry that some
+/// terminals/renderers honour, which would split a `[Broadcast] `-prefixed
+/// line into an unprefixed continuation and defeat the attribution -- they
+/// are stripped rather than mapped to `\n`, since a broadcast's only line
+/// terminator is `\n` (see [`prefix_broadcast_lines`]) and every other
+/// line-break lookalike (`\r`, `U+0085` NEL) is already stripped. `U+061C`
+/// is a bidi initiator in the same family as the `U+202A..=U+202E`
+/// controls above.
+fn sanitize_broadcast_text(input: &str) -> String {
+    input
+        .chars()
+        .filter(|&c| {
+            if c == '\n' {
+                return true;
+            }
+            let code = c as u32;
+            let is_control = code <= 0x1F || code == 0x7F || (0x80..=0x9F).contains(&code);
+            let is_bidi_or_zero_width = (0x202A..=0x202E).contains(&code)
+                || (0x2066..=0x2069).contains(&code)
+                || (0x200B..=0x200F).contains(&code)
+                || code == 0xFEFF
+                || code == 0x2028
+                || code == 0x2029
+                || code == 0x061C;
+            !(is_control || is_bidi_or_zero_width)
+        })
+        .collect()
+}
+
+/// Whether a failed delivery can be *ruled out*, for the `admin.broadcast`
+/// deny audit row's `outcome=` field (CTO review, OBI-233 third pass,
+/// optional item 1).
+///
+/// `"unknown"` for [`crate::admin_query::WorldQueryError::Timeout`] and
+/// [`crate::admin_query::WorldQueryError::Closed`]: both happen *after* the
+/// request was queued to (or picked up by) the world thread, so the text
+/// may well have reached sessions even though no reply came back.
+/// `"not_delivered"` for
+/// [`crate::admin_query::WorldQueryError::Busy`], a `try_send` that failed
+/// on a full queue -- the request never left `loom-http`, so nothing could
+/// have been sent. `NotFound`/`Internal` are never produced by the
+/// broadcast arm today; they are reported as `"unknown"` rather than
+/// guessed at.
+fn delivery_outcome_label(err: &crate::admin_query::WorldQueryError) -> &'static str {
+    use crate::admin_query::WorldQueryError;
+    match err {
+        WorldQueryError::Busy => "not_delivered",
+        WorldQueryError::Timeout
+        | WorldQueryError::Closed
+        | WorldQueryError::NotFound
+        | WorldQueryError::Internal(_) => "unknown",
+    }
+}
+
+/// CTO review (OBI-233, second pass): a driver-fixed [`BROADCAST_PREFIX`]
+/// on every line, so a broadcast is visually distinguishable from
+/// ordinary game output -- applied here, once, so the exact same string
+/// is both the audited `detail` and the text handed to
+/// `crate::admin_query::WorldAdminQuery::broadcast` (never two separately
+/// derived copies that could drift). `sanitized` is assumed to already
+/// be the output of [`sanitize_broadcast_text`] (no control characters,
+/// so splitting on `\n` can't be confused by a stray `\r`). Always ends
+/// in exactly one trailing `\n` (CTO review, first pass, must-fix 1):
+/// the world/net output path owns line framing and otherwise the
+/// broadcast would run into whatever the session prints next on the
+/// same line.
+fn prefix_broadcast_lines(sanitized: &str) -> String {
+    let mut out = String::new();
+    // `trim_end_matches` only drops *trailing* `\n`s (the split below
+    // would otherwise produce one spurious empty final "line", since
+    // `"a\n".split('\n')` is `["a", ""]`) -- interior blank lines (e.g.
+    // a deliberate blank line in the middle of a multi-line broadcast)
+    // are untouched and still get prefixed.
+    for line in sanitized.trim_end_matches('\n').split('\n') {
+        out.push_str(BROADCAST_PREFIX);
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// The rate limiter's account key for a resolved staff uid (OBI-204): the
