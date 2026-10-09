@@ -46,16 +46,36 @@ pub trait HttpClient: Send + Sync {
 }
 
 /// The `ureq`-backed transport (no TLS feature -- see module docs).
+///
+/// The default budget is a *product* policy: 10 s of wall clock per call, so
+/// a hung GitHub (or a hung proxy in front of it) can never hold the world
+/// thread's worker (OBI-215). `with_timeout` exists so a test harness can
+/// state its own budget instead of inheriting that policy by accident --
+/// production wiring keeps [`Default::default`] (see
+/// [`super::GitHubAppClient::from_pem_file`]).
 pub struct UreqClient {
     agent: ureq::Agent,
 }
 
 impl Default for UreqClient {
     fn default() -> Self {
+        Self::with_timeout(std::time::Duration::from_secs(10))
+    }
+}
+
+impl UreqClient {
+    /// Build the transport with an explicit total budget per call.
+    ///
+    /// Nothing here changes what the driver does: `Default::default()` (the
+    /// 10 s product policy) still goes to `api.github.com`. This is the seam
+    /// the loopback test harness uses (OBI-351), where an absolute budget is
+    /// exactly what turns a busy runner into a `Transport` error: the fake
+    /// server proves it is answering requests *before* the measured call
+    /// ([`super::fake_server::FakeHttpServer`]), so the budget that is left
+    /// covers one loopback round trip and nothing else.
+    pub fn with_timeout(timeout: std::time::Duration) -> Self {
         Self {
-            agent: ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(10))
-                .build(),
+            agent: ureq::AgentBuilder::new().timeout(timeout).build(),
         }
     }
 }
