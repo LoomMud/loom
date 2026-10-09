@@ -1067,8 +1067,13 @@ jobs:
           # milliseconds went. Weight both by stall *time*, not event count: a
           # run with ten 55 ms stalls and one 800 ms stall has a different
           # problem to solve, and the ranking below says which one it is.
-          kind_ms=$(sed -n 's/^loom_world_loop_stall_ms_by_kind_total{kind="\([a-z_]*\)"} \([0-9]\+\).*/\1=\2/p' /tmp/loom-metrics-final.txt | tr '\n' ' ')
-          phase_ms=$(sed -n 's/^loom_world_loop_stall_ms_by_phase_total{phase="\([a-z_]*\)"} \([0-9]\+\).*/\1=\2/p' /tmp/loom-metrics-final.txt | tr '\n' ' ')
+          # `phase` is dominant-phase attribution, not a full split (see
+          # results/README.md); the per-breach split is on the stall warn! line.
+          # Values are printed exactly as the exporter wrote them -- awk on field
+          # 2, not a digit-only sed, so a float or exponent rendering is never
+          # silently truncated into a different number.
+          kind_ms=$(awk '$1 ~ /^loom_world_loop_stall_ms_by_kind_total/ {n=$1; sub(/^.*kind="/", "", n); sub(/".*$/, "", n); printf "%s=%s ", n, $2}' /tmp/loom-metrics-final.txt)
+          phase_ms=$(awk '$1 ~ /^loom_world_loop_stall_ms_by_phase_total/ {n=$1; sub(/^.*phase="/", "", n); sub(/".*$/, "", n); printf "%s=%s ", n, $2}' /tmp/loom-metrics-final.txt)
           echo "world_loop: worst_iteration_ms=${durmax:-unknown} stall_events=${stalls:-0} kinds=${kinds:-none} stall_ms_by_kind=${kind_ms:-none} stall_ms_by_phase=${phase_ms:-none}"
           if [ -n "$durmax" ] && [ "$(awk -v d="$durmax" 'BEGIN {print (d > 50) ? 1 : 0}')" = "1" ]; then
             echo "::warning title=OBI-344 world-thread stall recorded::E1.1 recorded $stalls world-loop iteration(s) over the 50 ms stall budget, worst ${durmax} ms (kinds: ${kinds:-none}). Check whether they fall inside the sampled window before treating the p99 verdict as evidence about them."

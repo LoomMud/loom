@@ -39,9 +39,19 @@
 //!   tick id of the most recent breach, so a scraper polling at 1 Hz can
 //!   bracket a stall to within one polling interval without keeping a
 //!   per-stall series.
-//! - `loom_world_loop_stall_ms_by_kind_total{kind}` and, for the most recent
-//!   breach, `loom_world_loop_last_stall_phase_ms{phase}` -- **where inside**
-//!   the stalled iteration the milliseconds went.
+//! - `loom_world_loop_stall_ms_by_kind_total{kind}` -- **all** the stalled
+//!   milliseconds whose iteration woke on that kind.
+//! - `loom_world_loop_stall_ms_by_phase_total{phase}` -- the stalled
+//!   milliseconds attributed to the **dominant** phase of each breach. This is
+//!   deliberately *not* a full split: one breach contributes only the phase
+//!   that held the most time (`dominant_ms`), so `sum(phase) <= stall_ms_total`
+//!   and the difference is minority phase-time inside otherwise-similar
+//!   breaches. It is the cheap answer to "which phase owns the tail", not an
+//!   accounting ledger.
+//! - `loom_world_loop_last_stall_phase_ms{phase}` -- for the most recent breach
+//!   only, the **full** per-phase split, i.e. **where inside** the stalled
+//!   iteration the milliseconds went. The `phases=` field on the stall `warn!`
+//!   carries the same breakdown for every logged breach.
 //!
 //! ## Why `kind` is not the answer
 //!
@@ -56,9 +66,9 @@
 //! fixes the question by measuring the loop body in segments and attributing a
 //! breach to the segment that held it.
 //!
-//! and `loom_net_command_blocked_total` /
+//! Alongside these, [`NetCommandProbe`] records `loom_net_command_blocked_total` /
 //! `loom_net_command_blocked_last_unix_ms` /
-//! `loom_net_command_blocked_ms_max`, recorded by [`NetCommandProbe`] from
+//! `loom_net_command_blocked_ms_max` from
 //! the world thread's `Host` implementation: `blocking_send` on the
 //! world -> net command channel is the one place in the serve path where
 //! the world thread can wait on the net task, and a full command channel
@@ -444,6 +454,12 @@ impl WorldLoopProbe {
             metrics::gauge!("loom_world_loop_last_stall_net_send_ms").set(net_send_ms as f64);
             metrics::counter!("loom_world_loop_stall_ms_by_kind_total", "kind" => kind.as_str())
                 .increment(duration_ms);
+            // Dominant-phase attribution, not a full split: the breach adds only
+            // `dominant_ms` here, so these counters sum to less than
+            // `loom_world_loop_stall_ms_total` whenever a stalled iteration
+            // mixed phases. The full split of the last breach is
+            // `loom_world_loop_last_stall_phase_ms{phase}` and `phases=` on the
+            // `warn!` below.
             metrics::counter!("loom_world_loop_stall_ms_by_phase_total", "phase" => dominant.as_str())
                 .increment(dominant_ms);
             self.last_stall_phase = Some(dominant);
