@@ -255,3 +255,32 @@ is **not** worth the durability argument it would require. Re-measure on the E1.
 runner before revisiting: a network-backed or journaling FS changes that ratio,
 and the deferred queue makes any remaining per-save syscall invisible to the
 world thread regardless.
+
+### Review round: one writer, and what the counters mean now (CTO, blocking 1)
+
+The first version fell back to an inline commit when the queue was full or a
+flush deadline had passed. That is a second writer beside the worker on the
+same path, and CI priced it: `same_path_commits_in_order_so_the_newest_wins`
+lost 2 of 20 saves on run 37869788819 (`committed` 18, `failed` 2) because the
+inline commit and the worker both used `fileio`'s per-process temp name
+`.leaf.tmp-{pid}` -- one lost `create_new` to `EEXIST`, the other's cleanup
+`remove_file` unlinked its in-flight temp file. It reproduced deterministically
+in a worktree at the pre-fix commit (final content `v8` where `v9` was due).
+
+* A full queue now **waits for one slot** (`backpressure_waits`) instead of
+  writing beside the worker, and `flush_deadline` became a **reporting**
+  threshold (`flush_deadline_exceeded` plus an `errors` inbox entry) with the
+  flush still waiting. Inline commits remain only where there is provably no
+  other writer: `Sync` mode, no worker, a worker whose *exit* was confirmed,
+  `outstanding` empty, or an item that could never fit even an empty queue.
+* Temp names are unique per write (`.leaf.tmp-{pid}-{seq}`), the legacy
+  `{pid}`-only shape still swept. Defence in depth -- the VM guarantees one
+  writer, but `stage_write` is `pub`.
+* The measured cost is unchanged, which is the point: both fixes only *remove*
+  world-thread work. Re-run after the fix
+  (`cargo run --release -p loom-vm --example save_durability_bench 60`):
+  world-thread **0.004 ms/logout** deferred against **1.42 ms** `Sync`, with
+  `inline_commits 0` and `backpressure_waits 0`. The extra per-write `unlink`
+  of the legacy name is a worker-side syscall in the noise of an `fsync`.
+* `inline_commits` keeps its alerting meaning ("the world thread just paid for
+  an `fsync`"); `backpressure_waits` and `flush_deadline_exceeded` say *why*.

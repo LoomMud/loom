@@ -1016,8 +1016,10 @@ impl World {
     /// `save_object()` returns `true` once the content is *accepted*, and
     /// the `fsync`/`rename`/dir-`fsync` half happens on the durability
     /// worker. Anything already queued is flushed on the way to `Sync`, so
-    /// switching modes never strands a save. The queue's own saturation
-    /// fallback commits inline regardless of mode.
+    /// switching modes never strands a save. While a worker is alive it is
+    /// the only writer in `Deferred` mode -- a full queue waits for a slot
+    /// rather than committing beside it (`save_queue`'s single-writer
+    /// invariant, CTO review OBI-348).
     pub fn set_save_durability(&mut self, mode: crate::save_queue::SaveDurability) {
         self.save_queue.set_durability(mode);
     }
@@ -1043,8 +1045,11 @@ impl World {
 
     /// What the durability queue has done, for the runtime to scrape
     /// (`loom-obs` owns the counter families; this is the pull-side data,
-    /// OBI-348 interface note). `inline_commits` is the one to alert on:
-    /// every increment is an `fsync` the world thread paid for.
+    /// OBI-348 interface note). The three to watch:
+    /// `inline_commits` (an `fsync` the world thread paid for -- ~0 while a
+    /// worker lives), `backpressure_waits` + `flush_deadline_exceeded` (the
+    /// disk is behind; the second one also lands an `errors` entry), and
+    /// `panicked` (a bug in the durability path, not a disk error).
     pub fn save_queue_stats(&self) -> crate::save_queue::SaveQueueStats {
         self.save_queue.stats()
     }
@@ -1059,6 +1064,7 @@ impl World {
         let outcomes = self.save_queue.poll(batch);
         let now = unix_now_ms();
         crate::save_queue::apply_outcomes(&outcomes, &mut self.disk_usage, &mut self.errors, now);
+        self.note_save_queue_stall(now);
         outcomes.len()
     }
 
@@ -1076,7 +1082,28 @@ impl World {
         let outcomes = self.save_queue.flush();
         let now = unix_now_ms();
         crate::save_queue::apply_outcomes(&outcomes, &mut self.disk_usage, &mut self.errors, now);
+        self.note_save_queue_stall(now);
         outcomes.len()
+    }
+
+    /// A wait that went past `flush_deadline` is an operator-visible event:
+    /// durability is behind and a world-thread call is waiting on it. One
+    /// error inbox entry per event (the queue hands the report over once),
+    /// plus the `save_queue_stats()` counter for the census. Recorded against
+    /// `"driver"` because there is no script to blame -- the disk is.
+    fn note_save_queue_stall(&mut self, now_unix_ms: u64) {
+        let Some(message) = self.save_queue.take_deadline_report() else {
+            return;
+        };
+        self.errors.record(
+            "driver",
+            "save_object",
+            0,
+            &message,
+            &[],
+            now_unix_ms,
+            false,
+        );
     }
 
     /// Run `body` against a fresh [`RegistryHost`] with driver context

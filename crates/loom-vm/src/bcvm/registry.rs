@@ -5929,13 +5929,27 @@ impl<'a> RegistryHost<'a> {
         match driver.save_queue.enqueue(task) {
             // Accepted by the worker: durable at the next flush, not yet.
             crate::save_queue::Enqueued::Queued => Ok(true),
-            // `SaveDurability::Sync`, a full queue, or no worker: this
-            // thread did the durable write itself, so `true` means exactly
-            // what it meant before OBI-348.
-            crate::save_queue::Enqueued::Inline(Ok(())) => Ok(true),
-            crate::save_queue::Enqueued::Inline(Err(e)) => Err(RtError::new(format!(
-                "save_object(\"{raw_path}\") failed: {e}"
-            ))),
+            // This thread did the durable write itself, because there was no
+            // other writer to hand it to (`Sync` mode, no worker, a worker
+            // confirmed gone) or because the save alone exceeds the queue's
+            // byte budget. `true` means exactly what it meant before OBI-348,
+            // so the quota charge is applied here and now rather than deferred
+            // (CTO review: a full queue *waits*, it does not start a second
+            // writer -- see `save_queue`'s single-writer invariant).
+            crate::save_queue::Enqueued::Inline(outcome) => match outcome.committed_bytes {
+                Some(committed) => {
+                    driver
+                        .disk_usage
+                        .note_save_write(&outcome.uid, outcome.old_bytes, committed);
+                    Ok(true)
+                }
+                None => Err(RtError::new(format!(
+                    "save_object(\"{raw_path}\") failed: {}",
+                    outcome
+                        .error
+                        .unwrap_or_else(|| "durable write failed".to_string())
+                ))),
+            },
         }
     }
 

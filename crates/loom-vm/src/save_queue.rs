@@ -49,14 +49,49 @@
 //! ## Backpressure: what a full queue does
 //!
 //! The queue is bounded by [`SaveQueueConfig::max_pending`] and
-//! `max_pending_bytes`. A full queue **never blocks the world thread on a
-//! lock and never drops a save**: [`SaveQueue::enqueue`] first reaps what has
-//! already completed, then waits for the queue to drain, and if it still
-//! cannot fit an item, commits that item inline. Degradation is "the old
-//! behaviour for one save", not "a lost character". `flush` has its own
-//! deadline, so even a wedged worker cannot wedge the world thread
-//! indefinitely -- the remainder goes inline and the event is counted in
-//! [`SaveQueueStats::flush_deadline_exceeded`].
+//! `max_pending_bytes`. A full queue **never takes a lock and never drops a
+//! save**: [`SaveQueue::enqueue`] reaps what has already completed, and if
+//! it still cannot fit an item it *waits for one slot* -- one commit's
+//! latency, counted in [`SaveQueueStats::backpressure_waits`] -- instead of
+//! committing inline beside a live worker. Only when there is no writer to
+//! wait on (no worker, an item that can never fit even an empty queue, a
+//! worker confirmed gone) does the save commit on the calling thread; that
+//! is the one and only place the world thread pays for an `fsync` in
+//! `save_object`, and [`SaveQueueStats::inline_commits`] counts it.
+//!
+//! `flush`/`flush_path` treat [`SaveQueueConfig::flush_deadline`] as a
+//! *reporting* threshold, not a licence to start a second writer: past it the
+//! flush keeps waiting, counts
+//! [`SaveQueueStats::flush_deadline_exceeded`] (once per flush) and leaves a
+//! one-line report for `World` to put in the error inbox
+//! ([`SaveQueue::take_deadline_report`]). A wedged disk therefore stalls
+//! `save_object`/`flush` instead of stalling *and* corrupting order. That is
+//! deliberate, and no worse than the pre-OBI-348 driver, where every save
+//! paid the wedge inline.
+//!
+//! ## The single-writer invariant (CTO review, OBI-348) -- non-negotiable
+//!
+//! **While the durability worker is alive, it is the only thread that ever
+//! commits a save.** One writer per path is what makes "newest wins" true:
+//! two threads committing the same path race on the temp file, and an older
+//! queued save can be renamed *after* a newer one, so the newest content
+//! loses. Committing inline to "make progress" on a wedged disk does not make
+//! anything durable sooner -- it only adds the second writer. So an inline
+//! commit happens **only** when there is provably nobody else writing: the
+//! worker was never started, or it has been *confirmed* exited (its task
+//! channel is closed and its buffered results drained), or `outstanding` is
+//! empty -- which, because a task sits in `outstanding` from the moment it is
+//! handed over until the moment its outcome is reaped, means the worker is
+//! idle.
+//!
+//! CI proved why. `same_path_commits_in_order_so_the_newest_wins` failed on
+//! run 37869788819 with `committed` 18 of 20: on a loaded runner the flush
+//! deadline passed with two tasks still in flight, the old code committed
+//! those two inline **while the worker still held them**, both writers used
+//! `fileio`'s per-process temp name `.{leaf}.tmp-{pid}`, and one of the two
+//! failed (`create_new` -> `EEXIST`, or the other writer's cleanup
+//! `remove_file` unlinked its in-flight temp file). Both halves are now
+//! regression-tested, and the temp name is unique per write.
 //!
 //! ## What an unclean shutdown costs
 //!
@@ -127,7 +162,7 @@ pub struct SaveTask {
 }
 
 /// The durability worker's report on one [`SaveTask`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaveOutcome {
     pub seq: u64,
     pub path: String,
@@ -155,12 +190,16 @@ impl SaveOutcome {
 }
 
 /// Tuning for one durability queue.
+///
+/// Every wait here is a wait *on the worker*, never a second writer: see the
+/// module doc's single-writer invariant.
 #[derive(Clone, Debug)]
 pub struct SaveQueueConfig {
-    /// Maximum number of saves accepted before the queue counts as full.
-    /// The hand-off channel is bounded to exactly this, so the world
-    /// thread's `try_send` is a constant-time "does it fit" test, never a
-    /// wait.
+    /// Maximum number of saves accepted before the queue counts as full. A
+    /// full queue makes [`SaveQueue::enqueue`] wait for one slot (counted in
+    /// [`SaveQueueStats::backpressure_waits`]) rather than commit beside the
+    /// worker; the hand-off channel is bounded to exactly this, so the fit
+    /// test itself is constant-time.
     pub max_pending: usize,
     /// Maximum total bytes of rendered-but-not-yet-durable saves. The count
     /// cap alone would let `max_pending` x `MAX_FILE_BYTES` (1 MiB) of save
@@ -184,9 +223,12 @@ pub struct SaveQueueConfig {
     /// How long one wait slice in `flush`/`flush_path` blocks before
     /// re-checking whether the worker is still alive.
     pub flush_wait_slice: Duration,
-    /// Total budget for one `flush`/`flush_path` wait before it gives up and
-    /// commits the remainder inline. Hitting it means the worker is wedged
-    /// or the disk is pathological.
+    /// Reporting threshold for one `flush`/`flush_path`/saturated-`enqueue`
+    /// wait. Past it the wait *continues* -- a live worker is the only writer
+    /// -- and the event is counted (`flush_deadline_exceeded`) plus left as a
+    /// one-line report for `World` to put in the error inbox. It is how an
+    /// operator learns the disk is behind, not a licence to start a second
+    /// writer (CTO review, OBI-348).
     pub flush_deadline: Duration,
 }
 
@@ -217,9 +259,11 @@ pub struct SaveQueueStats {
     /// Deferred durable writes that failed (each is also recorded in the
     /// world's error inbox against its own program).
     pub failed: u64,
-    /// Durable writes performed on the **calling** thread: `Sync` mode, the
-    /// saturation fallback, or a worker that could not be started/was lost.
-    /// The number that answers "did the world thread just `fsync`?".
+    /// Durable writes performed on the **calling** thread: `Sync` mode, or a
+    /// worker that could not be started / was confirmed gone. The number that
+    /// answers "did the world thread just `fsync`?". With a live worker this
+    /// stays flat: a full queue *waits* (see `backpressure_waits`) rather than
+    /// starting a second writer (CTO review, OBI-348).
     pub inline_commits: u64,
     /// Tasks handed over and not yet reported on.
     pub pending: usize,
@@ -227,8 +271,16 @@ pub struct SaveQueueStats {
     pub pending_bytes: u64,
     /// High-water mark of `pending`.
     pub peak_pending: usize,
-    /// Flushes that ran out `flush_deadline` and had to commit inline.
+    /// Flushes that passed `flush_deadline` and were still waiting on the
+    /// worker. Not an error in itself -- a slow disk -- but the number that
+    /// says "durability is behind, and a world-thread call is waiting on it".
+    /// It no longer means "a second writer was started" (CTO review, OBI-348).
     pub flush_deadline_exceeded: u64,
+    /// Saturated `enqueue` calls that had to wait for one queue slot instead
+    /// of committing inline. Each is roughly one commit's latency added to a
+    /// `save_object` call, and it is the signal that the disk is behind the
+    /// saves the world is producing.
+    pub backpressure_waits: u64,
     /// Durable writes that panicked inside the worker (converted to a failed
     /// outcome rather than taking the thread down). Non-zero here means a bug
     /// in the durability path, not a disk problem.
@@ -240,16 +292,12 @@ pub struct SaveQueueStats {
 pub enum Enqueued {
     /// Handed to the durability worker; not on disk yet.
     Queued,
-    /// Made durable on the calling thread (sync mode, saturation fallback,
-    /// or no worker available). Carries the durable write's own result.
-    Inline(Result<(), String>),
-}
-
-struct Worker {
-    tx: SyncSender<Arc<SaveTask>>,
-    results: Receiver<SaveOutcome>,
-    join: Option<JoinHandle<()>>,
-    alive: Arc<AtomicBool>,
+    /// Made durable on the calling thread, because there was provably no
+    /// other writer to hand it to (`Sync` mode, no worker, a worker whose exit
+    /// was confirmed) or because the item can never fit even an empty queue.
+    /// Carries the write's own outcome, so the caller can bill
+    /// `disk_quota_mb` off the real size.
+    Inline(SaveOutcome),
 }
 
 /// The durability queue: a bounded FIFO hand-off to one worker thread, plus
@@ -265,7 +313,22 @@ struct Worker {
 pub struct SaveQueue {
     cfg: SaveQueueConfig,
     mode: SaveDurability,
-    worker: Option<Worker>,
+    /// The worker's task sender. `None` before the first deferred save (the
+    /// worker starts lazily) and after it has been detached.
+    task_tx: Option<SyncSender<Arc<SaveTask>>>,
+    /// The worker's completion receiver. Owned by the queue rather than by a
+    /// worker handle, deliberately: the single-writer rule is decided by
+    /// `thread_alive`, so losing the join handle must never be able to look
+    /// like "the worker is gone, commit here" -- and with the receiver in the
+    /// queue, the outcomes still arrive either way (CTO review, OBI-348).
+    results: Option<Receiver<SaveOutcome>>,
+    /// The worker's join handle. `None` means "not ours to wait for", never
+    /// "the thread stopped writing".
+    join: Option<JoinHandle<()>>,
+    /// Every inline commit consults this first (the single-writer invariant):
+    /// it is cleared by the worker thread itself as it exits, so a dropped
+    /// handle can never be mistaken for a finished worker.
+    thread_alive: Arc<AtomicBool>,
     next_seq: u64,
     /// Everything handed to the worker (or being committed inline) that has
     /// not been reported on yet, oldest first. `Arc` so the mirror costs a
@@ -280,7 +343,20 @@ pub struct SaveQueue {
     /// queued saves still count against its `disk_quota_mb` (OBI-348: the
     /// charge must neither double-count nor escape).
     pending_by_path: HashMap<String, QueuedSave>,
+    /// Outcomes reaped by some entry point that no caller has billed yet.
+    /// Held rather than returned where the call has no way to return them:
+    /// `enqueue` reaps to free capacity, and swallowing those outcomes would
+    /// let the deferred `disk_quota_mb` charge escape (OBI-348: the charge
+    /// must neither double-count nor escape). Drained by
+    /// [`SaveQueue::poll`], [`SaveQueue::flush`], [`SaveQueue::flush_path`]
+    /// and [`SaveQueue::take_reports`], each exactly once.
+    reports: VecDeque<SaveOutcome>,
     stats: SaveQueueStats,
+
+    /// Set once a flush has gone past `flush_deadline`, for
+    /// [`SaveQueue::take_deadline_report`]; `World` turns it into one error
+    /// inbox entry per event instead of one per wait slice.
+    deadline_report: Option<String>,
 }
 
 impl Default for SaveQueue {
@@ -290,12 +366,22 @@ impl Default for SaveQueue {
 }
 
 /// What one slice of a wait on the completion channel produced (OBI-348).
-/// `TooLate` is the flush deadline having passed **or** the worker being
-/// gone, and the callers already treat those the same way.
+/// Deliberately has no "deadline passed" case: the deadline is the caller's
+/// reporting concern, and conflating it with "the worker is gone" is what
+/// used to let a second writer start (CTO review, OBI-348).
 enum Slice {
-    Got(SaveOutcome),
+    Got,
     Timeout,
-    TooLate,
+    /// No completion channel any more -- the worker exited. Callers re-check
+    /// [`SaveQueue::worker_may_commit`] and only commit inline once it is
+    /// really gone.
+    NoWriter,
+}
+
+/// What [`SaveQueue::drain`] waits for: everything, or just one path.
+enum Drain {
+    All,
+    Path(String),
 }
 
 /// One queued save's quota-projection entry (see `SaveQueue::pending_by_path`).
@@ -320,12 +406,17 @@ impl SaveQueue {
         Self {
             cfg,
             mode,
-            worker: None,
+            task_tx: None,
+            results: None,
+            join: None,
+            thread_alive: Arc::new(AtomicBool::new(false)),
             next_seq: 0,
             outstanding: VecDeque::new(),
             pending_bytes_total: 0,
             pending_by_path: HashMap::new(),
+            reports: VecDeque::new(),
             stats: SaveQueueStats::default(),
+            deadline_report: None,
         }
     }
 
@@ -398,37 +489,78 @@ impl SaveQueue {
 
     /// Accept a rendered, authorised, quota-projected save.
     ///
-    /// Never blocks on a lock, never drops the save. See the module doc's
-    /// `Backpressure` section for the (short) list of things that can happen
-    /// here.
+    /// Never takes a lock, never drops the save, and -- while a worker is
+    /// alive -- never commits on this thread. See the module doc's
+    /// `Backpressure` and `single-writer invariant` sections for what happens
+    /// when the queue is full.
     pub fn enqueue(&mut self, task: SaveTask) -> Enqueued {
         if self.mode == SaveDurability::Sync {
             return Enqueued::Inline(self.commit_inline(&task));
         }
         // Reap first: completed outcomes are what free queue capacity, and
-        // this is also how queued memory gets released between ticks.
-        self.take_ready(usize::MAX);
+        // this is also how queued memory gets released between ticks. The
+        // outcomes themselves go to `reports` rather than being dropped here,
+        // so the `disk_quota_mb` charge they carry cannot escape.
+        self.reap_ready();
         let need_bytes = task.content.len() as u64;
-        if !self.fits(need_bytes) {
-            // Full. The answer is **not** to wait for the worker here: a
-            // bounded-but-real `flush` inside `enqueue` would put the
-            // worker's disk latency back on the world thread, which is the
-            // exact thing this module exists to remove (and its worst case
-            // is `flush_deadline`). Reap what has *already* finished --
-            // that costs nothing -- and if it is still full, commit here.
-            // This is the one and only place the queue puts a synchronous
-            // `fsync` back on the world thread, and it is counted
-            // (`SaveQueueStats::inline_commits`) so a operator can see it.
-            self.poll(self.cfg.poll_batch);
+        let start = Instant::now();
+        let mut waited = false;
+        let mut reported = false;
+        loop {
+            if self.fits(need_bytes) {
+                return self.hand_off(task);
+            }
+            if self.outstanding.is_empty() {
+                // The queue can never hold this item (it alone exceeds
+                // `max_pending_bytes`), or there is no worker at all. An
+                // empty `outstanding` means a live worker is between tasks
+                // and a dead one is gone, so this thread is the only writer
+                // and committing here cannot race with anything.
+                return Enqueued::Inline(self.commit_inline(&task));
+            }
+            if !self.worker_may_commit() {
+                // The worker died with a backlog. Confirm the exit (drain its
+                // reported results, join it) and take the backlog over oldest
+                // first -- committing the new save on top of an order the
+                // world thread is now responsible for.
+                self.detach_dead_worker();
+                self.commit_remaining_inline();
+                continue;
+            }
+            // Full, with a live worker holding work. Wait for *one* slot:
+            // one commit's latency, and never a second writer (CTO review,
+            // OBI-348). `inline_commits` deliberately does not move here.
+            if !waited {
+                self.stats.backpressure_waits += 1;
+                waited = true;
+            }
+            match self.wait_slice() {
+                Slice::Got => {}
+                Slice::NoWriter => self.detach_dead_worker(),
+                Slice::Timeout => {
+                    if !reported && start.elapsed() >= self.cfg.flush_deadline {
+                        reported = true;
+                        self.stats.flush_deadline_exceeded += 1;
+                        self.deadline_report = Some(format!(
+                            "save_object waited {:?} for a queue slot ({} save(s) \
+                             outstanding, durability worker alive): the disk is behind",
+                            start.elapsed(),
+                            self.outstanding.len()
+                        ));
+                    }
+                }
+            }
         }
-        if !self.fits(need_bytes) {
-            return Enqueued::Inline(self.commit_inline(&task));
-        }
+    }
+
+    /// Assign the ordering sequence, start the worker if this is the first
+    /// deferred save, and hand the task over.
+    fn hand_off(&mut self, task: SaveTask) -> Enqueued {
         let seq = self.next_seq;
         self.next_seq += 1;
         let task = Arc::new(SaveTask { seq, ..task });
         // Lazy start: a world that never saves never pays for a thread.
-        if self.worker.is_none()
+        if self.task_tx.is_none()
             && let Err(reason) = self.start_worker()
         {
             return Enqueued::Inline(self.commit_inline_with_reason(&task, &reason));
@@ -437,11 +569,10 @@ impl SaveQueue {
     }
 
     fn send_to_worker(&mut self, task: Arc<SaveTask>) -> Enqueued {
-        let send = self
-            .worker
-            .as_ref()
-            .map(|w| w.tx.try_send(task.clone()))
-            .unwrap_or_else(|| Err(mpsc::TrySendError::Disconnected(task.clone())));
+        let send = match self.task_tx.as_ref() {
+            Some(tx) => tx.try_send(task.clone()),
+            None => Err(mpsc::TrySendError::Disconnected(task.clone())),
+        };
         match send {
             Ok(()) => {
                 // Replace any older queued save for this path: it is what
@@ -459,11 +590,15 @@ impl SaveQueue {
                 Enqueued::Queued
             }
             Err(_) => {
-                // `Disconnected`: the worker exited (a panic it could not
-                // contain, or its receiver was dropped). The task never
-                // reached it, so undo the projection and commit here.
-                self.drop_projection(&task);
-                self.kill_worker();
+                // `Disconnected`: the worker's task receiver is gone, which
+                // happens only after its exit flag is cleared -- so the
+                // thread has exited. `task` never reached it and is not in
+                // `outstanding`/`pending_by_path`, so there is no projection
+                // to undo. Confirm the exit (drain + join) before committing
+                // anything here: that is what makes this thread the single
+                // writer rather than a second one racing a dying worker.
+                self.detach_dead_worker();
+                self.commit_remaining_inline();
                 Enqueued::Inline(self.commit_inline_with_reason(&task, "durability worker gone"))
             }
         }
@@ -477,32 +612,33 @@ impl SaveQueue {
     /// Non-blocking reap of up to `max` completed outcomes, oldest first.
     /// This is what `World::tick` calls; it does no filesystem work.
     pub fn poll(&mut self, max: usize) -> Vec<SaveOutcome> {
-        self.take_ready(max)
+        self.reap_ready();
+        self.take_reports(max)
+    }
+
+    /// Everything reaped and not yet billed to `DiskUsage`/the error inbox.
+    /// Outcomes are handed out exactly once: whoever drains them applies them.
+    pub fn take_reports(&mut self, max: usize) -> Vec<SaveOutcome> {
+        let n = max.min(self.reports.len());
+        self.reports.drain(..n).collect()
+    }
+
+    /// A one-line description of the last flush/wait that ran past
+    /// [`SaveQueueConfig::flush_deadline`], or `None`. Taken (not peeked) so
+    /// `World` records exactly one error inbox entry per event; the counter
+    /// [`SaveQueueStats::flush_deadline_exceeded`] is the census.
+    pub fn take_deadline_report(&mut self) -> Option<String> {
+        self.deadline_report.take()
     }
 
     /// Block until every queued save has been made durable. Returns the
     /// outcomes -- including the ones this thread had to commit itself -- so
     /// the caller can apply the deferred `disk_quota_mb` charges.
+    ///
+    /// Past `flush_deadline` this keeps waiting on the worker and reports the
+    /// event; it does not start a second writer.
     pub fn flush(&mut self) -> Vec<SaveOutcome> {
-        let mut out = self.take_ready(usize::MAX);
-        let deadline = Instant::now() + self.cfg.flush_deadline;
-        while !self.outstanding.is_empty() {
-            if !self.worker_alive() {
-                self.stats.flush_deadline_exceeded += 1;
-                out.extend(self.commit_remaining_inline());
-                break;
-            }
-            match self.wait_slice(deadline) {
-                Slice::Got(o) => out.push(o),
-                Slice::Timeout => {}
-                Slice::TooLate => {
-                    self.stats.flush_deadline_exceeded += 1;
-                    out.extend(self.commit_remaining_inline());
-                    break;
-                }
-            }
-        }
-        out
+        self.drain(Drain::All)
     }
 
     /// Block until nothing is queued for `path`. `restore_object` uses this
@@ -510,70 +646,92 @@ impl SaveQueue {
     /// still in flight, and because the worker is a single FIFO thread,
     /// waiting for `path` also lands everything queued before it.
     pub fn flush_path(&mut self, path: &str) -> Vec<SaveOutcome> {
-        let mut out = self.take_ready(usize::MAX);
-        if !self.outstanding.iter().any(|t| t.path == path) {
-            return out;
-        }
-        let deadline = Instant::now() + self.cfg.flush_deadline;
-        while self.outstanding.iter().any(|t| t.path == path) {
-            if !self.worker_alive() {
-                self.stats.flush_deadline_exceeded += 1;
-                out.extend(self.commit_remaining_inline());
+        self.drain(Drain::Path(path.to_string()))
+    }
+
+    fn drain(&mut self, want: Drain) -> Vec<SaveOutcome> {
+        self.reap_ready();
+        let start = Instant::now();
+        let mut reported = false;
+        while self.drain_pending(&want) {
+            if !self.worker_may_commit() {
+                // Confirmed exited, so nobody else can commit these. Oldest
+                // first, which is also the order the worker would have used.
+                self.detach_dead_worker();
+                self.commit_remaining_inline();
                 break;
             }
-            match self.wait_slice(deadline) {
-                Slice::Got(o) => out.push(o),
-                Slice::Timeout => {}
-                Slice::TooLate => {
-                    self.stats.flush_deadline_exceeded += 1;
-                    out.extend(self.commit_remaining_inline());
-                    break;
+            match self.wait_slice() {
+                Slice::Got => {}
+                Slice::NoWriter => self.detach_dead_worker(),
+                Slice::Timeout => {
+                    if !reported && start.elapsed() >= self.cfg.flush_deadline {
+                        reported = true;
+                        self.stats.flush_deadline_exceeded += 1;
+                        self.deadline_report = Some(format!(
+                            "flush_pending_saves waited {:?} for {} queued save(s) \
+                             (durability worker alive, disk behind)",
+                            start.elapsed(),
+                            self.outstanding.len()
+                        ));
+                    }
                 }
             }
         }
-        out
+        self.take_reports(usize::MAX)
     }
 
-    /// One bounded wait for the next completed outcome, reaping everything
-    /// that came in with it.
-    fn wait_slice(&mut self, deadline: Instant) -> Slice {
-        if Instant::now() >= deadline {
-            return Slice::TooLate;
+    fn drain_pending(&self, want: &Drain) -> bool {
+        match want {
+            Drain::All => !self.outstanding.is_empty(),
+            Drain::Path(p) => self.outstanding.iter().any(|t| &t.path == p),
         }
-        let Some(results) = self.worker.as_ref().map(|w| &w.results) else {
-            return Slice::TooLate;
+    }
+
+    /// One bounded wait for the next completed outcome. Past the deadline is
+    /// the caller's business (`drain` reports it); this only distinguishes
+    /// "nothing yet" from "there never will be, the worker is gone".
+    fn wait_slice(&mut self) -> Slice {
+        let next = match self.results.as_mut() {
+            Some(r) => r.recv_timeout(self.cfg.flush_wait_slice),
+            None => return Slice::NoWriter,
         };
-        match results.recv_timeout(self.cfg.flush_wait_slice) {
+        match next {
             Ok(o) => {
-                let o = self.accept(o);
-                Slice::Got(o)
+                self.accept(o);
+                Slice::Got
             }
             Err(mpsc::RecvTimeoutError::Timeout) => Slice::Timeout,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.kill_worker();
-                Slice::TooLate
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Slice::NoWriter,
         }
     }
 
-    fn take_ready(&mut self, max: usize) -> Vec<SaveOutcome> {
-        let mut out = Vec::new();
-        if self.worker.is_none() {
-            return out;
-        }
-        for _ in 0..max {
-            let next = match self.worker.as_ref().unwrap().results.try_recv() {
-                Ok(o) => o,
-                Err(_) => break,
+    /// Drain everything the worker has already reported, without waiting.
+    fn reap_ready(&mut self) {
+        loop {
+            let next = match self.results.as_mut() {
+                Some(r) => r.try_recv().ok(),
+                None => None,
             };
-            out.push(self.accept(next));
+            match next {
+                Some(o) => self.accept(o),
+                None => break,
+            };
         }
-        out
     }
 
-    /// Bookkeep one outcome: drop the queue's mirror/projection for it and
-    /// count it. The *charges* stay with the caller (they need `DiskUsage`).
-    fn accept(&mut self, o: SaveOutcome) -> SaveOutcome {
+    /// Bookkeep one outcome: drop the queue's mirror/projection for it, count
+    /// it, and hold it until someone bills it. The *charges* stay with the
+    /// caller (they need `DiskUsage`).
+    fn accept(&mut self, o: SaveOutcome) {
+        self.bookkeep(&o);
+        self.reports.push_back(o);
+    }
+
+    /// The bookkeeping half of [`SaveQueue::accept`], for outcomes this thread
+    /// produced itself and hands straight back to the caller: those must not
+    /// also sit in `reports`, or the charge would be applied twice.
+    fn bookkeep(&mut self, o: &SaveOutcome) {
         // The worker commits and reports strictly in order, so everything up
         // to `o.seq` is finished. Anything newer stays.
         while let Some(front) = self.outstanding.front().cloned() {
@@ -593,7 +751,6 @@ impl SaveQueue {
         if o.panicked {
             self.stats.panicked += 1;
         }
-        o
     }
 
     fn release(&mut self, task: &SaveTask) {
@@ -613,47 +770,52 @@ impl SaveQueue {
         }
     }
 
-    /// Commit every remaining task, in order, on the calling thread. Used
-    /// when the worker is gone or the flush budget expired -- never
-    /// loses a save.
-    fn commit_remaining_inline(&mut self) -> Vec<SaveOutcome> {
-        let mut out = Vec::new();
+    /// Commit every remaining task, in order, on the calling thread. Only
+    /// ever reached once the worker is *confirmed* gone -- a live worker is
+    /// the only writer (CTO review, OBI-348). Outcomes go to `reports`, so
+    /// whoever is flushing bills them.
+    fn commit_remaining_inline(&mut self) {
         let rest: Vec<Arc<SaveTask>> = self.outstanding.iter().cloned().collect();
         for task in rest {
-            let outcome = outcome_for(&task, self.commit_inline(&task));
-            self.accept(outcome.clone());
-            out.push(outcome);
+            let outcome = self.commit_inline_with_reason(&task, "durability worker gone");
+            self.accept(outcome);
         }
-        out
     }
 
-    fn commit_inline(&mut self, task: &SaveTask) -> Result<(), String> {
+    fn commit_inline(&mut self, task: &SaveTask) -> SaveOutcome {
         self.commit_inline_with_reason(task, "")
     }
 
     /// Commit on the calling thread. `reason` is non-empty only when the
     /// queue could not serve the save (no worker / a lost worker), and it
     /// rides along in the failure text so `errors` says *why* a save went
-    /// through the slow path.
-    fn commit_inline_with_reason(&mut self, task: &SaveTask, reason: &str) -> Result<(), String> {
+    /// through the slow path. The caller applies the returned outcome: this
+    /// write is durable **now**, so `disk_quota_mb` must see it on this call,
+    /// exactly as it did before OBI-348.
+    fn commit_inline_with_reason(&mut self, task: &SaveTask, reason: &str) -> SaveOutcome {
         self.stats.inline_commits += 1;
-        match commit_task(task, self.cfg.commit_delay) {
-            Ok(()) => Ok(()),
-            Err(e) if reason.is_empty() => Err(e),
-            Err(e) => Err(format!("{e}; [committed inline: {reason}]")),
-        }
+        let outcome = match commit_task(task, self.cfg.commit_delay) {
+            Ok(()) => outcome_for(task, Ok(())),
+            Err(e) if reason.is_empty() => outcome_for(task, Err(e)),
+            Err(e) => outcome_for(task, Err(format!("{e}; [committed inline: {reason}]"))),
+        };
+        self.bookkeep(&outcome);
+        outcome
     }
 
-    fn worker_alive(&self) -> bool {
-        self.worker
-            .as_ref()
-            .is_some_and(|w| w.alive.load(Ordering::Acquire))
+    /// Is there a durability worker thread that might be committing right
+    /// now? Cleared by the thread itself as it exits, and independent of
+    /// whether we still hold its handle, because "we lost the handle" is not
+    /// evidence that the write finished.
+    fn worker_may_commit(&self) -> bool {
+        self.thread_alive.load(Ordering::Acquire)
     }
 
     /// Spawn the durability worker. Lazy (first deferred save), so a `World`
     /// that never saves anything never pays for a thread, and so a test
     /// harness that builds worlds in the hundreds doesn't leak them.
     fn start_worker(&mut self) -> Result<(), String> {
+        debug_assert!(self.task_tx.is_none(), "one worker at a time");
         if self.cfg.worker_disabled {
             return Err("durability worker disabled by config".to_string());
         }
@@ -662,6 +824,11 @@ impl SaveQueue {
         let (out_tx, out_rx): (mpsc::Sender<SaveOutcome>, Receiver<SaveOutcome>) = mpsc::channel();
         let alive = Arc::new(AtomicBool::new(true));
         let alive_flag = alive.clone();
+        // Replace the previous flag *before* spawning: a fresh worker means
+        // the old thread is confirmed gone (`start_worker` is only reached
+        // with no handle), and `thread_alive` must never describe a thread
+        // that no longer exists.
+        self.thread_alive = alive.clone();
         let delay = self.cfg.commit_delay;
         let join = std::thread::Builder::new()
             .name("loom-save-worker".to_string())
@@ -683,31 +850,42 @@ impl SaveQueue {
                 }
             })
             .map_err(|e| format!("spawn durability worker: {e}"))?;
-        self.worker = Some(Worker {
-            tx: task_tx,
-            results: out_rx,
-            join: Some(join),
-            alive,
-        });
+        self.task_tx = Some(task_tx);
+        self.results = Some(out_rx);
+        self.join = Some(join);
         Ok(())
     }
 
-    /// Forget the worker handle without waiting for it, exactly as a worker
-    /// that died would look to the next call.
+    /// Test hook: the worker thread is gone *for certain* and its handle is
+    /// gone with it -- the state `detach_dead_worker` leaves behind, and the
+    /// only state in which an inline commit of a non-empty backlog is legal.
     #[cfg(test)]
     fn abandon_worker(&mut self) {
-        self.worker = None;
+        self.thread_alive.store(false, Ordering::Release);
+        self.task_tx = None;
+        self.results = None;
+        self.join = None;
     }
 
-    /// The worker is gone. Drop its ends so it exits, and **detach** the
-    /// join handle: the world thread must not block here (that would put us
-    /// right back where OBI-348 started). Whatever was queued is committed
-    /// inline by the next `flush`/`enqueue`.
-    fn kill_worker(&mut self) {
-        let Some(w) = self.worker.take() else { return };
-        drop(w.tx);
-        drop(w.results);
-        drop(w.join); // detached on purpose
+    /// Test hook: the join handle is gone but the thread is alive and its
+    /// channels still work. Nothing may commit inline in this state, and the
+    /// outcomes must still come back.
+    #[cfg(test)]
+    fn abandon_handle_only(&mut self) {
+        self.join = None;
+    }
+
+    /// The worker has exited: drain the outcomes it reported, join it so we
+    /// *know* no write is in flight, and drop the handle. Afterwards this
+    /// thread is the only writer again, which is exactly what makes an inline
+    /// commit legal. Only reached once `thread_alive` is false or a channel
+    /// closed, so the join cannot block on a live worker.
+    fn detach_dead_worker(&mut self) {
+        self.reap_ready();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        self.thread_alive.store(false, Ordering::Release);
     }
 
     /// Flush everything still queued, then stop the worker and join it.
@@ -715,11 +893,13 @@ impl SaveQueue {
     /// drained at a known point instead of at drop.
     pub fn shutdown(&mut self) {
         self.flush();
-        let Some(w) = self.worker.take() else { return };
-        drop(w.tx);
-        if let Some(join) = w.join {
+        // Dropping the sender is what tells the worker there is no more work.
+        self.task_tx = None;
+        if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+        self.results = None;
+        self.thread_alive.store(false, Ordering::Release);
     }
 }
 
@@ -911,16 +1091,21 @@ mod tests {
     fn sync_mode_commits_on_the_calling_thread() {
         let root = scratch("sync");
         let mut q = SaveQueue::new(SaveQueueConfig::default(), SaveDurability::Sync);
-        assert_eq!(
-            q.enqueue(task(&root, "/b.o", "two")),
-            Enqueued::Inline(Ok(()))
-        );
+        let e = q.enqueue(task(&root, "/b.o", "two"));
+        assert!(matches!(e, Enqueued::Inline(ref o) if o.ok()), "{e:?}");
         assert_eq!(std::fs::read_to_string(root.join("b.o")).unwrap(), "two");
         assert_eq!(q.stats().inline_commits, 1);
         assert_eq!(q.stats().queued, 0);
         assert!(q.is_empty());
     }
 
+    /// The CTO's regression bar for run 37869788819, where 2 of these 20
+    /// same-path saves came back `failed` because the flush deadline let the
+    /// world thread commit inline *while the worker still held those tasks*:
+    /// both writers used `fileio`'s then-per-process temp name, so one lost
+    /// `create_new` to `EEXIST` or had its in-flight temp file unlinked.
+    /// `committed == 20` / `failed == 0` / `inline_commits == 0` is what
+    /// "one writer, newest wins" looks like from the outside.
     #[test]
     fn same_path_commits_in_order_so_the_newest_wins() {
         let root = scratch("order");
@@ -937,8 +1122,103 @@ mod tests {
         }
         q.flush();
         assert_eq!(std::fs::read_to_string(root.join("c.o")).unwrap(), "v19");
-        assert_eq!(q.stats().committed, 20);
+        let s = q.stats();
+        assert_eq!(s.committed, 20, "{s:?}");
+        assert_eq!(s.failed, 0, "{s:?}");
+        assert_eq!(s.inline_commits, 0, "the worker was the only writer");
         assert!(q.is_empty());
+    }
+
+    /// CTO review item 5(a): a saturated queue on **one path** must still
+    /// produce exactly one writer. `max_pending: 2` forces every enqueue after
+    /// the second to wait for a slot; the newest content must win and nothing
+    /// may fail. Deterministic: 10 saves x 20 ms of simulated disk, no load.
+    #[test]
+    fn a_saturated_queue_on_one_path_still_has_one_writer() {
+        let root = scratch("saturation-order");
+        let cfg = SaveQueueConfig {
+            max_pending: 2,
+            commit_delay: Some(Duration::from_millis(20)),
+            ..SaveQueueConfig::default()
+        };
+        let mut q = queue(cfg);
+        for i in 0..10 {
+            q.enqueue(task(&root, "/c.o", &format!("v{i}")));
+        }
+        q.flush();
+        let s = q.stats();
+        assert_eq!(std::fs::read_to_string(root.join("c.o")).unwrap(), "v9");
+        assert_eq!(s.committed, 10, "{s:?}");
+        assert_eq!(s.failed, 0, "{s:?}");
+        assert_eq!(s.inline_commits, 0, "a live worker means no inline commit");
+        assert!(s.backpressure_waits > 0, "{s:?}");
+    }
+
+    /// CTO review item 5(b): the same shape with `flush_deadline` far shorter
+    /// than the backlog, so the deadline branch is forced on every wait. Past
+    /// the deadline the queue reports and keeps waiting -- it must not start a
+    /// second writer, which is precisely what used to lose two saves.
+    #[test]
+    fn a_flush_deadline_does_not_start_a_second_writer() {
+        let root = scratch("deadline-order");
+        let cfg = SaveQueueConfig {
+            max_pending: 2,
+            commit_delay: Some(Duration::from_millis(20)),
+            flush_deadline: Duration::from_millis(5),
+            ..SaveQueueConfig::default()
+        };
+        let mut q = queue(cfg);
+        for i in 0..10 {
+            q.enqueue(task(&root, "/c.o", &format!("v{i}")));
+        }
+        q.flush();
+        let s = q.stats();
+        assert_eq!(std::fs::read_to_string(root.join("c.o")).unwrap(), "v9");
+        assert_eq!(s.committed, 10, "{s:?}");
+        assert_eq!(s.failed, 0, "{s:?}");
+        assert_eq!(s.inline_commits, 0, "a wedged disk is not a second writer");
+        assert!(
+            s.flush_deadline_exceeded > 0,
+            "the deadline was crossed and had to be reported: {s:?}"
+        );
+        assert!(
+            q.take_deadline_report().is_some() || s.flush_deadline_exceeded > 1,
+            "the report is handed to the caller at least once"
+        );
+    }
+
+    /// The other half of the single-writer invariant: losing the *handle* is
+    /// not losing the thread. With a worker still alive, `flush` must wait for
+    /// it rather than commit the same files a second time.
+    #[test]
+    fn a_live_worker_without_a_handle_is_still_the_only_writer() {
+        let root = scratch("handle-gone");
+        let cfg = SaveQueueConfig {
+            commit_delay: Some(Duration::from_millis(5)),
+            ..SaveQueueConfig::default()
+        };
+        let mut q = queue(cfg);
+        for i in 0..4 {
+            q.enqueue(task(&root, &format!("/h{i}.o"), "H"));
+        }
+        // The handle disappears; the thread and its tasks do not.
+        q.abandon_handle_only();
+        let before = q.stats().inline_commits;
+        q.flush();
+        assert_eq!(
+            q.stats().inline_commits,
+            before,
+            "the worker is alive: nothing may commit on this thread"
+        );
+        for i in 0..4 {
+            assert_eq!(
+                std::fs::read_to_string(root.join(format!("h{i}.o"))).unwrap(),
+                "H",
+                "save {i} landed exactly once"
+            );
+        }
+        assert_eq!(q.stats().committed, 4, "{:?}", q.stats());
+        q.shutdown();
     }
 
     #[test]
@@ -962,17 +1242,26 @@ mod tests {
             );
         }
         let s = q.stats();
-        assert_eq!(s.queued + s.inline_commits, 10);
-        assert!(s.inline_commits > 0, "saturation used the fallback");
+        // Saturation costs a *wait*, not a second writer and not a save.
+        assert_eq!(s.queued, 10, "{s:?}");
+        assert_eq!(s.committed, 10, "{s:?}");
+        assert_eq!(s.failed, 0, "{s:?}");
+        assert_eq!(s.inline_commits, 0, "{s:?}");
+        assert!(s.backpressure_waits > 0, "saturation waited for slots");
         assert!(s.peak_pending <= 3, "the cap held: {s:?}");
     }
 
+    /// Two ways a queue is "full": waiting helps with the first and can never
+    /// help with the second. A save that alone exceeds `max_pending_bytes`
+    /// cannot be queued at all, so it is the calling thread's -- with the
+    /// queue empty, so there is nobody to race.
     #[test]
-    fn byte_budget_bounds_the_queue_too() {
+    fn byte_budget_waits_then_falls_back_only_for_an_unqueueable_save() {
         let root = scratch("bytes");
         let cfg = SaveQueueConfig {
             max_pending: 1000,
             max_pending_bytes: 16,
+            commit_delay: Some(Duration::from_millis(2)),
             ..SaveQueueConfig::default()
         };
         let mut q = queue(cfg);
@@ -985,8 +1274,32 @@ mod tests {
                 inline += 1;
             }
         }
-        assert!(inline > 0, "the byte budget forced an inline commit");
-        assert!(q.stats().pending_bytes <= 26, "{:?}", q.stats());
+        let s = q.stats();
+        assert_eq!(inline, 0, "a slow queue is waited on, not bypassed");
+        assert_eq!(s.queued, 6, "{s:?}");
+        assert!(
+            s.backpressure_waits > 0,
+            "the byte budget made enqueue wait: {s:?}"
+        );
+        assert!(q.stats().pending_bytes <= 16, "{:?}", q.stats());
+        q.flush();
+        for i in 0..6 {
+            assert_eq!(
+                std::fs::read_to_string(root.join(format!("q{i}.o"))).unwrap(),
+                "z".repeat(10)
+            );
+        }
+        // Now a save no queue slot could ever hold: inline, and it lands.
+        let big = "B".repeat(40);
+        assert!(matches!(
+            q.enqueue(task(&root, "/too-big.o", &big)),
+            Enqueued::Inline(ref o) if o.ok()
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("too-big.o")).unwrap(),
+            big
+        );
+        assert_eq!(q.stats().inline_commits, 1);
     }
 
     #[test]
@@ -1086,10 +1399,10 @@ mod tests {
         };
         let mut q = queue(cfg);
         for i in 0..5 {
-            assert_eq!(
-                q.enqueue(task(&root, &format!("/w{i}.o"), "W")),
-                Enqueued::Inline(Ok(())),
-                "a world with no worker must still durably save"
+            let e = q.enqueue(task(&root, &format!("/w{i}.o"), "W"));
+            assert!(
+                matches!(e, Enqueued::Inline(ref o) if o.ok()),
+                "a world with no worker must still durably save: {e:?}"
             );
         }
         for i in 0..5 {
@@ -1170,5 +1483,100 @@ mod tests {
         seqs.sort_unstable();
         assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5]);
         assert_eq!(q.stats().committed, 6);
+    }
+
+    /// Disk failures stay per-save: one path the save root cannot write (a
+    /// plain file where a directory would have to be -- `stage_write` creates
+    /// missing parents, so that is the deterministic "the disk said no") must
+    /// not fail its neighbours, and the queue must keep working afterwards.
+    /// `save_object`'s error contract, and the `errors` inbox entry, depend
+    /// on that granularity.
+    #[test]
+    fn a_commit_failure_reports_one_save_not_the_batch() {
+        let root = scratch("failure");
+        std::fs::write(root.join("blocker"), "not a directory").unwrap();
+        let cfg = SaveQueueConfig {
+            commit_delay: Some(Duration::from_millis(1)),
+            ..SaveQueueConfig::default()
+        };
+        let mut q = queue(cfg);
+        q.enqueue(task(&root, "/ok1.o", "one"));
+        q.enqueue(task(&root, "/blocker/deeper.o", "doomed"));
+        q.enqueue(task(&root, "/ok2.o", "two"));
+        let out = q.flush();
+        assert_eq!(out.len(), 3, "one outcome per save");
+        let doomed = out
+            .iter()
+            .find(|o| o.path.contains("blocker"))
+            .expect("the failing save is reported");
+        assert!(
+            !doomed.ok(),
+            "a path the root cannot write fails: {doomed:?}"
+        );
+        assert!(doomed.committed_bytes.is_none(), "nothing to bill");
+        let err = doomed.error.as_deref().unwrap();
+        assert!(err.contains("blocker"), "names the path: {err}");
+        assert!(
+            !err.contains("committed inline"),
+            "not a fallback case: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("ok1.o")).unwrap(),
+            "one",
+            "the neighbour before it landed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("ok2.o")).unwrap(),
+            "two",
+            "the neighbour after it landed too"
+        );
+        let s = q.stats();
+        assert_eq!((s.committed, s.failed, s.panicked), (2, 1, 0), "{s:?}");
+        assert!(q.is_empty());
+        // ...and the queue still accepts work afterwards.
+        q.enqueue(task(&root, "/ok3.o", "three"));
+        assert_eq!(q.flush().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join("ok3.o")).unwrap(),
+            "three"
+        );
+    }
+
+    /// Defence in depth for the single-writer invariant (CTO review item 4):
+    /// even if a second thread ever does stage a save for the same path,
+    /// `fileio`'s per-write temp name means they cannot unlink each other's
+    /// in-flight file or lose `create_new` to `EEXIST` -- which is what
+    /// CI run 37869788819 actually hit.
+    #[test]
+    fn temp_files_do_not_collide_across_threads() {
+        use crate::fileio::write_file_atomic as loom_write_file_atomic;
+        let root = scratch("temp-race");
+        std::fs::create_dir_all(&root).unwrap();
+        let writes = 100;
+        std::thread::scope(|s| {
+            for t in 0..2 {
+                let root = root.clone();
+                s.spawn(move || {
+                    for i in 0..writes {
+                        let path = "/shared.o".to_string();
+                        let content = format!("thread{t}-save{i}");
+                        let out = loom_write_file_atomic(&root, &path, &content);
+                        assert!(out.is_ok(), "{out:?}");
+                    }
+                });
+            }
+        });
+        // Every write either completed or was replaced by a later one; the
+        // file exists and no temp litter is left behind.
+        let contents = std::fs::read_to_string(root.join("shared.o")).unwrap();
+        assert!(contents.starts_with("thread"), "{contents}");
+        let litter: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(litter.is_empty(), "temp files left behind: {litter:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
