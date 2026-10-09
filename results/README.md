@@ -205,18 +205,31 @@ so each pair reproduces with
   rows from t+0, each stamped `unix_ms`, and a genuinely clean tail (slowest
   command 41.54 ms against a 50 ms SLA), which is what the "no tail at all"
   wording is for.
+* `ci-e1-1-5b6afa5.*` -- run 37915451498, the first CI run that *did* stall, and
+  therefore the first window this project has ever placed from the server's own
+  clock instead of inferring it: 91 stamped scrape rows from t+0, one 51 ms
+  `input` stall, `stall_window_precision: absolute`, and the window table
+  reading `| 40.1 - 40.2 | 1 | 51 | measured |` -- `[finish - duration, finish]`
+  with no scrape-interval slack. It placed 6 of that run's 9 at-or-over-SLA
+  samples, all 6 inside the measured window, and left 3 unattributed at t+35.8 s
+  -- 4.3 s *before* the stall, in a slice the report marks as having no stall.
+  Those 3 are the honest remainder: this report could not place them, and it
+  does not claim the server was fine at any other moment.
 * `2026-09-27-500-players-stretch.rerendered.*` -- a run that scraped no
   instrumented server and archived no samples, which must say "not this
   re-render's claim" instead of inventing either.
 
-Neither CI run above stalled, so the server never published a stall stamp and
-both re-renders are `bracket`-only by necessity. The `measured` side of the path
--- a stamp inside the run's own axis becoming `[finish - duration, finish]`, and
-a second stall whose stamp was already consumed falling back to a bracket -- is
-held by `rerender::tests::a_stamped_series_is_placed_by_the_server_s_own_clock`,
-which drives a stamped series through the same `re_render` the `--rerender`
-command calls. The first CI run that actually stalls will show the same thing in
-the uploaded artifact without anyone adding a step.
+The two earliest CI runs above never stalled, so the server published no stall
+stamp and their re-renders are `bracket`-only by necessity. `ci-e1-1-5b6afa5.*`
+is the `measured` arm observed live rather than in a test: a stamp inside the
+run's own axis becoming `[finish - duration, finish]`, and a second stall whose
+stamp was already consumed falling back to a bracket is held by
+`rerender::tests::a_stamped_series_is_placed_by_the_server_s_own_clock`, which
+drives a stamped series through the same `re_render` the `--rerender` command
+calls. `ci-e1-1-5b6afa5.rerendered.*` is byte-identical to the re-render the CI
+job published for itself (`ci-e1-1-rerendered.*` in run 37915451498's artifact)
+except for the one line that names the input path, which is
+`results/ci-e1-1-5b6afa5.json` here and `results/ci-e1-1.json` on the runner.
 
 The first finding that visibility produced: the
 `loom_runtime_errors_total{program="/std/player"}` count of exactly 150 that

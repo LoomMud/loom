@@ -1,0 +1,2151 @@
+{
+  "players": 150,
+  "slow_reader_fraction": 0.1,
+  "requested_duration_secs": 90,
+  "actual_duration_secs": 90.663244711,
+  "login_failures": 0,
+  "disconnects": 0,
+  "commands_sent": 10057,
+  "sla_p99_ms": 50.0,
+  "command_latency": {
+    "count": 10057,
+    "p50_ms": 1.263,
+    "p95_ms": 9.267,
+    "p99_ms": 16.413,
+    "max_ms": 92.308,
+    "mean_ms": 2.9463168937058763
+  },
+  "slow_reader_command_latency": {
+    "count": 824,
+    "p50_ms": 401.256,
+    "p95_ms": 802.537,
+    "p99_ms": 803.542,
+    "max_ms": 1204.271,
+    "mean_ms": 471.2671553398058
+  },
+  "login_latency": {
+    "count": 150,
+    "p50_ms": 64.731,
+    "p95_ms": 137.345,
+    "p99_ms": 140.159,
+    "max_ms": 143.762,
+    "mean_ms": 67.19278666666666
+  },
+  "login_auth_latency": {
+    "count": 150,
+    "p50_ms": 8.0,
+    "p95_ms": 67.0,
+    "p99_ms": 68.0,
+    "max_ms": 69.0,
+    "mean_ms": 17.05333333333333
+  },
+  "prompt_timeouts": 0,
+  "e1_1_pass": true,
+  "notes": [
+    "server counters at the last successful scrape (cumulative for this process): 1 world-loop stall(s) totalling 51 ms; slowest iteration 51 ms; longest between-iteration gap 92 ms"
+  ],
+  "latency_timeline": [
+    {
+      "start_ms": 0,
+      "bucket_ms": 5000,
+      "count": 202,
+      "p50_ms": 0.68,
+      "p95_ms": 3.458,
+      "p99_ms": 6.436,
+      "max_ms": 7.821,
+      "mean_ms": 1.207970297029703,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 5000,
+      "bucket_ms": 5000,
+      "count": 480,
+      "p50_ms": 1.137,
+      "p95_ms": 6.139,
+      "p99_ms": 7.948,
+      "max_ms": 11.961,
+      "mean_ms": 2.174922916666667,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 10000,
+      "bucket_ms": 5000,
+      "count": 618,
+      "p50_ms": 1.037,
+      "p95_ms": 7.653,
+      "p99_ms": 14.491,
+      "max_ms": 23.013,
+      "mean_ms": 2.5011844660194176,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 15000,
+      "bucket_ms": 5000,
+      "count": 591,
+      "p50_ms": 1.08,
+      "p95_ms": 7.735,
+      "p99_ms": 11.226,
+      "max_ms": 12.926,
+      "mean_ms": 2.5238155668358715,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 20000,
+      "bucket_ms": 5000,
+      "count": 576,
+      "p50_ms": 0.961,
+      "p95_ms": 5.662,
+      "p99_ms": 7.603,
+      "max_ms": 9.246,
+      "mean_ms": 2.009010416666667,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 25000,
+      "bucket_ms": 5000,
+      "count": 593,
+      "p50_ms": 1.08,
+      "p95_ms": 6.52,
+      "p99_ms": 10.752,
+      "max_ms": 15.15,
+      "mean_ms": 2.438102866779089,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 30000,
+      "bucket_ms": 5000,
+      "count": 570,
+      "p50_ms": 1.255,
+      "p95_ms": 6.852,
+      "p99_ms": 10.263,
+      "max_ms": 12.95,
+      "mean_ms": 2.5963368421052633,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 35000,
+      "bucket_ms": 5000,
+      "count": 604,
+      "p50_ms": 2.543,
+      "p95_ms": 14.939,
+      "p99_ms": 28.131,
+      "max_ms": 55.742,
+      "mean_ms": 4.493033112582782,
+      "over_sla": 3,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 40000,
+      "bucket_ms": 5000,
+      "count": 596,
+      "p50_ms": 2.885,
+      "p95_ms": 18.21,
+      "p99_ms": 57.707,
+      "max_ms": 92.308,
+      "mean_ms": 5.322842281879195,
+      "over_sla": 6,
+      "server_stalled": true
+    },
+    {
+      "start_ms": 45000,
+      "bucket_ms": 5000,
+      "count": 574,
+      "p50_ms": 2.297,
+      "p95_ms": 11.804,
+      "p99_ms": 15.892,
+      "max_ms": 21.781,
+      "mean_ms": 3.4819459930313585,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 50000,
+      "bucket_ms": 5000,
+      "count": 568,
+      "p50_ms": 2.186,
+      "p95_ms": 12.377,
+      "p99_ms": 18.165,
+      "max_ms": 23.471,
+      "mean_ms": 3.604593309859155,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 55000,
+      "bucket_ms": 5000,
+      "count": 610,
+      "p50_ms": 1.48,
+      "p95_ms": 10.782,
+      "p99_ms": 18.759,
+      "max_ms": 23.737,
+      "mean_ms": 3.2676442622950823,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 60000,
+      "bucket_ms": 5000,
+      "count": 594,
+      "p50_ms": 2.151,
+      "p95_ms": 8.422,
+      "p99_ms": 16.13,
+      "max_ms": 26.357,
+      "mean_ms": 3.0335269360269357,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 65000,
+      "bucket_ms": 5000,
+      "count": 573,
+      "p50_ms": 1.635,
+      "p95_ms": 10.109,
+      "p99_ms": 18.426,
+      "max_ms": 24.218,
+      "mean_ms": 3.1310750436300174,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 70000,
+      "bucket_ms": 5000,
+      "count": 564,
+      "p50_ms": 1.021,
+      "p95_ms": 7.549,
+      "p99_ms": 11.711,
+      "max_ms": 28.403,
+      "mean_ms": 2.579267730496454,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 75000,
+      "bucket_ms": 5000,
+      "count": 593,
+      "p50_ms": 0.951,
+      "p95_ms": 5.911,
+      "p99_ms": 8.943,
+      "max_ms": 14.736,
+      "mean_ms": 2.109372681281619,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 80000,
+      "bucket_ms": 5000,
+      "count": 579,
+      "p50_ms": 1.001,
+      "p95_ms": 7.505,
+      "p99_ms": 11.253,
+      "max_ms": 18.488,
+      "mean_ms": 2.417096718480138,
+      "over_sla": 0,
+      "server_stalled": false
+    },
+    {
+      "start_ms": 85000,
+      "bucket_ms": 5000,
+      "count": 572,
+      "p50_ms": 1.151,
+      "p95_ms": 9.277,
+      "p99_ms": 15.28,
+      "max_ms": 28.364,
+      "mean_ms": 2.7907902097902095,
+      "over_sla": 0,
+      "server_stalled": false
+    }
+  ],
+  "tail_samples": [
+    {
+      "at_ms": 40080,
+      "latency_ms": 92.308
+    },
+    {
+      "at_ms": 40080,
+      "latency_ms": 83.917
+    },
+    {
+      "at_ms": 40075,
+      "latency_ms": 79.282
+    },
+    {
+      "at_ms": 40106,
+      "latency_ms": 66.618
+    },
+    {
+      "at_ms": 40108,
+      "latency_ms": 64.168
+    },
+    {
+      "at_ms": 40115,
+      "latency_ms": 57.707
+    },
+    {
+      "at_ms": 35816,
+      "latency_ms": 55.742
+    },
+    {
+      "at_ms": 35814,
+      "latency_ms": 55.313
+    },
+    {
+      "at_ms": 35833,
+      "latency_ms": 52.257
+    },
+    {
+      "at_ms": 35827,
+      "latency_ms": 47.0
+    },
+    {
+      "at_ms": 40059,
+      "latency_ms": 46.995
+    },
+    {
+      "at_ms": 35813,
+      "latency_ms": 39.617
+    },
+    {
+      "at_ms": 42737,
+      "latency_ms": 32.215
+    },
+    {
+      "at_ms": 40144,
+      "latency_ms": 31.245
+    },
+    {
+      "at_ms": 39585,
+      "latency_ms": 29.31
+    },
+    {
+      "at_ms": 42741,
+      "latency_ms": 28.944
+    },
+    {
+      "at_ms": 72534,
+      "latency_ms": 28.403
+    },
+    {
+      "at_ms": 42749,
+      "latency_ms": 28.394
+    },
+    {
+      "at_ms": 89351,
+      "latency_ms": 28.364
+    },
+    {
+      "at_ms": 39588,
+      "latency_ms": 28.131
+    }
+  ],
+  "tail_samples_over_sla": [
+    {
+      "at_ms": 35814,
+      "latency_ms": 55.313
+    },
+    {
+      "at_ms": 35816,
+      "latency_ms": 55.742
+    },
+    {
+      "at_ms": 35833,
+      "latency_ms": 52.257
+    },
+    {
+      "at_ms": 40075,
+      "latency_ms": 79.282
+    },
+    {
+      "at_ms": 40080,
+      "latency_ms": 83.917
+    },
+    {
+      "at_ms": 40080,
+      "latency_ms": 92.308
+    },
+    {
+      "at_ms": 40106,
+      "latency_ms": 66.618
+    },
+    {
+      "at_ms": 40108,
+      "latency_ms": 64.168
+    },
+    {
+      "at_ms": 40115,
+      "latency_ms": 57.707
+    }
+  ],
+  "tail_attribution": {
+    "threshold_ms": 50.0,
+    "tail_count": 9,
+    "server_stall": 6,
+    "server_stall_precise": 6,
+    "bot_starvation": 0,
+    "login_ramp": 0,
+    "unattributed": 3,
+    "server_stall_pct": 66.66666666666667,
+    "p99_ms": 16.413,
+    "p99_excluding_server_stall_ms": 15.993,
+    "server_stall_windows": [
+      {
+        "start_ms": 40103,
+        "end_ms": 40154,
+        "events": 1,
+        "stall_ms": 51,
+        "approximate": false
+      }
+    ],
+    "bot_starvation_windows": [],
+    "login_ramp_end_ms": 10184,
+    "scrape_resolution_ms": 1000,
+    "stall_window_precision": "absolute"
+  },
+  "server_timeline": [
+    {
+      "at_ms": 0,
+      "unix_ms": 1791543076106,
+      "counters": {
+        "ticks": 1.0,
+        "iterations": 4.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 1.0,
+        "gap_ms_max": 21.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 1000,
+      "unix_ms": 1791543077106,
+      "counters": {
+        "ticks": 11.0,
+        "iterations": 182.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 7.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 2001,
+      "unix_ms": 1791543078107,
+      "counters": {
+        "ticks": 21.0,
+        "iterations": 371.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 7.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 3001,
+      "unix_ms": 1791543079107,
+      "counters": {
+        "ticks": 31.0,
+        "iterations": 584.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 7.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 4000,
+      "unix_ms": 1791543080106,
+      "counters": {
+        "ticks": 41.0,
+        "iterations": 791.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 5000,
+      "unix_ms": 1791543081106,
+      "counters": {
+        "ticks": 51.0,
+        "iterations": 1013.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 6001,
+      "unix_ms": 1791543082107,
+      "counters": {
+        "ticks": 61.0,
+        "iterations": 1246.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 7000,
+      "unix_ms": 1791543083106,
+      "counters": {
+        "ticks": 71.0,
+        "iterations": 1504.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 8001,
+      "unix_ms": 1791543084107,
+      "counters": {
+        "ticks": 81.0,
+        "iterations": 1775.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 9000,
+      "unix_ms": 1791543085107,
+      "counters": {
+        "ticks": 91.0,
+        "iterations": 2033.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 10001,
+      "unix_ms": 1791543086107,
+      "counters": {
+        "ticks": 101.0,
+        "iterations": 2319.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 11000,
+      "unix_ms": 1791543087106,
+      "counters": {
+        "ticks": 111.0,
+        "iterations": 2486.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 12000,
+      "unix_ms": 1791543088107,
+      "counters": {
+        "ticks": 121.0,
+        "iterations": 2627.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 13000,
+      "unix_ms": 1791543089107,
+      "counters": {
+        "ticks": 131.0,
+        "iterations": 2761.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 14001,
+      "unix_ms": 1791543090107,
+      "counters": {
+        "ticks": 141.0,
+        "iterations": 2900.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 15000,
+      "unix_ms": 1791543091106,
+      "counters": {
+        "ticks": 151.0,
+        "iterations": 3059.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 16000,
+      "unix_ms": 1791543092106,
+      "counters": {
+        "ticks": 161.0,
+        "iterations": 3207.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 17001,
+      "unix_ms": 1791543093107,
+      "counters": {
+        "ticks": 171.0,
+        "iterations": 3338.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 18001,
+      "unix_ms": 1791543094107,
+      "counters": {
+        "ticks": 181.0,
+        "iterations": 3469.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 19001,
+      "unix_ms": 1791543095107,
+      "counters": {
+        "ticks": 191.0,
+        "iterations": 3601.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 20000,
+      "unix_ms": 1791543096106,
+      "counters": {
+        "ticks": 201.0,
+        "iterations": 3746.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 21001,
+      "unix_ms": 1791543097107,
+      "counters": {
+        "ticks": 211.0,
+        "iterations": 3876.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 22001,
+      "unix_ms": 1791543098107,
+      "counters": {
+        "ticks": 221.0,
+        "iterations": 4000.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 23001,
+      "unix_ms": 1791543099107,
+      "counters": {
+        "ticks": 231.0,
+        "iterations": 4144.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 24001,
+      "unix_ms": 1791543100107,
+      "counters": {
+        "ticks": 241.0,
+        "iterations": 4287.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 25000,
+      "unix_ms": 1791543101107,
+      "counters": {
+        "ticks": 251.0,
+        "iterations": 4418.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 26000,
+      "unix_ms": 1791543102107,
+      "counters": {
+        "ticks": 261.0,
+        "iterations": 4556.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 27000,
+      "unix_ms": 1791543103106,
+      "counters": {
+        "ticks": 271.0,
+        "iterations": 4703.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 28000,
+      "unix_ms": 1791543104107,
+      "counters": {
+        "ticks": 281.0,
+        "iterations": 4831.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 29000,
+      "unix_ms": 1791543105106,
+      "counters": {
+        "ticks": 291.0,
+        "iterations": 4955.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 30000,
+      "unix_ms": 1791543106106,
+      "counters": {
+        "ticks": 301.0,
+        "iterations": 5111.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 31000,
+      "unix_ms": 1791543107107,
+      "counters": {
+        "ticks": 311.0,
+        "iterations": 5221.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 32001,
+      "unix_ms": 1791543108107,
+      "counters": {
+        "ticks": 321.0,
+        "iterations": 5359.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 33000,
+      "unix_ms": 1791543109106,
+      "counters": {
+        "ticks": 331.0,
+        "iterations": 5487.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 34000,
+      "unix_ms": 1791543110107,
+      "counters": {
+        "ticks": 341.0,
+        "iterations": 5628.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 35000,
+      "unix_ms": 1791543111106,
+      "counters": {
+        "ticks": 351.0,
+        "iterations": 5776.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 36000,
+      "unix_ms": 1791543112106,
+      "counters": {
+        "ticks": 361.0,
+        "iterations": 5888.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 37000,
+      "unix_ms": 1791543113106,
+      "counters": {
+        "ticks": 371.0,
+        "iterations": 6045.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 38000,
+      "unix_ms": 1791543114106,
+      "counters": {
+        "ticks": 381.0,
+        "iterations": 6199.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 39000,
+      "unix_ms": 1791543115106,
+      "counters": {
+        "ticks": 391.0,
+        "iterations": 6333.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 40000,
+      "unix_ms": 1791543116106,
+      "counters": {
+        "ticks": 401.0,
+        "iterations": 6482.0,
+        "stalls": null,
+        "stall_ms": null,
+        "duration_ms_max": 26.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": null,
+        "last_stall_duration_ms": null,
+        "last_stall_tick": null,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 41000,
+      "unix_ms": 1791543117106,
+      "counters": {
+        "ticks": 411.0,
+        "iterations": 6613.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 42001,
+      "unix_ms": 1791543118107,
+      "counters": {
+        "ticks": 421.0,
+        "iterations": 6745.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 43000,
+      "unix_ms": 1791543119106,
+      "counters": {
+        "ticks": 431.0,
+        "iterations": 6898.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 44001,
+      "unix_ms": 1791543120107,
+      "counters": {
+        "ticks": 441.0,
+        "iterations": 7028.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 45001,
+      "unix_ms": 1791543121107,
+      "counters": {
+        "ticks": 451.0,
+        "iterations": 7173.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 46001,
+      "unix_ms": 1791543122107,
+      "counters": {
+        "ticks": 461.0,
+        "iterations": 7322.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 47000,
+      "unix_ms": 1791543123107,
+      "counters": {
+        "ticks": 471.0,
+        "iterations": 7456.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 48000,
+      "unix_ms": 1791543124107,
+      "counters": {
+        "ticks": 481.0,
+        "iterations": 7585.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 49000,
+      "unix_ms": 1791543125106,
+      "counters": {
+        "ticks": 491.0,
+        "iterations": 7724.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 50000,
+      "unix_ms": 1791543126106,
+      "counters": {
+        "ticks": 501.0,
+        "iterations": 7851.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 51000,
+      "unix_ms": 1791543127106,
+      "counters": {
+        "ticks": 511.0,
+        "iterations": 7988.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 52000,
+      "unix_ms": 1791543128107,
+      "counters": {
+        "ticks": 521.0,
+        "iterations": 8130.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 53001,
+      "unix_ms": 1791543129107,
+      "counters": {
+        "ticks": 531.0,
+        "iterations": 8252.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 54000,
+      "unix_ms": 1791543130107,
+      "counters": {
+        "ticks": 541.0,
+        "iterations": 8391.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 55000,
+      "unix_ms": 1791543131107,
+      "counters": {
+        "ticks": 551.0,
+        "iterations": 8526.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 56000,
+      "unix_ms": 1791543132106,
+      "counters": {
+        "ticks": 561.0,
+        "iterations": 8663.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 57000,
+      "unix_ms": 1791543133107,
+      "counters": {
+        "ticks": 571.0,
+        "iterations": 8794.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 58000,
+      "unix_ms": 1791543134106,
+      "counters": {
+        "ticks": 581.0,
+        "iterations": 8933.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 59001,
+      "unix_ms": 1791543135107,
+      "counters": {
+        "ticks": 591.0,
+        "iterations": 9084.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 60000,
+      "unix_ms": 1791543136107,
+      "counters": {
+        "ticks": 601.0,
+        "iterations": 9234.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 61001,
+      "unix_ms": 1791543137107,
+      "counters": {
+        "ticks": 611.0,
+        "iterations": 9364.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 62000,
+      "unix_ms": 1791543138106,
+      "counters": {
+        "ticks": 621.0,
+        "iterations": 9482.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 63000,
+      "unix_ms": 1791543139107,
+      "counters": {
+        "ticks": 631.0,
+        "iterations": 9637.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 64000,
+      "unix_ms": 1791543140107,
+      "counters": {
+        "ticks": 641.0,
+        "iterations": 9766.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 65001,
+      "unix_ms": 1791543141107,
+      "counters": {
+        "ticks": 651.0,
+        "iterations": 9924.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 66000,
+      "unix_ms": 1791543142107,
+      "counters": {
+        "ticks": 661.0,
+        "iterations": 10047.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 67001,
+      "unix_ms": 1791543143107,
+      "counters": {
+        "ticks": 671.0,
+        "iterations": 10181.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 68001,
+      "unix_ms": 1791543144107,
+      "counters": {
+        "ticks": 681.0,
+        "iterations": 10324.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 69001,
+      "unix_ms": 1791543145107,
+      "counters": {
+        "ticks": 691.0,
+        "iterations": 10452.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 70001,
+      "unix_ms": 1791543146107,
+      "counters": {
+        "ticks": 701.0,
+        "iterations": 10589.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 71000,
+      "unix_ms": 1791543147107,
+      "counters": {
+        "ticks": 711.0,
+        "iterations": 10717.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 72000,
+      "unix_ms": 1791543148107,
+      "counters": {
+        "ticks": 721.0,
+        "iterations": 10850.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 73000,
+      "unix_ms": 1791543149106,
+      "counters": {
+        "ticks": 731.0,
+        "iterations": 10981.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 74001,
+      "unix_ms": 1791543150107,
+      "counters": {
+        "ticks": 741.0,
+        "iterations": 11125.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 75000,
+      "unix_ms": 1791543151106,
+      "counters": {
+        "ticks": 751.0,
+        "iterations": 11250.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 76001,
+      "unix_ms": 1791543152107,
+      "counters": {
+        "ticks": 761.0,
+        "iterations": 11393.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 67.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 77000,
+      "unix_ms": 1791543153106,
+      "counters": {
+        "ticks": 771.0,
+        "iterations": 11528.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 78000,
+      "unix_ms": 1791543154106,
+      "counters": {
+        "ticks": 781.0,
+        "iterations": 11671.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 79000,
+      "unix_ms": 1791543155106,
+      "counters": {
+        "ticks": 791.0,
+        "iterations": 11802.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 80001,
+      "unix_ms": 1791543156107,
+      "counters": {
+        "ticks": 801.0,
+        "iterations": 11937.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 81000,
+      "unix_ms": 1791543157106,
+      "counters": {
+        "ticks": 811.0,
+        "iterations": 12056.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 82000,
+      "unix_ms": 1791543158106,
+      "counters": {
+        "ticks": 821.0,
+        "iterations": 12199.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 83001,
+      "unix_ms": 1791543159107,
+      "counters": {
+        "ticks": 831.0,
+        "iterations": 12350.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 84000,
+      "unix_ms": 1791543160107,
+      "counters": {
+        "ticks": 841.0,
+        "iterations": 12482.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 85000,
+      "unix_ms": 1791543161106,
+      "counters": {
+        "ticks": 851.0,
+        "iterations": 12614.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 86000,
+      "unix_ms": 1791543162107,
+      "counters": {
+        "ticks": 861.0,
+        "iterations": 12739.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 87000,
+      "unix_ms": 1791543163106,
+      "counters": {
+        "ticks": 871.0,
+        "iterations": 12880.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 88000,
+      "unix_ms": 1791543164106,
+      "counters": {
+        "ticks": 881.0,
+        "iterations": 13003.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 89000,
+      "unix_ms": 1791543165106,
+      "counters": {
+        "ticks": 891.0,
+        "iterations": 13161.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    },
+    {
+      "at_ms": 90002,
+      "unix_ms": 1791543166108,
+      "counters": {
+        "ticks": 901.0,
+        "iterations": 13285.0,
+        "stalls": 1.0,
+        "stall_ms": 51.0,
+        "duration_ms_max": 51.0,
+        "gap_ms_max": 92.0,
+        "last_stall_unix_ms": 1791543116260.0,
+        "last_stall_duration_ms": 51.0,
+        "last_stall_tick": 402.0,
+        "command_blocked_last_unix_ms": null,
+        "command_blocked": null,
+        "command_blocked_ms": null,
+        "runtime_errors": null
+      }
+    }
+  ],
+  "server_instrumented": true,
+  "bot_timer_lag": {
+    "count": 7499,
+    "p50_ms": 1.07,
+    "p95_ms": 1.841,
+    "p99_ms": 3.669,
+    "max_ms": 7.306,
+    "mean_ms": 1.1160066675556741
+  },
+  "server_metrics": "# TYPE loom_world_loop_stall_ms_total counter\nloom_world_loop_stall_ms_total 51\n\n# TYPE loom_world_loop_iterations_total counter\nloom_world_loop_iterations_total 13585\n\n# TYPE loom_world_loop_stalls_total counter\nloom_world_loop_stalls_total{kind=\"input\"} 1\n\n# TYPE loom_world_loop_ticks_total counter\nloom_world_loop_ticks_total 903\n\n# TYPE loom_world_loop_gap_ms_max gauge\nloom_world_loop_gap_ms_max 92\n\n# TYPE loom_world_loop_last_stall_tick gauge\nloom_world_loop_last_stall_tick 402\n\n# TYPE loom_world_loop_last_stall_duration_ms gauge\nloom_world_loop_last_stall_duration_ms 51\n\n# TYPE loom_world_loop_last_stall_unix_ms gauge\nloom_world_loop_last_stall_unix_ms 1791543116260\n\n# TYPE loom_world_loop_duration_ms_max gauge\nloom_world_loop_duration_ms_max 51\n\n"
+}
