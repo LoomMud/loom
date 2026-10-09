@@ -2998,6 +2998,216 @@ fn to_persist_audit_row(r: loom_vm::AuditRow) -> loom_persist::AuditRow {
     }
 }
 
+/// How many queued disconnect teardowns one serve-loop iteration may run
+/// (OBI-344 half (b), CTO-approved split). Overridable with
+/// `LOOM_WORLD_DISCONNECT_BUDGET` (see [`parse_disconnect_drain_config`]).
+const DISCONNECT_BUDGET_PER_ITERATION: usize = 1;
+
+/// Shortest spacing between two disconnect-teardown passes (OBI-344 half
+/// (b)). Overridable with `LOOM_WORLD_DISCONNECT_INTERVAL_MS`.
+const DISCONNECT_DRAIN_MIN_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Depth past which a pass stops pacing and drains the whole queue inline
+/// (OBI-344 half (b)). A backlog this deep is no longer a fairness problem,
+/// it is dying sessions never being told they are dead: a bounded-but-stale
+/// teardown is worse than a slow one, and `DISCONNECT_DRAIN_MIN_INTERVAL * n`
+/// of drain time would in any case exceed the time an operator has to react.
+/// Well above any session count the driver admits (`loom_net`'s own connection
+/// cap bounds it first), so this is a tripwire, not a tuned limit.
+const DISCONNECT_PENDING_HARD_CAP: usize = 4096;
+
+/// Upper bound accepted for `LOOM_WORLD_DISCONNECT_BUDGET`: a pass larger than
+/// this is a pacing knob being used to turn the drain back off.
+const DISCONNECT_BUDGET_MAX: usize = 64;
+
+/// Upper bound accepted for `LOOM_WORLD_DISCONNECT_INTERVAL_MS`.
+const DISCONNECT_INTERVAL_MAX_MS: u64 = 5_000;
+
+/// The serve loop's bounded, paced disconnect drain (OBI-344 half (b),
+/// CTO-approved split; the sibling half that makes a single teardown cheap is
+/// OBI-348, in `loom-vm`).
+///
+/// # Why this exists
+///
+/// `World::disconnect` is one atomic, synchronous unit: `autosave()` -- a
+/// mudlib apply that ends in `save_object`, i.e. two blocking `fsync`s in
+/// `loom_vm::fileio::write_file_atomic` -- then `net_dead()`. While the E1.1
+/// save root did not exist the write failed on ENOENT and a teardown cost
+/// ~32 ms; with it (`ad489db`), the run of the gate recorded
+/// `loom_world_loop_stalls_total{kind="disconnect"} = 31`, `stall_ms_total`
+/// 4905 and a **562 ms** single iteration when all 150 test sessions dropped
+/// together (`37843414478`, report in OBI-344). `spawn_world_thread`'s loop
+/// handles exactly one `NetEvent` per iteration and every event shares one
+/// FIFO, so a live player's `Line` queued *behind that whole backlog*: ~4.9 s
+/// of world-thread time, and `ticks` frozen while iterations kept advancing.
+///
+/// # What it does
+///
+/// The `Disconnected` arm queues the connection id here instead of calling
+/// `World::disconnect`. Each iteration then runs at most `budget` (default 1)
+/// queued teardowns, and only if the previous pass was at least
+/// `min_interval` (default 50 ms) ago. Nothing about a single teardown
+/// changes: `last_pass` only moves when a pass actually runs, so a lone
+/// `quit` is still torn down in the very iteration that saw it, with today's
+/// exact semantics (`net_dead()` fires now, the session leaves admin `who`
+/// now, the save lands before the next tick).
+///
+/// This does **not** make a teardown cheaper -- only OBI-348 (persistence off
+/// the world thread) can. What it buys is fairness: behind a mass drop a live
+/// player's command now waits for at most *one* teardown plus its own work
+/// instead of the entire backlog, and the world tick keeps firing instead of
+/// starving.
+///
+/// # Ordering rule (correctness, not tuning)
+///
+/// A queued teardown must have run before the next `NetEvent::Connected` is
+/// handled: `World::connect` is the only `registry.bind()` call site and
+/// `World::disconnect` clears `object.conn`, so a reconnect that bound an
+/// object while that object's teardown was still queued would have the
+/// deferred teardown clobber the new live binding and strand the session.
+/// [`Self::run_pending_disconnects`] (which ignores pacing) is therefore
+/// called on every `Connected`, on every snapshot request, and when the event
+/// loop ends.
+///
+/// # What the pacing costs
+///
+/// A pass only happens on an iteration, and an iteration only happens when an
+/// event arrives, so a deep backlog drains over `depth * max(min_interval,
+/// event cadence)` of wall time rather than in one burst -- with the defaults
+/// and an otherwise idle server, the 100 ms tick timer sets the pace and a
+/// 150-session mass drop takes ~15 s to clean up instead of ~4 s. During that
+/// window the last dying session stays bound, keeps receiving heartbeats, and
+/// has no `net_dead()`/autosave. Single logouts are unaffected: with nothing
+/// else queued the teardown runs in the iteration that saw it, worst case one
+/// `min_interval` late when it lands inside another teardown's interval.
+#[derive(Debug)]
+struct DisconnectDrain {
+    pending: std::collections::VecDeque<u64>,
+    budget: usize,
+    min_interval: Duration,
+    /// When the last pass that *ran* finished. `None` until the first one,
+    /// so boot-time logouts are never delayed by pacing.
+    last_pass: Option<std::time::Instant>,
+    hard_cap: usize,
+}
+
+impl DisconnectDrain {
+    fn new(budget: usize, min_interval: Duration) -> Self {
+        Self {
+            pending: std::collections::VecDeque::new(),
+            budget: budget.max(1),
+            min_interval,
+            last_pass: None,
+            hard_cap: DISCONNECT_PENDING_HARD_CAP,
+        }
+    }
+
+    /// Process config, so the knobs are settable without a rebuild (a mass
+    /// drop is the one event where an operator may want to trade pacing for
+    /// teardown speed, or vice versa). Defaults when unset or garbage.
+    fn from_env() -> Self {
+        let (budget, min_interval) = parse_disconnect_drain_config(
+            std::env::var("LOOM_WORLD_DISCONNECT_BUDGET")
+                .ok()
+                .as_deref(),
+            std::env::var("LOOM_WORLD_DISCONNECT_INTERVAL_MS")
+                .ok()
+                .as_deref(),
+        );
+        Self::new(budget, min_interval)
+    }
+
+    /// Queue one teardown. Never does world work.
+    fn push(&mut self, conn: u64) {
+        self.pending.push_back(conn);
+    }
+
+    /// How many teardowns are waiting.
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The teardowns this iteration is allowed to run, oldest first: nothing
+    /// if the queue is empty or the previous pass was less than
+    /// `min_interval` ago, otherwise at most `budget`. Past `hard_cap` the
+    /// pacing is abandoned and the whole queue goes in one pass (see
+    /// [`DISCONNECT_PENDING_HARD_CAP`]).
+    ///
+    /// Takes the clock reading rather than calling `std::time::Instant::now()` itself so
+    /// the policy is testable against a deterministic clock.
+    fn take_due(&mut self, now: std::time::Instant) -> Vec<u64> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        let over_cap = self.pending_len() > self.hard_cap;
+        if !over_cap
+            && let Some(last) = self.last_pass
+            && now.duration_since(last) < self.min_interval
+        {
+            return Vec::new();
+        }
+        let count = if over_cap {
+            warn!(
+                pending = self.pending_len(),
+                hard_cap = self.hard_cap,
+                "disconnect backlog passed the hard cap; draining it inline, ignoring pacing (OBI-344)"
+            );
+            self.pending_len()
+        } else {
+            self.budget.min(self.pending.len())
+        };
+        // `count <= pending.len()` by both branches above.
+        let due: Vec<u64> = self.pending.drain(..count).collect();
+        self.last_pass = Some(now);
+        due
+    }
+
+    /// Every queued teardown, oldest first, ignoring pacing: the flush the
+    /// ordering rule and every snapshot/shutdown path call. Bounded by the
+    /// queue length, so it cannot re-enter the arm that calls it.
+    fn take_all(&mut self, now: std::time::Instant) -> Vec<u64> {
+        let all: Vec<u64> = self.pending.drain(..).collect();
+        self.last_pass = Some(now);
+        all
+    }
+
+    /// Run [`Self::take_due`]'s teardowns; returns how many ran.
+    fn run_due_disconnects(&mut self, world: &mut World, host: &mut dyn Host) -> usize {
+        let due = self.take_due(std::time::Instant::now());
+        for conn in &due {
+            world.disconnect(*conn, host);
+        }
+        due.len()
+    }
+
+    /// Run [`Self::take_all`]'s teardowns (see that method for when);
+    /// returns how many ran.
+    fn run_pending_disconnects(&mut self, world: &mut World, host: &mut dyn Host) -> usize {
+        let all = self.take_all(std::time::Instant::now());
+        for conn in &all {
+            world.disconnect(*conn, host);
+        }
+        all.len()
+    }
+}
+
+/// Pure config parse behind [`DisconnectDrain::from_env`]: unset or
+/// unparseable values keep the defaults, out-of-range values clamp.
+fn parse_disconnect_drain_config(
+    budget: Option<&str>,
+    interval_ms: Option<&str>,
+) -> (usize, Duration) {
+    let budget = budget
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, DISCONNECT_BUDGET_MAX))
+        .unwrap_or(DISCONNECT_BUDGET_PER_ITERATION);
+    let interval = interval_ms
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|n| Duration::from_millis(n.min(DISCONNECT_INTERVAL_MAX_MS)))
+        .unwrap_or(DISCONNECT_DRAIN_MIN_INTERVAL);
+    (budget, interval)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_world_thread(
     mudlib_root: PathBuf,
@@ -3249,10 +3459,13 @@ fn spawn_world_thread(
                 .unwrap_or(false);
             let mut seen_errors: std::collections::HashSet<(String, String, u32, u64)> =
                 std::collections::HashSet::new();
+            // OBI-344 half (b): queued `NetEvent::Disconnected` teardowns and
+            // their pacing -- see `DisconnectDrain`'s doc comment.
+            let mut disconnect_drain = DisconnectDrain::from_env();
 
             while let Some(event) = event_rx.blocking_recv() {
                 let iter_started = std::time::Instant::now();
-                let iter_kind = match &event {
+                let mut iter_kind = match &event {
                     NetEvent::Tick => loom_obs::WorldEventKind::Tick,
                     NetEvent::Line(..) => loom_obs::WorldEventKind::Input,
                     NetEvent::Connected(..) => loom_obs::WorldEventKind::Connect,
@@ -3261,10 +3474,25 @@ fn spawn_world_thread(
                         loom_obs::WorldEventKind::Negotiation
                     }
                 };
+                // Teardowns this iteration ran, from either drain call below.
+                // Attribution reports them under `Disconnect` even when the
+                // event that woke the iteration was a `Tick` or a `Line`: a
+                // `stalls{kind="disconnect"}` count must mean "iterations that
+                // did disconnect work", which is the thing OBI-348 has to
+                // make cheap.
+                let mut disconnects_run = 0usize;
+                // The drain's ordering rule: `World::connect` binds the new
+                // session's object, and a teardown still queued behind it
+                // would clear that fresh binding. Runs before the match, so
+                // no connect can ever precede a pending disconnect.
+                if matches!(event, NetEvent::Connected(_)) {
+                    disconnects_run += disconnect_drain.run_pending_disconnects(&mut world, &mut host);
+                }
                 match event {
                     NetEvent::Connected(conn) => world.connect(conn, &mut host),
                     NetEvent::Line(conn, line) => world.input(conn, &line, &mut host),
-                    NetEvent::Disconnected(conn) => world.disconnect(conn, &mut host),
+                    // Queued, not run: see `DisconnectDrain`.
+                    NetEvent::Disconnected(conn) => disconnect_drain.push(conn),
                     NetEvent::Tick => {
                         world.tick(&mut host);
                         if error_log_enabled {
@@ -3354,6 +3582,13 @@ fn spawn_world_thread(
                         debug!(conn, module, "GMCP message");
                     }
                 }
+                // OBI-344 half (b): the paced teardown pass. Deliberately
+                // *after* the event handler, so the one teardown this
+                // iteration is allowed to run lands inside the span
+                // `world_probe` measures below, and *before* the side-channel
+                // drains, so a queued disconnect can never outrank a db/audit
+                // /file-op reply that some session is waiting on.
+                disconnects_run += disconnect_drain.run_due_disconnects(&mut world, &mut host);
                 // OBI-123: the roles snapshot's own swap-in point -- checked
                 // every loop iteration (cheap: `watch::Receiver::has_changed`
                 // never awaits), so a reload from `run_roles_manager` takes
@@ -3372,6 +3607,13 @@ fn spawn_world_thread(
                 // never-sent) channel costs nothing and a request can
                 // never stall a tick waiting on it.
                 while let Ok(reply_tx) = snapshot_req_rx.try_recv() {
+                    // OBI-344 half (b): a snapshot must not be taken while
+                    // disconnect teardowns are still queued -- their
+                    // autosaves/`net_dead` would describe a session the
+                    // snapshot already calls gone, and a copyover that lost
+                    // the process would lose the save with it. Bounded by the
+                    // queue length, so this cannot re-enter the drain.
+                    disconnects_run += disconnect_drain.run_pending_disconnects(&mut world, &mut host);
                     let result = world
                         .begin_snapshot()
                         .map_err(|err| err.to_string())
@@ -3467,6 +3709,11 @@ fn spawn_world_thread(
                     req.respond(result);
                 }
 
+                if disconnects_run > 0 {
+                    // The cost of this iteration was disconnect work, whatever
+                    // event woke it (see `disconnects_run`'s declaration).
+                    iter_kind = loom_obs::WorldEventKind::Disconnect;
+                }
                 world_probe.record_iteration(
                     iter_kind,
                     iter_started,
@@ -3474,6 +3721,10 @@ fn spawn_world_thread(
                     loom_obs::world::unix_ms(),
                 );
             }
+            // The event channel is closed: the net task is gone (shutdown,
+            // or a copyover handover). Nothing may still be queued -- a
+            // teardown left here is a character whose autosave never ran.
+            disconnect_drain.run_pending_disconnects(&mut world, &mut host);
         })
         .map_err(|err| format!("failed to spawn world thread: {err}"))?;
     ready_rx
@@ -3813,6 +4064,170 @@ mod tick_timer_tests {
         assert!(event_rx.try_recv().is_err());
 
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod disconnect_drain_tests {
+    use super::*;
+
+    const PACE: Duration = Duration::from_millis(50);
+
+    fn drain(budget: usize, interval: Duration) -> DisconnectDrain {
+        DisconnectDrain::new(budget, interval)
+    }
+
+    /// The behaviour a single `quit` must keep: the teardown is due in the
+    /// very iteration that queued it, so `net_dead()`/autosave still run
+    /// before the next tick, exactly as before OBI-344 half (b).
+    #[test]
+    fn a_lone_teardown_is_due_in_the_iteration_that_queued_it() {
+        let mut d = drain(1, PACE);
+        let t = std::time::Instant::now();
+        d.push(7);
+        assert_eq!(d.take_due(t), vec![7]);
+        // Nothing left to run, and the queue is empty again.
+        assert_eq!(d.take_due(t), Vec::<u64>::new());
+        assert_eq!(d.pending_len(), 0);
+    }
+
+    /// The fairness property the whole change exists for: with 150 sessions
+    /// dropped at once, no single iteration carries more than `budget`
+    /// teardowns, and the backlog is walked oldest-first.
+    #[test]
+    fn a_backlog_runs_one_teardown_per_pass_and_is_paced() {
+        let mut d = drain(1, PACE);
+        let t = std::time::Instant::now();
+        for conn in 0..150 {
+            d.push(conn);
+        }
+        let mut ran = d.take_due(t);
+        assert_eq!(ran, vec![0], "the queueing iteration runs exactly one");
+        assert!(
+            d.take_due(t + PACE / 2).is_empty(),
+            "a pass ran inside the pacing interval"
+        );
+        assert!(
+            d.take_due(t + PACE - Duration::from_micros(1)).is_empty(),
+            "the pacing boundary is not inclusive"
+        );
+        let mut now = t + PACE;
+        while d.pending_len() > 0 {
+            let pass = d.take_due(now);
+            assert!(
+                pass.len() <= 1,
+                "one iteration carried {} teardowns (budget 1)",
+                pass.len()
+            );
+            ran.extend(pass);
+            now += PACE;
+        }
+        assert_eq!(ran, (0..150).collect::<Vec<u64>>(), "FIFO order");
+    }
+
+    /// The ordering rule (see `DisconnectDrain`'s doc): a `Connected` must
+    /// never be handled with a teardown still queued behind it, pacing or
+    /// not -- otherwise `World::connect`'s fresh binding gets clobbered by
+    /// the deferred `World::disconnect`.
+    #[test]
+    fn the_flush_ignores_pacing_and_drains_fifo() {
+        let mut d = drain(1, PACE);
+        let t = std::time::Instant::now();
+        for conn in [1, 2, 3] {
+            d.push(conn);
+        }
+        assert_eq!(d.take_due(t), vec![1]);
+        assert_eq!(
+            d.take_all(t + Duration::from_millis(1)),
+            vec![2, 3],
+            "a flush 1 ms after a pass must still take the whole backlog"
+        );
+        assert_eq!(d.pending_len(), 0);
+    }
+
+    /// Raising the budget batches, but never past what was asked for.
+    #[test]
+    fn a_larger_budget_batches_but_never_exceeds_it() {
+        let mut d = drain(4, Duration::ZERO);
+        let t = std::time::Instant::now();
+        for conn in 0..10 {
+            d.push(conn);
+        }
+        assert_eq!(d.take_due(t), vec![0, 1, 2, 3]);
+        assert_eq!(d.take_due(t), vec![4, 5, 6, 7]);
+        assert_eq!(d.take_due(t), vec![8, 9]);
+        assert_eq!(d.take_due(t), Vec::<u64>::new());
+    }
+
+    /// A queue deeper than the cap is no longer a fairness problem, it is
+    /// dying sessions that never get told they are dead: the cap trades the
+    /// pacing away rather than letting staleness grow unbounded.
+    #[test]
+    fn past_the_hard_cap_the_pacing_is_abandoned() {
+        let mut d = drain(1, PACE);
+        d.hard_cap = 4;
+        let t = std::time::Instant::now();
+        for conn in 0..5 {
+            d.push(conn);
+        }
+        assert_eq!(d.take_due(t), (0..5).collect::<Vec<u64>>());
+        assert_eq!(d.pending_len(), 0);
+    }
+
+    /// `last_pass` only moves when a pass actually ran, so a server that has
+    /// been quiet for hours never makes a lone logout wait for the interval.
+    #[test]
+    fn an_empty_queue_does_not_move_the_pacing_clock() {
+        let mut d = drain(1, PACE);
+        let t = std::time::Instant::now();
+        assert!(d.take_due(t).is_empty());
+        d.push(3);
+        d.push(4);
+        assert_eq!(d.take_due(t + Duration::from_millis(1)), vec![3]);
+    }
+
+    /// The knobs an operator can set, without a rebuild, and what they
+    /// cannot be talked into.
+    #[test]
+    fn config_defaults_clamps_and_ignores_garbage() {
+        assert_eq!(
+            parse_disconnect_drain_config(None, None),
+            (
+                DISCONNECT_BUDGET_PER_ITERATION,
+                DISCONNECT_DRAIN_MIN_INTERVAL
+            )
+        );
+        assert_eq!(
+            parse_disconnect_drain_config(Some(" 8 "), Some("0")),
+            (8, Duration::ZERO),
+            "0 ms must mean 'pace nothing', not 'fall back to the default'"
+        );
+        assert_eq!(
+            parse_disconnect_drain_config(Some("0"), Some("999999")),
+            (1, Duration::from_millis(DISCONNECT_INTERVAL_MAX_MS))
+        );
+        assert_eq!(
+            parse_disconnect_drain_config(Some("65"), Some("nope")),
+            (DISCONNECT_BUDGET_MAX, DISCONNECT_DRAIN_MIN_INTERVAL)
+        );
+        assert_eq!(
+            parse_disconnect_drain_config(Some("-1"), Some("")),
+            (
+                DISCONNECT_BUDGET_PER_ITERATION,
+                DISCONNECT_DRAIN_MIN_INTERVAL
+            )
+        );
+    }
+
+    /// The `budget` a caller asks for is never 0: a 0-budget drain would
+    /// queue teardowns forever, which is the unsaved-character bug, not a
+    /// pacing knob.
+    #[test]
+    fn a_zero_budget_code_still_runs_one_per_pass() {
+        let mut d = drain(0, PACE);
+        let t = std::time::Instant::now();
+        d.push(9);
+        assert_eq!(d.take_due(t), vec![9]);
     }
 }
 

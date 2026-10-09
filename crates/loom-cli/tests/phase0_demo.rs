@@ -93,6 +93,98 @@ fn phase0_exit_demo_walks_and_hot_updates_without_disconnect() {
     server.assert_alive();
 }
 
+/// OBI-344 half (b): a dropped session's teardown is queued and paced, so
+/// it never sits in front of the world loop's other work -- and it still
+/// runs.
+///
+/// `warp-phase0`'s `/std/player::net_dead()` announces "<name> leaves the
+/// game." to the room, which makes the deferred work observable from a
+/// session that stays connected. With `LOOM_WORLD_DISCONNECT_INTERVAL_MS`
+/// raised to 3000 ms, the second drop lands inside the first teardown's
+/// pacing interval: the world loop must answer an ordinary `look` *without*
+/// having run that teardown (before this change, `World::disconnect` --
+/// `autosave()` then `net_dead()` -- ran inside the `Disconnected` arm, so
+/// the departure line was already on its way and, at E1.1's scale, everything
+/// behind it waited ~4.9 s). The queued teardown then still gets run: by the
+/// next connection's flush (the drain's ordering rule) or by the following
+/// paced pass, whichever comes first -- both are asserted here only as "the
+/// announcement arrives", which is what a player cares about.
+#[test]
+fn a_paced_teardown_does_not_stand_in_front_of_the_world_loop() {
+    let mudlib = fixture("warp-phase0");
+    let port = reserve_local_port();
+    let bind = format!("127.0.0.1:{port}");
+
+    let mut server = LoomServer::spawn_with_env(
+        &mudlib,
+        &bind,
+        &[("LOOM_WORLD_DISCONNECT_INTERVAL_MS", "3000")],
+    );
+
+    // The observer: stays connected throughout, sits in the Entrance Hall,
+    // and therefore sees every arrival/departure announcement.
+    let observer = connect_with_retry(&bind, Duration::from_secs(5));
+    observer
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set read timeout");
+    let mut observer = BufReader::new(observer);
+    let intro = read_until_contains(&mut observer, INTRO_EXITS, Duration::from_secs(5));
+    assert!(intro.contains(HALL_DESC), "{intro}");
+
+    // Session 1: connect and drop. This teardown is the *first* pass, so it
+    // runs in the same iteration -- a lone `quit` keeps today's exact
+    // semantics, and this is what arms the pacing clock for session 2.
+    let first = connect_with_retry(&bind, Duration::from_secs(5));
+    let mut first_reader = BufReader::new(first);
+    let first_hello = read_until_contains(&mut first_reader, INTRO_EXITS, Duration::from_secs(5));
+    let first_name = extract_guest_name(&first_hello).expect("guest name for session 1");
+    drop(first_reader);
+    let first_gone = read_until_contains(
+        &mut observer,
+        &format!("{first_name} leaves the game"),
+        Duration::from_secs(5),
+    );
+    assert!(first_gone.contains("leaves the game"), "{first_gone}");
+
+    // Session 2: dropped immediately after, i.e. well inside the 3000 ms
+    // pacing interval that session 1's pass just started.
+    let second = connect_with_retry(&bind, Duration::from_secs(5));
+    let mut second_reader = BufReader::new(second);
+    let second_hello = read_until_contains(&mut second_reader, INTRO_EXITS, Duration::from_secs(5));
+    let second_name = extract_guest_name(&second_hello).expect("guest name for session 2");
+    drop(second_reader);
+
+    // The world loop is serving everyone else while that teardown waits:
+    // `look` comes back, and the departure announcement is *not* in what
+    // arrived with it. This assertion is what fails without the drain.
+    send_line(&mut observer, "look");
+    let looked = read_until_contains(&mut observer, HALL_DESC, Duration::from_secs(2));
+    assert!(looked.contains("The Entrance Hall"), "{looked}");
+    assert!(
+        !looked.contains(&format!("{second_name} leaves")),
+        "session 2's teardown ran inline instead of being queued and paced: {looked}"
+    );
+
+    // It still runs. A new connection must flush the queue first (ordering
+    // rule: no session may bind an object while its teardown is pending), so
+    // the observer hears about session 2 now, at the latest on the next
+    // paced pass.
+    let third = connect_with_retry(&bind, Duration::from_secs(5));
+    let mut third_reader = BufReader::new(third);
+    let _ = read_until_contains(&mut third_reader, INTRO_EXITS, Duration::from_secs(5));
+    let second_gone = read_until_contains(
+        &mut observer,
+        &format!("{second_name} leaves the game"),
+        Duration::from_secs(5),
+    );
+    assert!(
+        second_gone.contains("leaves the game"),
+        "the queued teardown never ran: {second_gone}"
+    );
+
+    server.assert_alive();
+}
+
 fn rewrite_garden_description(mudlib: &Path, new_desc: &str) {
     let path = mudlib.join("domains/start/garden.wf");
     let src = std::fs::read_to_string(&path).expect("read garden source");
@@ -207,13 +299,17 @@ struct LoomServer {
 
 impl LoomServer {
     fn spawn(mudlib: &Path, bind: &str) -> Self {
+        Self::spawn_with_env(mudlib, bind, &[])
+    }
+
+    fn spawn_with_env(mudlib: &Path, bind: &str, extra_env: &[(&str, &str)]) -> Self {
         let loom_bin = std::env::var("CARGO_BIN_EXE_loom-cli")
             .or_else(|_| std::env::var("CARGO_BIN_EXE_loom_cli"))
             .expect("cargo binary path for loom-cli");
         let http_port = reserve_local_port();
 
-        let child = Command::new(loom_bin)
-            .arg("serve")
+        let mut cmd = Command::new(loom_bin);
+        cmd.arg("serve")
             .arg("--mudlib")
             .arg(mudlib)
             .env("LOOM_TELNET_ADDR", bind)
@@ -221,11 +317,14 @@ impl LoomServer {
             .env("RUST_LOG", "")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn loom serve");
+            .stderr(Stdio::null());
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
 
-        Self { child }
+        Self {
+            child: cmd.spawn().expect("spawn loom serve"),
+        }
     }
 
     fn assert_alive(&mut self) {
