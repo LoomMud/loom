@@ -186,6 +186,50 @@ concurrency:
 # On the skip path the job writes a summary saying the green is "not
 # applicable", not "measured", which is the whole point of keeping the check.
 #
+#
+# ── Who has to wait, stage two: ask the compiler (OBI-397) ─────────────────────
+# A table of paths is hand-maintained, so it can only speak about *files*. On
+# `crates/*/src/**` its answer is "driver or load-bot source" whether the commit
+# rewrites the scheduler or adds a doc comment -- and a PR that touches a
+# `#[cfg(test)]` module under `src/` cannot be lane-skipped, because the
+# allow-list would then allow-list the whole of the driver. That is not
+# hypothetical: the sample week in results/2026-10-09-load-lane-before-after.md
+# has 38 PR runs holding a lane place, 21 of them (70.3 of 110.0 lane minutes)
+# carried by source alone, and the one that prompted this -- PR #160, six files,
+# 1289 added lines, all test harness or dead code -- waited six lane places for
+# a measurement of a binary it had not changed.
+#
+# So the lane-verdict diffs that are *purely* source get a second stage, and it
+# is not another guess. `loadtest-e1-1` runs exactly two programs, built by
+# exactly one command. `scripts/load-lane-identity.py` runs that command at the
+# merge base and at the PR head and compares the SHA-256 of both artefacts:
+# identical bytes means the 150-player run would measure the same program that
+# already has a recorded p99, so there is nothing to learn from the lane. This
+# is the compiler's own answer instead of a model of it: `#[cfg(test)]` code,
+# doc comments, macros, generics that were never instantiated and dead code the
+# optimiser removes all come out of the artefact, and no `#[cfg(test)]` span
+# parser has to be right the first time.
+#
+# What the hash is allowed to speak for is decided by the table itself, not a
+# second list: stage two may ask only when, after dropping every path the table
+# already waves through, what remains is `crates/*/src/*.rs`. That leaves
+# `Cargo.lock`/`Cargo.toml`/`.cargo/`/`rust-toolchain.toml` (what gets compiled),
+# `warp.ref` and `mudlib/**` (what the *driver reads* -- a bump there moves p99
+# with byte-identical binaries, which is exactly the hole OBI-326 closed), and
+# `crates/*/benches/*.rs`, `scripts/bench-gate.sh`, `scripts/bench_compare.py`
+# (a *different* measurement sharing this lane) permanently in stage one's hands.
+#
+# Where the proof came from matters as much as the proof, so the `classify` job
+# carries it: same toolchain pin, same `Swatinem/rust-cache`, same build command
+# string as `loadtest-e1-1` (rules 12 and 13 of `scripts/check-ci-load-lane.py`
+# diff those three against the gate's own steps, so the proof cannot drift away
+# from what it claims to predict). The job's verdict is the *merge* of the two
+# stages and the merge is one-directional: a matching hash can downgrade
+# "relevant" to "skip", and nothing can upgrade a skip. Every non-answer --
+# build failure, timeout, dirty tree, unreadable range, a dead proof step --
+# says `same=false` and the lane is taken, and the `verdict` step is the last
+# step with no `if:` so the outputs are always written rather than skipped.
+#
 # These invariants are enforced by scripts/check-ci-load-lane.py, run in the
 # `hygiene` job below -- rule 8 there pins the escape hatch, both copies of it,
 # and the fail-closed comparison. Which runs may be cancelled *at all* is the
@@ -384,7 +428,7 @@ jobs:
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" -o "$workdir/gitleaks.tar.gz"
           tar -xzf "$workdir/gitleaks.tar.gz" -C "$workdir" gitleaks
           "$workdir/gitleaks" git --redact --exit-code 1 .
-      - name: CI load lane invariants (OBI-308, workflow-level cancel OBI-313, lane escape OBI-325, mudlib pin OBI-326)
+      - name: CI load lane invariants (OBI-308, workflow-level cancel OBI-313, lane escape OBI-325, mudlib pin OBI-326, lane identity OBI-397)
         # The latency gates in this workflow are only meaningful on a quiet
         # host. Keep the lane (concurrency group + DAG order + "no required
         # check may be skipped") from rotting silently, and keep the
@@ -546,11 +590,23 @@ jobs:
     # measure". A classifier that cannot decide delays merges; it does not
     # silently wave a regression through.
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
-    timeout-minutes: 10
+    # The proof is two release builds (about 50 s warm each, and a cold workspace
+    # is under 4 min), so the budget is 2 x the script's own 900 s per-build cap
+    # plus setup. The cap inside the script must fire first -- rule 13 pins it --
+    # because a job that Actions kills writes no output, `runtime` comes out empty,
+    # and the gate takes the lane. That is the right *direction*, but it is a
+    # warning-free way to spend 30 minutes of someone's queue on a diff the
+    # compiler could have cleared in 40 seconds.
+    timeout-minutes: 45
     outputs:
-      runtime: ${{ steps.decide.outputs.runtime }}
-      reason: ${{ steps.decide.outputs.reason }}
+      runtime: ${{ steps.verdict.outputs.runtime }}
+      reason: ${{ steps.verdict.outputs.reason }}
       files: ${{ steps.decide.outputs.files }}
+      # Diagnostics only: no job reads these, and nothing may `needs:` them --
+      # the merge below is the only place a stage-two answer is allowed to
+      # change what the lane does.
+      identity_scope: ${{ steps.decide.outputs.identity }}
+      identity_proof: ${{ steps.prove.outputs.same }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -606,6 +662,78 @@ jobs:
           # is the economics: an undecided diff must fail *toward* the lane (the
           # fallback above writes `runtime=true`), and the warning is what makes
           # that cost visible instead of silent.
+          exit 0
+      # ── stage two (OBI-397): put the question to the compiler ──────────────
+      # Three steps that only exist for a *lane-verdict that is pure source* on a
+      # pull request, and every one of them is tolerated: a proof that cannot run
+      # writes no `same=true`, which the merge below reads as "not proven, so
+      # measure". `main` pushes are excluded by the `if:` and by rule 8 -- the
+      # Phase 1 exit criterion wants a real p99 per release, and a merge to main
+      # is where a regression has to land, so the last word on a push is never a
+      # 40-second build on a different checkout.
+      - name: identity proof toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-27)
+        if: ${{ steps.decide.outputs.runtime == 'true' && steps.decide.outputs.identity == 'true' && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        with:
+          # Pinned, and rule 12 compares this string with the gate's own step: a
+          # proof built by a different rustc predicts nothing about the binary
+          # E1.1 measured.
+          toolchain: "1.98.1"
+      - name: identity proof build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: ${{ steps.decide.outputs.runtime == 'true' && steps.decide.outputs.identity == 'true' && github.event_name == 'pull_request' }}
+        continue-on-error: true
+      - name: prove the release build is unchanged
+        id: prove
+        if: ${{ steps.decide.outputs.runtime == 'true' && steps.decide.outputs.identity == 'true' && github.event_name == 'pull_request' }}
+        env:
+          # `base.sha` and `github.sha`: the *merge commit the run is
+          # measuring*, not `pull_request.head.sha`. E1.1 builds and drives
+          # this checkout, so "identical to the merge base" has to be said
+          # about the tree E1.1 will actually test -- and the merge commit is
+          # what `actions/checkout` leaves in HEAD, which is the provenance the
+          # script insists on.
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          # No `--offline`: the gate's build step does not use it either, and the
+          # proof has to fail the same way the thing it predicts would.
+          # 1980 = 2 x the script's own 900 s per-build cap + 3 min of slack, and
+          # less than this job's 45 min (rule 13). Whichever fires first the answer
+          # is "not proven", which takes the lane.
+          timeout -k 30 1980 python3 scripts/load-lane-identity.py \
+            --base "$BASE" --head "$HEAD" --output-file "$GITHUB_OUTPUT" --summary \
+            || echo 'same=false' >> "$GITHUB_OUTPUT"
+          echo "identity proof: $(grep '^same=' "$GITHUB_OUTPUT" 2>/dev/null || echo 'same=false')"
+          exit 0
+      - name: verdict
+        id: verdict
+        env:
+          TABLE_RUNTIME: ${{ steps.decide.outputs.runtime }}
+          TABLE_REASON: ${{ steps.decide.outputs.reason }}
+          SCOPE: ${{ steps.decide.outputs.identity }}
+          SAME: ${{ steps.prove.outputs.same }}
+          PROOF_REASON: ${{ steps.prove.outputs.reason }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -uo pipefail
+          runtime="$TABLE_RUNTIME"
+          reason="$TABLE_REASON"
+          # One direction only. A byte-identical release build may clear the lane
+          # for a diff the table could not decide; nothing here can turn a table
+          # "skip" into a measurement, because that verdict is already the
+          # cheaper-and-safer answer. `[ "$SAME" = true ]` is the whole proof: an
+          # absent output (no python, dead step, capped build, failed checkout)
+          # is not `true`, so the lane is taken.
+          if [ "$EVENT" = pull_request ] && [ "$SCOPE" = true ] \
+             && [ "$runtime" != false ] && [ "$SAME" = true ]; then
+            runtime=false
+            reason="stage two: $PROOF_REASON"
+          fi
+          { echo "runtime=$runtime"; echo "reason=$reason"; } >> "$GITHUB_OUTPUT" 2>/dev/null || true
+          echo "load-lane verdict: runtime=$runtime ($reason)"
           exit 0
 
   loadtest-smoke:
