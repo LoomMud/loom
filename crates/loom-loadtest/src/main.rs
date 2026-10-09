@@ -589,3 +589,17 @@ mod tests {
         assert!(err.contains("--note"), "unexpected error text: {err}");
     }
 }
+
+// OBI-397 evidence, not OBI-397 code: a `#[cfg(test)]` module at the end of a
+// file the path table calls runtime-relevant. It must cost no lane slot, because
+// `cargo build --release` cannot see it -- which is the whole claim stage two
+// makes, tested in the real topology rather than asserted in a PR body. Delete
+// this branch once the CI run is recorded.
+#[cfg(test)]
+mod lane_identity_probe {
+    #[test]
+    fn cfg_test_weight_reaches_no_release_binary() {
+        let measured = ["loom-cli", "loom-loadtest"];
+        assert_eq!(measured.len(), 2);
+    }
+}
