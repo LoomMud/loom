@@ -592,6 +592,19 @@ jobs:
           if [ "$saved" -eq 0 ]; then
             echo "::warning title=OBI-344 save path not exercised::no save objects were written to $SAVES; E1.1 is not measuring character persistence"
           fi
+          # OBI-344: what the world thread did, independent of whether the
+          # sampled latency noticed. A stall while all 150 sessions are being
+          # torn down lands *after* --duration-secs, so it cannot reach p99 at
+          # all -- and a green verdict would otherwise read as "the world thread
+          # never blocked". Printed, and annotated as a warning; it does not
+          # decide pass/fail, the p99 verdict does.
+          durmax=$(awk '/^loom_world_loop_duration_ms_max/ {print $2; exit}' /tmp/loom-metrics-final.txt)
+          stalls=$(awk '/^loom_world_loop_stalls_total/ {s+=$2} END {printf "%d", s+0}' /tmp/loom-metrics-final.txt)
+          kinds=$(grep -oE 'kind="[a-z_]+"' /tmp/loom-metrics-final.txt | sed 's/kind="//;s/"//' | sort -u | tr '\n' ' ')
+          echo "world_loop: worst_iteration_ms=${durmax:-unknown} stall_events=${stalls:-0} kinds=${kinds:-none}"
+          if [ -n "$durmax" ] && [ "$(awk -v d="$durmax" 'BEGIN {print (d > 50) ? 1 : 0}')" = "1" ]; then
+            echo "::warning title=OBI-344 world-thread stall recorded::E1.1 recorded $stalls world-loop iteration(s) over the 50 ms stall budget, worst ${durmax} ms (kinds: ${kinds:-none}). Check whether they fall inside the sampled window before treating the p99 verdict as evidence about them."
+          fi
           exit $status
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
