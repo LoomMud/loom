@@ -150,37 +150,92 @@ async fn last_role_change_actor(owner: &PgPool, target_uid: &str) -> Option<Stri
         .expect("query role_changes")
 }
 
+/// How long a test waits for a row the driver has already decided to record.
+///
+/// OBI-354: the world thread flushes at most once per tick (100ms) and now
+/// *holds* a batch the sink cannot take, so a deferred row always arrives.
+/// What this budget has to cover is `run_audit_sink`'s own insert: it shares
+/// the world pool's 5 connections (sqlx's default `acquire_timeout` there is
+/// 30s) on a runner measured stretching this suite past two minutes. A budget
+/// under 30s cannot tell "written late" from "never written" -- the exact
+/// distinction OBI-354 has to make -- so it sits above the pool timeout.
+const AUDIT_ROW_BUDGET: Duration = Duration::from_secs(45);
+
+/// The newest `audit_log` arguments for `kind`/`verdict`, newest first.
+async fn audit_log_arguments(owner: &PgPool, kind: &str, verdict: &str) -> Vec<Option<String>> {
+    sqlx::query_scalar(
+        "SELECT argument FROM audit_log WHERE kind = $1 AND verdict = $2 \
+         ORDER BY id DESC LIMIT 50",
+    )
+    .bind(kind)
+    .bind(verdict)
+    .fetch_all(owner)
+    .await
+    .expect("query audit_log")
+}
+
 /// Poll `audit_log` for a row matching `kind`/`verdict` whose `argument`
 /// contains `needle`, up to `timeout` -- the sink flushes once per world
 /// tick (100ms), so this is never instantaneous.
+///
+/// On timeout the error says what `audit_log` *does* hold for that
+/// `kind`/`verdict` (OBI-354): a bare "expected a row" panic left a CI
+/// failure ambiguous between the row never being written, being written after
+/// the budget, and being written in a shape the test does not expect. Pair it
+/// with [`LoomServer::dump_log`] -- `run_audit_sink` logs every batch it
+/// writes at `debug!`, which settles "never" against "late".
 async fn poll_audit_log_row(
     owner: &PgPool,
     kind: &str,
     verdict: &str,
     needle: &str,
     timeout: Duration,
-) -> bool {
+) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
-    loop {
-        let rows: Vec<Option<String>> = sqlx::query_scalar(
-            "SELECT argument FROM audit_log WHERE kind = $1 AND verdict = $2 \
-             ORDER BY id DESC LIMIT 50",
-        )
-        .bind(kind)
-        .bind(verdict)
-        .fetch_all(owner)
-        .await
-        .expect("query audit_log");
+    let rows = loop {
+        let rows = audit_log_arguments(owner, kind, verdict).await;
         if rows
             .iter()
             .any(|a| a.as_deref().is_some_and(|a| a.contains(needle)))
         {
-            return true;
+            return Ok(());
         }
         if Instant::now() > deadline {
-            return false;
+            break rows;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_log")
+        .fetch_one(owner)
+        .await
+        .unwrap_or(0);
+    let newest: Vec<String> = rows
+        .iter()
+        .take(5)
+        .map(|a| a.clone().unwrap_or_else(|| "(null argument)".to_string()))
+        .collect();
+    Err(format!(
+        "nothing matched (kind={kind}, verdict={verdict}, argument containing {needle:?}) \
+         within {timeout:?}: {matched} row(s) carry that kind/verdict, {total} row(s) in \
+         `audit_log` overall, newest arguments {newest:?}",
+        matched = rows.len(),
+    ))
+}
+
+/// [`poll_audit_log_row`] with [`AUDIT_ROW_BUDGET`], dumping the server's own
+/// log into the failure so `audit_log batch written`/`insert failed` is right
+/// there in the CI output.
+async fn assert_audit_log_row(
+    owner: &PgPool,
+    kind: &str,
+    verdict: &str,
+    needle: &str,
+    server: &LoomServer,
+    what: &str,
+) {
+    if let Err(diag) = poll_audit_log_row(owner, kind, verdict, needle, AUDIT_ROW_BUDGET).await {
+        server.dump_log();
+        panic!("expected {what} in `audit_log`: {diag}");
     }
 }
 
@@ -275,17 +330,15 @@ fn mutation_from_secure_roles_reaches_sql_with_the_interactives_euid_as_actor() 
             Some(lead_uid.as_str()),
             "role_changes.actor must be the interactive's own euid, never a Weft string"
         );
-        assert!(
-            poll_audit_log_row(
-                &fx.owner,
-                "roles_set_tier",
-                "allow",
-                &format!("{member_uid} tier=2"),
-                Duration::from_secs(10),
-            )
-            .await,
-            "audit_log must have an allowed roles_set_tier row naming the operation and target"
-        );
+        assert_audit_log_row(
+            &fx.owner,
+            "roles_set_tier",
+            "allow",
+            &format!("{member_uid} tier=2"),
+            &server,
+            "an allowed roles_set_tier row naming the operation and target",
+        )
+        .await;
     });
 
     server.assert_alive();
@@ -480,17 +533,15 @@ fn audit_log_has_a_row_for_a_denied_p2_plus_check() {
     assert!(out.contains("denied"), "{out}");
 
     rt.block_on(async {
-        assert!(
-            poll_audit_log_row(
-                &fx.owner,
-                "write_file",
-                "deny",
-                &marker,
-                Duration::from_secs(10)
-            )
-            .await,
-            "expected a denied write_file audit_log row for {marker}"
-        );
+        assert_audit_log_row(
+            &fx.owner,
+            "write_file",
+            "deny",
+            &marker,
+            &server,
+            &format!("a denied write_file row for {marker}"),
+        )
+        .await;
     });
 
     server.assert_alive();
