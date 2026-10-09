@@ -54,13 +54,28 @@
     />
     <title>Loom IDE</title>
     <link rel="stylesheet" href="./ide.css" />
-    <link rel="stylesheet" href="./vendor/monaco/vs/editor/editor.main.css" />
+    <!--
+      The version in these two URLs is load-bearing, not a comment: it is
+      what lets `loom-http` serve this directory with
+      `Cache-Control: public, max-age=31536000, immutable` (OBI-338), which
+      is the only reason 21.9 MB of self-hosted Monaco is affordable on an
+      IDE load. `immutable` is safe exactly while the URL changes whenever
+      the bytes do, so the vendored tree is staged at a directory named for
+      the `monaco-editor` version this page needs.
+
+      Which means a bump edits this file. `scripts/vendor-monaco.mjs`
+      refuses to stage anything unless every reference here and in
+      `src/ide/amd-boot.ts` names the version it is staging, so forgetting
+      is a failed build rather than a year of 404s -- or, the other way
+      round, a year of cached bytes that belong to the version before.
+    -->
+    <link rel="stylesheet" href="./vendor/monaco/0.57.0/vs/editor/editor.main.css" />
     <!--
       External classic script only (M-IDE-1). It is `defer`red and loads
       Monaco's AMD loader before the app module; see `src/ide/amd-boot.ts`
       for why this one file is not an ES module.
     -->
-    <script defer src="./vendor/monaco/vs/loader.js"></script>
+    <script defer src="./vendor/monaco/0.57.0/vs/loader.js"></script>
     <script type="module" src="./dist/ide/amd-boot.js"></script>
   </head>
   <body>
