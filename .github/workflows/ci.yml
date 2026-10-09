@@ -88,7 +88,7 @@ concurrency:
 # bench -- so the three never overlap inside one run either. The required gate
 # goes first in the chain: nothing may skip it or make it optional, and the one
 # permitted `needs:` on it is `classify`, the OBI-325 job below that decides
-# whether this diff has to be measured at all -- permitted because rule 7 of
+# whether this diff has to be measured at all -- permitted because rule 8 of
 # scripts/check-ci-load-lane.py proves `classify` cannot be skipped and cannot
 # fail-open, and it has no `if:` of its own. `rust`/`deny`/`dco`/`hygiene` (the
 # other required checks) stay outside the lane and unscheduled so they can never
@@ -137,7 +137,7 @@ concurrency:
 # (or treating it as an input) is OBI-326.
 #
 # `.github/**` itself is on the irrelevant list, and that is only honest because
-# of rule 8 of scripts/check-ci-load-lane.py: no job may install a `toolchain:`
+# of rule 9 of scripts/check-ci-load-lane.py: no job may install a `toolchain:`
 # that rust-toolchain.toml does not declare. The compiler is an input the lane
 # measures, so it gets exactly one place to change -- a file the classifier
 # counts as runtime-relevant -- and a workflow-only bump fails `hygiene` (a
@@ -152,7 +152,7 @@ concurrency:
 # applicable", not "measured", which is the whole point of keeping the check.
 #
 # These invariants are enforced by scripts/check-ci-load-lane.py, run in the
-# `hygiene` job below -- rule 7 there pins the escape hatch, both copies of it,
+# `hygiene` job below -- rule 8 there pins the escape hatch, both copies of it,
 # and the fail-closed comparison. Which runs may be cancelled *at all* is the
 # workflow-level `concurrency` block above, not anything in the lane.
 jobs:
@@ -636,7 +636,7 @@ jobs:
     # verdict means "queue and measure"; and the gate is the one that publishes
     # the verdict (`outputs.runtime`) for `loadtest-smoke` and `bench` to
     # inherit, so the three jobs always agree about whether this run holds the
-    # lane. Rule 7 of scripts/check-ci-load-lane.py pins both halves of that.
+    # lane. Rule 8 of scripts/check-ci-load-lane.py pins both halves of that.
     #
     # `needs:` and `if:` are a pair, and rule 4 checks the pair. Without the
     # `!cancelled()`, a `classify` that dies (lost runner, failed checkout,

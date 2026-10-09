@@ -14,7 +14,7 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      with `cancel-in-progress: false` (never kill a running measurement) and
      `queue: max` (a *cancelled* required check blocks a PR as hard as a
      failed one, so waiting runs must queue in FIFO, not replace each other);
-     or is in an OBI-325 escape group, which rule 7 pins to exactly the shape
+     or is in an OBI-325 escape group, which rule 8 pins to exactly the shape
      that still puts every runtime-relevant run in the lane;
   2. no other job may take that group -- unrelated work must not hold the
      lane that the latency gates are waiting on;
@@ -45,7 +45,17 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      labeling a PR would cancel its own running gate -- and the narrowing may
      not drop `opened` or `synchronize`, which is how a required check gets
      skipped under cover of "narrowing the trigger"; and
-  7. the OBI-325 lane escape (`needs: classify` + a conditional
+  7. in `loadtest-e1-1`, the p99 verdict is the only thing that fails the job:
+     the step saves the loadtest exit status, runs its post-run evidence tail
+     with errexit disabled, and re-asserts the saved status at the end. The
+     runner's default `bash --noprofile --norc -e -o pipefail` means one
+     non-zero command in that tail aborts the step *after* the verdict was
+     computed -- which is how main run 37862921160 (sha eaf9ceb) went red on a
+     p99 PASS of 21.47 ms: the world thread recorded zero stalls, so the scrape
+     had no `kind="..."` label, `grep -oE` exited 1, pipefail carried it through
+     the pipeline, and the command substitution failed the step. A gate that
+     goes red exactly when the world thread behaves is worse than no gate; and
+  8. the OBI-325 lane escape (`needs: classify` + a conditional
      `concurrency.group`) is only allowed in the shape that keeps the gate
      fail-closed: the `classify` job has nothing upstream of it, can never be
      skipped, and writes a verdict on every path (a job that dies mid-decision
@@ -58,10 +68,16 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      chain, and every step that could touch the measurement host is guarded by
      that same test -- an escaped group with unguarded steps is precisely the
      contention OBI-308 was written to stop; and
-  8. every `toolchain:` a job installs equals the channel `rust-toolchain.toml`
-     declares. Rule 8 is what makes `.github/**` safe to put on the skip list:
+  9. every `toolchain:` a job installs equals the channel `rust-toolchain.toml`
+     declares. Rule 9 is what makes `.github/**` safe to put on the skip list:
      the compiler is one of the inputs the lane measures, so the workflow may
-     not be a second, unsynced place to change it.
+     not be a second, unsynced place to change it; and
+ 10. no `${{ ... }}` that calls a status function (`cancelled()`, `always()`,
+     `failure()`, `success()`) may appear inside a `run:` block -- including
+     inside a shell comment there, because Actions expands expressions before
+     the shell sees them. One is a workflow file GitHub cannot compile: no job
+     runs, and on `pull_request` not even a check run appears, so required
+     checks do not go red, they vanish. PR #144 lost its CI to exactly this.
 
 Usage: check-ci-load-lane.py [.github/workflows/ci.yml]
 """
@@ -122,6 +138,12 @@ WF_GROUP_PREFIX = "github.workflow"
 WF_RUNID_FALLBACK = "github.run_id"
 WF_PR_SCOPED = ("github.ref", "github.head_ref", "github.event.pull_request.number")
 WF_PR_TEST = re.compile(r"github\.event_name\s*==\s*['\"]pull_request['\"]")
+# Rule 7: the E1.1 step's contract with the shell. The verdict is captured in
+# `status=$?` and re-asserted with `exit $status`; the evidence in between must
+# not be able to end the step, so it runs under `set +e`.
+E11_STATUS_CAPTURE = "status=$?"
+E11_VERDICT_EXIT = re.compile(r"^\s*exit \$status\s*$")
+E11_ERREXIT_OFF = re.compile(r"^\s*set \+e\s*$")
 WF_OTHER_EVENTS = ("push", "pull_request_target", "workflow_dispatch", "workflow_call",
                    "schedule", "repository_dispatch", "merge_request_event")
 
@@ -305,7 +327,7 @@ def lane_group_error(job, group):
 
 
 def check_classifier(jobs):
-    """Rule 7. The escape hatch is only safe while the classifier can fail
+    """Rule 8. The escape hatch is only safe while the classifier can fail
     *toward the lane* and every step that could load the host is guarded."""
     errors = []
     if CLASSIFIER not in jobs:
@@ -560,7 +582,7 @@ def declared_toolchain(root):
 
 
 def check_toolchain_pins(text, root):
-    """Rule 8: a job may not install a compiler the repo does not declare.
+    """Rule 9: a job may not install a compiler the repo does not declare.
 
     The toolchain is an input to what the lane measures, and OBI-325 put
     `.github/**` on the runtime-irrelevant list. Both are only true together if
@@ -602,7 +624,7 @@ def check_toolchain_pins(text, root):
 # file path, no logs) and `gh pr checks` reported nothing. A comment mentioning
 # `if: ${{ !cancelled() }}` inside the classifier's `run:` block was the whole
 # cause. Write the expression bare (`if: !cancelled()`) in a script instead --
-# rule 4 accepts both forms because GitHub itself does.
+# rule 4 accepts both forms because GitHub itself does. This is rule 10.
 STATUS_FUNCS = ("cancelled(", "always(", "failure(", "success(", "no_status(")
 
 
@@ -711,7 +733,7 @@ def check_text(text, root="."):
                           "an upstream failure would *skip* it, and GitHub counts a skipped "
                           "required check as passing -- a green that measured nothing. "
                           f"`{CLASSIFIER}` is the one exception, and only beside the "
-                          f"`if: ${{ GATE_IF }}` below plus rule 7.")
+                          f"`if: ${{ GATE_IF }}` below plus rule 8.")
         cond = if_expression(scalar(block, "if"))
         if job == "loadtest-e1-1":
             # The gate needs `needs: classify` and `if: !cancelled()` as a pair.
@@ -725,7 +747,7 @@ def check_text(text, root="."):
         elif cond is not None:
             errors.append(f"required check `{job}` has `if:` -- it can be skipped, and a "
                           "skipped required check counts as passing; only `loadtest-e1-1` may "
-                          f"carry `{GATE_IF}`, and only because rule 7 keeps its `needs:` "
+                          f"carry `{GATE_IF}`, and only because rule 8 keeps its `needs:` "
                           "unable to change the verdict")
         if scalar(block, "continue-on-error") == "true":
             errors.append(f"required check `{job}` sets continue-on-error: true")
@@ -733,6 +755,7 @@ def check_text(text, root="."):
     errors += check_classifier(jobs)
     errors += check_toolchain_pins(text, root)
     errors += check_run_block_expressions(text)
+    check_e11_verdict_isolation(jobs, errors)
 
     e11 = [l for l in jobs.get("loadtest-e1-1", []) if not l.lstrip().startswith("#")]
     body = "\n".join(e11)  # comments excluded: the flags must be in the command
@@ -742,6 +765,40 @@ def check_text(text, root="."):
                           "must keep measuring 150 players and failing on an SLA miss")
 
     return errors
+
+
+def check_e11_verdict_isolation(jobs, errors):
+    """Rule 7: nothing but the p99 verdict may fail `loadtest-e1-1`.
+
+    Requires the three-beat shape in the gate's shell step: capture the
+    loadtest exit status, disable errexit for everything that runs after the
+    verdict, and re-assert the captured status as the step's last act. Reads
+    shell lines with comments stripped, so prose about `exit $status` or
+    `set +e` cannot satisfy it -- that is how the check notices the shape rot
+    instead of being fooled by the comment that explains it.
+    """
+    block = jobs.get("loadtest-e1-1")
+    if block is None:
+        return  # rule 4 already reported the missing required check
+    shell = [l for l in block if not l.lstrip().startswith("#")]
+    capture = next((i for i, l in enumerate(shell) if E11_STATUS_CAPTURE in l), None)
+    if capture is None:
+        errors.append("`loadtest-e1-1` no longer captures the loadtest exit status "
+                      "(`status=$?`): without it the gate cannot separate 'the world "
+                      "missed its SLA' from 'some shell command in this step failed'")
+        return
+    exits = [i for i, l in enumerate(shell) if E11_VERDICT_EXIT.match(l)]
+    if not exits:
+        errors.append("`loadtest-e1-1` no longer ends its gate step with "
+                      "`exit $status`: the captured p99 verdict is dropped, so the "
+                      "step's exit code comes from whatever command ran last")
+        return
+    guards = [i for i, l in enumerate(shell) if E11_ERREXIT_OFF.match(l)]
+    if not any(capture < g < exits[-1] for g in guards):
+        errors.append("`loadtest-e1-1` runs its post-verdict evidence tail under "
+                      "errexit: one non-zero grep/awk in the reporting section aborts "
+                      "the step after the p99 verdict was already computed (main run "
+                      "37862921160 went red on a PASS this way)")
 
 
 # --- self-test ---------------------------------------------------------------
@@ -908,7 +965,15 @@ MUTANTS = [
     ("supersede trigger narrowed until `opened` is gone",
      lambda t: _sub(t, "types: [opened, synchronize, reopened]",
                     "    types: [synchronize, reopened]\n")),
-    # OBI-325: the lane escape. Each of these turns "this run cannot change what
+    # Rule 7 (#154/OBI-344). The first two are the shape main run 37862921160
+    # actually broke.
+    ("E1.1 evidence tail put back under errexit",
+     lambda t: _sub(t, "set +e", None)),
+    ("E1.1 gate step that drops the captured p99 verdict",
+     lambda t: _sub(t, "exit $status", "          exit 0\n")),
+    ("E1.1 gate step that stops saving the loadtest exit status",
+     lambda t: _sub(t, "status=$?", "          echo verdict-captured\n")),
+    # Rule 8: the lane escape. Each of these turns "this run cannot change what
     # the gate measures" into either an unmeasured regression (fail open), a
     # queue that skipped runs still sit in, or -- the worst -- a run that
     # skipped the queue and then measured on a loaded host anyway.

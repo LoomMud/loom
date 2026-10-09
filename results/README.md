@@ -331,8 +331,9 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
   headroom, that no required check became skippable or optional, and that the
   workflow-level block can only ever cancel a superseded `pull_request` run),
-  plus a `--self-test` of 50 mutations (51 cases, and one of them is the gate
-  losing its `if: ${{ !cancelled() }}`). Both run in the required `hygiene`
+  plus a `--self-test` of 55 mutations (56 cases, among them the gate losing its
+  `if: ${{ !cancelled() }}`, the three verdict-isolation beats #154 added, and a
+  `${{ }}` written inside a `run:` block). Both run in the required `hygiene`
   job, with the classifier's own path table (`scripts/load-lane-classify.py
   --self-test`, 36 cases: 30 classification rows plus 6 that build a throwaway
   git repo), so the lane cannot rot silently and the comment here
@@ -395,17 +396,17 @@ twice: through a conditional `concurrency.group` (runtime-relevant, or
 undecided, takes `loom-ci-load-lane`; irrelevant takes a `github.run_id`-scoped
 group no other run is in) and through the same test on every step that could put
 load on the host. Both halves are keyed on `!= 'false'` and never `== 'true'`,
-so a missing or unreadable verdict means "take the lane and measure". Rule 7 of
+so a missing or unreadable verdict means "take the lane and measure". Rule 8 of
 `scripts/check-ci-load-lane.py` pins the whole shape -- the expression, its
 run-scoped arm, the classifier's inability to be skipped or to fail the job, and
 a step guard beside every measurement -- because each of those has a fail-open
-mutation: 44 of them now, all run in `hygiene`.
+mutation: 55 of them now, all run in `hygiene`.
 
-Putting `.github/**` on the irrelevant list is only safe because of rule 8: the
+Putting `.github/**` on the irrelevant list is only safe because of rule 9: the
 workflow may not install a `toolchain:` that `rust-toolchain.toml` does not
 declare. The compiler is an input the lane measures, so it may have exactly one
 place where it is pinned -- and that file is runtime-relevant, which means a
-toolchain bump is measured instead of skipped. Before rule 8, bumping the
+toolchain bump is measured instead of skipped. Before rule 9, bumping the
 version in `ci.yml` alone would have changed what every later run builds and
 never entered the lane.
 
@@ -489,7 +490,7 @@ run at all -- a required check that never posts is what branch protection report
 as "waiting for status", which is why the merge order appeared to stall on a PR
 with five green checks an hour earlier. Fix (`cfef45e`): the bare expression in a
 script (`if: !cancelled()`), `${{ }}` kept only where GitHub evaluates it as a
-condition. Rule 11 of `check-ci-load-lane.py` now fails any `${{ }}` inside a
+condition. Rule 10 of `check-ci-load-lane.py` now fails any `${{ }}` inside a
 `run:` block that calls a status function, so the next time it is a red `hygiene`
 check with a sentence instead of an absent suite, and `actionlint` (1.7.7) flags
 the same class -- its `queue:` complaints are a schema lag behind the lane's own

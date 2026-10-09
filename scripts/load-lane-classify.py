@@ -34,7 +34,7 @@ regression. Three overlaps are resolved that way rather than by file type:
     the measurement are pinned by scripts/check-ci-load-lane.py, which runs in
     `hygiene` -- a required check with no `needs:` and no `if:` -- so weakening
     the gate fails CI instead of sailing past it unmeasured. The same script's
-    rule 8 keeps the one input the flags do not cover, the `toolchain:` the
+    rule 9 keeps the one input the flags do not cover, the `toolchain:` the
     workflow installs, equal to the channel `rust-toolchain.toml` declares --
     and that file *is* runtime-relevant, so a compiler bump is measured.
 

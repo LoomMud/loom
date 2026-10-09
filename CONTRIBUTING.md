@@ -94,7 +94,7 @@ follow:
   throwaway repo and asserts both halves, including the counterfactual that `-M`
   alone would have skipped it.
 - **CI does not get to pick its own compiler.** `.github/**` counts as
-  irrelevant, so `scripts/check-ci-load-lane.py` (rule 8, run by `hygiene`) also
+  irrelevant, so `scripts/check-ci-load-lane.py` (rule 9, run by `hygiene`) also
   requires every `toolchain:` the workflow installs to equal the channel in
   `rust-toolchain.toml`. Bump the compiler there, where the change is measured;
   a bump in `ci.yml` alone fails a required check.
@@ -132,7 +132,7 @@ Two things this does **not** change:
   placeholder run named after the file path with 0 jobs and no logs, plus
   `gh pr checks` reporting "no checks reported" -- which looks like Actions being
   stuck and is not (PR #144 lost its suite that way for a whole evening, 2026-10-09).
-  Rule 11 of `scripts/check-ci-load-lane.py` fails it in `hygiene`; write the
+  Rule 10 of `scripts/check-ci-load-lane.py` fails it in `hygiene`; write the
   expression bare in a script (`if: !cancelled()`) and keep `${{ }}` for YAML
   comments and real `if:` conditions. `actionlint` finds this class too.
 - **`ci.yml` and `scripts/check-ci-load-lane.py` are shared real estate.** OBI-311
