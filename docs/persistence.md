@@ -247,7 +247,9 @@ runs `cargo sqlx prepare` against it, then re-checks the macros offline from the
 cache it just wrote -- so a refresh that the default build cannot use fails
 there instead of in CI. Commit the resulting `git diff .sqlx` with the query
 change. `crates/loom-persist/tests/sqlx_offline_default.rs` guards both the
-config entry and the presence of the cache.
+config entry and the presence of the cache. The re-check still begins with
+`cargo clean -p loom-persist`: the mode is in cargo's fingerprint now, the
+contents of `.sqlx/` are not -- see the next section.
 
 The manual form, if you must use it, is the same prepare the script runs --
 connected as `loom_owner` (the schema owner: `loom_app` cannot `DESCRIBE` the
@@ -261,3 +263,63 @@ SQLX_OFFLINE=false DATABASE_URL=postgres://loom_owner:...@host/db \
 Note where `-p` goes: sqlx-cli 0.8's `prepare` has no package flag of its own,
 so the package and target filters belong after `--`, where they are handed to
 the `cargo check` it runs.
+
+### A live-DB build is a rebuild, not a cache hit (OBI-328)
+
+`force = false` keeps a live-DB build *available*; it does not make one
+*happen*. Cargo's fingerprint for a crate did not include `SQLX_OFFLINE`, and
+the `query!` macros are only re-expanded when the crate is recompiled, so an
+unchanged `loom-persist` answered a live-DB build straight from the cache.
+Measured with a closed localhost port as `DATABASE_URL`, so that any dial is
+loud -- the same probe `scripts/check-sqlx-cache-modes.sh` runs:
+
+```text
+before  SQLX_OFFLINE=false, unchanged crate -> Fresh loom-persist, Finished in 0.14s,
+                                                exit 0, no dial at all
+after   SQLX_OFFLINE=false, unchanged crate -> Dirty loom-persist ...: the env variable
+                                                SQLX_OFFLINE changed, then
+                                                error communicating with database:
+                                                Connection refused (os error 111)
+```
+
+[`crates/loom-persist/build.rs`](../crates/loom-persist/build.rs) is the fix. It
+names the variables the macros read (`cargo:rerun-if-env-changed=SQLX_OFFLINE`,
+plus `DATABASE_URL` when live and `SQLX_OFFLINE_DIR` when offline, and the
+`.env` files sqlx falls back to), so a mode change re-runs the build script --
+which recompiles the crate, which re-expands the macros. The mode-dependent
+watches are emitted only in the mode that reads them, so an unrelated
+`DATABASE_URL` change on a normal offline build still costs nothing (verified:
+the offline artifact is reused, `Finished` in 0.12s).
+
+Three limits, all measured rather than assumed:
+
+- **A `.env` that appears *after* a build is invisible until the next
+  rebuild.** Only `.env` files that exist get a `cargo:rerun-if-changed`, because
+  naming a missing path makes cargo re-run the script and recompile
+  `loom-persist` on every invocation (measured: 0.27 s of `Compiling
+  loom-persist` per build). The mode itself cannot come from `.env` anyway -- the
+  workspace `[env]` pin is always in the environment cargo hands to rustc -- and
+  a live build is told its URL explicitly, so this costs nothing in practice.
+- **The contents of `.sqlx/` are still not tracked.** Edit a cached query file
+  with unchanged sources and the build is a cache hit (`Finished in 0.14s` with
+  a deliberately unparseable `describe.parameters.Left`); only
+  `cargo clean -p loom-persist` makes the macros re-read it (`error: unknown
+  variant BogusType`). That is why step 4 of `scripts/sqlx-prepare.sh` still
+  cleans the package, and why "the cache is committed" is not evidence that the
+  cache was validated.
+- **`SQLX_OFFLINE=false` with no `DATABASE_URL` is not a live build.** sqlx 0.8
+  falls back to the cache and exits 0 -- its "set `DATABASE_URL` to use query
+  macros online" error only fires for a query with no cached entry. Always pass
+  a URL you own explicitly; `scripts/sqlx-prepare.sh` and the guard script do.
+
+The guard is a CI step in the `rust` job (`scripts/check-sqlx-cache-modes.sh`)
+and can be run anywhere; it is red without the build script and green with it.
+[`tests/sqlx_offline_default.rs`](../crates/loom-persist/tests/sqlx_offline_default.rs)
+fails if the build script or one of its directives disappears. A unit test
+cannot prove the cargo behaviour itself: `cargo test` holds the build-directory
+lock, so a nested `cargo check` would deadlock on it.
+
+Build scripts are per-package, so this covers `loom-persist` only -- which is
+correct today, since it is the sole crate with `query!` macros (`grep -l 'query!'
+crates/*/src` returns just it). A second crate that adopts the macros needs the
+same watch, and `scripts/check-sqlx-cache-modes.sh` widened to cover it.

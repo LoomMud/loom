@@ -1,0 +1,74 @@
+// OBI-171 fixture: persistent vars of several shapes (scalar, map), a
+// non-persistent var to prove it's never saved/restored, and an
+// `upgrade()` hook so the upgrade-then-restore scenario exercises the
+// real spec §7.3 migration path, not just a lossless round trip.
+//
+// OBI-348 copy: identical except that `autosave()` does what a real player
+// object's does -- it calls `save_object` -- so the driver's periodic and
+// disconnect autosave paths actually go through the durability queue. The
+// `persist` fixture's own `autosave()` only counts calls, and its tests
+// assert on that count, which is why this lives in its own fixture instead
+// of changing that one.
+//
+// Struct types are parsed but not yet implemented by the checker
+// (W0254/W0252, OBI-88 follow-up); `stats` uses `{string: int}` instead
+// (the checker's own suggested workaround), which still exercises
+// `hydrate`'s map branch end to end.
+
+persistent var hp: int = 100
+persistent var title: string = "adventurer"
+persistent var stats: {string: int} = { "str": 10, "dex": 10 }
+var not_persistent: int = 999
+var autosave_count: int = 0
+
+pub fn logon() {
+    send(self, "ok\n")
+}
+
+pub fn net_dead() {
+}
+
+pub fn autosave() {
+    autosave_count += 1
+    save_object("/whoever")
+}
+
+pub fn process_input(line: string) {
+    let words = split(trim(line), " ")
+    let verb = words[0]
+    if verb == "sethp" and len(words) == 2 {
+        hp = to_int(words[1]) ?? 0
+        send(self, "ok\n")
+    } else if verb == "gethp" {
+        send(self, $"{hp}\n")
+    } else if verb == "gettitle" {
+        send(self, $"{title}\n")
+    } else if verb == "getstats" {
+        let a = stats["str"] ?? 0
+        let b = stats["dex"] ?? 0
+        send(self, $"{a} {b}\n")
+    } else if verb == "setstats" and len(words) == 3 {
+        stats = { "str": to_int(words[1]) ?? 0, "dex": to_int(words[2]) ?? 0 }
+        send(self, "ok\n")
+    } else if verb == "setnotpersistent" and len(words) == 2 {
+        not_persistent = to_int(words[1]) ?? 0
+        send(self, "ok\n")
+    } else if verb == "getnotpersistent" {
+        send(self, $"{not_persistent}\n")
+    } else if verb == "getautosavecount" {
+        send(self, $"{autosave_count}\n")
+    } else if verb == "savefile" and len(words) == 2 {
+        send(self, $"{save_object(words[1])}\n")
+    } else if verb == "restorefile" and len(words) == 2 {
+        send(self, $"{restore_object(words[1])}\n")
+    } else if verb == "update" and len(words) == 2 {
+        let err = compile_object(words[1])
+        if err == null {
+            send(self, "updated\n")
+        } else {
+            send(self, $"{err}\n")
+        }
+    } else {
+        send(self, "What?\n")
+    }
+}
