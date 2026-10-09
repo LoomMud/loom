@@ -37,7 +37,7 @@ on:
   # Neither of them is cancellable, and neither may cancel: rule 5 keeps the
   # workflow-level group on `github.run_id` for any non-`pull_request` event with
   # `cancel-in-progress` false, so a nightly run can never kill an in-flight gate
-  # and a force-push cannot kill the nightly measurement. Rule 10 asserts both
+  # and a force-push cannot kill the nightly measurement. Rule 12 asserts both
   # triggers are still here -- a backstop that can be deleted through `.github/**`
   # (which the classifier counts irrelevant) is a comment, not a backstop.
   schedule:
@@ -384,7 +384,7 @@ jobs:
         # check may be skipped") from rotting silently, and keep the
         # workflow-level group cancelling superseded `pull_request` runs only:
         # a workflow-level cancel reaches into jobs whose own
-        # `cancel-in-progress: false` forbids it. Rule 9 also reads
+        # `cancel-in-progress: false` forbids it. Rule 11 also reads
         # `warp.ref` here, so the world the gate serves cannot stop
         # being pinned without failing a required check.
         run: |
@@ -620,7 +620,7 @@ jobs:
       # job reads `warp.ref` and checks that exact commit out. There is
       # no fallback here on purpose: an absent, unreadable or branch-named pin
       # fails the gate instead of quietly serving warp's default branch again.
-      # Rule 9 of scripts/check-ci-load-lane.py enforces this shape -- and that
+      # Rule 11 of scripts/check-ci-load-lane.py enforces this shape -- and that
       # the pin file is on the classifier's runtime-relevant list -- in
       # `hygiene`, a required check that runs on every PR, so the pin cannot
       # rot into a comment.
@@ -637,7 +637,7 @@ jobs:
           fi
           # One payload line: comments and blanks stripped, the SHA, nothing else.
           # The line count is checked, not just the shape: `head -1` would otherwise
-          # serve the first of two revs and leave rule 9 to notice -- a gate should
+          # serve the first of two revs and leave rule 11 to notice -- a gate should
           # fail on the input it was handed, not on a later reader's arithmetic.
           payload=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PIN_FILE")
           if [ -z "$payload" ]; then
@@ -825,7 +825,7 @@ jobs:
           fi
           # One payload line: comments and blanks stripped, the SHA, nothing else.
           # The line count is checked, not just the shape: `head -1` would otherwise
-          # serve the first of two revs and leave rule 9 to notice -- a gate should
+          # serve the first of two revs and leave rule 11 to notice -- a gate should
           # fail on the input it was handed, not on a later reader's arithmetic.
           payload=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PIN_FILE")
           if [ -z "$payload" ]; then

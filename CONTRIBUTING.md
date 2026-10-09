@@ -108,9 +108,9 @@ follow:
   E1.1 serves `LoomMud/warp`, a second repository, so the commit it measures is
   named in `warp.ref` at the repo root -- one line, a full 40-character SHA -- and
   read from there by each load job (OBI-326). The repository name stays in the
-  workflow as that one literal, and rule 9 asserts it, so retargeting the load
+  workflow as that one literal, and rule 11 asserts it, so retargeting the load
   jobs at a fork fails `hygiene` even though `.github/**` is on the skip list.
-  Rule 9 also fails a workflow that serves a mudlib from an unpinned or
+  Rule 11 also fails a workflow that serves a mudlib from an unpinned or
   unverified checkout, and `warp.ref` is runtime-relevant, so bumping the world
   takes a lane place and gets measured. Move the rev only to a warp commit that
   is reachable from warp's default branch, name the warp PR it came from, and
@@ -142,7 +142,7 @@ Since OBI-325 a PR can be green without a p99 in it, so a number that must exist
 --ref <sha>` or from the nightly `on.schedule` run, never from hoping a diff
 takes the lane. Both are outside the `pull_request`-scoped concurrency group: a
 schedule or dispatch run gets a run-scoped group and is never cancelled (rule 5),
-and rule 10 fails the workflow if either trigger is deleted -- they live in
+and rule 12 fails the workflow if either trigger is deleted -- they live in
 `.github/**`, which the lane counts irrelevant, so a backstop with no guard in
 `hygiene` is a comment. Either way the report names the world it served: the
 `## Notes` block carries `mudlib LoomMud/warp@<sha>`, and the job summary prints

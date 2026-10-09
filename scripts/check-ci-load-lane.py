@@ -77,29 +77,29 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      inside a shell comment there, because Actions expands expressions before
      the shell sees them. One is a workflow file GitHub cannot compile: no job
      runs, and on `pull_request` not even a check run appears, so required
-     checks do not go red, they vanish. PR #144 lost its CI to exactly this.
-  9. the mudlib the lane serves is a *pinned input* (OBI-326). `warp.ref` names
+     checks do not go red, they vanish. PR #144 lost its CI to exactly this; and
+ 11. the mudlib the lane serves is a *pinned input* (OBI-326). `warp.ref` names
      the world being measured -- one line, a full 40-character commit SHA, never
      a branch name, which can move underneath a run -- the classifier counts it
      runtime-relevant so a bump takes a lane place, and every job that serves a
      mudlib reads the rev from that file, refuses an external checkout whose rev
      comes from anywhere else, re-reads the file to verify what landed on disk,
      and stamps the rev into the report with `--note`. The repository name is the
-     one half that may stay a workflow literal (`LoomMud/warp`), and rule 9
+     one half that may stay a workflow literal (`LoomMud/warp`), and rule 11
      asserts that literal, so a fork swap fails `hygiene` even though `.github/**`
-     is on the skip list. Rule 9 is what keeps the OBI-325 skip honest for the one
+     is on the skip list. Rule 11 is what keeps the OBI-325 skip honest for the one
      input that lives in a second repository: without it a warp-side change moves
      p99 while every loom PR skips, and the next source PR is blamed for a
      regression it did not cause; and
- 10. the workflow keeps a *drift backstop* (OBI-326): `on.schedule` and
+ 12. the workflow keeps a *drift backstop* (OBI-326): `on.schedule` and
      `on.workflow_dispatch` are both still triggers. Neither carries a commit
      range, so the classifier falls closed to "take the lane", which means the
      nightly run measures `main` every day however quiet the diffs are, and a
      release SHA can be measured on demand instead of forced through the lane by
-     an empty commit. Rule 10 exists for the same reason as rule 8: the trigger
+     an empty commit. Rule 12 exists for the same reason as rule 8: the trigger
      list lives in `.github/**`, which the lane counts irrelevant, so a backstop
-     that can be deleted without a required check noticing is a comment.
- 10b. a job that audits commit sign-off gives an answer for an event with no
+     that can be deleted without a required check noticing is a comment; and
+ 13. a job that audits commit sign-off gives an answer for an event with no
      commit range, and the answer is a bounded range, never a bare rev. A schedule
      or dispatch run that audits "every commit reachable from HEAD" is red on the
      first night and stays red, because merged history contains commits whose
@@ -176,11 +176,11 @@ E11_ERREXIT_OFF = re.compile(r"^\s*set \+e\s*$")
 WF_OTHER_EVENTS = ("push", "pull_request_target", "workflow_dispatch", "workflow_call",
                    "schedule", "repository_dispatch", "merge_request_event")
 
-# Rule 9 (OBI-326): the mudlib is a second repository, and it is an input to the
+# Rule 11 (OBI-326): the mudlib is a second repository, and it is an input to the
 # number the gate prints, so it is pinned in this one -- the same way `Cargo.lock`
 # pins dependencies. `warp.ref` holds exactly one thing: the commit SHA. The
 # repository name is the one half that may stay a workflow literal, because it
-# never moves and because `hygiene` runs rule 9 on every PR whatever `classify`
+# never moves and because `hygiene` runs rule 11 on every PR whatever `classify`
 # decides -- a fork swap there fails a required check even though `.github/**` is
 # on the skip list. The rev is the half that moves underneath a run, so it may
 # only ever come from the pin file.
@@ -199,7 +199,7 @@ PIN_FILE_TOKEN = re.compile(r"(?:^|[\s:=])%s(?=$|[\s:|])" % re.escape(MUDLIB_PIN
 SERVING_NEEDLES = ("--mudlib", "repository:")
 PIN_REV_SHA = re.compile(r"^[0-9a-f]{40}$")
 
-# Rule 10 (OBI-326): the drift backstop. These two events carry no commit range,
+# Rule 12 (OBI-326): the drift backstop. These two events carry no commit range,
 # so `classify` falls closed to `runtime=true` and the run measures -- the only
 # paths to a number when every diff in between was correctly skipped.
 BACKSTOP_EVENTS = ("schedule", "workflow_dispatch")
@@ -739,6 +739,9 @@ def check_run_block_expressions(text):
                     "comment -- it is a workflow file GitHub cannot compile: no job runs, and "
                     "on a pull_request no check run is created at all. Write the expression "
                     "bare in scripts (`if: !cancelled()`) instead of wrapping it.")
+    return errors
+
+
 def read_mudlib_pin(root):
     """(rev, error) from the file that names the world under test.
 
@@ -751,7 +754,7 @@ def read_mudlib_pin(root):
     if not path.is_file():
         return None, (f"{MUDLIB_PIN} is missing: the load lane serves its mudlib from a "
                       "second repository, which is an input to the number it prints, so the "
-                      "commit has to be named here (rule 9)")
+                      "commit has to be named here (rule 11)")
     lines = [l.strip() for l in path.read_text().splitlines()
              if l.strip() and not l.lstrip().startswith("#")]
     if not lines:
@@ -789,7 +792,7 @@ def classifier_relevance(root, path):
 
 
 def check_mudlib_pin(text, root):
-    """Rule 9: the mudlib under measurement is pinned, read from one file, stamped.
+    """Rule 11: the mudlib under measurement is pinned, read from one file, stamped.
 
     Three failures are prevented here and each needs its own check, because
     fixing one is how you create another:
@@ -808,7 +811,7 @@ def check_mudlib_pin(text, root):
     relevant = classifier_relevance(root, MUDLIB_PIN)
     if relevant is None:
         errors.append("cannot ask scripts/load-lane-classify.py whether "
-                      f"`{MUDLIB_PIN}` is runtime-relevant: rule 9 needs to know, because a pin "
+                      f"`{MUDLIB_PIN}` is runtime-relevant: rule 11 needs to know, because a pin "
                       "the classifier cannot see is a mudlib bump that skips the lane")
     elif not relevant:
         errors.append(f"{MUDLIB_PIN} is not runtime-relevant in scripts/load-lane-classify.py: "
@@ -838,7 +841,7 @@ def check_mudlib_pin(text, root):
             if "0-9a-f" not in step_code(pin):
                 errors.append(f"`{job}`: the `{PIN_STEP_ID}` step does not validate the rev as a "
                               "commit SHA, so a branch name in the pin file would be served "
-                              "quietly -- the thing rule 9 exists to stop")
+                              "quietly -- the thing rule 11 exists to stop")
         for step in steps:
             body = step_code(step)
             if not re.search(r"^\s+repository:", body, re.M):
@@ -869,7 +872,7 @@ def check_mudlib_pin(text, root):
 
 
 def check_drift_backstop(text):
-    """Rule 10: the workflow keeps a path to a measurement that no diff can skip.
+    """Rule 12: the workflow keeps a path to a measurement that no diff can skip.
 
     OBI-325 made the lane conditional, which is right, and left a consequence: a
     run of irrelevant diffs means `main` can go unmeasured for as long as that run
@@ -877,11 +880,11 @@ def check_drift_backstop(text):
     their own schedule. `on.schedule` gives every day a number, and
     `on.workflow_dispatch` gives a release SHA one without faking a commit. Both
     are asserted because both live in `.github/**`, which the classifier counts
-    irrelevant: without rule 10 the backstop could be removed by a PR that never
+    irrelevant: without rule 12 the backstop could be removed by a PR that never
     entered the lane.
 
     The trigger alone is not enough: a backstop that cannot go green measures
-    nothing, so rule 10 also requires every job to answer for an event that carries
+    nothing, so rule 13 also requires every job to answer for an event that carries
     no commit range -- see `check_rangeless_audit`.
     """
     keys = on_trigger_keys(text)
@@ -890,18 +893,18 @@ def check_drift_backstop(text):
         errors.append("`on.schedule` is gone: after the OBI-325 skip a run of "
                       "runtime-irrelevant diffs leaves `main` unmeasured, and a "
                       "warp-side drift then has no date to land on -- it lands on "
-                      "whoever's PR happens to be measured next (rule 10)")
+                      "whoever's PR happens to be measured next (rule 12)")
     if "workflow_dispatch" not in keys:
         errors.append("`on.workflow_dispatch` is gone: results/README.md requires a "
                       "measured green `loadtest-e1-1` for a release SHA, and that "
                       "candidate may legitimately have skipped the lane -- without a "
                       "dispatch the only way to get the number is an empty commit "
-                      "that forces a lane run (rule 10)")
+                      "that forces a lane run (rule 12)")
     return errors
 
 
 def check_rangeless_audit(text):
-    """Rule 10b: a run with no commit range must not be asked to audit all history.
+    """Rule 13: a run with no commit range must not be asked to audit all history.
 
     `schedule` and `workflow_dispatch` carry no `base` and no `before`. The first
     dispatch of this workflow (run 37752599276) went red on `dco` for exactly that
@@ -939,7 +942,7 @@ def check_rangeless_audit(text):
                               "commit range, and the merged history contains commits whose "
                               "sign-off does not name their author, so the nightly could never "
                               "go green -- name the commits the run stands on as a range "
-                              "(rule 10b)")
+                              "(rule 13)")
     return errors
 
 
@@ -1314,7 +1317,7 @@ MUTANTS = [
     ("always() written into a script line",
      lambda t: _replace(t, 'cat "$verdict" >> "$GITHUB_OUTPUT"',
                         'cat "$verdict" >> "$GITHUB_OUTPUT"  # and ${{ always() }} elsewhere')),
-    # OBI-326 rule 9: the workflow may not become a second place to change the
+    # OBI-326 rule 11: the workflow may not become a second place to change the
     # *world* either. `warp` lives in another repository, so a floating checkout
     # moves p99 while every loom PR skips the lane -- and a pin that is only
     # documented, or only half-read, is that same hazard wearing a comment.
@@ -1336,7 +1339,7 @@ MUTANTS = [
      lambda t: _sub(t, "rev-parse HEAD", None)),
     ("report no longer stamped with the mudlib rev",
      lambda t: _sub(t, '--note "mudlib', None)),
-    # OBI-326 rule 10: the drift backstop is two triggers, and both are deletable
+    # OBI-326 rule 12: the drift backstop is two triggers, and both are deletable
     # through `.github/**`, which the lane counts irrelevant. Same argument as
     # rule 8 for the toolchain: an invariant that lives on the skip list needs a
     # guard in `hygiene`, which runs on every PR.
@@ -1344,7 +1347,7 @@ MUTANTS = [
      lambda t: _sub(t, "  schedule:", None)),
     ("on-demand measurement path removed",
      lambda t: _sub(t, "  workflow_dispatch:", None)),
-    # OBI-326 rule 10b: the backstop has to be able to go green. Both mutants are
+    # OBI-326 rule 13: the backstop has to be able to go green. Both mutants are
     # shapes the workflow actually held before the first dispatch run showed `dco`
     # failing on commits merged long before ci.yml existed.
     ("sign-off audit walks all history",

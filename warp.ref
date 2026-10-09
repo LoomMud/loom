@@ -21,7 +21,7 @@
 #     this SHA and checks that exact commit out of `LoomMud/warp`. There is no
 #     fallback: a missing or malformed pin fails the gate rather than quietly
 #     serving warp's default branch again.
-#   * `scripts/check-ci-load-lane.py` rule 9 -- `hygiene`, a required check that
+#   * `scripts/check-ci-load-lane.py` rule 11 -- `hygiene`, a required check that
 #     runs on every PR, re-reads this file and refuses any workflow that serves a
 #     mudlib from an unpinned checkout, so the pin cannot rot into a comment.
 #   * `scripts/load-lane-classify.py` -- this path is runtime-relevant, so
@@ -32,7 +32,7 @@
 #     artifact), so a number always names its mudlib.
 #
 # Who else moves under it. `ci.yml` also carries `on.schedule` and
-# `on.workflow_dispatch` (rule 10): neither carries a commit range, so both take
+# `on.workflow_dispatch` (rule 12): neither carries a commit range, so both take
 # the lane and measure whatever `warp.ref` names that day. That is the drift
 # detector -- if this file is stale relative to warp, the nightly says so on a
 # date, and a release SHA can get a measured number on demand.
@@ -40,13 +40,13 @@
 # How to bump it. Replace the one payload line with the full SHA of the warp
 # commit you want measured, exactly as `git rev-parse` prints it (the job
 # compares against that). Two payload lines are not "the later one wins": the
-# step that reads this file fails on a line count of anything but one, and rule 9
+# step that reads this file fails on a line count of anything but one, and rule 11
 # says so too. Bump it in its own PR, or a PR that clearly intends it: the run
 # that follows measures a different world than the reports in `results/`. Keep the
 # pinned commit reachable from warp's default branch, and name the warp PR it came
 # from in the commit message, so the archaeology is one hop rather than a search.
 #
-# The repository itself is not pinned here: it is `LoomMud/warp`, and rule 9
+# The repository itself is not pinned here: it is `LoomMud/warp`, and rule 11
 # asserts that literal in the workflow. `hygiene` runs on every PR whatever the
 # classifier decides, so pointing the load jobs at someone else's fork fails a
 # required check even though `.github/**` is on the skip list.
