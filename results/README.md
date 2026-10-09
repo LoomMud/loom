@@ -212,6 +212,50 @@ loom_world_loop_stall_ms_total 4905
 loom_world_loop_duration_ms_max 562
 ```
 
+**`kind` is not the answer to "what cost 562 ms".** It names the event that *woke*
+the loop. That same iteration also drains every side channel queued behind it (db
+results, admin queries, a snapshot request, finished recompiles, file ops, the roles
+swap), and several of those run a real `exec`. That is why run 37880215784 could hold
+an **875 ms** iteration and a scrape window carrying `negotiation` x1 + `input` x3
+stall events, and nobody could say which kind those 875 ms belonged to -- and the
+`negotiation` candidate never could have been the answer, because every negotiation
+arm in the serve loop is log-only (OBI-26 leaves the NAWS/TTYPE/GMCP hooks unmade).
+The loop now marks
+those segments (`WorldPhase`, `crates/loom-obs/src/world.rs`), so a breach says where
+its milliseconds went as well as what woke it:
+
+```text
+loom_world_loop_stall_ms_by_kind_total{kind="input"} 580
+loom_world_loop_stall_ms_by_phase_total{phase="exec"} 500
+loom_world_loop_stall_ms_by_phase_total{phase="db_drain"} 40
+loom_world_loop_last_stall_phase_ms{phase="exec"} 250
+loom_world_loop_last_stall_phase_ms{phase="db_drain"} 5
+loom_world_loop_last_stall_net_send_ms 0
+```
+
+Read those two families differently. The `by_kind` total is **all** the stalled time
+for that wake event (580 ms here). The `by_phase` total is **dominant-phase
+attribution, not a ledger**: each breach adds only the phase that held the most of
+it, so the phase counters sum to *less* than `stall_ms_total` whenever a stalled
+iteration mixed phases -- in this scrape 500 + 40 = 540 of 580 ms, and the missing
+40 ms is the 5 ms of `db_drain` inside two `exec`-dominated breaches plus the
+minority time of the third. It is the cheap answer to "which phase owns the tail".
+The **full** split survives for the most recent breach as
+`loom_world_loop_last_stall_phase_ms{phase}` and, for every breach the logger
+emitted, as the `phases=` field on the stall `warn!` -- so if a run's `by_phase`
+ranking is close between two phases, read the `warn!` lines rather than trusting
+the ranking.
+
+`net_send_ms` travels *beside* the phases, never inside one: time blocked in
+`blocking_send` happens within the arm that made the send, so putting it in a bucket
+would double-count. A stalled `exec` whose `net_send_ms` equals its duration is the
+net task not draining, not mudlib compute. The non-gating `world_loop:` line carries
+`stall_ms_by_kind=` and `stall_ms_by_phase=` for the same reason -- weight stalls by
+time, not by event count, because ten 55 ms stalls and one 800 ms stall are different
+problems. Both are printed with the value exactly as the exporter wrote it (a plain
+`awk '{print $2}'`, no digit-truncating `sed`), because a counter rendered in float
+or exponent form is a fact about the exporter, not a rounding opportunity.
+
 All 31 landed between t+91 s and t+94 s, *after* `--duration-secs 90` had stopped
 issuing commands: that is the 150 bots logging out at once. `World::disconnect`
 (`crates/loom-vm/src/world.rs`) applies `autosave` -- which is `save_character`,

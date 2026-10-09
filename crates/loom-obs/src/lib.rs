@@ -37,7 +37,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 pub mod world;
 
-pub use world::{DEFAULT_STALL_THRESHOLD_MS, NetCommandProbe, WorldEventKind, WorldLoopProbe};
+pub use world::{
+    DEFAULT_STALL_THRESHOLD_MS, NetCommandProbe, WorldEventKind, WorldLoopProbe, WorldPhase,
+};
 
 /// Env var read by [`init_tracing`]: when set to an OTLP/gRPC collector
 /// endpoint (e.g. `http://otel-collector:4317`), spans are exported there
