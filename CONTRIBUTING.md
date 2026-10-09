@@ -96,8 +96,14 @@ follow:
 So `loadtest-e1-1` can be green in two different ways, and the job says which
 one you got in its step summary: **measured** (p99 against the 50 ms budget) or
 **not applicable** (nothing was built, no players were connected, and the rule
-that decided it is named). The check is never skipped or made optional -- a
-skipped required check blocks a PR exactly like a failure.
+that decided it is named). The check is never made optional, and it is never
+`if:`-ed away by anything except `!cancelled()` -- a detail that matters, because
+GitHub counts a *skipped* required check as **passing**. `needs: classify` alone
+would therefore be a fail-open: a classifier that dies (lost runner, failed
+checkout, timeout) would skip the gate and hand the PR a green that never
+measured. `if: ${{ !cancelled() }}` is the closing half, rule 4 requires the two
+lines as a pair, and rule 4 rejects `always()` too -- it would run 150 players on
+a host GitHub is already tearing down.
 
 If you think a diff was wrongly called irrelevant -- a change that should have
 been measured -- say so on the PR and fix the *rule* in

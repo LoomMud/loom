@@ -34,7 +34,10 @@ permissions:
 # lane, for `rust` and the three `fuzz-smoke*` jobs too -- and had to be
 # cancelled by hand 43 s later. Draft state does not suppress `pull_request`
 # runs in this repo, and suppressing them with a job-level `if:` would *skip* a
-# required check, which blocks a PR as hard as a failure. Cancelling a run that
+# required check -- and GitHub counts a skipped required check as **passing**, so
+# that draft would go green having measured nothing. (The OBI-325 review found the
+# same fail-open in the classifier path; `loadtest-e1-1` now runs
+# `if: ${{ !cancelled() }}`, and rule 4 pins that exact expression.) Cancelling a run that
 # is already superseded is the control we have -- which is also why the trigger
 # above is narrowed to the commit-changing activity types: a label is not a
 # superseded commit, and must not be able to kill a running gate.
@@ -478,8 +481,10 @@ jobs:
           fetch-depth: 0
       - run: scripts/ci-ensure-tools.sh python3:python3-minimal
         # Tolerated on purpose: a runner that cannot apt-install python3 must not
-        # fail this job, because a failed `classify` *skips* the required gate --
-        # which blocks every PR in the queue. The fallback below takes the lane.
+        # fail this job. The gate now runs even when this job does not
+        # (`if: ${{ !cancelled() }}`), so a dead classifier costs a lane place and a
+        # full measurement for a diff that may not need one -- expensive, not
+        # dangerous, and never a silent green. The fallback below writes the verdict.
         continue-on-error: true
       - name: classify the diff
         id: decide
@@ -514,12 +519,14 @@ jobs:
           fi
           cat "$verdict" >> "$GITHUB_OUTPUT" 2>/dev/null || true
           cat "$verdict" || true
-          # This job must never fail on the classification itself: a failed
-          # `classify` *skips* `loadtest-e1-1`, and a skipped required check
-          # blocks the PR as hard as a failed one -- with `strict: true` it
-          # blocks every PR behind it too. Missing verdicts already mean "take
-          # the lane" above, which is the safe direction; the warning is what
-          # makes the delay visible instead of silent.
+          # This job must not fail *instead of answering*. It used to matter
+          # because a failed `classify` skipped `loadtest-e1-1`, and a *skipped*
+          # required check is counted as passing -- a green with no measurement.
+          # `loadtest-e1-1` runs `if: ${{ !cancelled() }}` now, so that hole is
+          # closed at the gate instead of depending on this exit code. What is left
+          # is the economics: an undecided diff must fail *toward* the lane (the
+          # fallback above writes `runtime=true`), and the warning is what makes
+          # that cost visible instead of silent.
           exit 0
 
   loadtest-smoke:
@@ -616,9 +623,10 @@ jobs:
     #
     # Load-lane holder (OBI-308): the p99 number is meaningless if anything
     # else is on the host, so this job takes the `loom-ci-load-lane` group
-    # alone-across-runs (queueing, never cancelling). It has no `if:` of its
-    # own -- it is a required check and must never be *skipped*, which would
-    # block a PR exactly as hard as a failure.
+    # alone-across-runs (queueing, never cancelling). It carries exactly one
+    # `if:` -- `${{ !cancelled() }}` -- because a *skipped* required check counts
+    # as passing in GitHub, and a gate that can be skipped by an upstream failure
+    # is a gate that can be green without ever measuring.
     #
     # OBI-325: it does have one `needs:`, and that is the whole change. A
     # required check may not be skippable, but it can be *cheap when there is
@@ -629,7 +637,17 @@ jobs:
     # the verdict (`outputs.runtime`) for `loadtest-smoke` and `bench` to
     # inherit, so the three jobs always agree about whether this run holds the
     # lane. Rule 7 of scripts/check-ci-load-lane.py pins both halves of that.
+    #
+    # `needs:` and `if:` are a pair, and rule 4 checks the pair. Without the
+    # `!cancelled()`, a `classify` that dies (lost runner, failed checkout,
+    # timeout) leaves this job *skipped*, GitHub reports that as passing, and the
+    # PR becomes mergeable with no p99 at all -- the exact hole the OBI-325 review
+    # caught. With it, an empty verdict flows through `!= 'false'` and the job
+    # takes the lane and measures. `always()` is rejected by rule 4 for a reason:
+    # it would start a 150-player run on a host GitHub is already tearing down
+    # after a cancel, which produces a number nobody can interpret.
     needs: classify
+    if: ${{ !cancelled() }}
     outputs:
       runtime: ${{ needs.classify.outputs.runtime }}
       reason: ${{ needs.classify.outputs.reason }}

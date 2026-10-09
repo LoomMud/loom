@@ -22,12 +22,13 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
      (loadtest-e1-1 -> loadtest-smoke -> bench) so they never overlap inside
      one run either;
   4. the required checks (rust, deny, dco, hygiene, loadtest-e1-1) cannot be
-     skipped or downgraded: no `needs`, no `if`, no `continue-on-error`, and
-     `loadtest-e1-1` still runs `loom-loadtest` with `--players 150` and
-     `--fail-on-sla-miss`, with enough `timeout-minutes` that host load can
-     only make the measurement slow, never get the job cancelled. The one
-     `needs` allowed on a required check is `classify`, and only because rule 7
-     shows that job cannot be skipped and cannot report "irrelevant" wrongly;
+     skipped or downgraded: no `needs`, no `if`, no `continue-on-error` -- except
+     that `loadtest-e1-1` may `needs: classify` *only* beside the exact
+     `if: ${{ !cancelled() }}`, because GitHub counts a *skipped* required check
+     as passing and a gate that an upstream job can skip is a gate that can be
+     green without measuring. `loadtest-e1-1` still runs `loom-loadtest` with
+     `--players 150` and `--fail-on-sla-miss`, with enough `timeout-minutes` that
+     host load can only make the measurement slow, never get the job cancelled.
   5. if the workflow has a *workflow-level* `concurrency` block (OBI-313), it
      cancels superseded `pull_request` runs and nothing else. The rule the CTO
      accepted (2026-10-08) is that no required check on a *mergeable candidate*
@@ -47,9 +48,10 @@ disconnects (runs 37658696127 / 37658252388, 2026-10-07). So:
   7. the OBI-325 lane escape (`needs: classify` + a conditional
      `concurrency.group`) is only allowed in the shape that keeps the gate
      fail-closed: the `classify` job has nothing upstream of it, can never be
-     skipped, and can never fail the run it is deciding for (a failed
-     classifier would *skip* the required gate, which blocks every PR in the
-     queue), and can never report "irrelevant" on a diff it could not read
+     skipped, and writes a verdict on every path (a job that dies mid-decision
+     must still leave `runtime=true` behind, because rule 4's `if:` then makes
+     the gate queue and measure rather than be skipped-and-counted-as-passing),
+     and can never report "irrelevant" on a diff it could not read
      (`runtime != 'false'` everywhere, never `== 'true'`), the escape group is
      run-scoped (`github.run_id`) so skipped runs do not serialise behind each
      other, each lane job reads the verdict from its own place in the `needs`
@@ -74,6 +76,14 @@ LANE_GROUP = "loom-ci-load-lane"
 LANE_JOBS = ["loadtest-e1-1", "loadtest-smoke", "bench"]
 LANE_CHAIN = {"loadtest-smoke": "loadtest-e1-1", "bench": "loadtest-smoke"}
 REQUIRED_JOBS = ["rust", "deny", "dco", "hygiene", "loadtest-e1-1"]
+# OBI-325 review: the one job-level `if:` the required gate may carry. GitHub
+# counts a *skipped* required check as passing, so `needs: classify` without this
+# expression is a fail-open: a dead classifier buys a green with no measurement.
+# `${{ !cancelled() }}` makes the gate run whenever the run itself was not
+# cancelled, so an unreadable verdict costs a lane run instead of a fake green.
+# `always()` is deliberately not allowed -- it would start a 150-player
+# measurement on a host GitHub is already tearing down after a cancel.
+GATE_IF = "!cancelled()"
 # OBI-325: which job's output each lane job is allowed to read its lane verdict
 # from. `loadtest-e1-1` asks the classifier; the other two inherit the verdict
 # the gate already acted on, so one run cannot half-occupy the lane.
@@ -187,6 +197,18 @@ def scalar(block, key):
     return None
 
 
+def if_expression(value):
+    """`"${{ !cancelled() }}"` -> `"!cancelled()"`; anything else as written.
+
+    GitHub accepts an `if:` with or without the `${{ }}` wrapper, and this file
+    uses both. The rule is about the *expression*, so compare expressions.
+    """
+    if value is None:
+        return None
+    m = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", value)
+    return m.group(1) if m else value
+
+
 def needs_of(block):
     raw = scalar(block, "needs")
     if raw is not None:
@@ -291,16 +313,20 @@ def check_classifier(jobs):
                 "verdict from"]
     block = jobs[CLASSIFIER]
     if needs_of(block):
-        errors.append(f"`{CLASSIFIER}` has `needs:` -- a skipped classifier leaves the required "
-                      "gate with no verdict, and `!= 'false'` will (correctly) take the lane but a "
-                      "*skipped* required check blocks every PR in the queue")
+        errors.append(f"`{CLASSIFIER}` has `needs:` -- a classifier that is itself skipped "
+                      "has no verdict, and the gate's `if:` would still run it into the lane "
+                      "on an empty answer; the decision must come from reading this run's diff")
     if scalar(block, "if") is not None:
         errors.append(f"`{CLASSIFIER}` has a job-level `if:` -- it can be skipped, same failure "
                       "as giving it `needs:`")
     if scalar(block, "continue-on-error") == "true":
         errors.append(f"`{CLASSIFIER}` sets continue-on-error: true -- its output would then be "
                       "empty on a real failure instead of failing loudly")
-    text = "\n".join(block)
+    # Comments excluded throughout: this rule asks whether the *code* writes a
+    # verdict, and a prose mention of `runtime=true` or `exit 0` must not be able
+    # to satisfy it. (It did: a comment explaining the fallback kept the mutant
+    # "fallback deleted" passing.)
+    text = "\n".join(l for l in block if not l.lstrip().startswith("#"))
     if "runtime: ${{ steps.decide.outputs.runtime }}" not in text:
         errors.append(f"`{CLASSIFIER}` does not publish `outputs.runtime` from the `decide` step: "
                       "the lane verdict must have exactly one source")
@@ -321,17 +347,19 @@ def check_classifier(jobs):
             j += 1
         if "|| true" not in block[j]:
             errors.append(f"`{CLASSIFIER}` can fail on the classifier itself (line {k + 1}): the "
-                          "gate would then be *skipped*, which blocks every PR in the queue -- "
-                          "reading the diff has to fall back to `runtime=true` instead of failing")
+                          "gate would run with an empty verdict instead of the written "
+                          "fail-closed one -- reading the diff has to fall back to "
+                          "`runtime=true`, not to a missing output")
     if "exit 0" not in text:
         errors.append(f"`{CLASSIFIER}` ends on whatever its last command returned: a non-zero "
-                      "step fails the job, which skips the required gate -- it has to default "
+                      "step leaves no verdict written for the gate to read; it has to default "
                       "the verdict and then `exit 0`")
     for step in steps_of(block):
         if "ci-ensure-tools.sh" in step_code(step) and step_key(step, "continue-on-error") != "true":
             errors.append(f"`{CLASSIFIER}`'s package step is fatal: a runner that cannot "
-                          "apt-install python3 would fail the job, skip the required gate, and "
-                          "block every PR -- tolerate it and let the fallback take the lane")
+                          "apt-install python3 would fail the job before the fallback line "
+                          "runs, and the gate would queue on an empty verdict instead of a "
+                          "written one -- tolerate it and let the fallback take the lane")
 
     for job in LANE_JOBS:
         block = jobs.get(job) or []
@@ -628,10 +656,25 @@ def check_text(text, root="."):
         deps = needs_of(block)
         if deps != allowed:
             errors.append(f"required check `{job}` has `needs: {deps}`, expected `{allowed or []}`: "
-                          "an upstream failure would skip it, which blocks the PR like a failure. "
-                          f"`{CLASSIFIER}` is the one exception, and rule 7 is what makes it safe.")
-        if scalar(block, "if") is not None:
-            errors.append(f"required check `{job}` has `if:` -- it can be skipped")
+                          "an upstream failure would *skip* it, and GitHub counts a skipped "
+                          "required check as passing -- a green that measured nothing. "
+                          f"`{CLASSIFIER}` is the one exception, and only beside the "
+                          f"`if: ${{ GATE_IF }}` below plus rule 7.")
+        cond = if_expression(scalar(block, "if"))
+        if job == "loadtest-e1-1":
+            # The gate needs `needs: classify` and `if: !cancelled()` as a pair.
+            # Either half alone is the fail-open: no `if:` means a dead classifier
+            # skips it, any other expression can skip it too.
+            if cond != GATE_IF:
+                errors.append(f"required check `loadtest-e1-1` has `if: {cond}`, expected "
+                              f"`{GATE_IF}`: anything else (including no `if:` at all, which "
+                              "is GitHub's `success()`) lets an upstream job *skip* the gate, "
+                              "and a skipped required check is counted as passing")
+        elif cond is not None:
+            errors.append(f"required check `{job}` has `if:` -- it can be skipped, and a "
+                          "skipped required check counts as passing; only `loadtest-e1-1` may "
+                          f"carry `{GATE_IF}`, and only because rule 7 keeps its `needs:` "
+                          "unable to change the verdict")
         if scalar(block, "continue-on-error") == "true":
             errors.append(f"required check `{job}` sets continue-on-error: true")
 
@@ -748,6 +791,22 @@ MUTANTS = [
     ("required gate gains needs", lambda t: _sub(t, "needs: classify", "    needs: rust\n")),
     ("required gate made optional",
      lambda t: _prepend(t, "loadtest-e1-1", "    continue-on-error: true\n")),
+    # The OBI-325 review's fail-open: `needs: classify` + GitHub's default
+    # `success()` means a dead classifier *skips* the gate, and a skipped required
+    # check is counted as passing. Only `${{ !cancelled() }}` is allowed.
+    ("required gate loses its !cancelled()",
+     lambda t: _sub(t, "if: ${{ !cancelled() }}", None)),
+    ("required gate if: becomes always()",
+     lambda t: _sub(t, "if: ${{ !cancelled() }}", "    if: ${{ always() }}\n")),
+    ("required gate if: becomes a needs-condition",
+     lambda t: _sub(t, "if: ${{ !cancelled() }}",
+                    "    if: ${{ needs.classify.result == 'success' }}\n")),
+    ("required gate if: written as success()",
+     lambda t: _sub(t, "if: ${{ !cancelled() }}", "    if: success()\n")),
+    ("required gate !cancelled() loses its braces",
+     lambda t: _sub(t, "if: ${{ !cancelled() }}", "    if: !cancelled\n")),
+    ("a non-lane required check gains !cancelled()",
+     lambda t: _prepend(t, "rust", "    if: ${{ !cancelled() }}\n")),
     ("SLA flag dropped", lambda t: _sub(t, "--fail-on-sla-miss", None)),
     ("gate timeout cut back to 15",
      lambda t: _sub(t, "timeout-minutes: 30", "    timeout-minutes: 15\n")),

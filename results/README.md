@@ -443,11 +443,15 @@ rebases; the overlap is textual, not semantic (#131 swaps the lane jobs'
 runtime-relevant diff it is the 150-player measurement, unchanged. On a
 runtime-irrelevant one it means "not applicable": no release build, no players,
 no p99, and the job writes a step summary saying so and naming the rule that
-decided it. The check is never `if:`-ed away and never skipped -- a skipped
-required check blocks the PR like a failure, which is the trap this whole
-exercise had to walk around. If a p99 regression is ever found on a commit that
-skipped, the classifier was wrong: fix the rule (`--self-test` is the test),
-not the threshold, the population, or the check.
+decided it. The gate is never `if:`-ed away except by `if: ${{ !cancelled() }}`,
+and that one expression is not a convenience: GitHub counts a *skipped* required
+check as **passing**, so `needs: classify` without it meant a classifier that
+dies in infrastructure would skip the gate and hand the PR a green that had never
+measured -- the fail-open the OBI-325 review caught, and the reason rule 4 checks
+`needs:` and `if:` as a pair (and rejects `always()`, which would run 150 players
+on a host GitHub is already cancelling). If a p99 regression is ever found on a
+commit that skipped, the classifier was wrong: fix the rule (`--self-test` is the
+test), not the threshold, the population, or the check.
 
 ### Which runs may be cancelled, and which may never be (OBI-313)
 
