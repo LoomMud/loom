@@ -314,11 +314,15 @@ absolute p99 budget does not.
 
 How the lane is held (`.github/workflows/ci.yml`, header comment):
 
-- Each of the three jobs is in the job-level concurrency group
-  `loom-ci-load-lane`, so a second PR's copy of the same gate **queues**
-  instead of racing.
+- Every latency-measuring job **and every CPU-heavy build/fuzz job** is in the
+  job-level concurrency group `loom-ci-load-lane`: `loadtest-e1-1`,
+  `loadtest-smoke`, `bench`, plus `rust`, `fuzz-smoke`, `fuzz-smoke-bytecode`
+  and `fuzz-smoke-lsp`. Job-level groups are keyed by *name across the jobs of
+  a workflow* (measured, see below), so at most one heavy thing runs repo-wide
+  at a time and a second PR's gate **queues** instead of racing.
 - `cancel-in-progress: false` -- a measurement already running is never
-  killed. `queue: max` -- pending runs wait in FIFO instead of the default
+  killed. `queue: max` -- pending runs all wait (one at a time; the order is
+  not guaranteed, observed roughly FIFO) instead of the default
   `single`, where the third run cancels the pending one. A *cancelled*
   required check blocks a PR exactly like a failed one, so queueing (not
   replacing) is part of not weakening the gate.
@@ -328,10 +332,12 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   diff has to be measured at all (OBI-325, below) -- and no `if:` of its own,
   so nothing upstream can skip it; the two non-required gates wait for it
   instead of competing with it.
-- Each gate carries wall-clock headroom (`timeout-minutes` 30 for E1.1, 20
-  for the smoke run). The lane removes a second *gate* from the host, not
-  this run's own `rust` job or another PR's builds, and a release build
-  starved past the old 15-minute budget does not fail the check -- it gets
+- The CPU-heavy jobs (`rust`, `fuzz-smoke`, `fuzz-smoke-bytecode`,
+  `fuzz-smoke-lsp`) hold the same group, unconditionally (OBI-311, see below);
+  `deny`/`dco`/`hygiene`/`web-client` stay out of it.
+- Each gate carries wall-clock headroom (`timeout-minutes` 30 for E1.1, 20 for
+  the smoke run) because lane jobs queue behind every other heavy job in the
+  group, and a starved release build does not fail the check -- it gets
   **cancelled**, which blocks a PR just as hard and leaves no p99 to read
   (run 37663331238, 2026-10-07 18:01:00Z -> 18:16Z, cancelled mid-build while
   an intentionally contending probe PR ran eight jobs beside it). Slow is
@@ -345,7 +351,7 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
   headroom, that no required check became skippable or optional, and that the
   workflow-level block can only ever cancel a superseded `pull_request` run),
-  plus a `--self-test` of 68 mutations (69 cases, among them the gate losing its
+  plus a `--self-test` of 73 mutations (74 cases, among them the gate losing its
   `if: ${{ !cancelled() }}`, the three verdict-isolation beats #154 added, a
   `${{ }}` written inside a `run:` block, and the mudlib checkout going floating,
   unverified or unstamped). Both run in the required `hygiene` job, with the
@@ -353,28 +359,56 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   40 cases: 34 classification rows plus 6 that build a throwaway git repo), so the
   lane cannot rot silently and the comment here
   cannot drift from the workflow.
+  The mutation set includes "`rust` leaves the lane" and "`web-client` joins
+  the lane", i.e. it guards both directions of membership.
 
-**What the lane does *not* claim.** GitHub scopes a job-level concurrency
-group per workflow *and job*, so the hard guarantee is "the same gate never
-runs twice at once". Two *different* gates from two different PRs (PR A's
-`bench` against PR B's `loadtest-e1-1`) can still land on the host together;
-the `needs` chain removes that overlap inside a run, not across runs. The
-same-run `rust` job (`cargo test --workspace`) and the `fuzz-smoke*` jobs also
-stay parallel, and `release-image.yml` builds are outside the lane. All of
-that is runner capacity, not YAML: the durable fix is a dedicated/ephemeral
-load host, which is a CTO call and explicitly out of scope for OBI-308.
+**How job-level groups are actually scoped (measured, not assumed).** The
+first version of this section claimed GitHub scopes a job-level concurrency
+group "per workflow *and job*". The workflow-syntax docs never say that, and
+probe run `37680869590` (draft PR #132, 2026-10-07) disproved it: `web-client`
+-- a *different job id* given the same group name -- was serialized against
+`loadtest-e1-1` inside a single run. It sat `pending` from 20:17 while only
+gate-family jobs held the group (with `deny`, `dco`, `rust` and all three
+`fuzz-smoke*` jobs getting runners in that window), then ran 20:44:43 ->
+20:45:01 while the gate stayed `pending` and started 39 s later. So a
+job-level group is keyed by **name**, across the jobs of a workflow.
+
+That is the lever that closes the residual, and the residual was real: run
+`37674844425` (PR #124) had the lane to itself from 19:45 -> 19:55 and still
+reported **p99 1977 ms** with 7725 commands sent -- 22% fewer than the gates
+that passed either side of it -- with 0 login failures and 0 disconnects,
+because its own `cargo clippy --workspace` had been running on that host since
+19:31 and took 35 minutes. Starved, not slow: the tell is the command count
+with zero connection errors. Putting the heavy jobs in the group fixes it; on
+the probe run the gate measured **p99 23.71 ms** (p50 3.05 / p95 16.09 / max
+49.29, n 10077, 0 failures, 0 disconnects) once nothing else was running --
+2.1x under the SLA, first try, no manual retry.
+
+**Cost, stated plainly.** The lane now admits every CPU-heavy job, so one
+heavy job at a time repo-wide. Observed queue depth on 2026-10-07: run
+`37675041540`'s `loadtest-smoke` waited 16 min and its `bench` 33 min (both
+non-required). Contention is not free either: `rust` took 6 min on a quiet
+host, 10 min beside three fuzz jobs, and 35+ min with three runs piled on, and
+`fuzz-smoke-bytecode` once burned its whole 15-minute budget inside the
+cache-restore step without ever running its payload. If the resulting CI
+latency is unacceptable, the fix is capacity, not YAML: a dedicated
+load-runner label for the gates, which is OBI-311's remaining decision.
 
 **If you see `loadtest-e1-1` waiting** ("Waiting for job to run" on the
-checks tab): that is the lane working, and it has been watched working. On
-2026-10-07 PR #128 (carrying this change) took the lane at 18:01:00Z; the
-probe PR #129's `loadtest-e1-1` sat `pending` from 18:00:58Z and only started
-at 18:20:35Z, ~19.5 minutes later, *after* #128's job left the group -- it was
-never cancelled and never co-scheduled. One E1.1 slot costs ~3.5 min of
-runner wall-clock (build cache warm), so a queue of two PRs clears in well
-under ten. Do not respond to a wait, or to a p99 miss on a run that overlapped
-another, by raising the threshold, dropping the population, marking the check
-optional, or re-running it into a quiet window by hand -- `hygiene` fails
-those changes.
+checks tab): that is the lane working, and it has been watched working three
+times. (1) PR #128 held the lane from 18:01:00Z; probe PR #129's gate sat
+`pending` for ~19.5 min and started at 18:20:35Z only after #128 released the
+group -- never cancelled, never co-scheduled -- then measured p99 24.47 ms
+(n 9916). (2) `main` `8174d57` (19:37->19:44, PASS), PR #124 (pending
+19:31->19:45, gate 19:45->19:55) and PR #126 (pending 19:31->19:55, gate
+19:55->20:01, PASS) ran strictly FIFO, one gate at a time, with no human
+re-runs. (3) The #132 probe above serialized a *build-class* job against a
+gate inside one run. Do not respond to a wait, or to a p99 miss, by raising
+the threshold, dropping the population, marking the check optional, or
+re-running it into a quiet window by hand -- `hygiene` fails those changes.
+Before believing a miss, check that run's own job timeline: a low `commands
+sent` with 0 login failures and 0 disconnects means the host was busy, not
+that the driver got slower.
 
 ### Who has to wait for the lane at all (OBI-325)
 
@@ -439,7 +473,7 @@ so a missing or unreadable verdict means "take the lane and measure". Rule 8 of
 `scripts/check-ci-load-lane.py` pins the whole shape -- the expression, its
 run-scoped arm, the classifier's inability to be skipped or to fail the job, and
 a step guard beside every measurement -- because each of those has a fail-open
-mutation: 68 of them now, all run in `hygiene`.
+mutation: 73 of them now, all run in `hygiene`.
 
 Putting `.github/**` on the irrelevant list is only safe because of rule 9: the
 workflow may not install a `toolchain:` that `rust-toolchain.toml` does not
@@ -582,7 +616,7 @@ the same class -- its `queue:` complaints are a schema lag behind the lane's own
 ### Which runs may be cancelled, and which may never be (OBI-313)
 
 Queueing is not the only way the lane gets stuck. Because
-`loom-ci-load-lane` is a FIFO **across runs**, one PR that takes three pushes
+`loom-ci-load-lane` is a queue **across runs**, one PR that takes three pushes
 holds three places in it until they drain -- including the two pushes nobody
 meant to measure. Run 37698132725 (2026-10-07 22:44:59Z) was a *draft* PR whose
 diff was two README paragraphs and a comment block: it opened a full CI run,
