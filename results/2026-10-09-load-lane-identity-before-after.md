@@ -217,6 +217,58 @@ proof's, string for string, and two new `--self-test` mutants cover both ways to
 break it (delete it, or let it drift to a smaller package set). 77 cases, 0
 failures.
 
+## The second live run: a hash that described nobody's build
+
+With `cc` installed, run 37934115615 / `classify` job 113831804641 got further —
+and produced an answer that was wrong in the interesting direction:
+
+```
+proof: same=false
+reason: target/release/loom-loadtest differ(s) between 17d9aabe033e and 3f718efb80db
+head artefacts | 23613195a083… 528c135f0369… |
+base artefacts | 23613195a083… c3ee58049a3d… |
+```
+
+`loom-cli` matched, `loom-loadtest` differed — on a diff that appends a
+`#[cfg(test)]` module. Locally, that same pair builds byte-for-byte the same
+binary on both ends (`414fc848b883…` at each end, `cmp -l` reports 0 differing
+bytes). A `#[cfg(test)]` module cannot reach a release binary: it is not compiled.
+So one of those two numbers was not a build of the tree it was credited to.
+
+The asymmetry is the tell. `loom-cli`'s sources are untouched by the diff, so
+`cargo build` never re-ran for it at either end: the two "identical" hashes are
+the *same file*, left there by whoever built it first. A matching hash there is not
+evidence of build determinism, it is evidence of nothing. `loom-loadtest` was the
+only crate that actually got rebuilt, and the two ends came out different. With
+mtime-based freshness, a restored or shared cache (`Swatinem/rust-cache`, or
+whatever `target/` the runner already had) can hold artifacts newer than the tree
+that was just checked out — so "build the base end" can quietly skip the crate.
+Every conclusion the guard draws rides on the assumption that each hash came from
+the build that was supposed to produce it. Nothing was enforcing that.
+
+Fixed in `load-lane-identity.py`: each end now clears the two artifacts, asserts
+they are **gone**, builds, and asserts each file came back **written**. If a clean
+leaves a file in place, or a build does not produce one, the proof fails closed
+with the reason. Cost measured locally: 26 s for both ends (the two crates rebuild,
+every dependency stays cached) against the 900 s per-build cap.
+
+One trap worth writing down, because it fails in the unsafe direction: **`cargo
+clean -p loom-cli` with no profile cleans the *dev* artifacts. On a release tree it
+prints "Removed 0 files", exits 0, and removes nothing.** Used as written, that
+would have made both ends hash a stale file and reported `same=true` for every
+PR — the guard would have skipped the lane permanently, on a green-looking
+proof. The absence-assertion is what turns it into a refusal instead of a pass,
+and `check-ci-load-lane.py` now pins `--release` plus one `-p` per hashed artifact
+so the flag cannot be dropped by a later cleanup. Three hand-made script mutants
+(drop `--release`, drop an artifact from the clean list, remove the mtime witness)
+are each reported by the checker.
+
+**This invalidates part of the measurement above.** The 21 historical replays ran
+through the same non-clearing build path, so their `same=true` rows may be stale
+file comparisons rather than proofs, and some `same=false` rows may be skips that
+never rebuilt. Re-measuring with the fixed script; the table above stays until
+that run finishes, and whichever number moves, moves here.
+
 ## Where the minutes actually are (for whoever owns capacity)
 
 Recorded because the next ticket should start from measurement, not from this

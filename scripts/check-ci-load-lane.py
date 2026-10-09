@@ -1097,6 +1097,11 @@ def check_identity_stage(jobs, text, root):
     block = jobs.get(CLASSIFIER)
     if block is None:
         return [f"`{CLASSIFIER}` job is missing: rule 14 has no stage-two proof to check"]
+    try:
+        src = (root / IDENTITY_SCRIPT).read_text()
+    except OSError as exc:
+        src = ""
+        errors.append(f"cannot read {IDENTITY_SCRIPT}: {exc}")
     steps = steps_of(block)
     code = "\n".join(l for l in block if not l.lstrip().startswith("#"))
     proof = [s for s in steps if IDENTITY_SCRIPT in step_code(s)]
@@ -1198,6 +1203,41 @@ def check_identity_stage(jobs, text, root):
                           f"(`{want}`): a build environment the gate had to install is not a "
                           "build environment the proof can assume")
 
+    # A hash is only evidence about the binary *this build wrote*. Cargo decides
+    # freshness from mtimes, so a shared or restored cache can leave a crate
+    # unbuilt and the two ends compare as copies of one file -- a wrong `same=true`
+    # that skips a required measurement. The proof must therefore clear the two
+    # artefacts first and witness that each build re-created them. `--release` is
+    # load-bearing: `cargo clean -p x` with no profile cleans the dev artifacts
+    # and reports "Removed 0 files" on a release tree -- exit 0, nothing removed.
+    clean_cmd = _py_literal(root, "CLEAN_CMD")
+    if clean_cmd is None:
+        errors.append(f"{IDENTITY_SCRIPT} has no `CLEAN_CMD`: it hashes whatever is already in "
+                      "`target/` without proving this build wrote it, and a cached artefact "
+                      "makes two ends of one file look like evidence")
+    else:
+        if "--release" not in clean_cmd and "--profile release" not in clean_cmd:
+            errors.append(f"the proof's clean is `{clean_cmd}`: with no profile, cargo cleans "
+                          "the dev artifacts, reports \"Removed 0 files\", exits 0, and leaves "
+                          "both release artefacts stale -- and a stale file at both ends hashes "
+                          "as `same=true`, which is a wrong pass")
+        for art in hashed_list:
+            name = str(art).rsplit("/", 1)[-1]
+            if f"-p {name}" not in clean_cmd:
+                errors.append(f"the proof hashes `{art}` but its clean (`{clean_cmd}`) never "
+                              f"names `{name}`: that artefact can survive from an earlier build "
+                              "and be reported as this end's output")
+        body = re.search(r"def build_and_hash(?:.|\n)*?\n    (?:head_art|def |return )", src)
+        seg = body.group(0) if body else ""
+        if not seg:
+            errors.append(f"cannot read `build_and_hash` from {IDENTITY_SCRIPT}: the check that "
+                          "each artefact was rewritten by the build it is attributed to cannot "
+                          "be verified, so the hash is unattributed")
+        elif seg.find("clean_cmd") < 0 or seg.find("build_cmd") < 0 \
+                or seg.find("clean_cmd") > seg.find("build_cmd") or seg.count("mtime") < 2:
+            errors.append("the proof must clear the artefacts, assert they are absent, build, "
+                          "and assert each was written (mtime witness before and after) -- in "
+                          "that order; otherwise `same=true` can describe a binary nobody built")
     cap = _py_literal(root, "BUILD_TIMEOUT")
     job_to = scalar(block, "timeout-minutes")
     m = re.search(r"\btimeout\s+(?:-k\s+\d+\s+)?(\d+)\s+python3", pcode)

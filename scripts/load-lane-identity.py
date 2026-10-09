@@ -80,6 +80,28 @@ import time
 ARTIFACTS = ("target/release/loom-cli", "target/release/loom-loadtest")
 BUILD_CMD = "SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest"
 
+# Each end is built from scratch, not "up to date". `cargo build` decides what to
+# recompile from mtimes, and a shared or restored dependency cache -- the gate's
+# own `Swatinem/rust-cache`, or anything the job inherits from a previous run --
+# can carry artifacts stamped *newer* than the tree that was just checked out.
+# "Build the base end" then quietly reuses the head end's binary and the
+# comparison becomes two copies of one file, which reads as `same=true`: a wrong
+# *pass*, the only kind of wrong answer that can skip a required measurement.
+# The first live run showed the mirror-image symptom (PR #175 job 113831804641):
+# `loom-cli` matched -- never rebuilt, because nothing in its tree changed and
+# cargo had no reason to touch it -- while `loom-loadtest` differed on a diff that
+# is provably `#[cfg(test)]`-only and byte-neutral when the crate is genuinely
+# rebuilt. Neither end of that comparison was the program the gate would run.
+# `cargo clean -p` drops those two crates' outputs and leaves every dependency
+# cached, so a from-scratch build of the two programs costs seconds. The invariant
+# is then checkable rather than assumed: the file must be *absent* before each
+# build and *present*, with a new timestamp, after it. Anything else fails closed.
+# `--release` is load-bearing: `cargo clean -p loom-cli` without a profile cleans
+# the *dev* artifacts and reports "Removed 0 files" on a release tree -- exit
+# status 0, nothing removed, every artefact stale. The absence-witness is what
+# turns that silent no-op into a refused proof.
+CLEAN_CMD = "cargo clean --release -p loom-cli -p loom-loadtest"
+
 # Per-build wall-clock cap. The `classify` job's `timeout-minutes` must exceed
 # 2 * BUILD_TIMEOUT + setup (pinned by check-ci-load-lane.py rule 13) so the
 # inner cap always fires first: an Actions timeout fails the job, which skips
@@ -124,6 +146,12 @@ class Tree(object):
         p = self.run(["timeout", str(timeout), "sh", "-c", cmd])
         return p.returncode, ((p.stdout or "") + (p.stderr or ""))[-4000:]
 
+    def mtime(self, path):
+        try:
+            return int(os.path.getmtime(path) * 1000)
+        except OSError:
+            return None
+
     def hash(self, path):
         return hash_file(path)
 
@@ -132,7 +160,7 @@ class Tree(object):
 
 
 def prove(base, head, tree, build_cmd=BUILD_CMD, artifacts=ARTIFACTS,
-          build_timeout=BUILD_TIMEOUT):
+          build_timeout=BUILD_TIMEOUT, clean_cmd=CLEAN_CMD):
     """(same, reason, evidence). `same=True` only on a completed proof that the
     artefacts are byte-identical; every other answer is False."""
     ev = {"base": base or "", "head": head or "", "base_sha256": "", "head_sha256": "",
@@ -178,11 +206,28 @@ def prove(base, head, tree, build_cmd=BUILD_CMD, artifacts=ARTIFACTS,
     def build_and_hash(label, sha):
         if not tree.checkout(sha):
             return None, "%s: cannot check out %s" % (label, sha[:12])
+        rc, tail = tree.build(clean_cmd, build_timeout)
+        if rc != 0:
+            # Without the clean we cannot tell "this build wrote it" from "the
+            # cache had it", and only the first is evidence.
+            return None, "%s: could not clear the previous build (%s): the artefacts " \
+                         "would not be provably this build's output" % (label, clean_cmd)
+        absent = [a for a in artifacts if tree.mtime(os.path.join(tree.cwd or ".", a)) is not None]
+        if absent:
+            return None, "`%s` left %s in place, so `cargo build` could legitimately " \
+                         "skip it and the hash would describe someone else's binary" \
+                         % (clean_cmd, ", ".join(absent))
         rc, tail = tree.build(build_cmd, build_timeout)
         if rc == 124 or rc == 137:
             return None, "%s build hit the %d s cap (fail closed: take the lane)" % (label, build_timeout)
         if rc != 0:
             return None, "%s build failed (rc=%d): %s" % (label, rc, tail.strip().splitlines()[-1] if tail.strip() else "no output")
+        now = {}
+        for a in artifacts:
+            m = tree.mtime(os.path.join(tree.cwd or ".", a))
+            if m is None:
+                return None, "%s: no artefact to hash (%s was not produced)" % (label, a)
+            now[a] = m
         try:
             return {a: tree.hash(os.path.join(tree.cwd or ".", a)) for a in artifacts}, None
         except (OSError, KeyError) as e:
@@ -215,7 +260,7 @@ def prove(base, head, tree, build_cmd=BUILD_CMD, artifacts=ARTIFACTS,
 # ── self-test: the decision logic, with a fake world ────────────────────────
 class FakeTree(object):
     def __init__(self, head="h" * 40, revs=None, status="", builds=None, artifacts=None,
-                 cwd="."):
+                 cwd=".", clean_leaves=False):
         self.head_sha = head
         self.revs = revs or {}
         self.status_str = status
@@ -223,6 +268,17 @@ class FakeTree(object):
         self.artifacts = artifacts or {}  # sha -> {path: digest}
         self.cwd = cwd
         self.checkouts = []
+        # `clean_leaves` simulates a clean that reports success but does not
+        # remove the file -- the state in which a later `cargo build` may skip
+        # the crate and leave someone else's binary to be hashed.
+        self.clean_leaves = clean_leaves
+        self._tick = 1000
+        # One on-disk model, like the real `target/`: every artefact path any end
+        # of the range is known to produce, present and stale before the proof
+        # starts. A build only re-creates what that end actually produces, so a
+        # missing artefact stays missing rather than conjuring one.
+        self.disk = sorted({p for arts in (artifacts or {}).values() for p in arts})
+        self.mtimes = {p: 1 for p in self.disk}
 
     def rev(self, ref):
         return self.revs.get(ref)
@@ -239,8 +295,24 @@ class FakeTree(object):
         return True
 
     def build(self, cmd, timeout):
+        if cmd == CLEAN_CMD:
+            # A clean is not the measurement; make it fail separately (the real
+            # hazard under test is a *skipped* build, not a failed `cargo clean`).
+            if not self.clean_leaves:
+                for p in self.disk:
+                    self.mtimes[p] = None
+            return 0, ""
         rc = self.builds.get(self.head_sha, 0)
-        return rc, "" if rc == 0 else "error: simulated build failure"
+        if rc != 0:
+            return rc, "error: simulated build failure"
+        if cmd == BUILD_CMD:
+            self._tick += 1
+            for p in self.artifacts.get(self.head_sha, {}):
+                self.mtimes[p] = self._tick
+        return 0, ""
+
+    def mtime(self, path):
+        return self.mtimes.get(os.path.normpath(path))
 
     def hash(self, path):
         # `prove` hands back a cwd-joined path; keys here are repo-relative.
@@ -262,6 +334,14 @@ def self_test():
         ("one artefact differs -> measure",
          FakeTree(head=H, revs=revs, artifacts={H: same_art, B: other_art}),
          B, H, False, "differ"),
+        # The stale-artefact hazard: a `cargo build` that skips a crate because
+        # something in the cache looks newer than the tree would hand back a
+        # binary this build never wrote. `same=true` from that file would be a
+        # wrong *pass* -- it skips a measurement that should have happened.
+        ("clean leaves the artefact behind -> measure",
+         FakeTree(head=H, revs=revs, artifacts={H: same_art, B: dict(same_art)},
+                  clean_leaves=True),
+         B, H, False, "in place"),
         ("head build fails -> measure",
          FakeTree(head=H, revs=revs, builds={H: 101}, artifacts={B: same_art}),
          B, H, False, "head build failed"),
