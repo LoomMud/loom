@@ -1049,6 +1049,24 @@ mod tests {
     /// microseconds of work once polled.
     const HARNESS_ALIVE: Duration = Duration::from_secs(60);
 
+    /// A `/lsp` timer that is **not** the thing under test gets this value.
+    ///
+    /// OBI-367's other half of de-stopwatching the timing tests. Shrinking
+    /// every interval to tens of milliseconds (the original PR #122 recipe)
+    /// makes the wait cheap but makes the *verdict* ambiguous: with the
+    /// outer wait widened to `HARNESS_ALIVE`, a 10 s idle timeout or a 5 s
+    /// first-frame timeout would still fire inside that window, so a socket
+    /// closed by the wrong mechanism would answer for the one under test --
+    /// a `Close` that means "starved runner" or "idle timer", not
+    /// "revocation caught". Setting the unrelated timers beyond every wait
+    /// this module can perform makes each frame under test the only frame
+    /// the server is still able to produce, so the arrival itself carries
+    /// the verdict and no wall-clock budget has to.
+    ///
+    /// Deliberately far larger than `HARNESS_ALIVE`: if a test ever runs for
+    /// an hour, nothing here is deciding anything any more.
+    const OUT_OF_THE_WAY: Duration = Duration::from_secs(3600);
+
     /// The acceptance criterion of the replay tests, kept apart from the
     /// wait so the ambiguity itself is testable (OBI-365).
     ///
@@ -1124,16 +1142,10 @@ mod tests {
         .unwrap();
     }
 
-    /// The observable sign that the server has already *consumed* this
-    /// socket's ticket: an `initialize` reply. A refused socket never gets
-    /// an LSP server started for it at all
-    /// (`an_invalid_ticket_is_refused_before_any_lsp_server_starts`), so
-    /// this can only answer if the ticket redeemed here (same round trip
-    /// `a_valid_ticket_bridges_a_real_initialize_round_trip` uses).
-    ///
-    /// It replaces the old test's assumption that the socket which *sent*
-    /// first had consumed first (OBI-359).
-    async fn prove_ticket_consumed_by(ws: &mut TestWs, who: &str) {
+    /// The `initialize` request whose *reply* is the event the liveness
+    /// waits in this module await (OBI-367), and the round trip
+    /// [`prove_ticket_consumed_by`] measures.
+    async fn send_initialize_request(ws: &mut TestWs) {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::json!({
                 "id": 1,
@@ -1145,6 +1157,19 @@ mod tests {
         ))
         .await
         .unwrap();
+    }
+
+    /// The observable sign that the server has already *consumed* this
+    /// socket's ticket: an `initialize` reply. A refused socket never gets
+    /// an LSP server started for it at all
+    /// (`an_invalid_ticket_is_refused_before_any_lsp_server_starts`), so
+    /// this can only answer if the ticket redeemed here (same round trip
+    /// `a_valid_ticket_bridges_a_real_initialize_round_trip` uses).
+    ///
+    /// It replaces the old test's assumption that the socket which *sent*
+    /// first had consumed first (OBI-359).
+    async fn prove_ticket_consumed_by(ws: &mut TestWs, who: &str) {
+        send_initialize_request(ws).await;
         let deadline = tokio::time::Instant::now() + HARNESS_ALIVE;
         loop {
             let next = tokio::time::timeout_at(deadline, ws.next())
@@ -1255,6 +1280,12 @@ mod tests {
     ) {
         wait_for_active_sessions(limiter, 1, "the replay").await;
         assert_refused_as_ticket_replay(log, loser, loser_name).await;
+        // The one remaining fixed duration whose verdict depends on it, and
+        // the kind that cannot flake: `assert_stays_open` fails only if a
+        // close *arrives*, so contention can never make it fail -- it can
+        // only make the positive direction weaker (a close after 500 ms is
+        // missed). "Stays open" is a property with no event to await, so a
+        // floor is the strongest form it has (OBI-367).
         assert_stays_open(winner, Duration::from_millis(500), winner_name).await;
     }
 
@@ -1582,33 +1613,31 @@ mod tests {
         let claims = claims_for("frodo", &keys(), "sid-1");
         let ticket = auth.issue_ws_ticket(&claims).unwrap();
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
-            .await
-            .unwrap();
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({ "auth": ticket }).to_string().into(),
-        ))
-        .await
-        .unwrap();
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({
-                "id": 1,
-                "method": "initialize",
-                "params": { "capabilities": {} },
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .unwrap();
+        let mut ws = connect_staff_socket(addr).await;
+        send_ticket(&mut ws, &ticket).await;
 
-        let reply = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        // OBI-367: an `initialize` *reply* is the event this test waits on,
+        // and its arrival says nothing about timing -- so the budget is
+        // `HARNESS_ALIVE`, the module's "the server was never scheduled"
+        // guard (the same wait `prove_ticket_consumed_by` uses for the
+        // replay tests), not the old 10 s a contended runner could spend.
+        // The content assertions stay here: this is the test that says the
+        // ticket bridges a *real* LSP round trip.
+        send_initialize_request(&mut ws).await;
+        let reply = tokio::time::timeout(HARNESS_ALIVE, ws.next())
             .await
-            .expect("timed out waiting for the initialize response")
-            .expect("socket closed before answering")
+            .unwrap_or_else(|_| {
+                panic!(
+                    "no initialize reply within {HARNESS_ALIVE:?} -- the /lsp server never \
+                     answered this socket at all; harness failure (starved runner), not a \
+                     protocol verdict"
+                )
+            })
+            .expect("socket closed before answering initialize -- the ticket did not redeem")
             .expect("a WS error");
-        let tokio_tungstenite::tungstenite::Message::Text(text) = reply else {
-            panic!("expected a text frame");
+        let text = match reply {
+            tokio_tungstenite::tungstenite::Message::Text(text) => text,
+            other => panic!("expected the initialize reply to be a text frame, got {other:?}"),
         };
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["id"], 1);
@@ -1617,78 +1646,122 @@ mod tests {
 
     // -- Real end-to-end timing tests (CTO review of PR #122) ----------
     //
-    // These use `with_lsp_tuning_for_test` to shrink the idle timeout/
-    // ping interval/revocation-recheck interval to tens of
-    // milliseconds, so they can wait out the real behaviour over real
-    // (if brief) wall-clock time, deliberately with the recheck tick
-    // firing *faster* than the idle timeout -- reproducing the exact
-    // shape of the must-fix-1 bug (a fast unrelated timer in the same
-    // loop must not stop the idle timeout from firing).
+    // These use `with_lsp_tuning_for_test` to shrink *the timer under
+    // test* to tens of milliseconds, so they can wait out the real
+    // behaviour over real (if brief) wall-clock time -- deliberately
+    // with the recheck tick firing *faster* than the idle timeout in
+    // the first, reproducing the exact shape of the must-fix-1 bug (a
+    // fast unrelated timer in the same loop must not stop the idle
+    // timeout from firing).
+    //
+    // OBI-367 changes two things about them. Every timer that is not
+    // the subject gets [`OUT_OF_THE_WAY`], so the frame awaited below is
+    // the only frame the server can still produce; and the outer wait
+    // is `HARNESS_ALIVE`, an "is anything running at all" guard, not a
+    // budget the verdict may consume.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_timeout_fires_even_with_a_much_faster_recheck_tick() {
-        let (addr, auth, directory) = spawn_lsp_server_with_tuning(
-            None,
-            LspTuning {
-                idle_timeout: Duration::from_millis(300),
-                ping_interval: Duration::from_secs(10), // out of the way
-                first_frame_timeout: Duration::from_secs(5),
-                revocation_recheck_interval: Duration::from_millis(20),
-            },
-        )
-        .await;
+        let tuning = LspTuning {
+            idle_timeout: Duration::from_millis(300),
+            // OBI-367: the ping is not the subject, and leaving it armed at
+            // 10 s would be worse than irrelevant inside a 60 s wait -- its
+            // automatic `Pong` is inbound activity and would push the idle
+            // deadline out. Same for the first-frame timeout: at 5 s it can
+            // close a socket whose ticket the runtime never got to read,
+            // which this test's match would then pass for the wrong reason.
+            ping_interval: OUT_OF_THE_WAY,
+            first_frame_timeout: OUT_OF_THE_WAY,
+            revocation_recheck_interval: Duration::from_millis(20),
+        };
+        let (addr, auth, directory) = spawn_lsp_server_with_tuning(None, tuning).await;
         directory.seed_live_session_for_test("frodo", "sid-1");
         let claims = claims_for("frodo", &keys(), "sid-1");
         let ticket = auth.issue_ws_ticket(&claims).unwrap();
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
-            .await
-            .unwrap();
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({ "auth": ticket }).to_string().into(),
-        ))
-        .await
-        .unwrap();
+        let mut ws = connect_staff_socket(addr).await;
+        send_ticket(&mut ws, &ticket).await;
 
         // Send nothing else. The 20ms recheck tick fires ~15 times
         // before the 300ms idle timeout should; the old per-pass
         // `timeout(..)` bug would have let every one of those ticks
         // re-arm a fresh window, so this would never close.
-        let next = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+        //
+        // Timing is the property here, so this is the one place in the
+        // module that keeps a wall-clock number in its verdict -- and it is
+        // measured against the tuning, never against a budget the runner can
+        // spend: the *wait* is `HARNESS_ALIVE` (a close that never arrives at
+        // all is the must-fix-1 bug, and the `other =>` arm below says so),
+        // while the two bounds on `elapsed` say the close that arrived *was*
+        // the 300 ms deadline and not something else.
+        let started = tokio::time::Instant::now();
+        let next = tokio::time::timeout(HARNESS_ALIVE, ws.next()).await;
         match next {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => {}
             other => panic!("expected the idle timeout to close the socket, got {other:?}"),
         }
+        let elapsed = started.elapsed();
+        // Lower bound: the session sets its idle deadline only after it has
+        // read the ticket (i.e. after `started`), so a close that arrives
+        // before the deadline is due was not the idle timeout -- it is a
+        // connect-time refusal or a teardown, which would make this test
+        // green for an unrelated close. Contention can never break this.
+        assert!(
+            elapsed >= tuning.idle_timeout,
+            "the socket was closed after {elapsed:?}, before the {:?} idle deadline it was \
+             handed could fall due -- that close came from something other than the idle \
+             timeout, so this test proved nothing",
+            tuning.idle_timeout
+        );
+        // Upper bound: 20 configured intervals plus a second of scheduler
+        // slack. A deadline re-armed on every `select!` pass (the
+        // must-fix-1 bug) never fires at all and is caught by the
+        // `HARNESS_ALIVE` wait above; what this catches is a deadline that
+        // is being pushed out by something other than an inbound frame, or
+        // an idle close so late it no longer means "300 ms". If it trips on
+        // a runner that was simply starved, the message says which.
+        let upper = tuning.idle_timeout * 20 + Duration::from_secs(1);
+        assert!(
+            elapsed <= upper,
+            "the idle timeout closed the socket only after {elapsed:?}, more than {upper:?} \
+             ({:?} x20 plus a second of slack) -- either the session loop was starved for \
+             that long or something other than an inbound frame pushed the deadline out; \
+             this run did not prove the idle timeout fires",
+            tuning.idle_timeout
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_server_sends_periodic_pings() {
-        let (addr, auth, directory) = spawn_lsp_server_with_tuning(
-            None,
-            LspTuning {
-                idle_timeout: Duration::from_secs(10),
-                ping_interval: Duration::from_millis(50),
-                first_frame_timeout: Duration::from_secs(5),
-                revocation_recheck_interval: Duration::from_secs(10),
-            },
-        )
-        .await;
+        let tuning = LspTuning {
+            // OBI-367: with the idle deadline and the recheck tick beyond
+            // every wait this module performs, a `Ping` is the only frame the
+            // server is still able to put on this socket, so the frame's
+            // *arrival* is the verdict -- no wall-clock bound needed to say
+            // "the ping timer, not something else".
+            idle_timeout: OUT_OF_THE_WAY,
+            ping_interval: Duration::from_millis(50),
+            first_frame_timeout: OUT_OF_THE_WAY,
+            revocation_recheck_interval: OUT_OF_THE_WAY,
+        };
+        let (addr, auth, directory) = spawn_lsp_server_with_tuning(None, tuning).await;
         directory.seed_live_session_for_test("frodo", "sid-1");
         let claims = claims_for("frodo", &keys(), "sid-1");
         let ticket = auth.issue_ws_ticket(&claims).unwrap();
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
-            .await
-            .unwrap();
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({ "auth": ticket }).to_string().into(),
-        ))
-        .await
-        .unwrap();
+        let mut ws = connect_staff_socket(addr).await;
+        send_ticket(&mut ws, &ticket).await;
 
-        let next = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        let next = tokio::time::timeout(HARNESS_ALIVE, ws.next())
             .await
-            .expect("timed out waiting for a Ping")
+            .unwrap_or_else(|_| {
+                panic!(
+                    "no Ping frame within {HARNESS_ALIVE:?} on a {:?} ping interval -- the \
+                     session loop never ran; harness failure (starved runner), not a \
+                     protocol verdict",
+                    tuning.ping_interval
+                )
+            })
             .expect("socket closed before any Ping arrived")
             .expect("a WS error");
         assert!(
@@ -1699,57 +1772,51 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_revoked_session_family_closes_an_open_session_on_the_next_recheck() {
-        let (addr, auth, directory) = spawn_lsp_server_with_tuning(
-            None,
-            LspTuning {
-                idle_timeout: Duration::from_secs(10),
-                ping_interval: Duration::from_secs(10),
-                first_frame_timeout: Duration::from_secs(5),
-                revocation_recheck_interval: Duration::from_millis(50),
-            },
-        )
-        .await;
+        let tuning = LspTuning {
+            // OBI-367: the 50 ms recheck is the subject; everything else that
+            // could close this socket is set beyond every wait this module
+            // performs, so the `Close` below can only be the revocation tick
+            // and needs no time bound to mean that. (At the old 10 s idle
+            // timeout, widening the outer wait to `HARNESS_ALIVE` would have
+            // let an unrelated idle close answer for a revocation that never
+            // arrived.)
+            idle_timeout: OUT_OF_THE_WAY,
+            ping_interval: OUT_OF_THE_WAY,
+            first_frame_timeout: OUT_OF_THE_WAY,
+            revocation_recheck_interval: Duration::from_millis(50),
+        };
+        let (addr, auth, directory) = spawn_lsp_server_with_tuning(None, tuning).await;
         directory.seed_live_session_for_test("frodo", "sid-1");
         let claims = claims_for("frodo", &keys(), "sid-1");
         let ticket = auth.issue_ws_ticket(&claims).unwrap();
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
-            .await
-            .unwrap();
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({ "auth": ticket }).to_string().into(),
-        ))
-        .await
-        .unwrap();
+        let mut ws = connect_staff_socket(addr).await;
+        send_ticket(&mut ws, &ticket).await;
         // Prove the session is actually up first (same round trip as
         // `a_valid_ticket_bridges_a_real_initialize_round_trip`), so a
         // close below can only be the revocation recheck, not a session
-        // that never started.
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({
-                "id": 1,
-                "method": "initialize",
-                "params": { "capabilities": {} },
-            })
-            .to_string()
-            .into(),
-        ))
-        .await
-        .unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        // that never started. The reply's arrival is liveness, so the wait
+        // is `HARNESS_ALIVE`, not the old 5 s budget.
+        send_initialize_request(&mut ws).await;
+        let reply = tokio::time::timeout(HARNESS_ALIVE, ws.next())
             .await
-            .expect("timed out waiting for the initialize response")
-            .expect("socket closed before answering")
+            .unwrap_or_else(|_| {
+                panic!(
+                    "no initialize reply within {HARNESS_ALIVE:?} -- the session never came \
+                     up at all; harness failure (starved runner), not a protocol verdict"
+                )
+            })
+            .expect("socket closed before answering initialize -- the session never started")
             .expect("a WS error");
-        assert!(matches!(
-            reply,
-            tokio_tungstenite::tungstenite::Message::Text(_)
-        ));
+        assert!(
+            matches!(reply, tokio_tungstenite::tungstenite::Message::Text(_)),
+            "expected the initialize reply to be a text frame, got {reply:?}"
+        );
 
         // M-AUTH-5: revoke the token family -- no tier change at all.
         directory.revoke_session_family_for_test("sid-1");
 
-        let next = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
+        let next = tokio::time::timeout(HARNESS_ALIVE, ws.next()).await;
         match next {
             Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => {}
             other => {
@@ -1764,27 +1831,35 @@ mod tests {
         // connect must not be waved through -- admission used to fail
         // closed before the tier/session-family check existed, and a
         // brand-new session has no prior authorization to fall back on.
-        let (addr, auth, directory) = spawn_lsp_server(None).await;
+        //
+        // OBI-367 holds this fail-closed security test to the same standard
+        // as the replay tests. The old form -- "a `Close` arrives on the
+        // socket within 10 s" -- is satisfied by *all seven* refusal paths
+        // in `run_session`, any of which sends a byte-identical
+        // `Close(None)`, so it could not tell a directory-outage refusal
+        // from a malformed ticket, a full session cap, or a socket that was
+        // merely slow to speak and got timed out. Here the ticket is valid
+        // and unused and the family is live until the directory starts
+        // erroring, so the only verdict that means must-fix B was honoured
+        // is `NotAuthorized` -- the connect-time admission check refusing a
+        // uid/sid it could not verify. Anything else, including "no verdict
+        // at all", fails this test.
+        let (sender, mut log) = rejection_ledger();
+        let (addr, auth, directory, _limiter) = spawn_server(
+            None,
+            LspTuning::default(),
+            ServerHarness {
+                rejection_log: Some(sender),
+                ..ServerHarness::default()
+            },
+        )
+        .await;
         directory.seed_live_session_for_test("frodo", "sid-1");
         let claims = claims_for("frodo", &keys(), "sid-1");
         let ticket = auth.issue_ws_ticket(&claims).unwrap();
         directory.fail_directory_for_test();
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(ws_request(addr, Some(STAFF_ORIGIN)))
-            .await
-            .unwrap();
-        ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({ "auth": ticket }).to_string().into(),
-        ))
-        .await
-        .unwrap();
-
-        let next = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
-        match next {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => {}
-            other => {
-                panic!("expected a directory error at connect to refuse the session, got {other:?}")
-            }
-        }
+        assert_refused_without_an_lsp_reply(addr, &ticket, Rejection::NotAuthorized, &mut log)
+            .await;
     }
 }
