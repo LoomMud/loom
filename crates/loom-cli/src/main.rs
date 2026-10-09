@@ -3103,7 +3103,12 @@ async fn run_audit_sink(
 
 /// One `audit_log` batch, paired with the cursor that describes it: the unit
 /// the world thread retries on (OBI-354).
-type AuditBatch = (Vec<loom_vm::AuditRow>, u64);
+///
+/// OBI-360: this is `loom_vm`'s `AuditDrain`, which carries a third thing --
+/// the number of rows the ring evicted before this batch's cursor reached
+/// them -- because a batch alone cannot distinguish "nothing was recorded"
+/// from "everything recorded since the cursor was overwritten".
+type AuditBatch = loom_vm::AuditDrain;
 
 /// Result of one world-thread audit flush attempt -- see [`AuditHandoff`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3138,13 +3143,31 @@ enum AuditFlush {
 /// is immune to ring eviction while it waits. Delivering a held batch moves
 /// the cursor to that batch's own position, so no row is ever sent twice and
 /// no row between the two positions is skipped.
+///
+/// **OBI-360** covers what even a held batch cannot protect: rows still only
+/// in the ring when it wraps. A ring wider than the held batch is eviction,
+/// and the CTO decision on this is to make the gap *visible and durable*
+/// rather to put back-pressure from Postgres on the world thread or refuse
+/// new decisions when the ring is full. So a drain that reports
+/// [`loom_vm::AuditDrain::evicted`] `> 0` is reported three ways -- `error!`,
+/// `loom_audit_rows_evicted_total`, and one [`loom_vm::AuditRow::audit_gap`]
+/// row at the head of the batch that follows it -- and never re-reported, because
+/// the gap is a fact about one cursor position, not a standing condition.
 struct AuditHandoff {
     /// `SecurityState::audit_total` as of the last batch the sink took.
     cursor: u64,
     /// A batch the sink has not taken yet, with the cursor it belongs to.
+    /// Re-held after a refusal with `evicted: 0`: that field is a property of
+    /// the drain that produced it, and a drain is reported once -- by then the
+    /// gap row is already inside `rows`, so nothing is re-counted on retry.
     pending: Option<AuditBatch>,
     /// Sticky: the sink's receiver is gone, so the pipeline is over.
     sink_gone: bool,
+    /// Cumulative rows the ring evicted past this handoff's cursor, as
+    /// reported by the drains it made. Mirrors
+    /// `loom_audit_rows_evicted_total` for tests and introspection: the loss
+    /// is counted even on a world thread that has no metric recorder.
+    rows_evicted: u64,
 }
 
 impl AuditHandoff {
@@ -3153,12 +3176,20 @@ impl AuditHandoff {
             cursor: 0,
             pending: None,
             sink_gone: false,
+            rows_evicted: 0,
         }
     }
 
     /// Move everything the world has recorded toward Postgres, without ever
     /// blocking. `drain` is `World::drain_audit_since`; `tx` is the bounded
     /// channel `run_audit_sink` reads. World thread only.
+    ///
+    /// A drain that reports rows the ring evicted is handed to
+    /// [`Self::report_gap`] before anything is sent, so the gap is logged,
+    /// metered and given a durable `audit_gap` row at the head of the batch
+    /// that follows it -- inside the same non-blocking `try_send` path as the
+    /// decisions it describes, so reporting a gap can never block the world
+    /// thread either.
     fn flush<D>(&mut self, mut drain: D, tx: &mpsc::Sender<Vec<loom_vm::AuditRow>>) -> AuditFlush
     where
         D: FnMut(u64) -> AuditBatch,
@@ -3166,13 +3197,14 @@ impl AuditHandoff {
         // A refused `try_send` gives the batch back -- that is what makes the
         // retry possible without re-reading the ring.
         if self.sink_gone {
-            return AuditFlush::SinkGone(self.pending.as_ref().map_or(0, |b| b.0.len()));
+            return AuditFlush::SinkGone(self.pending.as_ref().map_or(0, |b| b.rows.len()));
         }
         // Rows handed to the sink by this call, before anything new is drained.
         let mut delivered = 0usize;
         // 1. Retry whatever the sink already refused; delivering it settles
         //    the cursor at *that* batch's position.
-        if let Some((rows, next)) = self.pending.take() {
+        if let Some(batch) = self.pending.take() {
+            let (rows, next) = (batch.rows, batch.cursor);
             let count = rows.len();
             match tx.try_send(rows) {
                 Ok(()) => {
@@ -3180,18 +3212,34 @@ impl AuditHandoff {
                     delivered = count;
                 }
                 Err(mpsc::error::TrySendError::Full(rows)) => {
-                    self.pending = Some((rows, next));
+                    self.pending = Some(AuditBatch {
+                        rows,
+                        cursor: next,
+                        evicted: 0,
+                    });
                     return AuditFlush::Deferred(count);
                 }
                 Err(mpsc::error::TrySendError::Closed(rows)) => {
-                    self.pending = Some((rows, next));
+                    self.pending = Some(AuditBatch {
+                        rows,
+                        cursor: next,
+                        evicted: 0,
+                    });
                     self.sink_gone = true;
                     return AuditFlush::SinkGone(count);
                 }
             }
         }
         // 2. Then anything recorded since.
-        let (rows, next) = drain(self.cursor);
+        let batch = drain(self.cursor);
+        let next = batch.cursor;
+        let mut rows = batch.rows;
+        // OBI-360: the ring is bounded and this thread must not block on, or
+        // refuse decisions because of, a sink that has fallen behind, so the
+        // eviction itself is not prevented -- only its silence is.
+        if batch.evicted > 0 {
+            rows.insert(0, self.report_gap(batch.evicted));
+        }
         let count = rows.len();
         if count == 0 {
             self.cursor = next;
@@ -3207,15 +3255,43 @@ impl AuditHandoff {
                 AuditFlush::Accepted(delivered + count)
             }
             Err(mpsc::error::TrySendError::Full(rows)) => {
-                self.pending = Some((rows, next));
+                self.pending = Some(AuditBatch {
+                    rows,
+                    cursor: next,
+                    evicted: 0,
+                });
                 AuditFlush::Deferred(count)
             }
             Err(mpsc::error::TrySendError::Closed(rows)) => {
-                self.pending = Some((rows, next));
+                self.pending = Some(AuditBatch {
+                    rows,
+                    cursor: next,
+                    evicted: 0,
+                });
                 self.sink_gone = true;
                 AuditFlush::SinkGone(count)
             }
         }
+    }
+
+    /// Turn a ring gap into the three things the CTO decision for OBI-360
+    /// requires, and hand back the durable one. Called on the world thread,
+    /// once per gap: `self.cursor` is still the position the evicted rows sat
+    /// at, so the range is the one the `error!` and the row both name.
+    fn report_gap(&mut self, evicted: u64) -> loom_vm::AuditRow {
+        let lost_from = self.cursor;
+        let lost_to = lost_from.saturating_add(evicted);
+        self.rows_evicted = self.rows_evicted.saturating_add(evicted);
+        error!(
+            evicted,
+            lost_from,
+            lost_to,
+            ring_capacity = loom_vm::security::AUDIT_LOG_CAPACITY,
+            total_rows_evicted = self.rows_evicted,
+            "audit_log ring wrapped before the flush read it: these decisions were evicted and \n             never reached the sink, so the audit trail has a gap (OBI-360)"
+        );
+        metrics::counter!("loom_audit_rows_evicted_total").increment(evicted);
+        loom_vm::AuditRow::audit_gap(evicted, lost_from, lost_to)
     }
 }
 
@@ -3548,7 +3624,10 @@ fn spawn_world_thread(
                         // tick instead of dropping it; a gone sink is a
                         // terminal, loudly logged state. Either way the world
                         // thread never blocks and the drain cursor never runs
-                        // ahead of what the sink actually received.
+                        // ahead of what the sink actually received. A ring that
+                        // wrapped past the cursor accounts for itself inside
+                        // `flush` (OBI-360) -- same non-blocking path, no new
+                        // state or work for this thread.
                         if has_audit_sink {
                             match audit_handoff
                                 .flush(|cursor| world.drain_audit_since(cursor), &audit_tx)
@@ -4130,6 +4209,9 @@ mod roles_manager_tests {
 #[cfg(test)]
 mod audit_handoff_tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
 
     /// One denied `/secure` write, as the world thread would hand it over.
     fn row(argument: &str) -> loom_vm::AuditRow {
@@ -4152,8 +4234,10 @@ mod audit_handoff_tests {
     }
 
     /// `World::drain_audit_since`'s contract without a booted `World`: every
-    /// row recorded since `cursor`, plus the new total. `drain_calls` is what
-    /// the world thread pays per tick -- a retry must not re-read the ring.
+    /// row still readable since `cursor`, plus the new total, and no eviction
+    /// (`MockRing` never overwrites, so it can only prove the no-gap path).
+    /// `drain_calls` is what the world thread pays per tick -- a retry must
+    /// not re-read the ring. [`GapRing`] below is the version that wraps.
     #[derive(Default)]
     struct MockRing {
         rows: Vec<loom_vm::AuditRow>,
@@ -4175,7 +4259,58 @@ mod audit_handoff_tests {
         fn drain(&mut self, cursor: u64) -> AuditBatch {
             self.drain_calls += 1;
             let start = cursor as usize;
-            (self.rows[start..].to_vec(), self.rows.len() as u64)
+            AuditBatch {
+                rows: self.rows[start..].to_vec(),
+                cursor: self.rows.len() as u64,
+                evicted: 0,
+            }
+        }
+    }
+
+    /// A ring that *overwrites*, which is what `World::drain_audit_since`
+    /// actually is: it keeps its last `capacity` rows, counts every push ever
+    /// made in `total`, and reports as `evicted` the rows between the caller's
+    /// cursor and the oldest row it can still hand back. Same arithmetic as
+    /// `SecurityState::log` + `audit_total`, at a capacity a unit test can
+    /// overflow in four pushes. `loom-vm`'s `tests/audit_ring_gap.rs` pins
+    /// that arithmetic against the real ring at the real
+    /// `AUDIT_LOG_CAPACITY`, so what is asserted here is the handoff's use of
+    /// it: the log line, the counter, and the one `audit_gap` row.
+    struct GapRing {
+        capacity: usize,
+        window: Vec<loom_vm::AuditRow>,
+        total: u64,
+        drain_calls: usize,
+    }
+
+    impl GapRing {
+        fn new(capacity: usize) -> Self {
+            Self {
+                capacity,
+                window: Vec::new(),
+                total: 0,
+                drain_calls: 0,
+            }
+        }
+
+        fn push(&mut self, argument: &str) {
+            self.window.push(row(argument));
+            self.total += 1;
+            let overflow = self.window.len().saturating_sub(self.capacity);
+            if overflow > 0 {
+                self.window.drain(..overflow);
+            }
+        }
+
+        fn drain(&mut self, cursor: u64) -> AuditBatch {
+            self.drain_calls += 1;
+            let start = self.total - self.window.len() as u64;
+            let skip = cursor.saturating_sub(start).min(self.window.len() as u64) as usize;
+            AuditBatch {
+                rows: self.window[skip..].to_vec(),
+                cursor: self.total,
+                evicted: start.saturating_sub(cursor),
+            }
         }
     }
 
@@ -4363,7 +4498,8 @@ mod audit_handoff_tests {
         let mut cursor: u64 = 0;
 
         // The pre-OBI-354 flush, verbatim: drain, move the cursor, then send.
-        let (rows, next) = ring.drain(cursor);
+        let batch = ring.drain(cursor);
+        let (rows, next) = (batch.rows, batch.cursor);
         cursor = next; // <-- the bug: before the sink has taken anything.
         assert!(
             tx.try_send(rows).is_err(),
@@ -4372,8 +4508,8 @@ mod audit_handoff_tests {
 
         // The consumer only ever drains from `cursor`: with the cursor already
         // at the ring's end, the denied decision is unreachable.
-        let (retry, _) = ring.drain(cursor);
-        assert!(retry.is_empty(), "the flush thinks the sink has them");
+        let retry = ring.drain(cursor);
+        assert!(retry.rows.is_empty(), "the flush thinks the sink has them");
         assert_eq!(
             arguments(&rx.try_recv().unwrap()),
             vec!["already in flight"]
@@ -4382,6 +4518,363 @@ mod audit_handoff_tests {
             rx.try_recv().is_err(),
             "the denied write never reaches Postgres"
         );
+    }
+
+    // ==== OBI-360: a wrapped ring is logged, metered, and written ====
+
+    /// What [`AuditHandoff::report_gap`] must bump, spelled once so a rename
+    /// in the production code fails a test rather than a dashboard nobody
+    /// looks at until the audit trail is already short.
+    const EVICTED_METRIC: &str = "loom_audit_rows_evicted_total";
+
+    /// Keeps the count `report_gap` adds to [`EVICTED_METRIC`]. Thread-local
+    /// (`metrics::with_local_recorder`), like `loom-vm`'s
+    /// `record_bumps_the_runtime_errors_metric`: no global recorder, no
+    /// `metrics-util`, no race with another test in this binary.
+    #[derive(Default)]
+    struct GapMeter(Arc<AtomicU64>);
+
+    struct EvictedCounter(Arc<AtomicU64>);
+
+    impl metrics::CounterFn for EvictedCounter {
+        fn increment(&self, value: u64) {
+            self.0.fetch_add(value, Ordering::SeqCst);
+        }
+        fn absolute(&self, value: u64) {
+            self.0.store(value, Ordering::SeqCst);
+        }
+    }
+
+    impl metrics::Recorder for GapMeter {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            assert_eq!(
+                key.name(),
+                EVICTED_METRIC,
+                "the flush must meter the gap on the name the alerting rule uses"
+            );
+            metrics::Counter::from_arc(Arc::new(EvictedCounter(self.0.clone())))
+        }
+        fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            unreachable!("report_gap emits a counter")
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            unreachable!("report_gap emits a counter")
+        }
+    }
+
+    /// One captured event: its level, and the structured fields it carried
+    /// (`message` included, as `tracing` records it).
+    type EventFields = BTreeMap<String, String>;
+
+    /// Captures what was logged, on this thread only
+    /// (`tracing::subscriber::with_default`): the level and the structured
+    /// fields of every event the flush emitted. Asserting the line is part of
+    /// OBI-360's acceptance -- a counter nobody reads and a row nobody queries
+    /// is half a fix for "silently lost".
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<Mutex<Vec<(tracing::Level, EventFields)>>>);
+
+    struct FieldCollector<'a> {
+        fields: &'a mut BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldCollector<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl tracing::Subscriber for CapturedEvents {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut FieldCollector {
+                fields: &mut fields,
+            });
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), fields));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    impl CapturedEvents {
+        /// Every `ERROR` event as `(message, fields)`.
+        fn errors(&self) -> Vec<(String, EventFields)> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(level, _)| *level == tracing::Level::ERROR)
+                .map(|(_, fields)| {
+                    (
+                        fields.get("message").cloned().unwrap_or_default(),
+                        fields.clone(),
+                    )
+                })
+                .collect()
+        }
+
+        fn clear(&self) {
+            self.0.lock().unwrap().clear();
+        }
+    }
+
+    /// The OBI-360 acceptance, end to end at the handoff: a sink that fell
+    /// behind far enough for the ring to wrap past the batch it was holding
+    /// must (b) log the loss at `error!` with the count and the cursor range,
+    /// (c) bump `loom_audit_rows_evicted_total` by exactly that count, and
+    /// (d) hand the sink exactly one `kind = "audit_gap"` row carrying
+    /// `evicted=N` -- once, not on every tick afterwards. Half (a), the count
+    /// the drain returns, is `loom-vm`'s `tests/audit_ring_gap.rs` against the
+    /// real ring.
+    #[test]
+    fn a_wrapped_ring_is_logged_metered_and_written_as_one_gap_row() {
+        let capacity = 4usize;
+        let gap = 3u64;
+        let events = CapturedEvents::default();
+        let meter = Arc::new(AtomicU64::new(0));
+        let recorder = GapMeter(meter.clone());
+
+        events.clear();
+        tracing::subscriber::with_default(events.clone(), || {
+            metrics::with_local_recorder(&recorder, || {
+                let (tx, mut rx) = queue_behind_one_batch();
+                let mut ring = GapRing::new(capacity);
+                let mut handoff = AuditHandoff::new();
+
+                // A ring filled exactly to capacity, refused by a behind sink:
+                // those rows are late, and OBI-354's held batch keeps them
+                // readable, so they are not a gap.
+                for n in 0..capacity {
+                    ring.push(&format!("held-{n}"));
+                }
+                assert_eq!(
+                    handoff.flush(|cursor| ring.drain(cursor), &tx),
+                    AuditFlush::Deferred(capacity)
+                );
+                assert_eq!(handoff.cursor, 0, "nothing accepted yet");
+
+                // The world keeps deciding past the held batch: the ring now
+                // holds `held-3` plus `gone-{gap}..gone-{last}`, and the rows
+                // `gone-0..{gap}` can never be read by this cursor again.
+                for n in 0..(gap + capacity as u64) {
+                    ring.push(&format!("gone-{n}"));
+                }
+
+                // Still behind: the retry costs no drain and reports no gap --
+                // a wrap that has not overtaken the held batch is lateness.
+                let drains = ring.drain_calls;
+                assert_eq!(
+                    handoff.flush(|cursor| ring.drain(cursor), &tx),
+                    AuditFlush::Deferred(capacity)
+                );
+                assert_eq!(ring.drain_calls, drains, "a held batch is not re-read");
+                assert_eq!(
+                    meter.load(Ordering::SeqCst),
+                    0,
+                    "nothing has been evicted past this cursor yet"
+                );
+                assert!(events.errors().is_empty(), "no gap, so no error line");
+
+                // The sink catches up. The held batch goes, and the drain that
+                // follows comes back from a cursor the ring has left behind.
+                rx.try_recv().expect("the in-flight batch");
+                assert_eq!(
+                    handoff.flush(|cursor| ring.drain(cursor), &tx),
+                    AuditFlush::Deferred(capacity + 1),
+                    "the gap row rides in the batch it describes, which the \
+                     full queue holds the same way as any other row"
+                );
+
+                // (b) logged, with the count and the range, once.
+                let errors = events.errors();
+                assert_eq!(errors.len(), 1, "one error line per gap: {errors:?}");
+                let (message, fields) = &errors[0];
+                assert!(
+                    message.contains("ring wrapped") && message.contains("OBI-360"),
+                    "the line must say what happened and why: {message}"
+                );
+                assert_eq!(
+                    (
+                        fields.get("evicted").map(String::as_str),
+                        fields.get("lost_from").map(String::as_str),
+                        fields.get("lost_to").map(String::as_str),
+                    ),
+                    (Some("3"), Some("4"), Some("7")),
+                    "N plus the cursor range the drain reported: {fields:?}"
+                );
+
+                // (c) metered, by exactly N and not by the batch size.
+                assert_eq!(
+                    meter.load(Ordering::SeqCst),
+                    gap,
+                    "{EVICTED_METRIC} must count the lost rows once"
+                );
+                assert_eq!(handoff.rows_evicted, gap);
+
+                // (d) durably: one `audit_gap` row, ahead of the survivors. The held
+                // batch arrives first and unchanged; the gap row leads the one
+                // that follows it.
+                assert_eq!(
+                    arguments(&rx.try_recv().expect("the held batch")),
+                    vec!["held-0", "held-1", "held-2", "held-3"],
+                    "the batch the handoff was holding arrives unchanged"
+                );
+                assert_eq!(
+                    handoff.flush(|cursor| ring.drain(cursor), &tx),
+                    AuditFlush::Accepted(capacity + 1)
+                );
+                let batch = rx.try_recv().expect("the gap batch");
+                let gaps: Vec<&loom_vm::AuditRow> = batch
+                    .iter()
+                    .filter(|r| r.kind == loom_vm::AUDIT_GAP_KIND)
+                    .collect();
+                assert_eq!(gaps.len(), 1, "exactly one gap row: {batch:?}");
+                assert_eq!(batch[0].kind, loom_vm::AUDIT_GAP_KIND, "and it leads");
+                assert_eq!(batch[0].detail.as_deref(), Some("evicted=3"));
+                assert_eq!(batch[0].argument, "4..7");
+                assert!(!batch[0].allowed, "a gap is never an approved decision");
+                assert_eq!(
+                    arguments(&batch[1..]),
+                    vec!["gone-3", "gone-4", "gone-5", "gone-6"],
+                    "the survivors follow it, in ring order, nothing duplicated"
+                );
+                assert_eq!(handoff.cursor, 11, "the cursor is the ring's total");
+                assert!(handoff.pending.is_none());
+
+                // Settled: a gap is a fact about one cursor position, not a
+                // standing condition. The next tick reports nothing and writes
+                // nothing, and the counter does not move.
+                assert_eq!(
+                    handoff.flush(|cursor| ring.drain(cursor), &tx),
+                    AuditFlush::Empty
+                );
+                assert_eq!(
+                    meter.load(Ordering::SeqCst),
+                    gap,
+                    "one gap must not meter twice"
+                );
+                assert_eq!(events.errors().len(), 1, "one gap must not log twice");
+                assert!(
+                    rx.try_recv().is_err(),
+                    "no second gap row may reach Postgres"
+                );
+            });
+        });
+    }
+
+    /// A gap row must be insertable, not just constructible: `audit_log` has
+    /// `NOT NULL`/`CHECK` columns (`at`, `kind`, `verdict`) and a `verdict IN
+    /// ('allow','deny')` that a driver record has to land inside. This is the
+    /// seam to `loom-persist`, which the sink's `INSERT` binds through -- a
+    /// gap that failed the schema would be re-held and retried forever, which
+    /// is the failure mode OBI-360 is meant to end, not restart.
+    #[test]
+    fn a_gap_row_fits_the_audit_log_table() {
+        let row = to_persist_audit_row(loom_vm::AuditRow::audit_gap(3, 4, 7));
+        assert_eq!(row.kind, "audit_gap");
+        assert_eq!(row.verdict, "deny", "the CHECK admits nothing else");
+        assert_eq!(row.apply.as_deref(), Some("audit_gap"));
+        assert_eq!(row.argument.as_deref(), Some("4..7"));
+        assert_eq!(row.detail.as_deref(), Some("evicted=3"));
+        assert!(
+            row.caller.is_none() && row.effective_principal.is_none(),
+            "no principal did anything; the driver lost records"
+        );
+        assert!(row.guard_set.is_empty());
+    }
+
+    /// A gap is never an idle tick. `AuditFlush::Empty` is the state an
+    /// operator reads as "nothing was recorded", so a drain that comes back
+    /// from a cursor a whole ring behind must still produce a batch -- and one
+    /// row must carry the entire shortfall, not one row per wrapped turn.
+    #[test]
+    fn a_handoff_behind_by_more_than_a_ring_reports_the_whole_shortfall_once() {
+        let capacity = 4usize;
+        let decisions = 100u64;
+        let events = CapturedEvents::default();
+        let meter = Arc::new(AtomicU64::new(0));
+        let recorder = GapMeter(meter.clone());
+
+        tracing::subscriber::with_default(events.clone(), || {
+            metrics::with_local_recorder(&recorder, || {
+                let (tx, mut rx) = mpsc::channel::<Vec<loom_vm::AuditRow>>(1);
+                let mut ring = GapRing::new(capacity);
+                let mut handoff = AuditHandoff::new();
+                for n in 0..decisions {
+                    ring.push(&format!("d-{n}"));
+                }
+
+                assert_eq!(
+                    handoff.flush(|cursor| ring.drain(cursor), &tx),
+                    AuditFlush::Accepted(capacity + 1),
+                    "a wrapped ring is not Empty"
+                );
+                assert_eq!(
+                    meter.load(Ordering::SeqCst),
+                    decisions - capacity as u64,
+                    "every row the ring turned over since cursor 0"
+                );
+                assert_eq!(handoff.rows_evicted, decisions - capacity as u64);
+                assert_eq!(events.errors().len(), 1, "one line, not one per wrap");
+                let batch = rx.try_recv().expect("the batch");
+                assert_eq!(
+                    batch
+                        .iter()
+                        .filter(|r| r.kind == loom_vm::AUDIT_GAP_KIND)
+                        .count(),
+                    1,
+                    "one row for the whole gap"
+                );
+                assert_eq!(batch[0].detail.as_deref(), Some("evicted=96"));
+                assert_eq!(batch[0].argument, "0..96");
+                assert_eq!(arguments(&batch[1..]), vec!["d-96", "d-97", "d-98", "d-99"]);
+            });
+        });
     }
 }
 
