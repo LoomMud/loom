@@ -686,6 +686,37 @@ both: `read the pinned mudlib rev` -> external checkout at that rev -> `verify t
 under measurement` -> build -> measure -> upload, all green, so the rev in the report is
 the rev served, not the rev a default branch happened to point at.
 
+#### The first post-merge `main` numbers, promoted by hand from the artifact
+
+The two rows above measure a PR branch. A merged `main` run writes the same report, but
+`results/ci-e1-1.*` is gitignored and the file goes only into the
+`loadtest-e1-1-report` artifact -- so until these rows nothing committed here carried a
+*post-merge* `main` number. Transcribed from the two job logs of the runs that followed
+the `warp.ref` pin landing (the human step named under *Report provenance* above):
+
+| Run | Event | loom commit | p50 / p95 / p99 (150 players, 90 s) | Verdict | Report `## Notes` |
+|---|---|---|---|---|---|
+| 37929376168 | `push` on `main` | `a653c15` (merge of #164) | 3.31 / 16.25 / **23.86 ms** (10 034 cmds, 0 disc, 0 login fails) | E1.1 PASS | `mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in warp.ref)` |
+| 37938451219 | `push` on `main` | `61f8e2c` (merge of #148) | 3.40 / 16.41 / **23.63 ms** (9 955 cmds, 0 disc, 0 login fails) | E1.1 PASS | same |
+
+The other two provenance inputs, shared by both: mix `warp/loadbot/mix.tsv`, 14 entries,
+10% slow-reader cohort, 91 s actual; release build of `loom-cli` + `loom-loadtest` on the
+CI lane runner set -- pods `arc-runner-set-loommud-s8gkm-runner-cc8zp` and
+`...-bpdlx` (Linux 6.8.0-124-generic, x86_64). Both windows are clean in the sense
+OBI-400/OBI-403 care about: every latency-timeline slice reports `no` server stall, each
+report's stall-adjusted p99 equals the measured one, and for `a653c15` the run's own
+`rust` job had finished 23 minutes before the gate got its runner, so no build overlapped
+the measurement. 0.23 ms apart on the same world.
+
+What these rows are **not** is the backstop. Both entered the lane the ordinary way: #164
+touched `Cargo.lock` and `crates/loom-net`, #148 touched `Cargo.lock` and
+`crates/loom-http/src/lib.rs`, and for both pushes `classify` answered `runtime=true` on
+the `Cargo.lock: dependency versions` rule from a real commit range. The range-less path -- the
+first `on.schedule` nightly (cron `17 4 * * *`, which fires on the default branch, first
+possible fire 2026-10-10T04:17Z) and a `gh workflow run ci.yml --ref main` -- is what
+OBI-333 exists to read, and a `warp.ref` bump is the third. Until those land, "`main` is
+measured daily" is a claim about a mechanism, not about a run.
+
 The release policy that goes with it: a release SHA needs a **measured** green
 `loadtest-e1-1` -- one from the nightly `on.schedule` run, or one started by
 `on.workflow_dispatch`. Since OBI-325 a PR can be green while having no p99 in it
