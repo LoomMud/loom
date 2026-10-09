@@ -305,9 +305,15 @@ fn mutation_actor_is_the_interactives_euid_from_input_never_a_weft_string() {
     assert_eq!(&*entry.arg, "roles_set_tier root tier=5");
     assert!(entry.allowed);
 
-    let (rows, cursor) = world.drain_audit_since(0);
+    let drain = world.drain_audit_since(0);
+    assert_eq!(
+        drain.evicted, 0,
+        "the ring has not wrapped: nothing is lost"
+    );
+    let cursor = drain.cursor;
     assert!(cursor > 0);
-    let row = rows
+    let row = drain
+        .rows
         .iter()
         .rev()
         .find(|r| r.apply == "roles_actor")
@@ -316,9 +322,10 @@ fn mutation_actor_is_the_interactives_euid_from_input_never_a_weft_string() {
     assert!(row.allowed);
     assert_eq!(row.effective_principal.as_deref(), Some("t3lead"));
     // Draining again from the returned cursor must not repeat any row.
-    let (rows2, cursor2) = world.drain_audit_since(cursor);
-    assert!(rows2.is_empty());
-    assert_eq!(cursor2, cursor);
+    let drain2 = world.drain_audit_since(cursor);
+    assert!(drain2.rows.is_empty());
+    assert_eq!(drain2.cursor, cursor);
+    assert_eq!(drain2.evicted, 0);
 }
 
 #[test]

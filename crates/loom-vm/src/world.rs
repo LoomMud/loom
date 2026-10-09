@@ -69,6 +69,82 @@ pub struct AuditRow {
     pub at_unix_ms: i64,
 }
 
+/// The `kind`/`apply` of the synthetic row that marks an OBI-360 audit gap.
+/// Not a decision and not an efun: a driver record of decisions the ring
+/// dropped before the sink's cursor reached them.
+pub const AUDIT_GAP_KIND: &str = "audit_gap";
+
+impl AuditRow {
+    /// One `kind = audit_gap` record: `evicted` decisions the bounded audit
+    /// ring overwrote between the sink's `lost_from` and the first row still
+    /// readable from it (`lost_to`, exclusive -- so `lost_to - lost_from ==
+    /// evicted`).
+    ///
+    /// This is the durable half of the OBI-360 CTO decision: a gap in a
+    /// security audit trail must fail loudly, and "loudly" has to outlive the
+    /// process, so the gap is written into `audit_log` next to the decisions
+    /// that survived rather than only being logged. The row is deliberately
+    /// *not* shaped like a decision:
+    ///
+    /// * `caller`/`effective_principal`/`guard_set` are empty -- no principal
+    ///   did anything; the driver lost records.
+    /// * `class` is 0 (`Privilege::P0`) because no privilege class applies.
+    /// * `argument` carries the lost sequence range, `detail` the exact
+    ///   `evicted=<N>` the log line reports, so a reader can recover both
+    ///   without parsing prose.
+    /// * `allowed` is `false`, which the `audit_log` schema renders as verdict
+    ///   `'deny'`. The column's `CHECK (verdict IN ('allow','deny'))` admits
+    ///   nothing else (a migration is not OBI-360's scope), and `'deny'` is
+    ///   the fail-loud choice: a gap then shows up in every query that filters
+    ///   on denials, and can never be misread as an approved decision.
+    /// * `at_unix_ms` is when the gap was *detected* -- there is no decision
+    ///   timestamp to carry, and the lost decisions' own times are unknown.
+    pub fn audit_gap(evicted: u64, lost_from: u64, lost_to: u64) -> Self {
+        Self {
+            kind: AUDIT_GAP_KIND,
+            caller: None,
+            effective_principal: None,
+            apply: AUDIT_GAP_KIND,
+            class: 0,
+            argument: format!("{lost_from}..{lost_to}"),
+            guard_set: Vec::new(),
+            allowed: false,
+            detail: Some(format!("evicted={evicted}")),
+            at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// One read of the audit ring by [`World::drain_audit_since`]: the rows still
+/// readable since the caller's cursor, the cursor to use next time, and --
+/// OBI-360 -- how many rows the ring had already evicted by the time the
+/// caller asked for them.
+///
+/// `evicted` exists because a `Vec<AuditRow>` alone cannot tell "nothing was
+/// recorded since the cursor" from "everything since the cursor was
+/// overwritten": both return an empty or short batch. The ring is bounded
+/// ([`crate::security::AUDIT_LOG_CAPACITY`]) and the world thread must never
+/// block on, or refuse work because of, a sink that has fallen behind, so
+/// eviction itself is not prevented -- the *silence* is. A caller that
+/// reports `evicted > 0` (and nothing here does more than report it) turns a
+/// lost decision into a logged, metered, durably-recorded gap instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditDrain {
+    /// Every still-retained row at or after the caller's cursor, oldest
+    /// first. Empty *and* `evicted == 0` is the only honest "nothing
+    /// happened".
+    pub rows: Vec<AuditRow>,
+    /// This call's `SecurityState::audit_total`: pass it as the next
+    /// `cursor`.
+    pub cursor: u64,
+    /// Decisions the ring overwrote before `cursor` reached them. `0` when
+    /// the caller is keeping up.
+    pub evicted: u64,
+}
+
 /// One live connection, as reported by the OBI-237 admin-query
 /// world-thread side (`World::who_sessions`). Mirrors
 /// `loom_http::admin_query::WhoEntry` field-for-field; defined here
@@ -2006,20 +2082,39 @@ impl World {
     /// lands) quota breaches all flow through the same
     /// `SecurityState::push`, so this one drain covers all of them.
     /// `cursor` is [`SecurityState::audit_total`] as of the *last* call (0
-    /// for the very first); the returned `u64` is this call's total, to
-    /// pass in next time. The audit ring is bounded
+    /// for the very first); the returned [`AuditDrain::cursor`] is this
+    /// call's total, to pass in next time. The audit ring is bounded
     /// ([`crate::security::AUDIT_LOG_CAPACITY`]): if the sink falls behind
     /// by more than that many entries between calls, the oldest
     /// still-retained entries are returned rather than erroring or
     /// blocking the world thread -- a gap in the Postgres sink is
     /// preferable to either.
-    pub fn drain_audit_since(&self, cursor: u64) -> (Vec<AuditRow>, u64) {
+    ///
+    /// **OBI-360:** that gap is now reported instead of being silent.
+    /// [`AuditDrain::evicted`] is the number of decisions the ring overwrote
+    /// between the caller's `cursor` and the oldest row it can still return
+    /// (`0` for a caller that is keeping up), and the returned rows start
+    /// where the retained window does. This function still never blocks and
+    /// never refuses a write -- it just cannot be called in a way that
+    /// mistakes "lost" for "empty". `loom-cli`'s `AuditHandoff` is the
+    /// consumer that turns a non-zero count into an `error!`, a
+    /// `loom_audit_rows_evicted_total` increment, and one durable
+    /// [`AuditRow::audit_gap`] row; `World::audit_log()` readers get the same
+    /// arithmetic from the ring's own `audit_total()`.
+    pub fn drain_audit_since(&self, cursor: u64) -> AuditDrain {
         let log = self.security.log();
         let total = self.security.audit_total();
+        // Oldest sequence number the ring can still hand back.
         let start = total.saturating_sub(log.len() as u64);
         let skip = cursor.saturating_sub(start).min(log.len() as u64) as usize;
         let rows = log[skip..].iter().map(|e| self.audit_row(e)).collect();
-        (rows, total)
+        // Rows in `[cursor, start)` were recorded, never taken, and are gone.
+        let evicted = start.saturating_sub(cursor);
+        AuditDrain {
+            rows,
+            cursor: total,
+            evicted,
+        }
     }
 
     fn audit_row(&self, e: &AuditEntry) -> AuditRow {

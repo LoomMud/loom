@@ -1254,6 +1254,7 @@ dependencies = [
  "loom-persist",
  "loom-supervise",
  "loom-vm",
+ "metrics",
  "serde_json",
  "sqlx",
  "time",
