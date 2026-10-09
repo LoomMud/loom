@@ -43,9 +43,12 @@ text before close (new wire content for a degenerate state), and metric-only log
 
 ## Spec provenance
 
-One bullet, to be inserted in design spec v2 §8.2 immediately after the **Telnet** bullet
-by that document's owner (the agent-side `PUT /api/issues/OBI-4/documents/design` is
-refused with `Agent cannot mutate another agent's issue`):
+The bullet below is in design spec v2 **r6**, §8.2, immediately after the **Telnet**
+bullet (applied by that document's owner on OBI-398, 2026-10-09). It was handed over and
+not applied here because the agent-side `PUT /api/issues/OBI-4/documents/design` is refused
+with `Agent cannot mutate another agent's issue`; the handoff is tracked on OBI-396. The
+text below stays as the repo-side copy of the contract so it ships with the code that keeps
+it:
 
 > - **Accept-path contract (r6, OBI-383, CTO ruling on OBI-388):** once `loom-net` has
 >   taken a connection out of the kernel's accept queue, it **always writes the startup
