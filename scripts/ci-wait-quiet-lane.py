@@ -657,6 +657,24 @@ def correlate(report, samples, t0, bucket_ms) -> list:
     return out
 
 
+def read_quiet_record(path):
+    """The gate's own record, if we can read it. Never raises.
+
+    `correlate` is the file a human reads next to an attribution table, and the
+    single most useful fact about a number is whether the host was quiet while
+    it was taken. That fact lives in `quiet-host.json`; without this the reader
+    has to open two artifacts to know whether a green run was quiet at all.
+    """
+    if not path:
+        return None
+    try:
+        with open(path) as fh:
+            record = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return record if isinstance(record, dict) and "lane_wait_seconds" in record else None
+
+
 def cmd_correlate(args):
     """Join the host samples to the report's latency buckets. Never gates."""
     try:
@@ -692,6 +710,23 @@ def cmd_correlate(args):
         """The t+offset of the first sample where `key` reached `value`."""
         return next((s["offset"] for s in samples if s.get(key) == value), None)
     lines = ["### `%s`: host vs latency (OBI-403)" % args.stage, ""]
+    quiet = read_quiet_record(getattr(args, "quiet_host_file", ""))
+    if quiet:
+        lines += ["| quiet host (before the measurement) | value |", "|---|---|",
+                  "| verdict | `%s` |" % quiet.get("verdict", "?"),
+                  "| lane_wait_seconds | %s |" % fmt(quiet.get("lane_wait_seconds")),
+                  "| loadavg at grant | %s (ceiling %s, %s cpus) |" % (
+                      fmt(quiet.get("runner_loadavg_end")),
+                      fmt(quiet.get("loadavg_ceiling")),
+                      quiet.get("runner_cores", "?")),
+                  "| run job list | `%s` (%s polls) |" % (quiet.get("job_list", "?"),
+                                                          quiet.get("job_list_polls", "?")),
+                  ""]
+    else:
+        wanted = getattr(args, "quiet_host_file", "")
+        if wanted:
+            lines += ["(`--quiet-host-file %s` was unreadable, so this run's quiet-host "
+                      "verdict is not recorded next to the tail)" % wanted, ""]
     if over:
         lines += ["| bucket | over SLA | p99 ms | host load1 max | host cpu max "
                   "| procs_running max |", "|---|---|---|---|---|---|"]
@@ -1061,7 +1096,7 @@ def self_test():
                              out=os.path.join(tmp, "host-vs-latency.md"),
                              summary_file=os.path.join(tmp, "corr.md"),
                              bucket_ms=5000, contention_pct=80.0, cores=8,
-                             stage="self-test")
+                             quiet_host_file="", stage="self-test")
     with open(os.path.join(tmp, "report.json"), "w") as fh:
         json.dump(report, fh)
     code = cmd_correlate(corr_args)
@@ -1091,6 +1126,38 @@ def self_test():
     ok = code == 0
     print("ok   correlate is non-fatal with no samples" if ok else
           "FAIL correlate no-samples: exit %s" % code)
+    failed += 0 if ok else 1
+
+    # 15. The gate's verdict travels with the tail it explains, through the
+    #     parser. OBI-403's sibling asked for `lane_wait_seconds` next to the
+    #     attribution table: a green run that waited 40 s and a green run that
+    #     measured over a saturated host are not the same fact, and today the
+    #     reader has to open quiet-host.json to tell them apart.
+    quiet_record = os.path.join(tmp, "quiet-host.json")
+    with open(quiet_record, "w") as fh:
+        json.dump({"schema": 1, "stage": "self-test", "verdict": "quiet",
+                   "lane_wait_seconds": 41.7, "runner_loadavg_end": 5.38,
+                   "loadavg_ceiling": 8.0, "runner_cores": 8, "job_list": "ok",
+                   "job_list_polls": 5}, fh)
+    corr_out = os.path.join(tmp, "with-quiet.md")
+    buffer = io.StringIO()
+    code = None
+    text = ""
+    try:
+        with contextlib.redirect_stdout(buffer):
+            code = main(["ci-wait-quiet-lane.py", "correlate",
+                         "--report", os.path.join(tmp, "report.json"),
+                         "--samples", samples_path, "--t0-epoch", "2000",
+                         "--quiet-host-file", quiet_record, "--out", corr_out,
+                         "--summary-file", os.path.join(tmp, "quiet-corr.md")])
+        text = open(corr_out).read()
+        ok = (code == 0 and "| lane_wait_seconds | 41.70 |" in text
+              and "over-SLA bucket(s) coincide with host" in text)
+        detail = "code=%s" % code
+    except Exception as exc:                                  # noqa: BLE001
+        ok, detail = False, "raised %s: %s" % (type(exc).__name__, exc)
+    print("ok   correlate prints the gate's lane_wait next to the tail" if ok else
+          "FAIL correlate lane_wait: %s %s" % (detail, text if not ok else ""))
     failed += 0 if ok else 1
 
     # 16. `sample` driven through the *parser*, not a hand-built Namespace. The
@@ -1129,7 +1196,7 @@ def self_test():
     failed += 0 if ok else 1
 
     print("ci-wait-quiet-lane self-test: %d cases, %d failure(s)" % (
-        len(cases) + 7, failed))
+        len(cases) + 8, failed))
     return 1 if failed else 0
 
 
@@ -1192,6 +1259,10 @@ def build_parser():
 
     corr = sub.add_parser("correlate", help="join host samples to the report tail")
     corr.add_argument("--report", default="results/ci-e1-1.json")
+    corr.add_argument("--quiet-host-file", default="",
+                      help="the gate's quiet-host.json; when readable, its verdict and "
+                           "lane_wait_seconds are printed next to the tail so a reader "
+                           "does not need two artifacts to know if the host was quiet")
     corr.add_argument("--samples", default="results/host-samples.tsv")
     corr.add_argument("--t0-epoch", type=int, default=None)
     corr.add_argument("--t0-file", default="")

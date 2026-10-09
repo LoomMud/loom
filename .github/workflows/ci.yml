@@ -1207,7 +1207,8 @@ jobs:
           # still the only thing that can fail this step (rule 7).
           python3 scripts/ci-wait-quiet-lane.py correlate --stage loadtest-e1-1 \
             --report results/ci-e1-1.json --samples results/host-samples.tsv \
-            --t0-file /tmp/loom-measure-t0 --out results/host-vs-latency.md || true
+            --t0-file /tmp/loom-measure-t0 --out results/host-vs-latency.md \
+            --quiet-host-file results/quiet-host.json || true
           exit $status
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always() && needs.classify.outputs.runtime != 'false'
