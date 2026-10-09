@@ -247,6 +247,18 @@ closes first. Two consequences, both recorded so nobody has to rediscover them:
   `status=$?` gone). Reproduced deterministically against both archived scrapes, and the
   rule states the invariant plainly: the p99 verdict is the only thing that can turn
   this check red, and the evidence below it can only ever inform, never decide.
+- The tail now **waits for the save queue before it reads it**, printing
+  `save_settle: objects_saved=… waited=…s drain_complete=…`. Both the save count and
+  `loom_world_loop_stalls_total` are sampled at a single instant, and character
+  persistence is work that can still be running after the last command -- PR #159
+  makes that explicit by taking it off the world thread. A run whose writes land
+  late would otherwise report fewer saved objects *and* fewer stall events than
+  actually happened, i.e. look better for a pure reporting-timing reason. The wait
+  is non-gating and capped at 60 s. Measured on a build off current `main`, where
+  teardown is still synchronous, one save still landed *after* the last command:
+  `save_settle: objects_saved=6 waited=1s drain_complete=yes` -- so the wait is
+  already load-bearing, not a placeholder. A `drain_complete=no` is an evidence
+  gap to read, never a verdict.
 
 This is also why the historical tail is still open. Before PR #151 the same
 disconnect path failed instantly on ENOENT and the worst iteration in a green run

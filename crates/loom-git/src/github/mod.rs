@@ -20,6 +20,11 @@ pub mod pulls;
 pub mod tls_transport;
 pub mod transport;
 
+/// Shared complete-request fake HTTP server used by this crate's loopback
+/// GitHub tests (OBI-350).
+#[cfg(test)]
+pub(crate) mod fake_http;
+
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -92,6 +97,20 @@ pub(super) fn truncate_body(body: &[u8]) -> String {
     } else {
         text.into_owned()
     }
+}
+
+/// The crate's one "does this byte buffer contain this needle, and where"
+/// scan, shared by the HTTP framing readers in `tls_transport` and
+/// `fake_http` (OBI-352).
+///
+/// Both readers need it and neither owns it: production code (the response
+/// reader) cannot reach into a `#[cfg(test)]` module, and a test helper
+/// living in one transport module would be the third copy the moment
+/// another transport appears.
+pub(crate) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 pub struct GitHubAppClient<C: HttpClient = RustlsHttpClient> {
@@ -230,7 +249,7 @@ impl<C: HttpClient> TokenProvider for GitHubAppClient<C> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Shared throwaway test fixture (see `jwt`'s test module docs): not a
@@ -243,9 +262,25 @@ mod tests {
     /// one TCP accept loop, canned JSON responses driven by a closure so
     /// each test controls status/body/expiry without a real mock-server
     /// dependency.
+    ///
+    /// Every request is served **complete** -- headers and body -- by
+    /// [`fake_http::read_request`], and every connection is closed the way
+    /// a real server closes one (`fake_http::respond`). Both halves are
+    /// what keep `unparseable_body_is_a_clear_error` honest about the
+    /// difference between a bad payload and a broken connection (OBI-350).
     struct FakeGitHub {
         addr: String,
         requests: std::sync::Arc<AtomicUsize>,
+        /// The full text of every request the fake actually served, in
+        /// order. Tests assert on this to prove the fake saw the whole
+        /// request (headers *and* body), not just the first TCP segment.
+        served: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeGitHub {
+        fn served_requests(&self) -> Vec<String> {
+            self.served.lock().unwrap().clone()
+        }
     }
 
     fn spawn_fake_github(
@@ -255,41 +290,28 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let requests = std::sync::Arc::new(AtomicUsize::new(0));
         let requests_clone = requests.clone();
+        let served = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let served_clone = served.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let mut stream = match stream {
                     Ok(s) => s,
                     Err(_) => break,
                 };
-                let mut buf = [0u8; 8192];
-                let n = match stream.read(&mut buf) {
-                    Ok(n) => n,
-                    Err(_) => continue,
+                let Some(req) = fake_http::read_request(&mut stream) else {
+                    continue;
                 };
-                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                let path = req
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("")
-                    .to_string();
+                served_clone.lock().unwrap().push(req.raw.clone());
                 let call_index = requests_clone.fetch_add(1, Ordering::SeqCst);
-                let (status, body) = respond(call_index, &path);
-                let status_text = match status {
-                    201 => "Created",
-                    401 => "Unauthorized",
-                    403 => "Forbidden",
-                    _ => "OK",
-                };
-                let resp = format!(
-                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = stream.write_all(resp.as_bytes());
-                let _ = stream.write_all(body.as_bytes());
+                let (status, body) = respond(call_index, &req.path);
+                fake_http::respond(&mut stream, status, &body);
             }
         });
-        FakeGitHub { addr, requests }
+        FakeGitHub {
+            addr,
+            requests,
+            served,
+        }
     }
 
     fn client(server: &FakeGitHub) -> GitHubAppClient<UreqClient> {
@@ -413,38 +435,127 @@ mod tests {
         ));
     }
 
+    /// Deterministic reproduction of the CI-only `unparseable_body` flake
+    /// (OBI-350): a POST whose headers and body leave the client as two
+    /// TCP segments must be served as **one** request.
+    ///
+    /// A fake that does a single `read()` per connection sees only the
+    /// first segment, answers from it, and leaves the body unread in its
+    /// own receive queue. Unread data at close time is what makes the
+    /// kernel answer the client's FIN with a RST -- `ureq` surfaces that
+    /// as an io error, and `GitHubAppClient` maps any io error to
+    /// [`GitHubAppError::Transport`], which is why the flake reported a
+    /// connection failure for a test that was only ever trying to prove a
+    /// *payload* failure. Reading the complete request before answering
+    /// is what retires that class.
+    #[test]
+    fn fake_serves_a_request_that_arrives_in_two_segments() {
+        let server = spawn_fake_github(|_, _| {
+            (
+                201,
+                r#"{"token":"ghs_segmented","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
+            )
+        });
+        let mut stream = TcpStream::connect(&server.addr).unwrap();
+        // `TCP_NODELAY` keeps the two writes in two segments (no Nagle
+        // coalescing), and the read bound means a fake that never finishes
+        // the exchange fails the assertions below instead of hanging CI.
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        const HEADERS: &str = "POST /app/installations/456/access_tokens HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Authorization: Bearer header.segment.body\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 2\r\n\
+             \r\n";
+        stream.write_all(HEADERS.as_bytes()).unwrap();
+        stream.flush().unwrap();
+        // Let the fake take the first segment. With the read-once fake
+        // this is exactly the moment it answered and stopped reading.
+        std::thread::sleep(Duration::from_millis(150));
+        let body_written = stream.write_all(b"{}");
+
+        let mut response = String::new();
+        let response_read = stream.read_to_string(&mut response);
+
+        // 1. The fake must have served the *whole* request, body included.
+        let served = server.served_requests();
+        assert_eq!(
+            served.len(),
+            1,
+            "the fake should have served exactly one request"
+        );
+        assert!(
+            served[0].ends_with("\r\n\r\n{}"),
+            "the fake served a truncated request (the body was lost): {:?}",
+            served[0]
+        );
+        // 2. ... and the client must have got a clean response, not a
+        //    reset: that is the `Transport` error the flake showed up as.
+        body_written.expect("the second segment must not land on a closing socket");
+        response_read.expect("reading the full response must not fail");
+        assert!(
+            response.contains("201 Created"),
+            "response was {response:?}"
+        );
+        assert!(
+            response.contains(r#""token":"ghs_segmented""#),
+            "response was {response:?}"
+        );
+    }
+
     #[test]
     fn request_carries_bearer_jwt_and_github_headers() {
-        let seen_auth = std::sync::Arc::new(Mutex::new(String::new()));
-        let seen_auth_clone = seen_auth.clone();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 8192];
-            let n = stream.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-            for line in req.lines() {
-                if let Some(v) = line.strip_prefix("Authorization: ") {
-                    *seen_auth_clone.lock().unwrap() = v.trim().to_string();
-                }
-            }
-            let body = r#"{"token":"ghs_ok","expires_at":"2099-01-01T00:00:00Z"}"#;
-            let resp = format!(
-                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            stream.write_all(resp.as_bytes()).unwrap();
-            stream.write_all(body.as_bytes()).unwrap();
+        let server = spawn_fake_github(|_, _| {
+            (
+                201,
+                r#"{"token":"ghs_ok","expires_at":"2099-01-01T00:00:00Z"}"#.to_string(),
+            )
         });
         let app = GitHubAppClient::new("99", "11", &test_pem(), UreqClient::default())
             .unwrap()
-            .with_api_base(format!("http://{addr}"));
+            .with_api_base(format!("http://{}", server.addr));
         app.installation_token().unwrap();
-        let auth = seen_auth.lock().unwrap().clone();
+
+        // The shared fake records the request it served, so this test gets
+        // the whole exchange -- headers *and* body -- instead of whatever
+        // one `read()` happened to return.
+        let served = server.served_requests();
+        assert_eq!(served.len(), 1, "expected one served request");
+        let request = &served[0];
+        let header = |name: &str| {
+            request.lines().skip(1).find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim()
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_string())
+            })
+        };
+
+        assert_eq!(
+            request.lines().next().unwrap_or(""),
+            "POST /app/installations/11/access_tokens HTTP/1.1"
+        );
+        let auth = header("Authorization").expect("no Authorization header");
         assert!(auth.starts_with("Bearer "));
         // Three JWT segments after "Bearer ".
         assert_eq!(auth.trim_start_matches("Bearer ").split('.').count(), 3);
+        // The GitHub API headers `UreqClient::post` is named for.
+        assert_eq!(
+            header("Accept").as_deref(),
+            Some("application/vnd.github+json")
+        );
+        assert_eq!(
+            header("X-GitHub-Api-Version").as_deref(),
+            Some("2022-11-28")
+        );
+        assert_eq!(header("Content-Type").as_deref(), Some("application/json"));
+        // And the body the mint posts. A fake that lost it to a truncated
+        // read (OBI-350) would show up here as an empty body.
+        assert_eq!(request.split_once("\r\n\r\n").unwrap().1, "{}");
     }
 
     #[test]

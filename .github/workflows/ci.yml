@@ -249,7 +249,13 @@ jobs:
           SQL
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # `--no-fail-fast`: cargo aborts the remaining test targets at the first
+      # failing one, so one broken crate silently hides the verdict of every
+      # crate after it -- OBI-317's first run died in a loom-cli test and never
+      # reached loom-lsp, which made that change's CI result unobservable. The
+      # job still goes red on any failure; this only makes all of them visible
+      # in one run instead of one per iteration.
+      - run: cargo test --workspace --no-fail-fast
   bench:
     # VM benchmark regression gate (OBI-25 / OBI-118 / OBI-312): this PR's
     # base vs its working tree, same runner, >15% on any workload fails.
@@ -414,6 +420,28 @@ jobs:
           set -euo pipefail
           scripts/ci-ensure-tools.sh python3:python3-minimal
           python3 scripts/bench_compare.py --self-test
+      - name: lsp thread-count guard isolation (OBI-317)
+        # tests/lsp_thread_count.rs measures /proc/self/task, a *process-wide*
+        # thread list. The number only means "one LSP session did not leak"
+        # while that binary hosts exactly one session, so a second #[test] in
+        # it re-creates the flake the file exists to remove (sibling sessions
+        # starting/stopping in the measurement window). No runtime assertion can
+        # tell "the harness grew" from "a sibling session appeared", so the
+        # rule is checked where it is unambiguous: statically, in the lane.
+        run: |
+          set -euo pipefail
+          f=crates/loom-lsp/tests/lsp_thread_count.rs
+          if [ ! -f "$f" ]; then
+            echo "$f is missing: the G1/M-LSP-4 thread-count guard needs its own test binary" >&2
+            exit 1
+          fi
+          n=$(grep -c '^#\[test\]' "$f" || true)
+          if [ "$n" != 1 ]; then
+            echo "$f must contain exactly one #[test] (found $n). Its thread-count" >&2
+            echo "measurement is process-wide, so a sibling session in the same binary" >&2
+            echo "makes it flaky (OBI-317). Put the new test in lsp_integration.rs." >&2
+            exit 1
+          fi
       - uses: fsfe/reuse-action@bb774aa972c2a89ff34781233d275075cbddf542 # v5.0.0
   fuzz-smoke:
     # Weft parser fuzz smoke (OBI-23): <= 60 s of libFuzzer seeded from the
@@ -951,6 +979,35 @@ jobs:
           # no longer fails the step; `upload-artifact` runs `if: always()` with
           # `if-no-files-found: warn`, so the missing file is still visible.
           set +e
+          # OBI-344 (salvaged from PR #157's evidence tail; the paced drain it was
+          # written for was withdrawn once #159 took character durability off the
+          # world thread): read the save count *after* giving the server a chance
+          # to finish writing. The p99 verdict is not the only thing this gate is
+          # evidence for -- the step also reports `save_path: objects_saved=N` and
+          # scrapes `loom_world_loop_stalls_total`, and both are read at a single
+          # instant while persistence is a queue that can still be draining after
+          # the last command. Without the wait, a run whose writes land late
+          # reports fewer saved objects *and* fewer stall events than happened,
+          # which would read as an improvement for a pure reporting-timing reason.
+          # Non-gating: an unfinished drain is printed, never failed, and the
+          # wait is bounded so a wedged writer cannot hang the job. Measured on a
+          # build off current `main`, where teardown is still synchronous, one of
+          # six saves had not landed when the last command finished -- the loop
+          # waited 1 s and then read the true count, so this is already
+          # load-bearing rather than a placeholder for #159.
+          settle_start=$(date +%s)
+          while [ "$(find "$SAVES" -type f -name '*.o' 2>/dev/null | wc -l)" -lt 150 ] \
+                 && [ $(( $(date +%s) - settle_start )) -lt 60 ]; do
+            sleep 1
+          done
+          settled=$(find "$SAVES" -type f -name '*.o' 2>/dev/null | wc -l)
+          settle_wait=$(( $(date +%s) - settle_start ))
+          if [ "$settled" -ge 150 ]; then
+            settle_done=yes
+          else
+            settle_done=no
+          fi
+          echo "save_settle: objects_saved=$settled waited=${settle_wait}s drain_complete=$settle_done"
           # Scrape before stopping: the previous version of this step curled
           # `/metrics` *after* `kill`, so the "final /metrics" section was
           # always empty and the artifact's only server numbers were the

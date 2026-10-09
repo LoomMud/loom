@@ -21,6 +21,11 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
+#[path = "support/read_until.rs"]
+mod read_until;
+
+use read_until::drain_telnet_preamble;
+
 const IAC: u8 = 255;
 const WILL: u8 = 251;
 const WONT: u8 = 252;
@@ -38,7 +43,7 @@ fn raw_telnet_transcript_shows_will_echo_then_wont_echo_around_password() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
 
-    drain_telnet_preamble(&mut stream);
+    drain_telnet_preamble(&mut stream, "after connecting to the server");
 
     // logon(): "Name: " with ordinary (enabled) echo -- no IAC bytes.
     let greeting = read_bytes(&mut stream, "Name: ".len());
@@ -206,17 +211,7 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
     }
 }
 
-/// `loom serve` opens with startup telnet option negotiation (OBI-26: `DO
-/// NAWS`, `DO TTYPE`, `WILL GMCP`, `WILL MSSP` -- 12 bytes) before
-/// anything else shows up on the wire; drop it so the byte-exact
-/// assertions above start at `logon()`'s own output.
-fn drain_telnet_preamble(stream: &mut TcpStream) {
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble");
-}
-
+/// A port to hand the child, bound-then-dropped so the OS has marked it free.
 fn reserve_local_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("read local addr").port()
