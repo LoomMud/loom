@@ -786,26 +786,15 @@ mod tests {
     #[test]
     fn markdown_carries_the_mudlib_provenance_note() {
         let mut s = Samples::default();
-        s.push(Duration::from_millis(9));
-        let report = RunReport {
-            players: 150,
-            slow_reader_fraction: 0.1,
-            requested_duration_secs: 90,
-            actual_duration_secs: 90.1,
-            login_failures: 0,
-            disconnects: 0,
-            commands_sent: 1,
-            sla_p99_ms: 50.0,
-            command_latency: LatencyReport::from_samples(&s),
-            slow_reader_command_latency: None,
-            login_latency: None,
-            e1_1_pass: true,
-            notes: vec![
-                "mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in warp.ref)"
-                    .to_string(),
-            ],
-            server_metrics: None,
-        };
+        s.push_at(0, Duration::from_millis(9));
+        // Built from the shared helper rather than a second literal: OBI-344
+        // added report fields, and a hand-written copy of the whole struct is
+        // how a provenance test quietly stops covering the real report.
+        let mut report = empty_report(&s, None);
+        report.notes = vec![
+            "mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in warp.ref)"
+                .to_string(),
+        ];
         let md = report.to_markdown();
         assert!(md.contains("## Notes"), "no notes section in:\n{md}");
         assert!(
