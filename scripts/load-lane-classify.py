@@ -41,21 +41,24 @@ regression. Three overlaps are resolved that way rather than by file type:
 Usage:
   load-lane-classify.py --range BASE...HEAD [--github-output] [--summary]
   load-lane-classify.py --path P [--path P2 ...] [--github-output] [--summary]
-  load-lane-classify.py --self-test          # deterministic classification table
+  load-lane-classify.py --self-test          # table + how the paths are read
 
 With no `--range`/`--path` the diff is unknown, which is the same as an
 unrecognised path: runtime-relevant.
 
 Exit status is 0 in classify mode even when the tool cannot work out a diff --
 that case is reported as `runtime=true`, and the caller must not have to
-improvise a fail-open. `--self-test` exits 1 if any table row misclassifies.
+improvise a fail-open. `--self-test` exits 1 if any table row misclassifies, or
+if the git half (`git_self_test`) cannot read a rename's source path.
 """
 
 import argparse
 import fnmatch
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 
 # (glob, verdict, rule label). First match wins, runtime-relevant rules first:
 # `crates/loom-vm/src/README.md` is documentation *and* a file under `src/`, and
@@ -212,19 +215,120 @@ def self_test():
             failed += 1
             print("FAIL %-28s -> runtime=%s reason=%r (wanted runtime=%s reason ~ %r, rule %r)"
                   % (name, runtime, reason, want, want_reason, rule))
-    print("load-lane-classify self-test: %d cases, %d failure(s)" % (len(TABLE), failed))
+    total = len(TABLE)
+    n, f = git_self_test()
+    total += n
+    failed += f
+    print("load-lane-classify self-test: %d cases, %d failure(s)" % (total, failed))
     return 1 if failed else 0
 
 
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True,
+                          text=True, check=True).stdout
+
+
+def git_self_test():
+    """The half the table cannot express: how changed paths *reach* `classify`.
+
+    The OBI-325 review's second defect. `git diff --name-only` detects renames by
+    default, and a detected rename is reported as its destination only -- so
+    moving `crates/loom-loadtest/tests/fixtures/mix.tsv` (compiled in by
+    `include_str!`, therefore runtime-relevant) next to the integration tests it
+    is no longer compiled from would list one allow-listed path and classify as
+    *skip*. `git_paths` passes `--no-renames`, so both ends are read and the
+    relevant source still decides. Builds a throwaway repo, changes nothing in
+    this one. Returns (cases, failures).
+    """
+    if shutil.which("git") is None:
+        print("FAIL git self-test                   -> no git on PATH: the diff-reading "
+              "half of this check is untested, not passed")
+        return 1, 1
+    seed = {
+        "crates/loom-loadtest/tests/fixtures/mix.tsv": "warp\tloadbot\tmix\n",
+        "mudlib/room/lobby.c": "var short descr = \"Lobby\";\n",
+        "docs/a.md": "prose\n",
+    }
+    moves = [("crates/loom-loadtest/tests/fixtures/mix.tsv",
+              "crates/loom-cli/tests/mix.tsv"),
+             ("mudlib/room/lobby.c", "docs/lobby.c")]
+    tmp = tempfile.mkdtemp(prefix="load-lane-classify-selftest-")
+    repo = os.path.join(tmp, "repo")
+    cases = failed = 0
+    cwd = os.getcwd()
+    try:
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "selftest@example.invalid")
+        _git(repo, "config", "user.name", "load-lane-classify self-test")
+        for path, body in seed.items():
+            full = os.path.join(repo, path)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(body)
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "seed")
+        base = _git(repo, "rev-parse", "HEAD").strip()
+        for src, dst in moves:
+            os.makedirs(os.path.dirname(os.path.join(repo, dst)), exist_ok=True)
+            _git(repo, "mv", src, dst)
+        _git(repo, "commit", "-q", "-m", "two renames, both destinations allow-listed")
+        rng = "%s...%s" % (base, _git(repo, "rev-parse", "HEAD").strip())
+        os.chdir(repo)
+        paths = git_paths(rng)
+
+        def check(name, ok, detail=""):
+            nonlocal cases, failed
+            cases += 1
+            if ok:
+                print("ok   %-28s -> %s" % (name, detail))
+            else:
+                failed += 1
+                print("FAIL %-28s -> %s" % (name, detail))
+
+        have = set(paths or [])
+        for src, dst in moves:
+            check("rename lists source",
+                  src in have, "missing" if src not in have else src)
+            check("rename lists destination",
+                  dst in have, "missing" if dst not in have else dst)
+        runtime, reason, rule = classify(paths or [])
+        check("renames take the lane", runtime is True,
+              "runtime=%s reason=%r" % (runtime, reason))
+        # The counterfactual, so this test cannot rot into vacuity: with rename
+        # detection forced on, the same range lists only the two allow-listed
+        # destinations and would skip. If a future table edit makes these
+        # destinations relevant, this case fails and the pairing must be redone.
+        folded = subprocess.run(["git", "-C", repo, "diff", "--name-only", "-M", rng],
+                                capture_output=True, text=True, check=True)
+        fold = [l for l in folded.stdout.splitlines() if l.strip()]
+        check("counterfactual: -M hides sources",
+              set(fold) == {dst for _, dst in moves} and classify(fold)[0] is False,
+              "-M lists %s -> runtime=%s" % (sorted(fold), classify(fold)[0]))
+    except (OSError, subprocess.CalledProcessError) as e:
+        check("git self-test ran", False, "could not build the throwaway repo: %s" % e)
+        cases += 1
+        failed += 1
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+    return cases, failed
+
+
 def git_paths(rng):
-    """`git diff --name-only BASE...HEAD`, or None when the range is unusable.
+    """`git diff --name-only --no-renames BASE...HEAD`, or None if unusable.
 
     Three-dot on purpose: the merge-base to head diff is *this change's* files.
     Two-dot would fold in whatever `main` moved by, which is exactly the
     mis-classification a rebase-while-queued produces.
+
+    `--no-renames` because rename detection is on by default and reports a move
+    as its destination alone: a file renamed *out* of a runtime-relevant path
+    into an allow-listed one would then classify as "skip the lane". Both ends of
+    a move are inputs to the verdict; `git_self_test` is the regression test.
     """
     try:
-        out = subprocess.run(["git", "diff", "--name-only", rng],
+        out = subprocess.run(["git", "diff", "--name-only", "--no-renames", rng],
                              capture_output=True, text=True, check=True)
     except (OSError, subprocess.CalledProcessError) as e:
         sys.stderr.write("load-lane-classify: cannot read %s: %s\n" % (rng, e))

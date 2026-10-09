@@ -331,9 +331,11 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
   headroom, that no required check became skippable or optional, and that the
   workflow-level block can only ever cancel a superseded `pull_request` run),
-  plus a `--self-test` of 44 mutations. Both run in the required `hygiene`
+  plus a `--self-test` of 50 mutations (51 cases, and one of them is the gate
+  losing its `if: ${{ !cancelled() }}`). Both run in the required `hygiene`
   job, with the classifier's own path table (`scripts/load-lane-classify.py
-  --self-test`, 30 cases), so the lane cannot rot silently and the comment here
+  --self-test`, 36 cases: 30 classification rows plus 6 that build a throwaway
+  git repo), so the lane cannot rot silently and the comment here
   cannot drift from the workflow.
 
 **What the lane does *not* claim.** GitHub scopes a job-level concurrency
@@ -406,6 +408,17 @@ place where it is pinned -- and that file is runtime-relevant, which means a
 toolchain bump is measured instead of skipped. Before rule 8, bumping the
 version in `ci.yml` alone would have changed what every later run builds and
 never entered the lane.
+
+**How the paths are read is part of the decision (OBI-325 review).**
+`git_paths` passes `--no-renames`. Git detects renames by default and reports a
+ detected one as its *destination* only, so moving
+`crates/loom-loadtest/tests/fixtures/mix.tsv` -- compiled in with `include_str!`,
+and therefore the most runtime-relevant path in the repo -- into
+`crates/loom-cli/tests/` would have listed one allow-listed path and skipped the
+lane. Both ends of a move are inputs now; `--self-test` builds a throwaway repo
+to prove it, and asserts the counterfactual (`-M` lists only the two destinations
+and classifies as skip) so the case cannot rot into vacuity. 30 table rows became
+36 cases.
 
 **First live skip (PR #144, run 37736253093, 2026-10-08).** The PR that
 introduces this decides its own diff irrelevant, and the numbers are what the

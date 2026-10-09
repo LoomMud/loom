@@ -86,7 +86,13 @@ follow:
   `tests/fixtures/**` that is compiled in with `include_str!`, or a bench
   workload/harness file takes the lane and is measured. Unknown paths take the
   lane too: the list is an *irrelevance allow-list*, and being unsure costs a
-  lane run rather than hiding a regression.
+  lane run rather than hiding a regression. A rename is read as **both** its old
+  and its new path (`git diff --name-only --no-renames`), because git's default
+  reports a detected rename as its destination only -- so a file moving *out* of
+  `mudlib/` or a compiled-in `tests/fixtures/**` into an allow-listed path would
+  otherwise look like a docs change. `load-lane-classify.py --self-test` builds a
+  throwaway repo and asserts both halves, including the counterfactual that `-M`
+  alone would have skipped it.
 - **CI does not get to pick its own compiler.** `.github/**` counts as
   irrelevant, so `scripts/check-ci-load-lane.py` (rule 8, run by `hygiene`) also
   requires every `toolchain:` the workflow installs to equal the channel in
