@@ -35,7 +35,11 @@
 //! * the probe window ends on "nothing left to measure" ([`next_pace`]), not on a
 //!   sample count, because `World::drain_account_results` hands the outbox over in
 //!   one batch per tick, and a tail that lands two-at-a-time used to leave the
-//!   loop unable to finish inside [`READY_DEADLINE`].
+//!   loop unable to finish inside [`READY_DEADLINE`]; and
+//! * reads are line-complete ([`Lines`]): an unterminated tail is carried across
+//!   polls instead of dropped with the poll's scratch buffer, because a 2 ms poll
+//!   that loses half an `ok` is the OBI-302 lost-bytes class wearing a timing
+//!   costume ([`a_partial_line_survives_the_poll_boundary`]).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -445,6 +449,10 @@ struct Window {
 fn probe_hashing_window(a: &mut BufReader<TcpStream>, b: &mut BufReader<TcpStream>) -> Window {
     a.get_mut().set_read_timeout(Some(POLL)).unwrap();
     b.get_mut().set_read_timeout(Some(POLL)).unwrap();
+    // One carry-over buffer per connection, for as long as that connection is
+    // polled -- see [`Lines`].
+    let mut a_carry = Lines::default();
+    let mut b_carry = Lines::default();
 
     for index in 0..PIPELINED_CREATES {
         send_line(
@@ -471,7 +479,7 @@ fn probe_hashing_window(a: &mut BufReader<TcpStream>, b: &mut BufReader<TcpStrea
         let Drain {
             lines: a_lines,
             closed: a_closed,
-        } = drain(a);
+        } = a_carry.poll(a);
         note(&mut transcript_a, &a_lines);
         for line in a_lines {
             if line.starts_with("result ") {
@@ -483,10 +491,28 @@ fn probe_hashing_window(a: &mut BufReader<TcpStream>, b: &mut BufReader<TcpStrea
         let Drain {
             lines: b_lines,
             closed: b_closed,
-        } = drain(b);
+        } = b_carry.poll(b);
         note(&mut transcript_b, &b_lines);
 
-        if a_closed || b_closed {
+        if let Some(sent) = probe_sent
+            && b_lines.iter().any(|line| line == "ok")
+        {
+            probe_rtt.push(sent.elapsed());
+            probe_sent = None;
+            if probe_rtt.len() == 1 {
+                results_before_first_probe = result_arrivals.len();
+            }
+        }
+
+        // One decision per drain, taken by the same pure function the replay test
+        // drives, so the loop's termination is a property of the counters and not
+        // of how the host happened to batch this run's deliveries.
+        let pace = next_pace(probe_rtt.len(), results.len(), probe_sent.is_some());
+        // A hang-up is only a defect while the window still has work outstanding;
+        // once the probes are answered and the results are in, a driver that closes
+        // on its way out has nothing left to tell us. Hence the decision above,
+        // taken after this drain's lines have all been accounted for.
+        if (a_closed || b_closed) && !matches!(pace, Pace::Done) {
             panic!(
                 "the driver closed {}while {} of {PIPELINED_CREATES} pipelined creates were \
                  still outstanding.\n--- connection a ---\n{transcript_a}\n--- connection b \
@@ -502,20 +528,7 @@ fn probe_hashing_window(a: &mut BufReader<TcpStream>, b: &mut BufReader<TcpStrea
             );
         }
 
-        if let Some(sent) = probe_sent
-            && b_lines.iter().any(|line| line == "ok")
-        {
-            probe_rtt.push(sent.elapsed());
-            probe_sent = None;
-            if probe_rtt.len() == 1 {
-                results_before_first_probe = result_arrivals.len();
-            }
-        }
-
-        // One decision per drain, taken by the same pure function the replay test
-        // drives, so the loop's termination is a property of the counters and not
-        // of how the host happened to batch this run's deliveries.
-        match next_pace(probe_rtt.len(), results.len(), probe_sent.is_some()) {
+        match pace {
             Pace::Send => {
                 send_line(b, PROBE);
                 probe_sent = Some(Instant::now());
@@ -762,33 +775,151 @@ struct Drain {
     closed: bool,
 }
 
-fn drain(reader: &mut BufReader<TcpStream>) -> Drain {
-    let mut lines = Vec::new();
-    let mut closed = false;
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                closed = true;
-                return Drain { lines, closed };
+/// Bytes read off a connection that no newline has completed yet, kept **across
+/// polls** for one connection.
+///
+/// This is what the OBI-329 review caught in the shape of [`Drain`]'s reader.
+/// `BufRead::read_line` copies whatever it has buffered into the caller's
+/// `String` and *then* discovers the line is unterminated, so it returns
+/// `Err(TimedOut)` with those bytes already consumed from the buffer. A caller
+/// that allocates a fresh `String` per poll -- which is what a poll loop does --
+/// drops them, and the next poll sees only the tail: `hello` arrives as `lo`, an
+/// `ok` is never recognised, and the round trip dies at [`READY_DEADLINE`]
+/// shouting "this connection is not being answered" about a driver that answered
+/// on time. At [`POLL`] = 2 ms that is a coin-flip on a contended runner, and it
+/// is the same lost-bytes class as OBI-302. [`Lines::poll`] completes a line only
+/// on `\n` and reads bytes rather than `String`s, so a mid-line timeout costs
+/// nothing and a non-UTF-8 byte cannot desynchronise the reader either.
+#[derive(Default)]
+struct Lines {
+    carry: Vec<u8>,
+}
+
+impl Lines {
+    fn poll(&mut self, reader: &mut BufReader<TcpStream>) -> Drain {
+        let mut lines = Vec::new();
+        let mut closed = false;
+        loop {
+            // `fill_buf` blocks only when the buffer is empty, which is what makes
+            // the socket read timeout act as the poll interval here; `consume`
+            // moves those bytes into `carry`, where they wait for a newline.
+            match reader.fill_buf() {
+                Ok(buf) => {
+                    if buf.is_empty() {
+                        closed = true;
+                        break;
+                    }
+                    let taken = buf.len();
+                    self.carry.extend_from_slice(buf);
+                    reader.consume(taken);
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    break;
+                }
+                Err(err) => panic!("socket read failed: {err}"),
             }
-            Ok(_) => {
-                let text = line.trim_end_matches(['\r', '\n']);
+            while let Some(newline) = self.carry.iter().position(|byte| *byte == b'\n') {
+                let raw: Vec<u8> = self.carry.drain(..=newline).collect();
+                let text = String::from_utf8_lossy(&raw[..raw.len() - 1]);
+                let text = text.trim_end_matches('\r');
                 if !text.is_empty() {
                     lines.push(text.to_string());
                 }
             }
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                return Drain { lines, closed };
-            }
-            Err(err) => panic!("socket read failed: {err}"),
         }
+        // A peer that hangs up mid-line still said something; hand it back rather
+        // than swallow it, because these transcripts are how the failures get
+        // diagnosed.
+        if closed && !self.carry.is_empty() {
+            let text = String::from_utf8_lossy(&self.carry).to_string();
+            self.carry.clear();
+            lines.push(text);
+        }
+        Drain { lines, closed }
     }
+}
+
+/// A connected pair on loopback: `peer` writes what a server would, `reader`
+/// polls it with the same [`POLL`] timeout the live tests use. Hermetic -- no
+/// driver, no ports from the test band, no load -- so the boundary behaviour is
+/// asserted deterministically rather than hoped for (OBI-329 review).
+fn probe_pair() -> (TcpStream, BufReader<TcpStream>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("loopback addr");
+    let peer = TcpStream::connect(addr).expect("connect loopback");
+    let accepted = listener.accept().expect("accept loopback").0;
+    accepted
+        .set_read_timeout(Some(POLL))
+        .expect("set poll timeout");
+    (peer, BufReader::new(accepted))
+}
+
+#[test]
+fn a_partial_line_survives_the_poll_boundary() {
+    let (mut peer, mut reader) = probe_pair();
+    let mut carry = Lines::default();
+
+    // Half a line, then a wait clearly longer than the poll interval, so this is
+    // the timeout path and not a fast read.
+    peer.write_all(b"hel").expect("write partial line");
+    peer.flush().expect("flush partial line");
+    std::thread::sleep(POLL * 10);
+    let first = carry.poll(&mut reader);
+    assert!(
+        first.lines.is_empty() && !first.closed,
+        "an unterminated line must not be handed back as one: {:?}",
+        first.lines,
+    );
+
+    // The rest of it. `read_line` had already consumed `hel` out of the buffer on
+    // the timed-out poll above, so the reader that dropped it reported `lo` here.
+    peer.write_all(b"lo\n").expect("write line tail");
+    peer.flush().expect("flush line tail");
+    let second = carry.poll(&mut reader);
+    assert_eq!(
+        second.lines,
+        vec!["hello".to_string()],
+        "the two halves must come back as the one line the driver sent"
+    );
+    assert!(!second.closed);
+
+    // And nothing is invented on the poll after that.
+    let third = carry.poll(&mut reader);
+    assert!(
+        third.lines.is_empty() && !third.closed,
+        "a completed line must not be re-delivered: {:?}",
+        third.lines,
+    );
+}
+
+#[test]
+fn a_needle_split_across_the_poll_boundary_is_still_found() {
+    // `read_until_contains` had the same shape, and it is the helper that waits
+    // for `Welcome.` / `Exits:` -- so a split line reads as "the driver never
+    // booted" rather than as the test losing bytes.
+    let (peer, mut reader) = probe_pair();
+    // The helper does its own polling, so the boundary has to be crossed while it
+    // is waiting: the head goes out, the gap is ten poll intervals, the tail
+    // follows. One writer thread, no traffic elsewhere in the process.
+    let writer = std::thread::spawn(move || {
+        let mut peer = peer;
+        peer.write_all(b"Welcome").expect("write needle head");
+        peer.flush().expect("flush needle head");
+        std::thread::sleep(POLL * 10);
+        peer.write_all(b".\n").expect("write needle tail");
+        peer.flush().expect("flush needle tail");
+    });
+    let transcript = read_until_contains(&mut reader, "Welcome.", READY_DEADLINE);
+    writer.join().expect("writer thread");
+    assert!(
+        transcript.contains("Welcome."),
+        "{transcript:?}: `read_until_contains` returned without the needle it waited for"
+    );
 }
 
 /// Append `lines` to a transcript for failure messages.
@@ -819,26 +950,27 @@ fn median(samples: &[Duration]) -> Duration {
 /// [`READY_DEADLINE`].
 fn round_trips(reader: &mut BufReader<TcpStream>, count: usize) -> Vec<Duration> {
     let mut out = Vec::with_capacity(count);
+    let mut carry = Lines::default();
     for i in 0..count {
         if i > 0 {
             // Space the samples out: back-to-back round trips on one connection
             // can all land in the same world-thread wakeup.
             std::thread::sleep(Duration::from_millis(20));
         }
-        out.push(round_trip(reader));
+        out.push(round_trip(reader, &mut carry));
     }
     out
 }
 
-fn round_trip(reader: &mut BufReader<TcpStream>) -> Duration {
+fn round_trip(reader: &mut BufReader<TcpStream>, carry: &mut Lines) -> Duration {
     let started = Instant::now();
     send_line(reader, PROBE);
     loop {
-        let drain = drain(reader);
-        assert!(!drain.closed, "peer closed the connection mid-measurement");
+        let drain = carry.poll(reader);
         if drain.lines.iter().any(|line| line == "ok") {
             return started.elapsed();
         }
+        assert!(!drain.closed, "peer closed the connection mid-measurement");
         assert!(
             started.elapsed() < READY_DEADLINE,
             "no reply to `{PROBE}` within {READY_DEADLINE:?}: this connection is not being \
@@ -867,6 +999,7 @@ fn read_until_contains(
 ) -> String {
     let started = Instant::now();
     let mut transcript = String::new();
+    let mut carry = Lines::default();
 
     loop {
         if started.elapsed() > timeout {
@@ -876,25 +1009,17 @@ fn read_until_contains(
             );
         }
 
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
+        let drain = carry.poll(reader);
+        note(&mut transcript, &drain.lines);
+        if transcript.contains(needle) {
+            return transcript;
+        }
+        // Only a close that left the needle unsaid is a failure: a driver that
+        // hangs up right after the line you were waiting for has answered.
+        if drain.closed {
+            panic!(
                 "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => {
-                let normalized = line.replace("\r\n", "\n");
-                transcript.push_str(&normalized);
-                if transcript.contains(needle) {
-                    return transcript;
-                }
-            }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!(
-                "socket read failed while waiting for `{needle}`: {err}. Transcript so far:\n\
-                 {transcript}"
-            ),
+            );
         }
     }
 }
