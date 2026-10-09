@@ -217,7 +217,16 @@ jobs:
           SQL
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # `--no-fail-fast` (OBI-369): cargo's default stops the lane at the first failing
+      # *test target*, and workspace order puts `loom-cli` ahead of `loom-http`, `loom-net`
+      # and `loom-vm`. One red `loom-cli` integration test -- the tracked `supervise_handoff`
+      # / `accounts_demo` flakes of OBI-329 / OBI-292 -- therefore ended the lane there and
+      # silently skipped every crate behind it, so "rust failed" said nothing about them and
+      # "rust passed" was only ever true of the crates cargo happened to reach. The flag runs
+      # every target and still exits non-zero if any of them failed: coverage widens, the
+      # gate does not weaken. Cost is zero on an all-green run (cargo already runs every
+      # target there); on a red run it is the time of the targets fail-fast used to skip.
+      - run: cargo test --workspace --no-fail-fast
   bench:
     # VM benchmark regression gate (OBI-25 / OBI-118 / OBI-312): this PR's
     # base vs its working tree, same runner, >15% on any workload fails.
