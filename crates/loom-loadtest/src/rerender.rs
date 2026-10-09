@@ -134,17 +134,38 @@ pub struct Outcome {
     pub bucket_level_attributed: usize,
     pub bucket_level_total: usize,
     /// `false` when the archived report carried only its slowest samples, so
-    /// `tail_count` covers those and not the whole tail.
+    /// `tail_count` covers those and not the whole tail. `true` both when it
+    /// carried every at-or-over-SLA sample and when the run scored none at all.
     pub sample_level_complete: bool,
+    /// Whether the archived run had any at-or-over-SLA sample at all, judged
+    /// from its own slowest command. `tail_count` can be 0 because the run was
+    /// clean, and 0 because the archive carried no samples to re-attribute.
+    /// Those are different sentences, and getting them backwards is how a
+    /// re-render ends up inventing a tail or denying a real one.
+    pub run_missed: bool,
+    pub slowest_command_ms: Option<f64>,
 }
 
 impl Outcome {
+    /// The tail's own slowest command, formatted for prose.
+    fn slowest(&self) -> String {
+        self.slowest_command_ms.map_or_else(
+            || "the report does not say".to_string(),
+            |m| format!("{m:.2} ms"),
+        )
+    }
+
     /// One line of plain text: the evidence a CI log or a human reading the
     /// shell wants, without the report's prose around it.
     pub fn summary(&self) -> String {
-        let sample_part = if self.tail_count == 0 {
+        let sample_part = if self.tail_count == 0 && !self.run_missed {
             "sample level: nothing was at or over the SLA, so there is no tail to attribute"
                 .to_string()
+        } else if self.tail_count == 0 {
+            format!(
+                "sample level: the run did miss the SLA (slowest command {}) but this archive carries no tail samples, so there is nothing here to re-attribute",
+                self.slowest()
+            )
         } else if self.sample_level_complete {
             format!(
                 "sample level: {}/{} tail samples attributed to a server stall ({} inside a measured window), {} unattributed",
@@ -152,7 +173,7 @@ impl Outcome {
             )
         } else {
             format!(
-                "sample level: {}/{} carried samples attributed to a stall (report predates `tail_samples_over_sla`, so the tail itself is not in it)",
+                "sample level: {}/{} carried samples attributed to a stall (the report carries only its slowest samples, so the tail itself is not in it)",
                 self.server_stall, self.tail_count
             )
         };
@@ -178,17 +199,33 @@ pub fn re_render(report: &mut RunReport, source: &str) -> Outcome {
     let precision = stalls.precision();
     let archived = report.tail_attribution.clone();
 
-    // A report written before `tail_samples_over_sla` existed carries only its
-    // slowest samples. Those are still worth re-attributing -- they are the
-    // samples that decide whether a tail is a stall or a shift -- but they are
-    // not the tail, and saying "20 of 20" where the run had 293 would be a lie
-    // of omission. The timeline's per-bucket `over_sla` counts are the way to
-    // state the rest without the samples.
-    let sample_level_complete = !report.tail_samples_over_sla.is_empty();
-    let tail = if sample_level_complete {
+    // A report written before `tail_samples_over_sla` existed, and a report
+    // whose run scored no at-or-over-SLA sample at all, have to be read
+    // differently from one that carries the whole tail. `tail_samples` is *the
+    // slowest twenty commands*, whatever they cost: re-attributing those as
+    // "the tail" in a run where nothing missed the SLA would invent 20 misses
+    // and 20 "unattributed" samples in the artifact -- which is exactly what
+    // the first CI re-render of `b758556` did to its own clean 21.82 ms run.
+    // So the fallback is allowed only when the run demonstrably had a tail, and
+    // the measurement that proves it is already in every report: `max_ms`, the
+    // slowest command of the run, which no report is allowed to round down.
+    // Even then the carried samples are not the tail, just the samples that
+    // decide whether a tail is a stall or a shift; the timeline's per-bucket
+    // `over_sla` counts are how the rest of it is stated.
+    let run_missed = report.sla_p99_ms > 0.0
+        && report
+            .command_latency
+            .as_ref()
+            .is_none_or(|c| c.max_ms >= report.sla_p99_ms);
+    let carried = !report.tail_samples_over_sla.is_empty();
+    let sample_level_complete = carried || !run_missed;
+    let slowest_command_ms = report.command_latency.as_ref().map(|c| c.max_ms);
+    let tail = if carried {
         report.tail_samples_over_sla.clone()
-    } else {
+    } else if run_missed {
         report.tail_samples.clone()
+    } else {
+        Vec::new()
     };
 
     let attribution = if report.commands_sent == 0 && tail.is_empty() {
@@ -266,7 +303,7 @@ pub fn re_render(report: &mut RunReport, source: &str) -> Outcome {
     }
     if !sample_level_complete && attribution.as_ref().is_some_and(|a| a.tail_count > 0) {
         note.push_str(&format!(
-            " This report predates `tail_samples_over_sla` and carries only its {} slowest samples, so the sample-level figures above cover those, not the whole tail.{}",
+            " This report carries only its {} slowest samples, not every at-or-over-SLA one, so the sample-level figures above cover those, not the whole tail.{}",
             tail.len(),
             if report.server_instrumented {
                 format!(
@@ -277,6 +314,28 @@ pub fn re_render(report: &mut RunReport, source: &str) -> Outcome {
                 String::new()
             }
         ));
+    }
+    // An empty tail means one of two opposite things, and reading it as the
+    // other one is how a re-render invents misses or denies real ones.
+    if tail.is_empty() && report.sla_p99_ms > 0.0 && report.command_latency.is_some() {
+        if run_missed {
+            note.push_str(&format!(
+                " The run did miss the SLA -- its slowest command cost {:.2} ms -- but this archive carries no tail samples to re-attribute, so the sample-level figures are 0 of 0; {}",
+                slowest_command_ms.unwrap_or_default(),
+                if report.latency_timeline.is_empty() {
+                    "neither samples nor a latency timeline were archived, so nothing here can say what the tail was."
+                } else {
+                    "only the report's latency timeline speaks for it."
+                }
+            ));
+        } else {
+            note.push_str(&format!(
+                " The run had no tail at all: nothing was at or over {:.0} ms -- its slowest command cost {:.2} ms -- so there was nothing to attribute, and the {} slowest samples this report carries are not treated as one.",
+                report.sla_p99_ms,
+                slowest_command_ms.unwrap_or_default(),
+                report.tail_samples.len()
+            ));
+        }
     }
     if report.command_latency.is_none() {
         note.push_str(" The archived report holds no command latency: nothing to attribute.");
@@ -303,6 +362,8 @@ pub fn re_render(report: &mut RunReport, source: &str) -> Outcome {
         bucket_level_attributed,
         bucket_level_total,
         sample_level_complete,
+        run_missed,
+        slowest_command_ms,
     }
 }
 
@@ -682,6 +743,141 @@ mod tests {
             Request::parse(&[arg("--rerender"), arg("a.json"), arg("b.json")])
                 .unwrap_err()
                 .contains("one report path")
+        );
+    }
+
+    /// The re-render step of CI run `37901080293` did this to its own clean run:
+    /// nothing had missed the 50 ms SLA (p99 21.82 ms), `tail_samples_over_sla`
+    /// was empty, and the builder still read the report's 20 slowest commands as
+    /// "the tail" -- so the artifact reported 20 misses and 20 of them
+    /// "unattributed" for a run that had none. A slowest-N set is only a tail
+    /// when the run demonstrably missed, and `max_ms` is the measurement that
+    /// says so without needing any new field.
+    #[test]
+    fn a_clean_run_does_not_get_a_tail_from_its_twenty_slowest_commands() {
+        let mut report = archived_report();
+        report.command_latency = Some(LatencyReport {
+            count: 4_200,
+            p50_ms: 11.0,
+            p95_ms: 18.0,
+            p99_ms: 21.82,
+            max_ms: 44.9,
+            mean_ms: 12.0,
+        });
+        report.tail_samples_over_sla = vec![];
+        report.tail_samples = (0..20)
+            .map(|i| TailSample {
+                at_ms: 30_000 + i * 7,
+                latency_ms: 44.9 - i as f64,
+            })
+            .collect();
+        report.tail_attribution = None;
+
+        let outcome = re_render(&mut report, "ci-e1-1.json");
+        assert_eq!(outcome.tail_count, 0, "the run scored no miss");
+        assert_eq!(outcome.unattributed, 0, "so there is nothing unexplained");
+        assert!(outcome.sample_level_complete);
+        assert!(
+            outcome.summary().contains("nothing was at or over the SLA"),
+            "{}",
+            outcome.summary()
+        );
+        let note = report.notes.last().unwrap();
+        assert!(
+            note.contains("The run had no tail at all") && note.contains("44.90 ms"),
+            "{note}"
+        );
+        assert!(
+            !note.contains("not every at-or-over-SLA one"),
+            "a report that carries the field must not be described as lacking it: {note}"
+        );
+    }
+
+    /// The opposite mistake: the 500-player stretch archive missed the SLA by a
+    /// kilometre (slowest command 1273.69 ms) and carries no tail samples at
+    /// all. An empty tail there is missing data, not a clean run, and saying
+    /// "nothing was at or over the SLA" would erase a real finding.
+    #[test]
+    fn an_archive_with_no_carried_samples_is_not_called_a_clean_run() {
+        let mut report = archived_report();
+        report.command_latency = Some(LatencyReport {
+            count: 19_000,
+            p50_ms: 20.0,
+            p95_ms: 400.0,
+            p99_ms: 900.0,
+            max_ms: 1273.69,
+            mean_ms: 60.0,
+        });
+        report.tail_samples = vec![];
+        report.tail_samples_over_sla = vec![];
+
+        let outcome = re_render(&mut report, "2026-09-27-500-players-stretch.json");
+        assert!(outcome.run_missed, "1273.69 ms against a 50 ms SLA");
+        assert_eq!(outcome.tail_count, 0, "but nothing was carried to rank");
+        assert!(
+            outcome.summary().contains("carries no tail samples"),
+            "{}",
+            outcome.summary()
+        );
+        let note = report.notes.last().unwrap();
+        assert!(
+            note.contains("The run did miss the SLA") && note.contains("1273.69 ms"),
+            "{note}"
+        );
+        assert!(
+            note.contains("only the report's latency timeline speaks for it"),
+            "{note}"
+        );
+        assert!(!note.contains("The run had no tail at all"), "{note}");
+        // And with the timeline gone too, it must not point at a section the
+        // report does not have.
+        report.latency_timeline = vec![];
+        re_render(&mut report, "2026-09-27-500-players-stretch.json");
+        assert!(
+            report
+                .notes
+                .last()
+                .unwrap()
+                .contains("neither samples nor a latency timeline were archived"),
+            "{}",
+            report.notes.last().unwrap()
+        );
+        // The markdown carries the same contradiction out into the section a
+        // human reads first, so "0 of 19127" cannot be read as a clean run.
+        let md = report.to_markdown();
+        assert!(
+            md.contains("This attribution disagrees with the run's own latency"),
+            "{md}"
+        );
+    }
+
+    /// The other half of the same rule: an archive from before the field, for a
+    /// run that really did miss, still gets its carried samples re-attributed --
+    /// and still says they are not the whole tail.
+    #[test]
+    fn a_legacy_archive_that_did_miss_still_has_its_carried_samples_attributed() {
+        let mut value = serde_json::to_value(archived_report()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("tail_samples_over_sla");
+        let mut report: RunReport = serde_json::from_value(value).unwrap();
+
+        let outcome = re_render(&mut report, "ci-e1-1.json");
+        assert_eq!(
+            (outcome.tail_count, outcome.server_stall),
+            (20, 20),
+            "the 996 ms run's 20 slowest commands are the samples that decide the tail"
+        );
+        assert!(!outcome.sample_level_complete);
+        assert!(
+            !report
+                .notes
+                .last()
+                .unwrap()
+                .contains("The run had no tail at all"),
+            "{}",
+            report.notes.last().unwrap()
         );
     }
 }

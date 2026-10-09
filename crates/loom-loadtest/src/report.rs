@@ -549,6 +549,30 @@ impl RunReport {
         }
         if let Some(a) = &self.tail_attribution {
             out.push_str("## Tail attribution (OBI-344)\n\n");
+            // An archived attribution that claims no missed sample while the
+            // same report's p99 sits past the SLA is not a clean run -- it is
+            // an attribution written by an older schema, or one that never ran,
+            // read back through `#[serde(default)]`. Saying "0 of 19127" as if
+            // it were a measurement would turn missing data into a claim that
+            // the tail is empty, so it is contradicted here, in the section a
+            // human reads first.
+            if a.tail_count == 0
+                && self.sla_p99_ms > 0.0
+                && self
+                    .command_latency
+                    .as_ref()
+                    .is_some_and(|c| c.p99_ms >= self.sla_p99_ms)
+            {
+                out.push_str(&format!(
+                    "- **This attribution disagrees with the run's own latency.** It reports no sample at or over the SLA while the measured p99 is {:.2} ms: treat the figures below as absent, not as a tail of zero.{}\n",
+                    self.command_latency.as_ref().unwrap().p99_ms,
+                    if self.latency_timeline.is_empty() {
+                        " The report carries no latency timeline either, so nothing here can say what the tail was."
+                    } else {
+                        " The latency timeline below is the report's own measurement of where the misses fell."
+                    }
+                ));
+            }
             out.push_str(&format!(
                 "- Samples at or over the {:.0} ms SLA: **{}** of {}\n",
                 a.threshold_ms, a.tail_count, self.commands_sent

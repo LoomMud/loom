@@ -181,15 +181,33 @@ windows, the tail attribution, and the timeline's stall marks from an archived
 report, using the report's own scrape series. It changes no measurement: `p99_ms`
 and `e1_1_pass` are the archived run's numbers, and the re-render appends a note
 saying exactly how much it could rebuild. Reports written before OBI-371 do not
-carry every at-or-over-SLA sample (only the 20 slowest), so their re-render is
-sample-level over that subset plus a bucket-level count over the whole tail;
-reports written after it carry `tail_samples_over_sla` and re-render at sample
-level forever. Two re-renders are committed here as examples of each path:
-`ci-e1-1-7086b58.rerendered.*` (the `37880215784` artifact, whose 875 ms stall
-this build places at t+9.4-11.3 s, explaining all 20 carried samples and
-putting 271 of the run's 293 over-SLA samples inside a stall-overlapping bucket)
-and `2026-09-27-500-players-stretch.rerendered.*` (a run with no scrape series
-at all, which must say "not this re-render's claim" instead of inventing one).
+carry every at-or-over-SLA sample -- only the 20 slowest -- so a re-render falls
+back to those, but *only* when the run demonstrably had a tail, which the
+report's own `max_ms` decides. That distinction is the point: the first CI
+re-render of a clean 21.82 ms run read its 20 slowest commands as "the tail" and
+reported 20 misses, 20 of them "unattributed", that never happened; while an
+older archive whose slowest command cost 1273.69 ms and whose sample lists are
+empty must be called missing data, not a clean run. So an empty tail now says
+which of the two it is, and a markdown section whose attribution reports zero
+misses while the same report's p99 sits past the SLA is flagged as disagreeing
+with its own latency instead of being printed as a measurement.
+
+Reports written after OBI-371 carry `tail_samples_over_sla` and re-render at
+sample level forever. The archives and their re-renders are committed together,
+so each pair reproduces with
+`cargo run -p loom-loadtest -- --rerender results/<archive>.json --out results/<archive>.rerendered`:
+
+* `ci-e1-1-7086b58.*` -- run 37880215784, the artifact that started this. Its
+  875 ms login-ramp stall, which the run could not place, is bracketed at
+  t+9.4-11.3 s; all 20 samples that archive carried are explained by it, and 271
+  of its 293 over-SLA samples fall in a bucket a stall window overlaps.
+* `ci-e1-1-b758556.*` -- run 37901080293, the first run of this build: 90 scrape
+  rows from t+0, each stamped `unix_ms`, and a genuinely clean tail (slowest
+  command 41.54 ms against a 50 ms SLA), which is what the "no tail at all"
+  wording is for.
+* `2026-09-27-500-players-stretch.rerendered.*` -- a run that scraped no
+  instrumented server and archived no samples, which must say "not this
+  re-render's claim" instead of inventing either.
 
 The first finding that visibility produced: the
 `loom_runtime_errors_total{program="/std/player"}` count of exactly 150 that
