@@ -452,12 +452,17 @@ mod tests {
     ///
     /// The order is the point (OBI-352). `shutdown(Write)` before the alert
     /// has been written means the alert never leaves the process, so the
-    /// peer's record layer sees a truncated connection instead of a clean
-    /// TLS EOF; and abandoning the `StreamOwned` while the request body is
-    /// still unread in *our* receive queue is what makes the kernel answer
-    /// the client's FIN with an RST. After the alert the drain runs on the
-    /// inner socket: rustls has nothing left to unseal, we only need those
-    /// bytes off the queue.
+    /// peer gets a truncated closure instead of a TLS EOF: rustls reports
+    /// that as `Error::UnexpectedEOF` -- "peer closed connection without
+    /// sending TLS close_notify", see the `unexpected-eof` section of the
+    /// rustls manual. And abandoning the `StreamOwned` while the request
+    /// body is still unread in *our* receive queue is what makes the kernel
+    /// answer the client's FIN with an RST, which is the failure the CI test
+    /// saw.
+    ///
+    /// After the alert, the drain runs on the inner socket: rustls has
+    /// nothing left to unseal there, we only need those bytes off the queue
+    /// so the close stays clean.
     fn close_tls_gracefully(tls: &mut StreamOwned<ServerConnection, TcpStream>) {
         tls.conn.send_close_notify();
         // Push the alert out with `write_tls` rather than `complete_io`: the
@@ -555,10 +560,12 @@ mod tests {
         );
 
         // The closing half, checked from the client's side. A clean TLS EOF
-        // reads as `Ok(0)` -- rustls only reports that once it has received
-        // `close_notify`. A closure with no alert comes back as
-        // `UnexpectedEof`, and a dropped socket with unread bytes in it as a
-        // connection error; the fake used to produce the second one.
+        // reads as `Ok(0)`; bytes past the response body would be a framing
+        // bug, and a connection error is either the RST the fake used to
+        // cause or a close with no alert -- `close_tls_gracefully`'s doc
+        // says which is which. The assertion after the match is the
+        // explicit statement of what the fake owes the client: a
+        // `close_notify` it actually received.
         let mut tail = [0u8; 32];
         match tls.read(&mut tail) {
             Ok(0) => {}
@@ -566,11 +573,17 @@ mod tests {
                 "the fake sent {n} bytes after the response body: {:?}",
                 &tail[..n]
             ),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                panic!("the fake closed without close_notify: truncated TLS closure")
-            }
             Err(e) => panic!("the fake closed abruptly: {e}"),
         }
+
+        let io = tls
+            .conn
+            .process_new_packets()
+            .expect("the client connection is still usable at EOF");
+        assert!(
+            io.peer_has_closed(),
+            "the fake closed without close_notify: {io:?}"
+        );
     }
 
     #[test]
