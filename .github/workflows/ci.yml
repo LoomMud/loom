@@ -12,6 +12,37 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [main]
+  # ── The drift backstop (OBI-326) ──────────────────────────────────────────────
+  # After OBI-325 a run only takes a place in the load lane when its diff can move
+  # the numbers, so a long stretch of irrelevant merges can leave `main`
+  # unmeasured -- and the world under test now changes on *warp's* schedule, when
+  # `warp.ref` is bumped, not on yours. These two triggers carry no commit range,
+  # so `classify` falls closed to `runtime=true` (an unreadable or absent range is
+  # never evidence that nothing changed: see scripts/load-lane-classify.py) and the
+  # run measures.
+  #
+  #   schedule          one measurement of `main` against the pinned world every
+  #                     day, so drift lands on a date instead of on whoever's PR
+  #                     happens to get measured next. GitHub only fires scheduled
+  #                     workflows on the default branch, which is exactly the
+  #                     branch this backstop is for; the minute is off the hour so
+  #                     we are not queuing behind every other repo's midnight run.
+  #   workflow_dispatch the on-demand measurement a release needs. The release
+  #                     policy in results/README.md requires a green,
+  #                     *measured* `loadtest-e1-1` for a release SHA, and the
+  #                     candidate for that SHA may well be a diff the classifier
+  #                     correctly skipped. Dispatch is how you get the number
+  #                     without inventing a commit to force a lane run.
+  #
+  # Neither of them is cancellable, and neither may cancel: rule 5 keeps the
+  # workflow-level group on `github.run_id` for any non-`pull_request` event with
+  # `cancel-in-progress` false, so a nightly run can never kill an in-flight gate
+  # and a force-push cannot kill the nightly measurement. Rule 12 asserts both
+  # triggers are still here -- a backstop that can be deleted through `.github/**`
+  # (which the classifier counts irrelevant) is a comment, not a backstop.
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
 permissions:
   contents: read
 
@@ -132,12 +163,13 @@ concurrency:
 # OBI-327 review pointed out), which is what makes a path under tests/ relevant
 # while the test code around it is not; and bench workloads and harness files are
 # relevant because `bench` measures them inside this same lane, and skipping
-# would silently retire the only bench regression gate. What the classifier
-# cannot see is the mudlib the gate serves: `warp` is checked out of
-# LoomMud/warp, unpinned, inside the job -- a warp-side change can move p99 while
-# every loom PR skips. That is a property of the un-pinned checkout, not of the
-# decision; pinning it
-# (or treating it as an input) is OBI-326.
+# would silently retire the only bench regression gate. The one input that lives
+# in a *second* repository -- the `warp` mudlib the gate serves -- is pinned in
+# `warp.ref` (OBI-326) and read by the `warp-pin` step in each load job,
+# so it is classified from a path the lane counts (`mudlib/**`) and a bump takes
+# a lane place like a `Cargo.lock` bump does. Before that the checkout floated on
+# warp's default branch: a warp-side change could move p99 while every loom PR
+# skipped the lane, and no committed number named the mudlib that produced it.
 #
 # `.github/**` itself is on the irrelevant list, and that is only honest because
 # of rule 9 of scripts/check-ci-load-lane.py: no job may install a `toolchain:`
@@ -217,7 +249,21 @@ jobs:
           SQL
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - name: sqlx offline and live-DB builds are separate builds (OBI-328)
+        # Cargo's fingerprint used to ignore SQLX_OFFLINE, so a live-DB build of
+        # an unchanged loom-persist was answered from the cache: exit 0, and not
+        # one DESCRIBE reached Postgres. `crates/loom-persist/build.rs` pins the
+        # mode into the fingerprint; this proves it on a closed localhost port,
+        # so the step never dials a database that is not its own (OBI-150) and
+        # needs no Postgres service.
+        run: scripts/check-sqlx-cache-modes.sh
+      # `--no-fail-fast`: cargo aborts the remaining test targets at the first
+      # failing one, so one broken crate silently hides the verdict of every
+      # crate after it -- OBI-317's first run died in a loom-cli test and never
+      # reached loom-lsp, which made that change's CI result unobservable. The
+      # job still goes red on any failure; this only makes all of them visible
+      # in one run instead of one per iteration.
+      - run: cargo test --workspace --no-fail-fast
   bench:
     # VM benchmark regression gate (OBI-25 / OBI-118 / OBI-312): this PR's
     # base vs its working tree, same runner, >15% on any workload fails.
@@ -315,8 +361,21 @@ jobs:
           elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
               && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
             scripts/check-dco.sh "$BEFORE..$AFTER"
+          elif git rev-parse -q --verify "$AFTER^" >/dev/null 2>&1; then
+            # No readable change range: a scheduled or dispatched run, or a push whose
+            # `before` is gone. Audit the commit this run is standing on, and only that.
+            # The fallback used to be `scripts/check-dco.sh HEAD`, which walks the *whole*
+            # history, and this repository's history contains commits authored by the
+            # founder and signed off by the agent who wrote them (a1d3dc4, 7f1b074 --
+            # author `Greg Oberfield`, trailer `Signed-off-by: Gimli`). The rule compares
+            # the trailer to the author, so that scan fails on the same two commits every
+            # single time. A nightly that is red by construction is not a drift backstop,
+            # it is noise people learn to skip -- and whether an agent's sign-off satisfies
+            # DCO for a human-authored commit is a policy call for the CTO, not something
+            # a scheduled run should be re-litigating on old merged history.
+            scripts/check-dco.sh "$AFTER^..$AFTER"
           else
-            scripts/check-dco.sh HEAD
+            scripts/check-dco.sh "$AFTER"
           fi
   hygiene:
     runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || vars.CI_RUNS_ON && (startsWith(vars.CI_RUNS_ON, '[') && fromJSON(vars.CI_RUNS_ON) || vars.CI_RUNS_ON) || 'arc-runner-set-loommud' }}
@@ -333,13 +392,15 @@ jobs:
           curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" -o "$workdir/gitleaks.tar.gz"
           tar -xzf "$workdir/gitleaks.tar.gz" -C "$workdir" gitleaks
           "$workdir/gitleaks" git --redact --exit-code 1 .
-      - name: CI load lane invariants (OBI-308, workflow-level cancel OBI-313, lane escape OBI-325)
+      - name: CI load lane invariants (OBI-308, workflow-level cancel OBI-313, lane escape OBI-325, mudlib pin OBI-326)
         # The latency gates in this workflow are only meaningful on a quiet
         # host. Keep the lane (concurrency group + DAG order + "no required
         # check may be skipped") from rotting silently, and keep the
         # workflow-level group cancelling superseded `pull_request` runs only:
         # a workflow-level cancel reaches into jobs whose own
-        # `cancel-in-progress: false` forbids it.
+        # `cancel-in-progress: false` forbids it. Rule 11 also reads
+        # `warp.ref` here, so the world the gate serves cannot stop
+        # being pinned without failing a required check.
         run: |
           set -euo pipefail
           scripts/ci-ensure-tools.sh python3:python3-minimal
@@ -367,6 +428,28 @@ jobs:
           set -euo pipefail
           scripts/ci-ensure-tools.sh python3:python3-minimal
           python3 scripts/bench_compare.py --self-test
+      - name: lsp thread-count guard isolation (OBI-317)
+        # tests/lsp_thread_count.rs measures /proc/self/task, a *process-wide*
+        # thread list. The number only means "one LSP session did not leak"
+        # while that binary hosts exactly one session, so a second #[test] in
+        # it re-creates the flake the file exists to remove (sibling sessions
+        # starting/stopping in the measurement window). No runtime assertion can
+        # tell "the harness grew" from "a sibling session appeared", so the
+        # rule is checked where it is unambiguous: statically, in the lane.
+        run: |
+          set -euo pipefail
+          f=crates/loom-lsp/tests/lsp_thread_count.rs
+          if [ ! -f "$f" ]; then
+            echo "$f is missing: the G1/M-LSP-4 thread-count guard needs its own test binary" >&2
+            exit 1
+          fi
+          n=$(grep -c '^#\[test\]' "$f" || true)
+          if [ "$n" != 1 ]; then
+            echo "$f must contain exactly one #[test] (found $n). Its thread-count" >&2
+            echo "measurement is process-wide, so a sibling session in the same binary" >&2
+            echo "makes it flaky (OBI-317). Put the new test in lsp_integration.rs." >&2
+            exit 1
+          fi
       - uses: fsfe/reuse-action@bb774aa972c2a89ff34781233d275075cbddf542 # v5.0.0
   fuzz-smoke:
     # Weft parser fuzz smoke (OBI-23): <= 60 s of libFuzzer seeded from the
@@ -573,11 +656,66 @@ jobs:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: needs.loadtest-e1-1.outputs.runtime != 'false'
+      # OBI-326: the mudlib is an input to the number this gate prints, so the
+      # job reads `warp.ref` and checks that exact commit out. There is
+      # no fallback here on purpose: an absent, unreadable or branch-named pin
+      # fails the gate instead of quietly serving warp's default branch again.
+      # Rule 11 of scripts/check-ci-load-lane.py enforces this shape -- and that
+      # the pin file is on the classifier's runtime-relevant list -- in
+      # `hygiene`, a required check that runs on every PR, so the pin cannot
+      # rot into a comment.
+      - name: read the pinned mudlib rev
+        id: warp-pin
+        if: needs.loadtest-e1-1.outputs.runtime != 'false'
+        env:
+          PIN_FILE: warp.ref
+        run: |
+          set -euo pipefail
+          if [ ! -f "$PIN_FILE" ]; then
+            echo "::error::$PIN_FILE is missing: the gate refuses to guess which mudlib to serve"
+            exit 1
+          fi
+          # One payload line: comments and blanks stripped, the SHA, nothing else.
+          # The line count is checked, not just the shape: `head -1` would otherwise
+          # serve the first of two revs and leave rule 11 to notice -- a gate should
+          # fail on the input it was handed, not on a later reader's arithmetic.
+          payload=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PIN_FILE")
+          if [ -z "$payload" ]; then
+            echo "::error::$PIN_FILE carries no commit SHA (the gate refuses to guess)"
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$payload" | wc -l)" -ne 1 ]; then
+            echo "::error::$PIN_FILE must hold exactly one line -- the commit SHA -- not two worlds"
+            printf '%s\n' "$payload" | sed 's/^/  /'
+            exit 1
+          fi
+          rev="$payload"
+          if [ "${#rev}" -ne 40 ] || [[ "$rev" =~ [^0-9a-f] ]]; then
+            echo "::error::$PIN_FILE must hold one full 40-character lowercase commit SHA, got '$rev'"
+            echo '::error::a branch name can move underneath a run, which is what this pin prevents'
+            exit 1
+          fi
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         if: needs.loadtest-e1-1.outputs.runtime != 'false'
         with:
           repository: LoomMud/warp
           path: warp
+          ref: ${{ steps.warp-pin.outputs.rev }}
+      - name: verify the mudlib under measurement
+        if: needs.loadtest-e1-1.outputs.runtime != 'false'
+        run: |
+          set -euo pipefail
+          # Re-read the pin file rather than trust the step output above: the
+          # gate serves the commit the repository names, and stamps the number
+          # it prints with the mudlib that produced it (results/README.md).
+          want=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' warp.ref | head -1)
+          got=$(git -C warp rev-parse HEAD)
+          if [ "$got" != "$want" ]; then
+            echo "::error::serving warp@$got while warp.ref pins $want"
+            exit 1
+          fi
+          echo "mudlib: \`LoomMud/warp@$got\` (pinned in \`warp.ref\`)" >> "$GITHUB_STEP_SUMMARY"
       - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
         if: needs.loadtest-e1-1.outputs.runtime != 'false'
       - name: run loom serve + loadtest smoke
@@ -610,7 +748,8 @@ jobs:
             --duration-secs 60 \
             --ramp-per-sec 10 \
             --metrics-url http://127.0.0.1:4001/metrics \
-            --out results/ci-smoke
+            --out results/ci-smoke \
+            --note "mudlib LoomMud/warp@${{ steps.warp-pin.outputs.rev }} (pinned in warp.ref)"
           kill "$(cat /tmp/loom-serve.pid)" || true
           cat /tmp/loom-serve.log
           cp /tmp/loom-serve.log results/loom-serve-smoke.log
@@ -710,11 +849,58 @@ jobs:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: needs.classify.outputs.runtime != 'false'
+      # OBI-326: same contract as `loadtest-smoke` -- the mudlib comes from the
+      # rev in `warp.ref`, never from whatever warp's default branch
+      # points at today, and the report says which mudlib it measured against.
+      - name: read the pinned mudlib rev
+        id: warp-pin
+        if: needs.classify.outputs.runtime != 'false'
+        env:
+          PIN_FILE: warp.ref
+        run: |
+          set -euo pipefail
+          if [ ! -f "$PIN_FILE" ]; then
+            echo "::error::$PIN_FILE is missing: the gate refuses to guess which mudlib to serve"
+            exit 1
+          fi
+          # One payload line: comments and blanks stripped, the SHA, nothing else.
+          # The line count is checked, not just the shape: `head -1` would otherwise
+          # serve the first of two revs and leave rule 11 to notice -- a gate should
+          # fail on the input it was handed, not on a later reader's arithmetic.
+          payload=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$PIN_FILE")
+          if [ -z "$payload" ]; then
+            echo "::error::$PIN_FILE carries no commit SHA (the gate refuses to guess)"
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$payload" | wc -l)" -ne 1 ]; then
+            echo "::error::$PIN_FILE must hold exactly one line -- the commit SHA -- not two worlds"
+            printf '%s\n' "$payload" | sed 's/^/  /'
+            exit 1
+          fi
+          rev="$payload"
+          if [ "${#rev}" -ne 40 ] || [[ "$rev" =~ [^0-9a-f] ]]; then
+            echo "::error::$PIN_FILE must hold one full 40-character lowercase commit SHA, got '$rev'"
+            echo '::error::a branch name can move underneath a run, which is what this pin prevents'
+            exit 1
+          fi
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         if: needs.classify.outputs.runtime != 'false'
         with:
           repository: LoomMud/warp
           path: warp
+          ref: ${{ steps.warp-pin.outputs.rev }}
+      - name: verify the mudlib under measurement
+        if: needs.classify.outputs.runtime != 'false'
+        run: |
+          set -euo pipefail
+          want=$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' warp.ref | head -1)
+          got=$(git -C warp rev-parse HEAD)
+          if [ "$got" != "$want" ]; then
+            echo "::error::serving warp@$got while warp.ref pins $want"
+            exit 1
+          fi
+          echo "mudlib: \`LoomMud/warp@$got\` (pinned in \`warp.ref\`)" >> "$GITHUB_STEP_SUMMARY"
       - run: SQLX_OFFLINE=true cargo build --release -p loom-cli -p loom-loadtest
         if: needs.classify.outputs.runtime != 'false'
       - name: capture runner context
@@ -789,6 +975,7 @@ jobs:
             --metrics-scrape-ms 1000 \
             --timeline-bucket-ms 5000 \
             --out results/ci-e1-1 \
+            --note "mudlib LoomMud/warp@${{ steps.warp-pin.outputs.rev }} (pinned in warp.ref)" \
             --fail-on-sla-miss
           status=$?
           # OBI-344 follow-up (main run 37862921160 on eaf9ceb): everything
@@ -804,6 +991,35 @@ jobs:
           # no longer fails the step; `upload-artifact` runs `if: always()` with
           # `if-no-files-found: warn`, so the missing file is still visible.
           set +e
+          # OBI-344 (salvaged from PR #157's evidence tail; the paced drain it was
+          # written for was withdrawn once #159 took character durability off the
+          # world thread): read the save count *after* giving the server a chance
+          # to finish writing. The p99 verdict is not the only thing this gate is
+          # evidence for -- the step also reports `save_path: objects_saved=N` and
+          # scrapes `loom_world_loop_stalls_total`, and both are read at a single
+          # instant while persistence is a queue that can still be draining after
+          # the last command. Without the wait, a run whose writes land late
+          # reports fewer saved objects *and* fewer stall events than happened,
+          # which would read as an improvement for a pure reporting-timing reason.
+          # Non-gating: an unfinished drain is printed, never failed, and the
+          # wait is bounded so a wedged writer cannot hang the job. Measured on a
+          # build off current `main`, where teardown is still synchronous, one of
+          # six saves had not landed when the last command finished -- the loop
+          # waited 1 s and then read the true count, so this is already
+          # load-bearing rather than a placeholder for #159.
+          settle_start=$(date +%s)
+          while [ "$(find "$SAVES" -type f -name '*.o' 2>/dev/null | wc -l)" -lt 150 ] \
+                 && [ $(( $(date +%s) - settle_start )) -lt 60 ]; do
+            sleep 1
+          done
+          settled=$(find "$SAVES" -type f -name '*.o' 2>/dev/null | wc -l)
+          settle_wait=$(( $(date +%s) - settle_start ))
+          if [ "$settled" -ge 150 ]; then
+            settle_done=yes
+          else
+            settle_done=no
+          fi
+          echo "save_settle: objects_saved=$settled waited=${settle_wait}s drain_complete=$settle_done"
           # Scrape before stopping: the previous version of this step curled
           # `/metrics` *after* `kill`, so the "final /metrics" section was
           # always empty and the artifact's only server numbers were the

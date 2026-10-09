@@ -7,12 +7,17 @@
 //! harness clock) advance the world. `f` must run exactly once, after (not
 //! before) the 3rd world tick.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+
+#[path = "support/read_until.rs"]
+mod read_until;
+
+use read_until::{Chunk, drain_telnet_preamble, read_one, read_until_contains};
 
 /// `WORLD_TICK_INTERVAL` in `loom-cli/src/main.rs`; kept in sync by eye
 /// (not `pub`, so not importable) since this is a black-box process test.
@@ -118,18 +123,22 @@ fn a_world_thread_that_falls_behind_never_has_more_than_one_pending_tick() {
 
 /// Reads for `window` and panics if anything at all arrives (used to pin
 /// "not yet due").
+///
+/// Byte-based (OBI-355): what arrives is reported as the bytes/text it is, and each
+/// give-up path says which failure it was, so a timing assertion can't be mistaken for
+/// a transport problem or the other way round.
 fn assert_no_output_within(reader: &mut BufReader<TcpStream>, window: Duration) {
     let deadline = Instant::now() + window;
-    let mut line = String::new();
     while Instant::now() < deadline {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!("connection closed unexpectedly"),
-            Ok(_) => panic!("unexpected output before it was due: {line:?}"),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!("socket read failed: {err}"),
+        match read_one(reader) {
+            Chunk::Data(chunk) => panic!(
+                "unexpected output before it was due: {chunk:?} ({} character(s) of transcript \
+                 read from the child's socket inside the {window:?} window)",
+                chunk.len()
+            ),
+            Chunk::Closed => panic!("connection closed unexpectedly while expecting silence"),
+            Chunk::Idle => {}
+            Chunk::Failed(err) => panic!("socket read failed while expecting silence: {err}"),
         }
     }
 }
@@ -147,45 +156,12 @@ fn send_line(reader: &mut BufReader<TcpStream>, line: &str) {
         .unwrap_or_else(|err| panic!("flush command `{line}` failed: {err}"));
 }
 
-fn read_until_contains(
-    reader: &mut BufReader<TcpStream>,
-    needle: &str,
-    timeout: Duration,
-) -> String {
-    let deadline = Instant::now() + timeout;
-    let mut transcript = String::new();
-
-    loop {
-        if Instant::now() > deadline {
-            panic!("timed out waiting for `{needle}`. Transcript so far:\n{transcript}");
-        }
-
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!(
-                "connection closed while waiting for `{needle}`. Transcript so far:\n{transcript}"
-            ),
-            Ok(_) => {
-                let normalized = line.replace("\r\n", "\n");
-                transcript.push_str(&normalized);
-                if transcript.contains(needle) {
-                    return transcript;
-                }
-            }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::TimedOut
-                    || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => panic!("socket read failed while waiting for `{needle}`: {err}"),
-        }
-    }
-}
-
 fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
     let deadline = Instant::now() + timeout;
     loop {
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
-                drain_telnet_preamble(&mut stream);
+                drain_telnet_preamble(&mut stream, "on connecting to the server");
                 return stream;
             }
             Err(err) if Instant::now() < deadline => {
@@ -203,19 +179,6 @@ fn connect_with_retry(addr: &str, timeout: Duration) -> TcpStream {
             Err(err) => panic!("failed to connect to {addr} before timeout: {err}"),
         }
     }
-}
-
-/// `loom serve` opens with startup telnet option negotiation (OBI-26: `DO
-/// NAWS`, `DO TTYPE`, `WILL GMCP`, `WILL MSSP` -- 12 bytes, none of them
-/// valid UTF-8 on their own) before anything text-protocol shows up on the
-/// wire. These tests read lines as UTF-8 text, so they don't speak telnet
-/// back; just drop the fixed-size preamble rather than negotiate.
-fn drain_telnet_preamble(stream: &mut TcpStream) {
-    use std::io::Read;
-    let mut preamble = [0_u8; 12];
-    stream
-        .read_exact(&mut preamble)
-        .expect("read telnet negotiation preamble");
 }
 
 fn reserve_local_port() -> u16 {

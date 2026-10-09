@@ -93,6 +93,18 @@ pub struct HttpState {
     /// -- `None` uses the real spec values (M-LSP-1/M-LSP-4). Set via
     /// [`Self::with_lsp_tuning_for_test`], never by `loom-cli`.
     lsp_tuning: lsp::LspTuning,
+    /// Test-only first-frame rendezvous for `/lsp` (OBI-359). `None` --
+    /// the production default, and what `loom-cli` always leaves -- means
+    /// every session reads its first frame as soon as its task starts,
+    /// exactly as it did before this field existed. Set via
+    /// [`Self::with_lsp_first_frame_gate_for_test`].
+    lsp_first_frame_gate: Option<std::sync::Arc<lsp::FirstFrameGate>>,
+    /// Test-only rejection ledger for `/lsp` (OBI-365). `None` -- the
+    /// production default, and what `loom-cli` always leaves -- means every
+    /// refusal sends its `Close` and records nothing, exactly as it did
+    /// before this field existed. Set via
+    /// [`Self::with_lsp_rejection_log_for_test`].
+    lsp_rejection_log: Option<lsp::RejectionLogSender>,
 }
 
 impl HttpState {
@@ -116,6 +128,8 @@ impl HttpState {
             world_query: None,
             lsp_sessions: lsp::SessionLimiter::default(),
             lsp_tuning: lsp::LspTuning::default(),
+            lsp_first_frame_gate: None,
+            lsp_rejection_log: None,
         }
     }
 
@@ -220,6 +234,14 @@ impl HttpState {
         &self.lsp_tuning
     }
 
+    pub(crate) fn lsp_first_frame_gate(&self) -> Option<&std::sync::Arc<lsp::FirstFrameGate>> {
+        self.lsp_first_frame_gate.as_ref()
+    }
+
+    pub(crate) fn lsp_rejection_log(&self) -> Option<&lsp::RejectionLogSender> {
+        self.lsp_rejection_log.as_ref()
+    }
+
     /// Shrink `/lsp`'s timing constants for a fast, deterministic test
     /// (idle timeout/ping interval/revocation-recheck interval all
     /// default to tens of seconds, far too slow for a test to wait out
@@ -229,6 +251,34 @@ impl HttpState {
     #[cfg(test)]
     pub(crate) fn with_lsp_tuning_for_test(mut self, tuning: lsp::LspTuning) -> Self {
         self.lsp_tuning = tuning;
+        self
+    }
+
+    /// Install `/lsp`'s test-only first-frame rendezvous (OBI-359) so a
+    /// test can decide which session gets to read -- and therefore to
+    /// redeem a ticket -- first. Test-only for the same reason as
+    /// [`Self::with_lsp_tuning_for_test`]: `loom-cli` never calls it, so
+    /// no real connection ever parks.
+    #[cfg(test)]
+    pub(crate) fn with_lsp_first_frame_gate_for_test(
+        mut self,
+        gate: std::sync::Arc<lsp::FirstFrameGate>,
+    ) -> Self {
+        self.lsp_first_frame_gate = Some(gate);
+        self
+    }
+
+    /// Install `/lsp`'s test-only rejection ledger (OBI-365) so a test can
+    /// await the *reason* the server refused a connection instead of
+    /// accepting any `Close` frame as proof. Test-only for the same reason
+    /// as [`Self::with_lsp_tuning_for_test`]: `loom-cli` never calls it, so
+    /// no real refusal records anything and every wire answer is unchanged.
+    #[cfg(test)]
+    pub(crate) fn with_lsp_rejection_log_for_test(
+        mut self,
+        sender: lsp::RejectionLogSender,
+    ) -> Self {
+        self.lsp_rejection_log = Some(sender);
         self
     }
 }

@@ -29,5 +29,15 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 # these counters up; loom-net itself never depends on loom-obs.
 metrics = "0.24.6"
 
+# OBI-362: the reclaim liveness probe asks the kernel, not tokio's readiness
+# cache, whether a peer FIN has already landed (`Socket::peek` ==
+# `recv(MSG_PEEK)`) -- the bytes it reports on have to stay in the queue for
+# the copyover's new owner. `SockRef` borrows the fd from any `AsFd`, so this
+# needs no `unsafe` (which `unsafe_code = "deny"` in the workspace forbids)
+# and no fd hand-offs. Unix only: `peer_sent_fin` has a documented fallback
+# elsewhere. MIT/Apache-2.0, already in Cargo.lock via mio.
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.6.5"
+
 [dev-dependencies]
 proptest = { version = "1", default-features = false, features = ["std"] }

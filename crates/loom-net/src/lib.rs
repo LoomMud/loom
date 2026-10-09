@@ -763,6 +763,107 @@ async fn drain_commands_before_reclaim(
     }
 }
 
+/// OBI-362: has this socket's peer already gone away -- without taking a
+/// single byte out of the receive queue?
+///
+/// `run_connection`'s read arm and its control arm live in one *unbiased*
+/// `select!`, so a `ConnControl::Reclaim` that arrives while the client's
+/// FIN is already sitting on the socket can win the poll. Handing that
+/// socket back as "a live session, moving to the new process" is a lie the
+/// rest of the driver cannot absorb, because the reclaim tail deliberately
+/// skips both `NetEvent::Disconnected` and the `closed_tx` notification:
+/// the world never runs `net_dead()` on the object the player stopped
+/// talking to, and the handoff marker installed for that id is never
+/// removed -- up to `output_queue_depth` commands park per race, for the
+/// life of the process, since conn ids are never reused
+/// (`a_dead_session_leaves_no_handoff_marker_behind`, OBI-304/B2). Which
+/// half happened was a coin flip per reclaim: the test that guards it was
+/// red in CI and green locally for exactly that reason, and that is the
+/// flake this closes.
+///
+/// `recv(MSG_PEEK)` is the only way to ask the question without stealing
+/// input the new owner still needs: a FIN with nothing buffered reports 0
+/// bytes, pending data reports its length and *stays* in the queue, an
+/// idle socket reports `EAGAIN`. So a live session with unread input is
+/// still handed over whole (guarded by
+/// `reclaimed_connection_is_a_live_stream_with_no_disconnect_event` and by
+/// `a_reclaim_probe_never_steals_the_peers_bytes`).
+///
+/// This is not linearizability: a FIN that has not reached the kernel yet
+/// reads as "live", and the new owner then sees the close on its first
+/// read. That is the correct handover semantics -- the defect being fixed
+/// is the one where the close was *already* observable here and this
+/// process still pretended the session was fine.
+#[cfg(unix)]
+fn peer_sent_fin(stream: &TcpStream) -> bool {
+    use std::io::ErrorKind;
+    use std::mem::MaybeUninit;
+
+    // `SockRef` borrows the fd (`tokio::net::TcpStream` is `AsFd`) and owns
+    // nothing, so there is no second close and no `unsafe` anywhere here.
+    // The fd is in non-blocking mode because tokio requires it, which is
+    // what makes this a question and not a wait -- it cannot park the task
+    // that is in the middle of a copyover hand-off.
+    let sock = socket2::SockRef::from(stream);
+    let mut probe = [MaybeUninit::new(0_u8); 1];
+    match sock.peek(&mut probe) {
+        // Nothing buffered, and the peer closed: end of stream.
+        Ok(0) => true,
+        // Pending input: hand it over and let the new owner read to EOF.
+        Ok(_) => false,
+        // `EAGAIN`/`EWOULDBLOCK` is the idle-but-alive case. Any other error
+        // (ECONNRESET, ENOTCONN, ...) is the same outcome for the caller:
+        // this fd cannot carry the session any further.
+        Err(err) => err.kind() != ErrorKind::WouldBlock,
+    }
+}
+
+/// OBI-362 on a platform with no `MSG_PEEK` reachable without `unsafe`: the
+/// driver image is Linux (see `Dockerfile`), so rather than invent a second,
+/// untested liveness check, report "not obviously gone" -- the pre-OBI-362
+/// behaviour -- and keep the invariant enforced where it can be.
+#[cfg(not(unix))]
+fn peer_sent_fin(_stream: &TcpStream) -> bool {
+    false
+}
+
+/// What honouring a `ConnControl::Reclaim` decided (OBI-362). Split out of
+/// `run_connection` so the invariant "a reclaim never hands back a socket the
+/// peer has already left" is testable without racing a whole connection task
+/// against tokio's arm selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimHandover {
+    /// The session was still there: the caller got the fd, and this task must
+    /// *not* run the disconnect bookkeeping (a hand-off is not a close).
+    HandedOff,
+    /// The peer was already gone: the caller got `None`, so the disconnect
+    /// bookkeeping must run exactly as it would for an EOF read.
+    PeerGone,
+}
+
+/// Hand a reclaimed socket to the copyover caller, or refuse to (OBI-362).
+fn reclaim_handover(
+    conn_id: ConnId,
+    stream: TcpStream,
+    reply_tx: oneshot::Sender<Option<TcpStream>>,
+) -> ReclaimHandover {
+    if peer_sent_fin(&stream) {
+        debug!(
+            conn_id,
+            "reclaim refused: the peer had already closed this socket"
+        );
+        metrics::counter!("loom_net_reclaim_refused_eof_total").increment(1);
+        // Dropping `stream` closes the fd. There is no session to hand over,
+        // and keeping the fd open for a caller that got `None` would leak it.
+        drop(stream);
+        let _ = reply_tx.send(None);
+        ReclaimHandover::PeerGone
+    } else {
+        let _ = reply_tx.send(Some(stream));
+        ReclaimHandover::HandedOff
+    }
+}
+
 async fn run_connection(
     conn_id: ConnId,
     stream: TcpStream,
@@ -892,17 +993,27 @@ async fn run_connection(
     }
 
     if let Some(reply_tx) = reclaimed_reply {
+        let stream = reader
+            .reunite(writer)
+            .expect("reunite: reader/writer came from the same into_split() call");
         // Copyover hand-off, not a disconnect: no `NetEvent::Disconnected`
         // (the world must not run `net_dead()` on this object), and no
         // `closed_tx` notification either -- `run_server_full` already
         // removed this connection's `ConnEntry` before it ever sent
         // `ConnControl::Reclaim`, specifically so it wouldn't be waiting
         // on this task's own bookkeeping to know the handoff happened.
-        let stream = reader
-            .reunite(writer)
-            .expect("reunite: reader/writer came from the same into_split() call");
-        let _ = reply_tx.send(Some(stream));
-        return;
+        //
+        // OBI-362: that reasoning only holds for a session that is actually
+        // still alive. If the peer's FIN is already on the socket, this is a
+        // close that raced a reclaim, not a hand-off -- so refuse it, answer
+        // `None`, and fall through to the disconnect bookkeeping below. Which
+        // of the two it was used to depend on which `select!` arm won.
+        if matches!(
+            reclaim_handover(conn_id, stream, reply_tx),
+            ReclaimHandover::HandedOff
+        ) {
+            return;
+        }
     }
 
     if !disconnected_sent {
@@ -2506,6 +2617,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// OBI-362: the reclaim liveness probe must not consume input. If it
+    /// did, a wrong answer would be the least of the damage -- the entire
+    /// point of a reclaim is that the new owner resumes reading the *same*
+    /// byte stream. `recv(MSG_PEEK)` is what makes both true at once.
+    ///
+    /// Every step is pinned to a kernel fact (`readable()` resolves on data
+    /// *or* EOF landing), never to a wall clock, so this is a repro of the
+    /// mechanism rather than a race in disguise.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reclaim_probe_never_steals_the_peers_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        // Idle, both ends open: `EAGAIN`, i.e. alive. Nothing to wait for on
+        // a fresh loopback pair -- there is no segment in flight.
+        assert!(
+            !peer_sent_fin(&server),
+            "an idle live socket must not read as a closed peer"
+        );
+
+        // Pending input: still alive, and the bytes are still there.
+        client.write_all(b"hand me over intact\n").await.unwrap();
+        server.readable().await.unwrap();
+        assert!(
+            !peer_sent_fin(&server),
+            "pending input is a live session, not a close"
+        );
+        let mut buf = [0_u8; 32];
+        let n = server.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"hand me over intact\n",
+            "the liveness probe consumed bytes the new owner needed"
+        );
+
+        // FIN with nothing buffered: the close this whole change is about.
+        drop(client);
+        server.readable().await.unwrap();
+        assert!(
+            peer_sent_fin(&server),
+            "a peer that already closed must be reported as closed"
+        );
+    }
+
+    /// OBI-362, the invariant the flake violated, stated without a race: a
+    /// reclaim of a socket whose peer has already sent FIN answers `None`
+    /// *and* reports `PeerGone`, which is precisely what makes
+    /// `run_connection` emit `NetEvent::Disconnected` and release the
+    /// handoff marker, instead of returning a dead fd and skipping both
+    /// because a copyover hand-off is not a close.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reclaim_of_a_dead_peer_answers_none_and_reports_gone() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        drop(client);
+        // Wait for the FIN to be observable rather than assume it: this is
+        // the same condition `peer_sent_fin` reads, so the assertion below
+        // cannot be a coin flip.
+        server.readable().await.unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            reclaim_handover(7, server, reply_tx),
+            ReclaimHandover::PeerGone,
+            "a socket the peer already left must not be handed over as a live session"
+        );
+        assert!(
+            matches!(reply_rx.await, Ok(None)),
+            "the copyover caller must be told there is no socket here"
+        );
+    }
+
+    /// The other half of the same seam, so the fix above cannot become a
+    /// way to break copyover: a live peer's reclaim still hands back a
+    /// usable stream, and the session's bytes are untouched by the probe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reclaim_of_a_live_peer_still_hands_back_the_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        assert_eq!(
+            reclaim_handover(7, server, reply_tx),
+            ReclaimHandover::HandedOff,
+            "a live session's reclaim must still hand the fd over"
+        );
+        let mut reclaimed = reply_rx
+            .await
+            .unwrap()
+            .expect("a live reclaim answers a socket");
+
+        client.write_all(b"still here\n").await.unwrap();
+        let mut buf = [0_u8; 16];
+        let n = reclaimed.read(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf[..n],
+            b"still here\n",
+            "the reclaimed stream must continue the same byte stream"
+        );
     }
 
     /// Copyover, old-process side (OBI-184): reclaiming a `ConnId` that

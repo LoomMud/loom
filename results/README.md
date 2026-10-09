@@ -8,9 +8,11 @@ one Markdown per run, named `<date>-<players>-players[-<label>].{json,md}`.
 `2026-09-27-150-players.{json,md}`: **PASS**, p99 46.91 ms < 50 ms SLA.
 
 Reference host: Intel Core i7-9750H @ 2.60GHz (12 logical CPUs), 32 GiB RAM,
-Linux. `loom serve --mudlib warp` (this checkout's mudlib snapshot, `HEAD` at
-run time), `loom-loadtest` on the same host (so this includes no network
-latency beyond loopback — see "Limitations" below).
+Linux. `loom serve --mudlib warp` (a local `warp` checkout at whatever its `HEAD`
+was that day -- nothing recorded it, which is the gap `warp.ref` closes; *Report
+provenance* below attributes it to warp `618b90c`), `loom-loadtest` on
+the same host (so this includes no network latency beyond loopback -- see
+"Limitations" below).
 
 Run command:
 
@@ -245,6 +247,18 @@ closes first. Two consequences, both recorded so nobody has to rediscover them:
   `status=$?` gone). Reproduced deterministically against both archived scrapes, and the
   rule states the invariant plainly: the p99 verdict is the only thing that can turn
   this check red, and the evidence below it can only ever inform, never decide.
+- The tail now **waits for the save queue before it reads it**, printing
+  `save_settle: objects_saved=… waited=…s drain_complete=…`. Both the save count and
+  `loom_world_loop_stalls_total` are sampled at a single instant, and character
+  persistence is work that can still be running after the last command -- PR #159
+  makes that explicit by taking it off the world thread. A run whose writes land
+  late would otherwise report fewer saved objects *and* fewer stall events than
+  actually happened, i.e. look better for a pure reporting-timing reason. The wait
+  is non-gating and capped at 60 s. Measured on a build off current `main`, where
+  teardown is still synchronous, one save still landed *after* the last command:
+  `save_settle: objects_saved=6 waited=1s drain_complete=yes` -- so the wait is
+  already load-bearing, not a placeholder. A `drain_complete=no` is an evidence
+  gap to read, never a verdict.
 
 This is also why the historical tail is still open. Before PR #151 the same
 disconnect path failed instantly on ENOENT and the worst iteration in a green run
@@ -331,12 +345,13 @@ How the lane is held (`.github/workflows/ci.yml`, header comment):
   gate still runs 150 players with `--fail-on-sla-miss`, keeps its timeout
   headroom, that no required check became skippable or optional, and that the
   workflow-level block can only ever cancel a superseded `pull_request` run),
-  plus a `--self-test` of 55 mutations (56 cases, among them the gate losing its
-  `if: ${{ !cancelled() }}`, the three verdict-isolation beats #154 added, and a
-  `${{ }}` written inside a `run:` block). Both run in the required `hygiene`
-  job, with the classifier's own path table (`scripts/load-lane-classify.py
-  --self-test`, 36 cases: 30 classification rows plus 6 that build a throwaway
-  git repo), so the lane cannot rot silently and the comment here
+  plus a `--self-test` of 68 mutations (69 cases, among them the gate losing its
+  `if: ${{ !cancelled() }}`, the three verdict-isolation beats #154 added, a
+  `${{ }}` written inside a `run:` block, and the mudlib checkout going floating,
+  unverified or unstamped). Both run in the required `hygiene` job, with the
+  classifier's own path table (`scripts/load-lane-classify.py --self-test`,
+  40 cases: 34 classification rows plus 6 that build a throwaway git repo), so the
+  lane cannot rot silently and the comment here
   cannot drift from the workflow.
 
 **What the lane does *not* claim.** GitHub scopes a job-level concurrency
@@ -398,11 +413,22 @@ unpinned `warp` checkout that supplies the measured mix, not this rule -- that i
 OBI-326, and the corrected premise raises its priority: the mix E1.1 measures is
 not compiled in, not pinned, and not in this repo.
 
-One thing the classifier cannot see: the `warp` mudlib E1.1 serves is checked
-out of `LoomMud/warp`, unpinned, inside the job. A warp-side change can move
-the p99 while every loom PR skips the lane. That is a property of the existing
-un-pinned checkout, not of the skip decision -- pinning warp (or measuring it
-as an input) is OBI-326.
+One thing the classifier could not see, until OBI-326: the `warp` mudlib E1.1
+serves lives in a *second* repository, checked out inside the job. While that
+checkout floated on warp's default branch, a warp-side change could move the p99
+with no loom diff to attach it to -- and after the skip landed, a run that never
+took the lane could be blamed on the next source PR. It also moved the *session
+mix*, because E1.1 replays `--mix warp/loadbot/mix.tsv` out of that same
+checkout, and the `include_str!` of `tests/fixtures/mix.tsv` is `#[cfg(test)]`-only.
+So the mudlib is now an input the repository names: `warp.ref` at the repo root
+holds one line, a full 40-character commit SHA, each load job's `warp-pin` step
+reads it and checks out exactly that commit of `LoomMud/warp`, the job re-reads
+the file to verify what landed on disk, and `loom-loadtest --note` stamps
+`LoomMud/warp@<sha>` into the report. There is no fallback: a missing,
+comment-only or branch-named pin fails the gate rather than serving whatever
+warp's default branch points at today. The numbers above, recorded before the
+pin, stay attributed to warp `618b90c` by hand -- which is the archaeology this
+file exists to stop requiring.
 
 A cheap `classify` job answers it, and the three lane jobs read the verdict
 twice: through a conditional `concurrency.group` (runtime-relevant, or
@@ -413,7 +439,7 @@ so a missing or unreadable verdict means "take the lane and measure". Rule 8 of
 `scripts/check-ci-load-lane.py` pins the whole shape -- the expression, its
 run-scoped arm, the classifier's inability to be skipped or to fail the job, and
 a step guard beside every measurement -- because each of those has a fail-open
-mutation: 55 of them now, all run in `hygiene`.
+mutation: 68 of them now, all run in `hygiene`.
 
 Putting `.github/**` on the irrelevant list is only safe because of rule 9: the
 workflow may not install a `toolchain:` that `rust-toolchain.toml` does not
@@ -431,8 +457,8 @@ replays, therefore runtime-relevant -- into `crates/loom-cli/tests/` would have
 listed one allow-listed path and skipped the lane. Both ends of a move are inputs
 now; `--self-test` builds a throwaway repo to prove it, and asserts the
 counterfactual (`-M` lists only the two destinations
-and classifies as skip) so the case cannot rot into vacuity. 30 table rows became
-36 cases.
+and classifies as skip) so the case cannot rot into vacuity. The table was 36
+cases after OBI-325; OBI-326's pin rows make it 40.
 
 **Two deliberate over-measures, so nobody "fixes" them into a hole.** A
 `Cargo.lock` delta counts as runtime-relevant even when it only touches
@@ -444,6 +470,38 @@ a resolver's behaviour off a text file and can fail *open*; one wasted slot is t
 cheaper mistake. And `mudlib/**` counts as relevant even though nothing there
 reaches `loom serve --mudlib warp` today. The general shape: where a rule could
 be made cheaper by reading something dynamic, the cheap-but-structural rule wins.
+
+Rule 11 (OBI-326) closes the same gap for the world under test. It reads
+`warp.ref` and refuses a workflow that serves a mudlib from anything other than
+that rev: every external `actions/checkout` must take its `ref` from the
+`warp-pin` step and its `repository` from the one name this repo measures
+against (`LoomMud/warp`), that step must be guarded by the same lane test as the
+steps beside it and must validate the rev as a commit SHA, the job must re-read
+the pin to verify what it checked out, the report must carry the `--note`, and
+the classifier must count `warp.ref` runtime-relevant -- so a bump takes a lane
+place instead of moving the goalpost under a queue of skips. The last of those is
+the one that needs a second look: an unlisted path already falls closed to
+"relevant", so what the explicit rule buys is a reason a reviewer can read and a
+property a guard can test, not the behaviour itself.
+
+The rev comes from the file and the repository name does not, and that asymmetry
+is deliberate. A name is stable -- and `hygiene` runs rule 11 on *every* PR
+whatever `classify` decides, so retargeting the load jobs at a fork fails a
+required check even though `.github/**` is on the skip list. A rev is not stable:
+it is the thing warp moves, so it may only ever be read from a file this repo
+owns and the classifier counts.
+
+**Rule 12: the drift backstop (OBI-326).** Pinning the world does not make it
+stop moving -- `warp.ref` bumps land on warp's schedule, and a run of
+runtime-irrelevant loom diffs can leave `main` unmeasured for weeks. So `ci.yml`
+also carries `on.schedule` (a nightly run) and `on.workflow_dispatch`. Neither
+event carries a commit range, which is precisely why they measure: the
+classifier's fail-closed rule (an unreadable or absent range is never evidence
+that nothing changed) makes them take the lane. The release policy follows: **a
+release SHA needs a measured, green `loadtest-e1-1`, taken from the nightly run
+or by dispatch** -- not a green that means "not applicable". Rule 12 asserts both
+triggers stay in the workflow, for the same reason rule 8 asserts the toolchain:
+they live on the skip list.
 
 **First live skip (PR #144, run 37736253093, 2026-10-08).** The PR that
 introduces this decides its own diff irrelevant, and the numbers are what the
@@ -475,7 +533,7 @@ same-run `rust` and `fuzz-smoke*` jobs still overlap an E1.1 measurement that
 Both changes edit the same three files as PR #131 (`.github/workflows/ci.yml`,
 `scripts/check-ci-load-lane.py`, `results/README.md`), so whichever lands second
 rebases; the overlap is textual, not semantic (#131 swaps the lane jobs'
-`runs-on:` for a configurable runner set, this adds a job and rules 7-8).
+`runs-on:` for a configurable runner set, this adds a job and rules 8-10).
 
 **What a green `loadtest-e1-1` means now.** Two different greens. On a
 runtime-relevant diff it is the 150-player measurement, unchanged. On a
@@ -582,9 +640,72 @@ into jobs whose own `cancel-in-progress: false` forbids being cancelled.
   on nothing but `opened`/`synchronize`/`reopened`, and keeps `opened` and
   `synchronize`.
 
-Eleven mutants prove both bite, including flipping the required gate's own
+The mutants aimed at rules 5 and 6 include flipping the required gate's own
 `cancel-in-progress` to `true` beside the new block and putting `labeled` back
 in the trigger.
+
+## Report provenance
+
+A number in this directory is only usable if a reader can name the world it was
+measured against. Four things belong with every committed report:
+
+| Input | Where it comes from |
+|---|---|
+| loom commit | the run's `github.sha` / `git rev-parse --short HEAD` |
+| **warp commit** | `warp.ref` at the repo root -- one line, one 40-char SHA |
+| session mix | `warp/loadbot/mix.tsv`, replayed by the load bot |
+| host + build profile | the reference host table above, release build |
+
+The warp commit is the one an agent cannot see from this repo's history, so it is
+the one that silently moved: every 150-player number above was taken against
+whatever `LoomMud/warp`'s default branch pointed at that day. The Phase 1
+numbers are attributed to warp `618b90c` by hand, from the host's working copy --
+archaeology that `warp.ref` + `--note` makes unnecessary from here on. `warp.ref`
+currently names `1b0cd394d4cd41586e1a2d5fd449786b75c96976`, which is the tip the
+gate was measured green against; bump it only with a load run attached to the PR.
+
+What is *not* yet automated: the `## Notes` block that `--note` writes into the
+report lands in the downloaded artifact and in the job summary, but copying it
+into the header of a committed `results/ci-e1-1.md` is still a human step. That
+promotion is OBI-326's follow-up.
+
+### The first rows recorded *by* the mechanism, not by archaeology
+
+Both taken at loom `39e2bad` on the CI lane host, with `warp.ref` naming
+`1b0cd394d4cd41586e1a2d5fd449786b75c96976`, and both entered the lane because the
+change touched the pin -- one by commit range, one because it had no range at all:
+
+| Run | Event | p50 / p95 / p99 (150 players, 90 s) | Verdict | Report `## Notes` |
+|---|---|---|---|---|
+| 37755092634 | `pull_request` | 3.15 / 15.83 / **22.35 ms** (10 061 cmds, 0 disc, 0 login fails) | E1.1 PASS | `mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in warp.ref)` |
+| 37755215021 | `workflow_dispatch` | 3.27 / 16.36 / **23.91 ms** (10 011 cmds, 0 disc, 0 login fails) | E1.1 PASS | same |
+
+The two numbers are 1.6 ms apart on the same world, which is the point: the pair is
+comparable in a way the 37.6 / 39.6 / 47.7 ms records above were not. Step sequence on
+both: `read the pinned mudlib rev` -> external checkout at that rev -> `verify the mudlib
+under measurement` -> build -> measure -> upload, all green, so the rev in the report is
+the rev served, not the rev a default branch happened to point at.
+
+The release policy that goes with it: a release SHA needs a **measured** green
+`loadtest-e1-1` -- one from the nightly `on.schedule` run, or one started by
+`on.workflow_dispatch`. Since OBI-325 a PR can be green while having no p99 in it
+at all, so "the check is green on the release commit" is not sufficient evidence;
+the run has to be one that took the lane. Both triggers are asserted by rule 12
+because they live in a path the lane itself counts irrelevant.
+
+A trigger nobody can read the result of is no backstop either, which is what rule
+13 guards. Neither `schedule` nor `workflow_dispatch` carries a commit range, and
+the first dispatch run (37752599276) went red on `dco` because of it: the step's
+fallback for a range-less event was an audit of *every commit reachable from HEAD*,
+and this repository's merged history contains commits authored by the founder and
+signed off by the agent who wrote them, so the comparison against the author fails
+on the same pair (`a1d3dc4`, `7f1b074`) on every run, forever. Not strict --
+unsatisfiable. The event-scoped audit now names the commits the run stands on, and
+rule 13 fails any `check-dco.sh` call handed a bare rev, because the next range-less
+fallback would arrive as a plausible-looking tightening of the sign-off gate. Whether
+an agent's `Signed-off-by` should satisfy DCO on a human-authored commit is a policy
+question for the CTO; it is not something a nightly should answer by re-judging
+history the gate already accepted.
 
 ## Limitations
 
