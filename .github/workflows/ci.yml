@@ -522,7 +522,7 @@ jobs:
           # This job must not fail *instead of answering*. It used to matter
           # because a failed `classify` skipped `loadtest-e1-1`, and a *skipped*
           # required check is counted as passing -- a green with no measurement.
-          # `loadtest-e1-1` runs `if: ${{ !cancelled() }}` now, so that hole is
+          # `loadtest-e1-1` runs `if: !cancelled()` now, so that hole is
           # closed at the gate instead of depending on this exit code. What is left
           # is the economics: an undecided diff must fail *toward* the lane (the
           # fallback above writes `runtime=true`), and the warning is what makes

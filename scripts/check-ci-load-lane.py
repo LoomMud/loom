@@ -591,6 +591,58 @@ def check_toolchain_pins(text, root):
     return errors
 
 
+# Expressions inside a `run:` block are substituted *before the shell sees the
+# script* -- including inside shell comments, which the shell never reads but
+# Actions already has. `cancelled()`, `always()`, `failure()`, `success()` and
+# `no_status()` are only available in `if:` conditions, so writing one in a
+# `run:` block is not a wrong step, it is a workflow file that does not compile:
+# no job in it runs, and on a `pull_request` event no check run appears at all,
+# which is indistinguishable from "CI is stuck". Observed 2026-10-09 on PR #144:
+# heads 18fc7ab/c114681 got only `push`-placeholder runs (0 jobs, named after the
+# file path, no logs) and `gh pr checks` reported nothing. A comment mentioning
+# `if: ${{ !cancelled() }}` inside the classifier's `run:` block was the whole
+# cause. Write the expression bare (`if: !cancelled()`) in a script instead --
+# rule 4 accepts both forms because GitHub itself does.
+STATUS_FUNCS = ("cancelled(", "always(", "failure(", "success(", "no_status(")
+
+
+def run_block_lines(text):
+    """Line numbers (1-based) that sit inside a `run:` block scalar."""
+    lines = text.splitlines()
+    inside, indent, out = False, 0, []
+    for i, line in enumerate(lines, 1):
+        head = re.match(r"^(\s*)(?:-\s+)?\w[^:\n]*:\s*[|>][-+]?\s*$", line)
+        if head and re.search(r"\brun:", line):
+            inside, indent = True, len(head.group(1))
+            continue
+        if not inside:
+            continue
+        if not line.strip():
+            out.append(i)
+            continue
+        if len(line) - len(line.lstrip()) <= indent:
+            inside = False
+            continue
+        out.append(i)
+    return out
+
+
+def check_run_block_expressions(text):
+    errors = []
+    for lineno in run_block_lines(text):
+        line = text.splitlines()[lineno - 1]
+        for expr in re.findall(r"\$\{\{(.+?)\}\}", line):
+            hit = next((f[:-1] for f in STATUS_FUNCS if f in expr), None)
+            if hit:
+                errors.append(
+                    f"line {lineno}: a `run:` block contains `${{{{ {expr.strip()} }}}}`. "
+                    f"`{hit}()` is only available in an `if:` condition, so this is not a "
+                    "comment -- it is a workflow file GitHub cannot compile: no job runs, and "
+                    "on a pull_request no check run is created at all. Write the expression "
+                    "bare in scripts (`if: !cancelled()`) instead of wrapping it.")
+    return errors
+
+
 def check_text(text, root="."):
     jobs = job_blocks(text)
     wc = workflow_concurrency(text)
@@ -680,6 +732,7 @@ def check_text(text, root="."):
 
     errors += check_classifier(jobs)
     errors += check_toolchain_pins(text, root)
+    errors += check_run_block_expressions(text)
 
     e11 = [l for l in jobs.get("loadtest-e1-1", []) if not l.lstrip().startswith("#")]
     body = "\n".join(e11)  # comments excluded: the flags must be in the command
@@ -906,6 +959,15 @@ MUTANTS = [
      lambda t: _prepend(t, "web-client",
                         "    concurrency:\n      group: ${{ true && 'loom-ci-load-lane' "
                         "|| format('x-{0}', github.run_id) }}\n")),
+    # Both of these are the 2026-10-09 shape: a *comment* inside a script, which
+    # the shell never reads and Actions substitutes anyway. The second one is the
+    # exact text that cost PR #144 its check suite.
+    ("a status function called inside a run block",
+     lambda t: _replace(t, "echo 'runtime=true' >> \"$verdict\"",
+                        'echo \'runtime=true\' >> "$verdict"  # the gate uses ${{ !cancelled() }}')),
+    ("always() written into a script line",
+     lambda t: _replace(t, 'cat "$verdict" >> "$GITHUB_OUTPUT"',
+                        'cat "$verdict" >> "$GITHUB_OUTPUT"  # and ${{ always() }} elsewhere')),
 ]
 
 
