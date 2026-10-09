@@ -1067,13 +1067,32 @@ jobs:
           if [ -n "$durmax" ] && [ "$(awk -v d="$durmax" 'BEGIN {print (d > 50) ? 1 : 0}')" = "1" ]; then
             echo "::warning title=OBI-344 world-thread stall recorded::E1.1 recorded $stalls world-loop iteration(s) over the 50 ms stall budget, worst ${durmax} ms (kinds: ${kinds:-none}). Check whether they fall inside the sampled window before treating the p99 verdict as evidence about them."
           fi
+          # OBI-371: re-render the report this run just wrote, using the window
+          # logic in this checkout, and keep both files as artifacts. This is
+          # the cheap half of the evidence: the run that produced the numbers
+          # can be re-read under new attribution logic without being repeated,
+          # and a stall-window change is reviewable against a finished run.
+          # It cannot fail the step (errexit is off above, and a re-render
+          # failure is an evidence gap, not a latency miss) and it does not
+          # touch `p99_ms` or `e1_1_pass` -- the gate stays the run's own
+          # measurement, and `exit $status` below stays the only verdict.
+          ./target/release/loom-loadtest --rerender results/ci-e1-1.json \
+            --out results/ci-e1-1-rerendered >/dev/null 2>/tmp/rerender.err
+          if [ "$?" -ne 0 ]; then
+            echo "::warning title=OBI-371 report re-render failed::$(head -1 /tmp/rerender.err)"
+          else
+            # The one-line summary is what a log reader needs: what the run
+            # attributed, what this build attributes, and how the windows were
+            # placed.
+            head -1 /tmp/rerender.err || true
+          fi
           exit $status
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always() && needs.classify.outputs.runtime != 'false'
         with:
           name: loadtest-e1-1-report
           path: |
-            results/ci-e1-1.*
+            results/ci-e1-1*
             results/loom-serve.log
             results/loom-metrics-final.txt
             results/runner-context-before.txt

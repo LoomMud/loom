@@ -133,18 +133,63 @@ What the report carries now:
   world-loop stall windows, loadtest-process timer starvation, and the login
   ramp, with p99 recomputed excluding server-stall-attributed slices as an
   informational number. The gate stays the measured p99.
-- **Server world-loop counters scraped during the run** (default every 1 s):
-  tick id, loop iterations, stall count/stall ms, slowest iteration, longest
-  between-iteration gap, blocked world->net command sends, runtime errors --
-  published by `loom_obs::WorldLoopProbe`/`NetCommandProbe` from the world
-  thread's own event loop (`LOOM_WORLD_STALL_MS`, default 50 ms -- the same
-  number the SLA is written against).
+- **Server world-loop counters scraped during the run** (default every 250 ms,
+  starting *before* the first connection so the login ramp is inside the
+  series): tick id, loop iterations, stall count/stall ms, slowest iteration,
+  longest between-iteration gap, blocked world->net command sends, runtime
+  errors -- published by `loom_obs::WorldLoopProbe`/`NetCommandProbe` from the
+  world thread's own event loop (`LOOM_WORLD_STALL_MS`, default 50 ms -- the
+  same number the SLA is written against). Each row also carries the wall-clock
+  millisecond it was taken (`unix_ms`), which is what lets a stall the server
+  timestamped absolutely be placed at the stall rather than one scrape after it.
 - **Loadtest process timer lag**, self-measured: how late the bot's own fixed
   intervals fired. Lag here inflates every number in the report, including the
   gate's, so it is measured rather than assumed away.
 - The `loadtest-e1-1` job now runs `loom serve` with `RUST_LOG=info` and
   `LOOM_SERVE_ERROR_LOG=1` and uploads `/tmp/loom-serve.log`; previously the
   serve log was captured at the default level, which printed nothing.
+
+### Where a stall window comes from (OBI-371)
+
+A stall window is the interval a tail sample is blamed on, and it is only as
+honest as the way it was placed. `loom-obs` publishes the edge of the world
+thread's last stall as `loom_world_loop_last_stall_unix_ms` (with
+`loom_world_loop_last_stall_duration_ms` and `..._tick`), so when a scrape
+carries that stamp, the window is the stall itself: `[finish - duration,
+finish]`, mapped onto the run's `t+` axis through the run's own clock anchor
+(the median of `unix_ms - at_ms` over the scrape series; the spread is reported
+when it is large enough to matter). Such a window is marked `measured`.
+
+When the stamp is missing, all that is known is that `loom_world_loop_stalls_total`
+rose by N between two scrapes. That interval is *after* the stall: a stall is
+observable one scrape late, while the commands it damaged were in flight
+before it. The fallback therefore builds a bracket that ends at the later
+scrape and opens one scrape width plus the recorded stall milliseconds earlier,
+marked `bracket`, and the report says so: `unattributed` next to brackets means
+"this report could not place it", never "the server was fine at that moment".
+Two details of the counter family matter here. `loom_world_loop_stalls_total`
+is created on its first increment, so a series that goes from absent to `1`
+recorded one stall -- an earlier version required a value on both sides of the
+pair, quietly deleted the first stall of every run, and reported the biggest
+stall of `7086b58`'s E1.1 run (875 ms at t+10.3 s, the login ramp) as
+unexplained. And in-run scraping now starts before the first connection
+instead of after every bot is logged in, so the login ramp is inside the
+series rather than in front of it.
+
+`loom-loadtest --rerender <report.json> [--out <prefix>]` re-derives the
+windows, the tail attribution, and the timeline's stall marks from an archived
+report, using the report's own scrape series. It changes no measurement: `p99_ms`
+and `e1_1_pass` are the archived run's numbers, and the re-render appends a note
+saying exactly how much it could rebuild. Reports written before OBI-371 do not
+carry every at-or-over-SLA sample (only the 20 slowest), so their re-render is
+sample-level over that subset plus a bucket-level count over the whole tail;
+reports written after it carry `tail_samples_over_sla` and re-render at sample
+level forever. Two re-renders are committed here as examples of each path:
+`ci-e1-1-7086b58.rerendered.*` (the `37880215784` artifact, whose 875 ms stall
+this build places at t+9.4-11.3 s, explaining all 20 carried samples and
+putting 271 of the run's 293 over-SLA samples inside a stall-overlapping bucket)
+and `2026-09-27-500-players-stretch.rerendered.*` (a run with no scrape series
+at all, which must say "not this re-render's claim" instead of inventing one).
 
 The first finding that visibility produced: the
 `loom_runtime_errors_total{program="/std/player"}` count of exactly 150 that
