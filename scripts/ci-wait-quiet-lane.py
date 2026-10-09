@@ -91,6 +91,7 @@ BUILDER_PATTERNS = (r"cargo (build|test|bench|run)", r"(^|/)rustc ", r"cc1[a-z]*
 # and say so loudly; `scripts/check-ci-load-lane.py` rule 14 pins the permission
 # in `hygiene`, where a config mistake is unambiguous instead of intermittent.
 PERMANENT_API_CODES = (401, 403, 404)
+RATE_LIMIT_BODY_MARKERS = ("rate limit", "secondary rate limit")
 LOADAVG_FILE = "/proc/loadavg"
 STAT_FILE = "/proc/stat"
 PSI_FILE = "/proc/pressure/cpu"
@@ -297,14 +298,53 @@ class Host:
 
 # ------------------------------------------------------------ job list ----
 
+def is_rate_limited(exc):
+    """Is this HTTPError a quota complaint rather than a permission complaint?
+
+    GitHub answers rate limits with 429 *or* 403 - primary limit as 403 with
+    `x-ratelimit-remaining: 0`, secondary limits and `retry-after` as 403/429 -
+    so the status code alone cannot tell "out of quota, retry in a minute" from
+    "this token may never read this endpoint". Only the first one is worth
+    waiting through, and the gate must not fall back to host-only for it.
+    """
+    try:
+        code = exc.code
+        headers = exc.headers
+    except AttributeError:
+        return False
+    if code == 429:
+        return True
+    if code != 403:
+        return False
+    if headers is not None:
+        try:
+            if (headers.get("x-ratelimit-remaining") or "").strip() == "0":
+                return True
+            if headers.get("retry-after"):
+                return True
+        except AttributeError:
+            pass
+    try:
+        body = (exc.read(600) or b"").decode("utf-8", "replace")
+    except Exception:                                       # noqa: BLE001
+        body = ""
+    return any(marker in body.lower() for marker in RATE_LIMIT_BODY_MARKERS)
+
+
 class JobList:
     """`GET /repos/{repo}/actions/runs/{run_id}/jobs` for the current run.
 
     Read-only, default `GITHUB_TOKEN` (needs `actions: read`, which
     `scripts/check-ci-load-lane.py` rule 14 pins on each lane job). A
-    401/403/404 is permanent for the life of the process: we then gate on the
-    host signals alone and record that the precise half was blind, rather than
-    redding a required check over a permissions block.
+    401/403/404 that really is about permission is permanent for the life of the
+    process: we then gate on the host signals alone and record that the precise
+    half was blind, rather than redding a required check over a permissions block.
+
+    A 403 is *not* always about permission - GitHub reports quota exhaustion as
+    403 as often as 429 (see `is_rate_limited`). Treating a rate limit as
+    permanent would drop us to host-only, and host-only cannot tell the 6.63 red
+    from the 6.20 green, so a rate-limited poll could grant a measurement while
+    `rust` is still running. That is fail-open; quota errors are transient.
     """
 
     def __init__(self, env=None, opener=None):
@@ -318,6 +358,7 @@ class JobList:
             base.rstrip("/"), self.repo or "unknown/unknown", self.run_id or "0")
         self.error = None
         self.permanent = False
+        self.rate_limited = 0
         self.polls = 0
         if not self.repo or not self.run_id:
             self.permanent = True
@@ -344,7 +385,10 @@ class JobList:
                 payload = self._get("%s?per_page=100&page=%d" % (self.url, page))
             except urllib.error.HTTPError as exc:
                 self.error = "HTTP %s" % exc.code
-                if exc.code in PERMANENT_API_CODES:
+                if is_rate_limited(exc):
+                    self.rate_limited += 1
+                    self.error = "HTTP %s (rate limited)" % exc.code
+                elif exc.code in PERMANENT_API_CODES:
                     self.permanent = True
                 return None
             except Exception as exc:  # network / DNS / JSON: transient, retry
@@ -439,9 +483,19 @@ def wait_for_quiet(args, host=None, jobs=None, now=time.time, sleep=time.sleep) 
     first_in_flight: Optional[list] = None
     polls: list = []
     shown: Optional[list] = None
+    # The job list is polled on its own clock (`--job-poll-secs`, default 30 s) while
+    # the host signals keep their 10 s cadence. A 30-minute wait at 10 s would be 180
+    # calls against a repo-wide 1000/hour token shared by every job in the pool, and
+    # quota exhaustion is the failure mode that would push us toward host-only.
+    api_at: Optional[float] = None
+    api_seen: Optional[list] = None
     while True:
         snap = host.sample()
-        in_flight = None if jobs.permanent else jobs.in_flight_nonlane(current_job)
+        if not jobs.permanent and (args.job_poll_secs <= 0 or api_at is None
+                                   or now() - api_at >= args.job_poll_secs):
+            api_at = now()
+            api_seen = jobs.in_flight_nonlane(current_job)
+        in_flight = None if jobs.permanent else api_seen
         if not first:
             first = dict(snap)
             first_in_flight = list(in_flight) if in_flight is not None else None
@@ -500,6 +554,8 @@ def wait_for_quiet(args, host=None, jobs=None, now=time.time, sleep=time.sleep) 
         "job_list": ("ok" if in_flight is not None
                      else "unavailable: %s" % (jobs.error or "unknown")),
         "job_list_polls": jobs.polls,
+        "job_list_rate_limited_polls": jobs.rate_limited,
+        "job_poll_seconds": args.job_poll_secs,
         "nonlane_jobs_in_flight_at_first_poll": first_in_flight,
         "nonlane_jobs_in_flight_at_grant": in_flight or [],
         "not_quiet_polls": len(polls),
@@ -533,6 +589,8 @@ def emit_wait(args, payload, summary_file=None):
              "| PSI some avg60 at grant | %s |" % fmt(payload["psi_some_avg60_end"]),
              "| run job list | `%s` (%s polls) |" % (payload["job_list"],
                                                      payload["job_list_polls"]),
+             "| job list rate limits | %s |" % payload.get(
+                 "job_list_rate_limited_polls", 0),
              "| in flight at grant | %s |" % (
                  ", ".join("`%s`=%s" % (j["name"], j["status"])
                            for j in payload["nonlane_jobs_in_flight_at_grant"]) or "none"),
@@ -780,7 +838,10 @@ class FakeAPI:
     """Stand-in for the Actions jobs endpoint, driven by a per-poll plan.
 
     `plan` entries are either a status string for the run's `rust` job, or the
-    literal "403"/"500" to make that poll fail.
+    literal "403" / "403-limit" / "429" / "500" to make that poll fail. "403" is a
+    permissions block (no quota headers); "403-limit" is the same status code with
+    `x-ratelimit-remaining: 0`, which is a quota complaint and must be treated
+    differently.
     """
 
     def __init__(self, plan):
@@ -792,6 +853,19 @@ class FakeAPI:
         step = self.plan[min(self.calls - 1, len(self.plan) - 1)]
         if step == "403":
             raise urllib.error.HTTPError(url, 403, "Forbidden", Message(), None)
+        if step == "403-limit":
+            headers = Message()
+            headers["x-ratelimit-remaining"] = "0"
+            headers["retry-after"] = "17"
+            raise urllib.error.HTTPError(url, 403, "Forbidden", headers, None)
+        if step == "429":
+            headers = Message()
+            headers["retry-after"] = "8"
+            raise urllib.error.HTTPError(url, 429, "Too Many Requests", headers, None)
+        if step == "403-msg":
+            raise urllib.error.HTTPError(url, 403, "Forbidden", Message(),
+                                         io.BytesIO(b'{"message": "API rate limit '
+                                                     b'exceeded for origin 10.0.0.1"}'))
         if step == "500":
             raise urllib.error.HTTPError(url, 500, "Server Error", Message(), None)
         if step == "garbage":
@@ -850,6 +924,7 @@ def wait_args(tmp, **kw):
     d = dict(stage="self-test", out=tmp, deadline_secs=3, interval_secs=0.1,
              stability_samples=2, loadavg_ceiling=None, loadavg_factor=1.0,
              cpu_busy_ceiling=None, cores=8, skip_proc_scan=True, current_job="loadtest-e1-1",
+             job_poll_secs=0.0,
              loadavg_file=os.path.join(tmp, "loadavg"), stat_file="/proc/stat",
              psi_file=PSI_FILE,
              summary_file=os.path.join(tmp, "summary.md"))
@@ -1003,6 +1078,49 @@ def self_test():
          wait_args(tmp), ["403"],
          dict(asserts=[(lambda p: p["job_list"].startswith("unavailable: HTTP 403"),
                         lambda p: p["job_list"])])),
+        # 5b. The same 403 status that GitHub uses for quota exhaustion must NOT
+        #     be read as a permissions block. `is_rate_limited` is the difference
+        #     between a gate that waits for the window to reset and one that drops
+        #     to host-only and grants a measurement while `rust` is still running -
+        #     host-only cannot separate the 6.63 red from the 6.20 green, so that
+        #     fallback is fail-open and only correct for a real permission denial.
+        ("job list 403 rate-limit -> transient, still gated on the job list",
+         "quiet", 0, wait_args(tmp), ["403-limit", "in_progress", "completed",
+                                       "completed"],
+         dict(asserts=[(lambda p: p["job_list"] == "ok", lambda p: p["job_list"]),
+                       (lambda p: p["job_list_rate_limited_polls"] == 1,
+                        lambda p: "rate_limited=%s" % p["job_list_rate_limited_polls"]),
+                       (lambda p: any("temporarily unavailable" in " ".join(r["reasons"])
+                                      for r in p["poll_log"]),
+                        lambda p: p["poll_log"])])),
+        # 5c. 429 is transient by the same argument.
+        ("job list 429 -> transient, not a host-only fallback", "quiet", 0,
+         wait_args(tmp), ["429", "completed", "completed"],
+         dict(asserts=[(lambda p: p["job_list"] == "ok", lambda p: p["job_list"]),
+                       (lambda p: p["job_list_rate_limited_polls"] == 1,
+                        lambda p: "rate_limited=%s" % p["job_list_rate_limited_polls"])])),
+        # 5d. The API clock is slower than the host clock, so a long wait does not
+        #     eat the shared token budget: one job-list read per --job-poll-secs
+        #     (30 s by default, ~60 calls over a 30-minute wait) while host probes
+        #     keep their 10 s cadence. A 403 for quota is a real risk of the fast
+        #     cadence, and the fast cadence buys nothing - `rust` does not start and
+        #     finish inside one interval.
+        ("job list polls on --job-poll-secs, host on --interval-secs",
+         "inconclusive", 1,
+         wait_args(tmp, job_poll_secs=1.0, interval_secs=0.1, deadline_secs=6,
+                   stability_samples=1), ["in_progress"],
+         dict(asserts=[(lambda p: p["job_list_polls"] < 10,
+                        lambda p: "api polls=%s" % p["job_list_polls"]),
+                       (lambda p: len(p["poll_log"]) >= 10,
+                        lambda p: "host rows=%s" % len(p["poll_log"])),
+                       (lambda p: p["job_poll_seconds"] == 1.0,
+                        lambda p: p["job_poll_seconds"])])),
+        # 5e. A 403 whose only tell is the body text is still a quota complaint.
+        ("job list 403 with a rate-limit body -> transient", "quiet", 0,
+         wait_args(tmp), ["403-msg", "completed", "completed"],
+         dict(asserts=[(lambda p: p["job_list"] == "ok", lambda p: p["job_list"]),
+                       (lambda p: p["job_list_rate_limited_polls"] == 1,
+                        lambda p: "rate_limited=%s" % p["job_list_rate_limited_polls"])])),
         # 6. A transient 500 is not permanent: the streak waits for good reads, so
         #    the job list still gates as soon as the endpoint recovers.
         ("job list 500 then recovers", "quiet", 0,
@@ -1233,6 +1351,10 @@ def build_parser():
                            "declared inconclusive (a normal `rust` job is 4-6 minutes, "
                            "15m51s worst observed, so 900s is the e1-1 default)")
     wait.add_argument("--interval-secs", type=float, default=10.0)
+    wait.add_argument("--job-poll-secs", type=float, default=30.0,
+                      help="how often to re-read the run's job list; the host signals "
+                           "keep --interval-secs. 0 polls every tick. Rate limits are "
+                           "transient, so the cheap cadence is the safe one")
     wait.add_argument("--stability-samples", type=int, default=3,
                       help="consecutive quiet polls required before measuring")
     wait.add_argument("--loadavg-ceiling", type=float, default=None,

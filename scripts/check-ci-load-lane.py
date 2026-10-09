@@ -1641,10 +1641,10 @@ MUTANTS = [
                             "        if: always() && needs.classify.outputs.runtime "
                             "!= 'false'\n")),
     ("quiet-host wait budget cut to a minute",
-     lambda t: _replace(t, "--stage loadtest-e1-1 --deadline-secs 900",
+     lambda t: _replace(t, "--stage loadtest-e1-1 --deadline-secs 1800",
                         "--stage loadtest-e1-1 --deadline-secs 60")),
     ("quiet-host wait budget longer than the job can survive",
-     lambda t: _replace(t, "--stage loadtest-e1-1 --deadline-secs 900",
+     lambda t: _replace(t, "--stage loadtest-e1-1 --deadline-secs 1800",
                         "--stage loadtest-e1-1 --deadline-secs 3000")),
     ("quiet-host grant stops naming its job",
      lambda t: _replace(t, "--stage loadtest-e1-1 --deadline-secs",

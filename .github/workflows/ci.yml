@@ -881,17 +881,24 @@ jobs:
     # exactly like a miss and says nothing about p99. A gate that can be
     # cancelled by load is not a gate; slow is survivable, cancelled is not.
     #
-    # OBI-403: the 45. The same argument applies to the *wait*, not just the
-    # build: the quiet-host gate may spend up to 900 s getting the lane to idle,
-    # and a budget that lets that wait run into the timeout produces a cancelled
-    # required check, which is the failure mode the paragraph above forbids. The
-    # arithmetic: build <= 15 min starved (run 37663331238 needed that much),
-    # wait <= 15 min (the longest wait this run's own `rust` has ever cost is
-    # ~9 min: run 37925921869, rust 11:48:21 -> 12:04:12 against a measurement
-    # that opened at 11:55:11), 90 s of load + a 60 s save drain + teardown ~4
-    # min, upload ~1 min. Rule 14 pins `--deadline-secs` against
-    # `timeout-minutes`, so the two cannot drift apart.
-    timeout-minutes: 45
+    # OBI-403: the 55, and the reason it is not 45. The same argument applies to
+    # the *wait*, not just the build: the quiet-host gate may spend up to 1800 s
+    # getting the lane to idle, and a budget that lets that wait run into the
+    # timeout produces a cancelled required check, which is the failure mode the
+    # paragraph above forbids. The arithmetic: build <= 15 min starved (run
+    # 37663331238 needed that much), wait <= 30 min, 90 s of load + a 60 s save
+    # drain + teardown ~4 min, upload ~1 min. Rule 14 pins `--deadline-secs`
+    # against `timeout-minutes`, so the two cannot drift apart.
+    #
+    # Why the wait gets 30 min and not 9: build and wait are anti-correlated (a
+    # starved own-build means this run's `rust` is near its end), so the worst
+    # case is roughly max(own build, `rust` end + loadavg decay), and cold-cache
+    # trunk pushes set that bar high - run 37929376168 measured `rust` at
+    # 12:20:59 -> 12:47:03, 26 minutes. A 900 s deadline would have made every
+    # cold-cache trunk push INCONCLUSIVE *by construction*, which is the same
+    # failure as a red that says nothing about p99. 1800 s < 55*60 - 600, so rule
+    # 14's headroom still holds.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       # Always runs, on both paths: a green check that measured nothing has to
@@ -1002,7 +1009,14 @@ jobs:
       # own `cargo build --release` on purpose: the question is what the host
       # looks like at the instant the clock starts, and a release build that ended
       # 20 s ago is still inside the 1-minute average.
-      - run: python3 scripts/ci-wait-quiet-lane.py wait --stage loadtest-e1-1 --deadline-secs 900
+      #
+      # Two clocks on purpose (the defaults inside the script): the host signals are
+      # read every 10 s, the run's job list every 30 s. A 30-minute wait at one
+      # cadence would be 180 calls against the pool's shared 1000/hour token, and a
+      # quota 403 is transient, not a permission block - the gate keeps waiting for a
+      # good read rather than falling back to host-only and granting a measurement
+      # while `rust` runs. `rust` does not start and finish inside 30 s.
+      - run: python3 scripts/ci-wait-quiet-lane.py wait --stage loadtest-e1-1 --deadline-secs 1800
         if: needs.classify.outputs.runtime != 'false'
         env:
           # Actions does not export `GITHUB_TOKEN` into a `run:` step's
