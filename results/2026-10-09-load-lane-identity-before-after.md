@@ -185,6 +185,38 @@ check-ci-load-lane --self-test: 75 cases, 0 failure(s)  (9 new mutants: the
   merge, and the classifier scope losing `crates/*/src/**`)
 ```
 
+## The first live run caught the one thing local tests could not
+
+PR #175 is a deliberate evidence PR: one `#[cfg(test)]`-only module in
+`crates/loom-loadtest/src/main.rs`, based on #174's branch so GitHub runs *this*
+workflow on a real `pull_request`. `classify` job 113823165936 (run 37931442841,
+12:46:48Z):
+
+```
+RUNTIME-RELEVANT -> load lane (crates/*/src/**: driver or load-bot source)
+runtime=true  identity=true
+identity proof did not clear the lane: head build failed (rc=101):
+  error: could not compile `libc` (build script) due to 1 previous error
+proof: same=false
+verdict: runtime=true (crates/*/src/**: driver or load-bot source)
+```
+
+Every safety property held: the scope rule accepted a src-only diff, the proof
+ran, the build failed, `same=false` was written, the merge refused to lower the
+verdict, and `loadtest-e1-1` went on to measure. What the run exposed is that the
+lane runner image is **not a build image**: `loadtest-e1-1` installs its own C
+compiler (`scripts/ci-ensure-tools.sh cc:build-essential python3:python3-minimal`)
+before it builds, and the proof had assumed it. So stage two would have been
+*permanently inert* — fail-closed forever, reporting "nothing is ever provably
+identical" — which is a silent, plausible, and wrong result that no local test
+could have found, because my replay ran on a host that has `cc`.
+
+Fixed in #174 (`identity proof build tools`), and pinned so the class of bug
+cannot return: rule 14 now compares the gate's tool-bootstrap invocation with the
+proof's, string for string, and two new `--self-test` mutants cover both ways to
+break it (delete it, or let it drift to a smaller package set). 77 cases, 0
+failures.
+
 ## Where the minutes actually are (for whoever owns capacity)
 
 Recorded because the next ticket should start from measurement, not from this

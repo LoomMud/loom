@@ -683,6 +683,19 @@ jobs:
       # Phase 1 exit criterion wants a real p99 per release, and a merge to main
       # is where a regression has to land, so the last word on a push is never a
       # 40-second build on a different checkout.
+      - name: identity proof build tools
+        # The lane runner image is not a build image. Without this step the
+        # proof's first `cc` call dies (`error: could not compile `libc` (build
+        # script)` -- the first live run of stage two, PR #175's `classify` job
+        # 113823165936, is what proved it). The proof returns `same=false`, which
+        # is safe, and permanently so: a stage two that can never say
+        # "identical" is a stage two that was never installed. This is the
+        # *gate's own* invocation, and rule 14 requires the two strings to match,
+        # because an environment that builds differently hashes a different
+        # program.
+        if: ${{ steps.decide.outputs.runtime == 'true' && steps.decide.outputs.identity == 'true' && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        run: scripts/ci-ensure-tools.sh cc:build-essential python3:python3-minimal
       - name: identity proof toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master (2026-09-27)
         if: ${{ steps.decide.outputs.runtime == 'true' && steps.decide.outputs.identity == 'true' && github.event_name == 'pull_request' }}

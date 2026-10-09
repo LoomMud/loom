@@ -237,6 +237,7 @@ VERDICT_STEP_ID = "verdict"
 E1_BUILD_MARK = "cargo build --release -p loom-cli -p loom-loadtest"
 E1_ARTIFACTS = ("loom-cli", "loom-loadtest")
 E1_PARITY_ACTIONS = ("dtolnay/rust-toolchain@", "Swatinem/rust-cache@")
+E1_TOOLS_MARK = "scripts/ci-ensure-tools.sh"
 # The candidate guard, spelled once per stage-two step. Two halves, each stopping
 # a different failure: `identity` keeps the proof off diffs the table cannot
 # settle by path alone, and `pull_request` keeps a `main` push -- where the
@@ -1161,12 +1162,11 @@ def check_identity_stage(jobs, text, root):
     if E1_BUILD_MARK not in e11_code:
         errors.append(f"`loadtest-e1-1` no longer runs `{E1_BUILD_MARK}`: rule 14's parity check "
                       "is comparing the proof to a gate that changed")
-    hashed = {str(a).rsplit("/", 1)[-1] for a in (_py_literal(root, "ARTIFACTS") or ())}
+    hashed_list = list(_py_literal(root, "ARTIFACTS") or ())
+    hashed = {str(a).rsplit("/", 1)[-1] for a in hashed_list}
     for art in E1_ARTIFACTS:
         if art not in hashed:
-            errors.append(f"the identity proof does not hash `{art}`: E1.1 runs it, so a change "
-                          "reaching it would be hashed as 'unchanged'" if False else
-                          f"the identity proof hashes {list(artefacts)}, which omits `{art}` "
+            errors.append(f"the identity proof hashes {hashed_list}, which omits `{art}` "
                           "-- a program E1.1 runs and no job compared")
     for prefix in E1_PARITY_ACTIONS:
         want, got = _uses_of(steps_of(e11), prefix), _uses_of(steps, prefix)
@@ -1177,6 +1177,26 @@ def check_identity_stage(jobs, text, root):
         elif want is not None and want != got:
             errors.append(f"the identity proof uses `{got}` but `loadtest-e1-1` uses `{want}`: "
                           "the proof must run the gate's own action pin, not a nearby one")
+    # The runner image is not a build image. `loadtest-e1-1` installs its own C
+    # toolchain before building; the proof must run the same invocation, or its
+    # first `cc` call dies (`libc` build script, rc=101) and stage two returns
+    # `same=false` forever -- safe, silent, and indistinguishable from "this repo
+    # has no test-only diffs", which is the false conclusion the first live run
+    # (PR #175, job 113823165936) would have led to.
+    def tools_line(step):
+        """The tool bootstrap a step runs, or None. Compared as the invocation
+        rather than the YAML line: one job writes `- run: scripts/…`, the other
+        `run: scripts/…`, and that difference is indentation, not tools."""
+        m = re.search(E1_TOOLS_MARK + r".*", step_code(step) or "")
+        return m.group(0).strip() if m else None
+
+    gate_tools = [tools_line(s) for s in steps_of(e11) if tools_line(s)]
+    if gate_tools:
+        want = gate_tools[0]
+        if want not in {tools_line(s) for s in stage2}:
+            errors.append(f"the identity proof does not run the gate's own tool bootstrap "
+                          f"(`{want}`): a build environment the gate had to install is not a "
+                          "build environment the proof can assume")
 
     cap = _py_literal(root, "BUILD_TIMEOUT")
     job_to = scalar(block, "timeout-minutes")
@@ -1706,6 +1726,16 @@ MUTANTS = [
      lambda t: _sub(t, "    timeout-minutes: 45", "    timeout-minutes: 10")),
     ("merge may raise the verdict instead of only clearing it",
      lambda t: _replace(t, "runtime=false", "runtime=true")),
+    # The two shapes of the gap the first live run actually hit (PR #175: the
+    # proof died on `libc`'s build script because the runner had no `cc`). Either
+    # mutant leaves stage two *silently inert* -- every proof returns `same=false`
+    # -- which reads as "this repo has no test-only diffs" and is the false
+    # conclusion a reviewer would never see fail.
+    ("proof loses the gate's tool bootstrap entirely",
+     lambda t: _sub(t, "        run: scripts/ci-ensure-tools.sh", None)),
+    ("proof's tool bootstrap drifts from the gate's",
+     lambda t: _replace(t, "        run: scripts/ci-ensure-tools.sh cc:build-essential python3:python3-minimal",
+                        "scripts/ci-ensure-tools.sh python3:python3-minimal")),
 ]
 
 
