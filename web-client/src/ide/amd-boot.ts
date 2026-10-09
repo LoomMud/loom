@@ -14,11 +14,16 @@
  * sequence the two worlds: wait for the AMD `vs/editor/editor.main`
  * module, then hand control to the ES module app (`./main.js`).
  *
- * `paths.vs` is relative (`vendor/monaco/vs`) so it resolves against the
- * page's own URL and never away from this origin -- there is no host name
- * in this file for someone to later point at a CDN (M-IDE-3), and
+ * `paths.vs` is relative and version-stamped (`MONACO_VS` below), for two
+ * separate reasons. Relative, so it resolves against the page's own URL and
+ * never away from this origin -- there is no host name in this file for
+ * someone to later point at a CDN (M-IDE-3), and
  * `scripts/check-static-csp.mjs` fails CI if the page itself grows an
- * off-origin reference.
+ * off-origin reference. Stamped, because `loom-http` caches the vendored
+ * tree as `immutable` for a year (OBI-338), which is only sound while the
+ * URL changes when the bytes do; `scripts/vendor-monaco.mjs` fails the build
+ * if this literal and the `monaco-editor` pin disagree, and `ide.html`'s two
+ * URLs have to move with it.
  *
  * Monaco's language services run in a worker it creates from a `blob:`
  * URL; that is what the document's `worker-src 'self' blob:` grants, and
@@ -43,6 +48,16 @@ interface AmdGlobal {
 
 const MONACO_AMD_MODULE = "vs/editor/editor.main";
 
+/** Where the vendored AMD tree is served from, relative to this page: the
+ * `monaco-editor` version in `package.json`, staged by
+ * `scripts/vendor-monaco.mjs` into a directory named for it.
+ *
+ * A literal, and deliberately so -- the loader is fetched by `ide.html`
+ * before anything here runs, so the stamp has to be written down in both
+ * places rather than discovered. The build script is the gate that keeps the
+ * two honest; see the module doc above. */
+const MONACO_VS = "vendor/monaco/0.57.0/vs";
+
 function bootFailure(message: string): void {
   // Inlined rather than imported from `./main.js`: if the AMD module never
   // loads, that module has not been fetched either, and a builder looking
@@ -62,12 +77,12 @@ function start(): void {
   const require = (globalThis as unknown as AmdGlobal).require;
   if (typeof require !== "function") {
     bootFailure(
-      "Monaco's AMD loader (vendor/monaco/vs/loader.js) did not load. " +
+      `Monaco's AMD loader (${MONACO_VS}/loader.js) did not load. ` +
         "The web root was probably built without `npm run vendor`.",
     );
     return;
   }
-  require.config({ paths: { vs: "vendor/monaco/vs" } });
+  require.config({ paths: { vs: MONACO_VS } });
   require([MONACO_AMD_MODULE], (error?: unknown) => {
     if (error !== undefined) {
       bootFailure(`Loading ${MONACO_AMD_MODULE} failed: ${String(error)}`);

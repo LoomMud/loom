@@ -18,6 +18,10 @@ axum = { version = "0.8.4", features = ["ws"] }
 base64 = "0.23.1"
 ed25519-dalek = "3.0.0"
 hmac = "0.13.0"
+# `tower-http`'s `ServeDir` already formats `Last-Modified` with this; the
+# static cache validator (OBI-338) reads it back. MIT OR Apache-2.0, already
+# in the lockfile graph, so no new supply chain for the licence gate.
+httpdate = "1.0.3"
 loom-git = { path = "../loom-git" }
 loom-lsp = { path = "../loom-lsp" }
 loom-net = { path = "../loom-net" }
