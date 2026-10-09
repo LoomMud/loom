@@ -141,6 +141,11 @@ pub struct SaveOutcome {
     pub committed_bytes: Option<u64>,
     /// `Some(reason)` on failure.
     pub error: Option<String>,
+    /// The durable write **panicked** rather than returning `Err`: the worker
+    /// caught it so the thread stayed alive, and this is what makes that
+    /// visible in [`SaveQueueStats::panicked`]. A `false`/`Some(error)`
+    /// outcome is a disk or policy failure; `true` is a bug.
+    pub panicked: bool,
 }
 
 impl SaveOutcome {
@@ -225,7 +230,8 @@ pub struct SaveQueueStats {
     /// Flushes that ran out `flush_deadline` and had to commit inline.
     pub flush_deadline_exceeded: u64,
     /// Durable writes that panicked inside the worker (converted to a failed
-    /// outcome rather than taking the thread down).
+    /// outcome rather than taking the thread down). Non-zero here means a bug
+    /// in the durability path, not a disk problem.
     pub panicked: u64,
 }
 
@@ -584,6 +590,9 @@ impl SaveQueue {
             Some(_) => self.stats.failed += 1,
             None => self.stats.committed += 1,
         }
+        if o.panicked {
+            self.stats.panicked += 1;
+        }
         o
     }
 
@@ -745,6 +754,7 @@ fn outcome_for(task: &SaveTask, result: Result<(), String>) -> SaveOutcome {
                 crate::fileio::file_size_bytes(&task.save_root, &task.path).unwrap_or(queued_bytes),
             ),
             error: None,
+            panicked: false,
         },
         Err(error) => SaveOutcome {
             seq: task.seq,
@@ -755,6 +765,7 @@ fn outcome_for(task: &SaveTask, result: Result<(), String>) -> SaveOutcome {
             queued_bytes,
             committed_bytes: None,
             error: Some(error),
+            panicked: false,
         },
     }
 }
@@ -781,14 +792,18 @@ fn commit_task_capturing_panic(task: &SaveTask, delay: Option<Duration>) -> Save
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| commit_task(task, delay)));
     match r {
         Ok(res) => outcome_for(task, res),
-        Err(p) => outcome_for(
-            task,
-            Err(format!(
-                "save_object({:?}) durable write panicked: {}",
-                task.path,
-                panic_message(&p)
-            )),
-        ),
+        Err(p) => {
+            let mut o = outcome_for(
+                task,
+                Err(format!(
+                    "save_object({:?}) durable write panicked: {}",
+                    task.path,
+                    panic_message(&p)
+                )),
+            );
+            o.panicked = true;
+            o
+        }
     }
 }
 
@@ -1022,8 +1037,13 @@ mod tests {
         let out = q.flush();
         assert_eq!(out.len(), 1);
         assert!(!out[0].ok(), "{:?}", out[0]);
+        assert!(
+            !out[0].panicked,
+            "a refused suffix is an ordinary error, not a caught panic"
+        );
         assert_eq!(q.stats().failed, 1);
         assert_eq!(q.stats().committed, 0);
+        assert_eq!(q.stats().panicked, 0);
         q.enqueue(task(&root, "/still-works.o", "y"));
         q.flush();
         assert_eq!(
