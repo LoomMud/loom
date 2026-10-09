@@ -466,6 +466,36 @@ on a host GitHub is already cancelling). If a p99 regression is ever found on a
 commit that skipped, the classifier was wrong: fix the rule (`--self-test` is the
 test), not the threshold, the population, or the check.
 
+### A workflow file that does not compile looks exactly like a stuck queue (2026-10-09)
+
+PR #144 rebased, pushed, and then reported nothing: `gh pr checks 144` said "no
+checks reported on the branch", and the only runs for the head SHAs were two
+`push` entries named `.github/workflows/ci.yml` (37865259655, 37865793025) with
+**0 jobs** and no downloadable logs. The reading was "Actions has stopped
+scheduling this PR", and there is nothing in that shape to argue with: no check
+suite, no run, no annotation. It was not a queue problem -- other PRs were being
+scheduled and running at the same minutes. The cause was one line of mine inside
+the `classify` job's `run: |` block:
+
+```sh
+# `loadtest-e1-1` runs `if: ${{ !cancelled() }}` now, so that hole is
+```
+
+A `#` in a script stops the shell, not Actions: `${{ ... }}` is substituted
+before the script is handed over, and `cancelled()` is only available in an `if:`
+condition, so the expression is invalid and the *whole file* fails to compile.
+A workflow that cannot compile produces no jobs and, for `pull_request`, no check
+run at all -- a required check that never posts is what branch protection reports
+as "waiting for status", which is why the merge order appeared to stall on a PR
+with five green checks an hour earlier. Fix (`cfef45e`): the bare expression in a
+script (`if: !cancelled()`), `${{ }}` kept only where GitHub evaluates it as a
+condition. Rule 11 of `check-ci-load-lane.py` now fails any `${{ }}` inside a
+`run:` block that calls a status function, so the next time it is a red `hygiene`
+check with a sentence instead of an absent suite, and `actionlint` (1.7.7) flags
+the same class -- its `queue:` complaints are a schema lag behind the lane's own
+`concurrency.queue: max`, which `main` runs with, so the parity check is
+"same complaints as main, no expression errors".
+
 ### Which runs may be cancelled, and which may never be (OBI-313)
 
 Queueing is not the only way the lane gets stuck. Because

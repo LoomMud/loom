@@ -124,6 +124,17 @@ Two things this does **not** change:
   misses while `rust` is still running in the same run, that is OBI-311 (a quiet
   runner via `CI_LOAD_RUNS_ON`), not a driver regression -- do not chase it as
   one, and do not re-run it into a quiet window by hand.
+- **A `${{ ... }}` in a `run:` script is evaluated before the shell sees it --
+  including in shell comments.** `cancelled()`, `always()`, `failure()`, `success()`
+  and `no_status()` exist only in `if:` conditions, so one of them inside a `run:`
+  block is not a bad step, it is a workflow file GitHub cannot compile: no job runs,
+  and on a `pull_request` not even a check run appears. The symptom is a `push`
+  placeholder run named after the file path with 0 jobs and no logs, plus
+  `gh pr checks` reporting "no checks reported" -- which looks like Actions being
+  stuck and is not (PR #144 lost its suite that way for a whole evening, 2026-10-09).
+  Rule 11 of `scripts/check-ci-load-lane.py` fails it in `hygiene`; write the
+  expression bare in a script (`if: !cancelled()`) and keep `${{ }}` for YAML
+  comments and real `if:` conditions. `actionlint` finds this class too.
 - **`ci.yml` and `scripts/check-ci-load-lane.py` are shared real estate.** OBI-311
   (PR #131) and OBI-325 (PR #144) both edit them plus `results/README.md`, so
   expect a textual rebase for whoever lands second; the shapes do not conflict
