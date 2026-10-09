@@ -508,13 +508,15 @@ async fn broadcast(
 
 #[cfg(test)]
 mod tests {
+    use axum::Json;
     use axum::http::Request;
     use axum::http::StatusCode;
     use axum::http::header::AUTHORIZATION;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
-    use crate::auth::{AuthService, JwtKeys, StaffDirectory, jwt};
+    use crate::admin::admin_error_response;
+    use crate::auth::{AdminError, AuthService, JwtKeys, StaffDirectory, jwt};
     use crate::{HttpState, app};
 
     // A minimal in-memory `StaffDirectory` sufficient to drive these HTTP
@@ -726,12 +728,33 @@ mod tests {
                 .collect())
         }
 
+        /// Sentinels, so a test can pick which answer the world gives: OBI-347
+        /// needs "no such thing" and "the world could not answer" to be
+        /// distinguishable at the HTTP edge, and until now this fake could
+        /// only ever say `Ok` -- which is why `object_vars_for_a_path_that_is
+        /// _not_live_is_404_not_500` did not exist. A real world answers
+        /// `NotFound` for a path with no live object (it is the only variant
+        /// the doc comment on `WorldQueryError` already reserves for "the
+        /// thing you named is not there"), `Busy`/`Timeout`/`Closed` for the
+        /// channel, and `Internal` for a `valid_read` that failed to produce a
+        /// decision (OBI-279).
         async fn object_vars(
             &self,
             _euid: &str,
             _tier: i16,
             path: &str,
         ) -> Result<crate::admin_query::ObjectVars, crate::admin_query::WorldQueryError> {
+            use crate::admin_query::WorldQueryError;
+            match path {
+                "/std/no-such-thing" => return Err(WorldQueryError::NotFound),
+                "/std/world-busy" => return Err(WorldQueryError::Busy),
+                "/std/world-panic" => {
+                    return Err(WorldQueryError::Internal(
+                        "valid_read gate failed: tick budget exhausted".to_string(),
+                    ));
+                }
+                _ => {}
+            }
             Ok(crate::admin_query::ObjectVars {
                 path: path.to_string(),
                 vars: vec![crate::admin_query::VarEntry {
@@ -1237,6 +1260,164 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "admin.objects.vars" && e.verdict == "allow")
         );
+    }
+
+    /// GET `/api/v1/admin/objects/{path}/vars` as a tier-4 wizard. The three
+    /// mapping tests below differ only in the path they ask for, so they share
+    /// this instead of each repeating the token dance.
+    async fn get_vars_as_wizard(
+        app: &axum::Router,
+        auth: &AuthService,
+        uri: &str,
+    ) -> axum::response::Response {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let token = access_token(auth, "wizard", 4, Some(now)).await;
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.clone().oneshot(with_peer(request)).await.unwrap()
+    }
+
+    /// OBI-347, the whole point of the ticket in one assertion: when the HTTP
+    /// layer asks the world for one named thing and the world says "I have no
+    /// such thing", the client gets `404`, not `500`. A 500 for a name the
+    /// server never heard of tells the operator their process is broken and
+    /// tells the caller nothing, and it pollutes the 5xx error-rate signal
+    /// that `loom_obs` exists to give.
+    ///
+    /// `object_vars` is the round-trip that exists today -- same shape a
+    /// `/mudcfg/<key>` GET would have: ask the world thread for one named
+    /// thing, the world answers from its own tables. Registered-vs-unknown is
+    /// the distinction under test, not rooms-vs-config.
+    #[tokio::test]
+    async fn object_vars_for_a_path_that_is_not_live_is_404_not_500() {
+        let (app, auth, dir) = test_app();
+        let response =
+            get_vars_as_wizard(&app, &auth, "/api/v1/admin/objects/std/no-such-thing/vars").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !response.status().is_server_error(),
+            "an unknown name is the caller's error, not the server's"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "not_found");
+        // The request was authorised and *reached the world* -- which is what
+        // separates this from `object_vars_below_tier_4_is_forbidden`. Note the
+        // asymmetry that is deliberately left in place: `AuthService::
+        // admin_object_vars` audits every world-side `Err` as `verdict="deny"`,
+        // so "no such object" and "you may not see this" share an audit row
+        // (differing only in `reason=NotFound` vs `reason=forbidden`) while the
+        // HTTP edge distinguishes them cleanly. A third verdict value is a
+        // migration plus a policy call -- `verdict` is `CHECK (verdict IN
+        // ('allow','deny'))` in `crates/loom-persist/migrations/
+        // 0002_roles_s2.sql:338` -- so it is OBI-347's one open question for the
+        // CTO, not something to change under a "map the error to 404" ticket.
+        let audits = dir.audits.lock().unwrap();
+        let row = audits
+            .iter()
+            .find(|e| e.kind == "admin.objects.vars")
+            .expect("the vars lookup is audited");
+        assert_eq!(row.verdict, "deny");
+        assert!(
+            row.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("reason=NotFound")),
+            "the audit must say the world had no such thing, got {:?}",
+            row.detail
+        );
+        assert!(
+            !row.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("forbidden")),
+            "a 404 must not be audited as a permission denial, got {:?}",
+            row.detail
+        );
+    }
+
+    /// OBI-347's other half: "every other world error stays a server-side
+    /// answer" -- and the mapping the CTO accepted in OBI-279 makes that a
+    /// `503`, which is strictly better than the `500` the ticket names, for
+    /// the same reason the ticket gives: a bare 500 blames the process for
+    /// something that is the world's transient state. Pinning both, because
+    /// the difference between "the key does not exist" and "the world did not
+    /// answer" is exactly what a caller has to be able to tell apart.
+    #[tokio::test]
+    async fn a_world_that_could_not_answer_is_503_not_500() {
+        for (sentinel, why) in [
+            ("world-busy", "the request channel was full"),
+            (
+                "world-panic",
+                "valid_read failed to produce a decision (OBI-279)",
+            ),
+        ] {
+            let (app, auth, _dir) = test_app();
+            let response = get_vars_as_wizard(
+                &app,
+                &auth,
+                &format!("/api/v1/admin/objects/std/{sentinel}/vars"),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{why} must read as \"try later\", not as a broken driver"
+            );
+            assert_ne!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            // And the world-side message stays out of the body: same
+            // "never a different error shape" rule `NotFound` follows.
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(payload["error"], "unavailable");
+            assert!(
+                !text.contains("tick budget"),
+                "the world-side detail must not reach the HTTP body"
+            );
+        }
+    }
+
+    /// The admin taxonomy has no bare `500` anywhere in it, so no handler --
+    /// including a future `/mudcfg/<key>` GET/PUT -- can produce one without
+    /// adding a variant, which is the moment this test wants to be argued
+    /// about. Exhaustive over `AdminError` by construction: a new variant is a
+    /// compile error here until someone says which class it belongs to.
+    #[tokio::test]
+    async fn no_admin_error_variant_answers_500() {
+        let variants = [
+            (AdminError::Forbidden, StatusCode::FORBIDDEN),
+            (AdminError::StepUpRequired, StatusCode::FORBIDDEN),
+            (AdminError::BadRequest, StatusCode::BAD_REQUEST),
+            (
+                AdminError::Rejected("self-promotion is not permitted".to_string()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AdminError::DirectoryUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                AdminError::WorldUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (AdminError::NotFound, StatusCode::NOT_FOUND),
+            (AdminError::BodyTooLarge, StatusCode::PAYLOAD_TOO_LARGE),
+        ];
+        for (error, want) in variants {
+            let (status, Json(body)) = admin_error_response(error);
+            assert_eq!(status, want);
+            assert!(
+                !status.is_server_error() || status == StatusCode::SERVICE_UNAVAILABLE,
+                "{body:?}: a server-side fault must be 503, never 500"
+            );
+            assert!(
+                body.detail.is_none() || matches!(body.error, "rejected"),
+                "{body:?}: only a refusal the caller can act on carries detail"
+            );
+        }
     }
 
     #[tokio::test]
