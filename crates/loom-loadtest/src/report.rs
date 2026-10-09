@@ -779,4 +779,29 @@ mod tests {
         );
         assert!(md.contains("2.0 - 3.0"), "{md}");
     }
+
+    /// OBI-326: a number has to name its inputs. The load lane passes the pinned
+    /// mudlib as a note, and the committed Markdown report is where a reader (or
+    /// a later bisect) finds out which `warp` commit produced the p99.
+    #[test]
+    fn markdown_carries_the_mudlib_provenance_note() {
+        let mut s = Samples::default();
+        s.push_at(0, Duration::from_millis(9));
+        // Built from the shared helper rather than a second literal: OBI-344
+        // added report fields, and a hand-written copy of the whole struct is
+        // how a provenance test quietly stops covering the real report.
+        let mut report = empty_report(&s, None);
+        report.notes = vec![
+            "mudlib LoomMud/warp@1b0cd394d4cd41586e1a2d5fd449786b75c96976 (pinned in warp.ref)"
+                .to_string(),
+        ];
+        let md = report.to_markdown();
+        assert!(md.contains("## Notes"), "no notes section in:\n{md}");
+        assert!(
+            md.contains("warp@1b0cd394"),
+            "provenance note missing:\n{md}"
+        );
+        let json = serde_json::to_string(&report).expect("report serializes");
+        assert!(json.contains("1b0cd394"), "note missing from json: {json}");
+    }
 }

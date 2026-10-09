@@ -96,7 +96,7 @@ fn snapshot_round_trip_then_reconnect_fires_on_the_reattached_session() {
 #[test]
 fn reconnect_all_on_a_snapshot_with_no_connections_is_a_no_op() {
     let root = fixture("tworoom");
-    let world = World::boot(&root).expect("boot");
+    let mut world = World::boot(&root).expect("boot"); // OBI-348: `begin_snapshot` flushes queued saves, so it takes `&mut`
     let bytes = world
         .begin_snapshot()
         .expect("capture")
@@ -117,7 +117,7 @@ fn reconnect_all_on_a_snapshot_with_no_connections_is_a_no_op() {
 #[test]
 fn reconnect_on_an_unbound_conn_id_is_a_no_op() {
     let root = fixture("tworoom");
-    let world = World::boot(&root).expect("boot");
+    let mut world = World::boot(&root).expect("boot"); // OBI-348: `begin_snapshot` flushes queued saves, so it takes `&mut`
     let bytes = world
         .begin_snapshot()
         .expect("capture")

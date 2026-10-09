@@ -2440,6 +2440,12 @@ struct Driver<'a> {
     /// `disk_quota_mb`'s per-`<u>` byte counter (OBI-137 S1), owned by
     /// `World`; see `crate::disk_usage::DiskUsage`.
     disk_usage: &'a mut crate::disk_usage::DiskUsage,
+    /// The deferred-durability queue for `save_object` (OBI-348, spec §8.1),
+    /// owned by `World` exactly like `disk_usage`/`errors` next to it; see
+    /// [`crate::save_queue`]. `save_object` enqueues here instead of calling
+    /// `write_file_atomic` itself, which is what takes the two `fsync`s a
+    /// save costs off the world thread.
+    save_queue: &'a mut crate::save_queue::SaveQueue,
     /// Grouped runtime-error inbox (OBI-169), owned by `World`; the
     /// `errors` efun reads it back (filtered by the caller's own
     /// `valid_read` permission on each distinct program it covers).
@@ -2724,6 +2730,7 @@ impl<'a> RegistryHost<'a> {
         input_actor: Option<Sym>,
         disk_usage: &'a mut crate::disk_usage::DiskUsage,
         errors: &'a mut crate::errors::ErrorInbox,
+        save_queue: &'a mut crate::save_queue::SaveQueue,
         save_root: PathBuf,
     ) -> Self {
         let base = cut_guard
@@ -2755,6 +2762,7 @@ impl<'a> RegistryHost<'a> {
                 root,
                 save_root,
                 disk_usage,
+                save_queue,
                 errors,
             }),
             stack_base: stack_addr(),
@@ -3304,7 +3312,10 @@ impl<'a> RegistryHost<'a> {
     /// contents). On acceptance, the counter is updated here too (the
     /// caller writes unconditionally right after this returns `true`, on
     /// the single-threaded world thread, so nothing else can race it in
-    /// between).
+    /// between). **OBI-348 deliberately leaves `write_file` charging at the
+    /// call:** it is a synchronous, mudlib-visible write; only
+    /// `save_object`'s durability moved to the queue, so only its quota
+    /// charge moved with it -- see [`Self::check_save_disk_quota`].
     ///
     /// **OBI-236 fix:** the directory pool (`seeded_total`/`note_write`)
     /// and the save pool (`DiskUsage::seeded_save_total`, used by
@@ -3341,10 +3352,16 @@ impl<'a> RegistryHost<'a> {
         let driver = self.driver.as_mut().expect("checked above");
         let seeded = driver.disk_usage.seeded_total(&root, &u);
         let save_now = driver.disk_usage.save_total(&u);
+        // OBI-348: a `save_object` accepted but not yet durable is charged to
+        // `DiskUsage` only when it lands, so its bytes have to be folded in
+        // here too -- otherwise a builder with saves in flight could write
+        // past `disk_quota_mb` through `write_file`.
+        let save_queued = driver.save_queue.pending_bytes_for_uid(&u);
         let projected = seeded
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes)
-            .saturating_add(save_now);
+            .saturating_add(save_now)
+            .saturating_add(save_queued);
         if projected > max_bytes {
             self.registry
                 .quota_breaches
@@ -3373,9 +3390,24 @@ impl<'a> RegistryHost<'a> {
     /// the same principal the master's save-path authorization contract
     /// (`docs/save-objects.md`) is responsible for confining each save to
     /// in the first place. Same seeded-once/`O(1)`-after contract and the
-    /// same non-raising `Ok(false)`-on-breach shape as `check_disk_quota`;
+    /// same non-raising `Ok(None)`-on-breach shape as `check_disk_quota`;
     /// see [`crate::disk_usage::DiskUsage::seeded_save_total`] for why the
     /// seed here is one `metadata()` stat instead of a directory walk.
+    ///
+    /// **OBI-348: this projects, it no longer charges.** Under deferred
+    /// durability the bytes are not on disk when this returns, so charging
+    /// `note_save_write` at *accept* time would bill the world for a write
+    /// that may never land (and would have to be unwound if the durable
+    /// write then failed). This returns the size the write replaces --
+    /// which `save_object` carries in the queued task -- and the charge is
+    /// applied exactly once, from the real post-rename size, when the
+    /// outcome is reaped ([`crate::save_queue::apply_outcomes`]). The
+    /// projection is what keeps the cap honest in the meantime: a second
+    /// save to a path whose first save has not landed yet is measured
+    /// against the **queued** content, not the stale file
+    /// ([`crate::save_queue::SaveQueue::pending_for_path`]), so N queued
+    /// saves to one path can neither be billed N times nor slip past the cap
+    /// as if each were the only one.
     ///
     /// **OBI-236 fix:** this uses its own save pool
     /// (`seeded_save_total`/`note_save_write`), seeded independently of
@@ -3386,24 +3418,39 @@ impl<'a> RegistryHost<'a> {
     /// through `check_disk_quota` yet, since the walk root is known here)
     /// so a save is checked against everything `<u>` has on disk, not
     /// just its own save file, even when the save runs first.
-    fn check_save_disk_quota(&mut self, save_file_rel: &str, new_bytes: u64) -> R<bool> {
+    fn check_save_disk_quota(&mut self, save_file_rel: &str, new_bytes: u64) -> R<Option<u64>> {
         let Some(driver) = self.driver.as_ref() else {
-            return Ok(true);
+            return Ok(Some(0));
         };
         let uid = principal_of(self.registry, self.self_object()).uid;
         let u = self.registry.syms.name(uid).to_string();
         if crate::quota::is_unlimited_uid(&u) {
-            return Ok(true);
+            return Ok(Some(0));
         }
         let tier = driver.roles.tier(&u);
         let Some(max_mb) =
             crate::quota::resolve(&driver.roles, &u, self.quota_defaults()).disk_quota_mb
         else {
-            return Ok(true);
+            return Ok(Some(0));
         };
         let save_root = driver.save_root.clone();
         let root = driver.root.clone();
-        let old_bytes = crate::fileio::file_size_bytes(&save_root, save_file_rel).unwrap_or(0);
+        // The "old" side of the projection: the newest queued save for this
+        // path if one is still waiting to land, else the file on disk.
+        let queued_same = driver
+            .save_queue
+            .pending_for_path(save_file_rel)
+            .map(|(_, b)| b);
+        let old_bytes = match queued_same {
+            Some(bytes) => bytes,
+            None => crate::fileio::file_size_bytes(&save_root, save_file_rel).unwrap_or(0),
+        };
+        // Everything else this uid has queued is uncharged too, and must
+        // still count against the cap (OBI-348).
+        let queued_other = driver
+            .save_queue
+            .pending_bytes_for_uid(&u)
+            .saturating_sub(queued_same.unwrap_or(0));
         let max_bytes = max_mb.saturating_mul(crate::quota::MB);
         let driver = self.driver.as_mut().expect("checked above");
         let seeded = driver
@@ -3413,6 +3460,7 @@ impl<'a> RegistryHost<'a> {
         let projected = seeded
             .saturating_sub(old_bytes)
             .saturating_add(new_bytes)
+            .saturating_add(queued_other)
             .saturating_add(dir_now);
         if projected > max_bytes {
             self.registry
@@ -3425,11 +3473,9 @@ impl<'a> RegistryHost<'a> {
                      use for save_object(\"{save_file_rel}\"), quota is {max_bytes} bytes)"
                 ),
             );
-            return Ok(false);
+            return Ok(None);
         }
-        let driver = self.driver.as_mut().expect("checked above");
-        driver.disk_usage.note_save_write(&u, old_bytes, new_bytes);
-        Ok(true)
+        Ok(Some(old_bytes))
     }
 
     /// Run apply `name` on `on` from a **cut** (an empty guard stack
@@ -5804,8 +5850,24 @@ impl<'a> RegistryHost<'a> {
     /// atomically (write + rename, `crate::fileio::write_file_atomic`)
     /// under the save root (never the mudlib VFS -- see
     /// `World::save_root`'s docs) at `<path>.o`. `Ok(false)`: the write
-    /// failed (oversized, a filesystem error) -- this never mutates the
-    /// object itself, so a failed save can't corrupt live state.
+    /// failed (oversized, a filesystem error, over `disk_quota_mb`) -- this
+    /// never mutates the object itself, so a failed save can't corrupt live
+    /// state.
+    ///
+    /// **OBI-348 (spec §8.1): the durable half is deferred.** Everything up
+    /// to the hand-off is unchanged and stays on the world thread -- the
+    /// §7.3 render, the size cap, the master's save-path authorisation, the
+    /// `disk_quota_mb` projection. What moves to
+    /// [`crate::save_queue`]'s worker is the content `fsync`, the `rename`
+    /// and the parent-directory `fsync`, i.e. the two blocking calls that
+    /// made a mass teardown (`World::disconnect` -> `autosave()` ->
+    /// `save_character()`) the world thread's worst iteration. So a `true`
+    /// here now means "**accepted, in order**": the bytes cannot be lost, but
+    /// they are durable at the next flush ([`crate::world::World::
+    /// flush_pending_saves`]`, which `begin_snapshot` and `World`'s own drop
+    /// both call) rather than at this return. Rejections (`Ok(false)`, an
+    /// `Err`) still happen exactly where they used to. `SaveDurability::Sync`
+    /// restores the old contract for an embedder or a test that wants it.
     fn save_object(&mut self, raw_path: &str) -> R<bool> {
         let id = self.self_object();
         let Some(obj) = self.registry.get(id) else {
@@ -5840,28 +5902,70 @@ impl<'a> RegistryHost<'a> {
         let text =
             serde_json::to_string(&doc).map_err(|e| RtError::new(format!("save_object(): {e}")))?;
         let save_file = Self::save_file_name(raw_path);
-        if !self.check_save_disk_quota(&save_file, text.len() as u64)? {
+        let Some(old_bytes) = self.check_save_disk_quota(&save_file, text.len() as u64)? else {
             // Same shape as `write_file`'s own `disk_quota_mb` breach
             // (OBI-137 S1): over quota is not an error, so `upgrade()`'s
             // caller-visible contract (never silently mutating on a
-            // rejected save) still holds -- this runs before the write,
-            // not after.
+            // rejected save) still holds -- this runs before anything is
+            // queued, not after.
             return Ok(false);
+        };
+        // The billing identity the deferred charge has to land on, captured
+        // now (the object could be destructed by the time the worker reports
+        // back, and `disk_quota_mb` is keyed on the uid, not the object).
+        let uid = principal_of(self.registry, id).uid;
+        let uid_name = self.registry.syms.name(uid).to_string();
+        let program_path = program.path.to_string();
+        let driver = self.driver.as_mut().expect("save_object: driver context");
+        let task = crate::save_queue::SaveTask {
+            seq: 0, // `SaveQueue::enqueue` assigns the ordering key
+            save_root: driver.save_root.clone(),
+            path: save_file,
+            content: text,
+            uid: uid_name,
+            program: program_path,
+            old_bytes,
+        };
+        match driver.save_queue.enqueue(task) {
+            // Accepted by the worker: durable at the next flush, not yet.
+            crate::save_queue::Enqueued::Queued => Ok(true),
+            // This thread did the durable write itself, because there was no
+            // other writer to hand it to (`Sync` mode, no worker, a worker
+            // confirmed gone) or because the save alone exceeds the queue's
+            // byte budget. `true` means exactly what it meant before OBI-348,
+            // so the quota charge is applied here and now rather than deferred
+            // (CTO review: a full queue *waits*, it does not start a second
+            // writer -- see `save_queue`'s single-writer invariant).
+            crate::save_queue::Enqueued::Inline(outcome) => match outcome.committed_bytes {
+                Some(committed) => {
+                    driver
+                        .disk_usage
+                        .note_save_write(&outcome.uid, outcome.old_bytes, committed);
+                    Ok(true)
+                }
+                None => Err(RtError::new(format!(
+                    "save_object(\"{raw_path}\") failed: {}",
+                    outcome
+                        .error
+                        .unwrap_or_else(|| "durable write failed".to_string())
+                ))),
+            },
         }
-        let save_root = self
-            .driver
-            .as_ref()
-            .expect("checked above")
-            .save_root
-            .clone();
-        crate::fileio::write_file_atomic(&save_root, &save_file, &text)
-            .map_err(|e| RtError::new(format!("save_object(\"{raw_path}\") failed: {e}")))
     }
 
     /// `restore_object(path)` (spec §8.1/§7.3, OBI-171): the converse of
     /// [`Self::save_object`]. Reads `<path>.o` from the save root
     /// (`Ok(false)`, not an error, if it does not exist or fails to
-    /// parse -- a missing/corrupt save is not a crash). For every
+    /// parse -- a missing/corrupt save is not a crash).
+    ///
+    /// **OBI-348 read-your-writes:** because `save_object` no longer waits
+    /// for its own durable write, a `restore_object` of a path with a save
+    /// still queued would otherwise read the *previous* file. So this waits
+    /// for that one path first ([`crate::save_queue::SaveQueue::flush_path`])
+    /// -- which costs a block only when a save for exactly this file is in
+    /// flight, and never a filesystem walk otherwise.
+    ///
+    /// For every
     /// `persistent` var in `self()`'s *current* inherit chain, the saved
     /// value (decoded to a type-erased portable form,
     /// `crate::bcvm::persist::decode_value`) either carries straight over
@@ -5887,13 +5991,27 @@ impl<'a> RegistryHost<'a> {
             return Err(RtError::new("restore_object(): object was destructed"));
         };
         let program = obj.program.clone();
+        let save_file = Self::save_file_name(raw_path);
         let save_root = self
             .driver
             .as_ref()
             .expect("checked above")
             .save_root
             .clone();
-        let text = match crate::fileio::read_file(&save_root, &Self::save_file_name(raw_path)) {
+        // OBI-348: land any queued save for *this* path before reading.
+        {
+            let driver = self.driver.as_mut().expect("checked above");
+            if driver.save_queue.has_pending_for_path(&save_file) {
+                let outcomes = driver.save_queue.flush_path(&save_file);
+                crate::save_queue::apply_outcomes(
+                    &outcomes,
+                    driver.disk_usage,
+                    driver.errors,
+                    crate::world::unix_now_ms(),
+                );
+            }
+        }
+        let text = match crate::fileio::read_file(&save_root, &save_file) {
             Ok(Some(t)) => t,
             Ok(None) => return Ok(false),
             Err(e) => {

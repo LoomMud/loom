@@ -24,6 +24,13 @@ server-side stall counters can be lined up against the slow samples instead of
 only being read after the fact) and `--timeline-bucket-ms` (default 5000, the
 width of the report's latency-over-time buckets).
 
+`--note <text>` (repeatable, OBI-326) carries provenance into both the JSON and
+the Markdown report. The CI load lane uses it to stamp the mudlib a number was
+measured against -- `mudlib LoomMud/warp@<sha> (pinned in warp.ref)` -- so a
+committed report names its inputs instead of leaving the next reader to guess.
+Notes you pass are written before the run's own warnings (login failures,
+disconnects), in the order given.
+
 ## Design notes
 
 - `telnet.rs`: client-side telnet option negotiation (NAWS, TTYPE, CHARSET,

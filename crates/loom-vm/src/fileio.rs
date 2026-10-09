@@ -340,6 +340,12 @@ pub fn write_file_atomic(root: &Path, path: &str, text: &str) -> Result<bool, St
 /// Phase 1: validate, confine, and durably write `text` to a sibling
 /// temp file next to where `path` resolves -- but do not yet touch
 /// `path` itself. Returns the temp file's path, still present on disk.
+///
+/// The temp name is unique **per write** (`.{leaf}.tmp-{pid}-{seq}`), not per
+/// process: OBI-348 put the durable half of a save on its own thread, and two
+/// writers that shared a temp name could delete each other's in-flight file
+/// or fail `create_new` with `EEXIST`. `commit_write` renames the exact path
+/// it was handed, so nothing else needs to know the name.
 fn stage_write(root: &Path, path: &str, text: &str) -> Result<PathBuf, String> {
     let trimmed = path.trim();
     if !trimmed.ends_with(".o") {
@@ -367,20 +373,30 @@ fn stage_write(root: &Path, path: &str, text: &str) -> Result<PathBuf, String> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("save");
-    let tmp = parent.join(format!(".{leaf}.tmp-{}", std::process::id()));
+    let tmp = parent.join(unique_tmp_name(leaf));
     // CTO review (OBI-171, PR #75): a previous crash between this
     // `stage_write` and its matching `commit_write` can leave a stale
-    // tmp file at this exact name (same pid is reused by the OS only
-    // after a reboot, but a retried `save_object` call from the *same*
-    // still-running process reuses it immediately) -- clear it first so
-    // `create_new` below can't spuriously fail on it. Not found is fine;
-    // any other removal error is surfaced; it's safer to fail the save
-    // than silently clobber or follow something unexpected left in its
-    // place.
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("{path}: clearing stale tmp file: {e}")),
+    // tmp file behind -- clear it first so `create_new` below can't
+    // spuriously fail on it. Not found is fine; any other removal error is
+    // surfaced; it's safer to fail the save than silently clobber or follow
+    // something unexpected left in its place.
+    //
+    // Two names get swept, and only these two (no directory walk per save):
+    // this write's own unique name, and the pre-OBI-348 `.{leaf}.tmp-{pid}`
+    // shape an older build of this same process could have left. The unique
+    // name is what makes a second writer in this process impossible to
+    // collide with (CTO review, OBI-348: `save_object`'s durability now runs
+    // on a worker thread, so a temp name deterministic per *path* would have
+    // two threads unlinking and `create_new`-ing the same file).
+    for stale in [
+        tmp.clone(),
+        parent.join(format!(".{leaf}.tmp-{}", std::process::id())),
+    ] {
+        match std::fs::remove_file(&stale) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{path}: clearing stale tmp file: {e}")),
+        }
     }
     {
         use std::io::Write;
@@ -403,6 +419,17 @@ fn stage_write(root: &Path, path: &str, text: &str) -> Result<PathBuf, String> {
         f.sync_all().map_err(|e| format!("{path}: {e}"))?;
     }
     Ok(tmp)
+}
+
+/// Monotonic per-process counter behind [`unique_tmp_name`]. Wrapping at
+/// `u64::MAX` is not a durability question: a collision would need 2^64
+/// writes with a crashed half-write between each.
+static STAGE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `.{leaf}.tmp-{pid}-{seq}` -- no other writer in this process can name it.
+fn unique_tmp_name(leaf: &str) -> String {
+    let seq = STAGE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(".{leaf}.tmp-{}-{seq}", std::process::id())
 }
 
 /// Phase 2: atomically rename a temp file staged by [`stage_write`] over
@@ -681,6 +708,39 @@ mod tests {
             "the symlink target must never be written through"
         );
         let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// OBI-348 (CTO review): two staged writes of the *same* path in one
+    /// process must not collide. The temp name carries a per-process sequence
+    /// as well as the pid, so a durable write on the save worker and one on
+    /// another thread cannot unlink each other's in-flight file or lose
+    /// `create_new` to `EEXIST` -- which is exactly how CI run 37869788819
+    /// turned 2 of 20 same-path saves into failures.
+    #[test]
+    fn two_staged_writes_of_one_path_do_not_share_a_tmp_name() {
+        let root = tmp_root("atomic-tmp-unique");
+        std::fs::create_dir_all(root.join("players")).unwrap();
+        let a = stage_write(&root, "/players/bob.o", "first").unwrap();
+        let b = stage_write(&root, "/players/bob.o", "second").unwrap();
+        assert_ne!(a, b, "each write stages its own temp file");
+        // Neither is the other's file: both half-writes are intact.
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "second");
+        // Oldest first, then newest: newest wins, no error.
+        assert!(commit_write(&root, "/players/bob.o", &a).unwrap());
+        assert!(commit_write(&root, "/players/bob.o", &b).unwrap());
+        assert_eq!(
+            read_file(&root, "/players/bob.o").unwrap().unwrap(),
+            "second"
+        );
+        let left: Vec<String> = std::fs::read_dir(root.join("players"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(left.is_empty(), "no leftover tmp file: {left:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

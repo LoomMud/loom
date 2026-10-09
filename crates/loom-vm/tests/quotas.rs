@@ -643,6 +643,12 @@ fn disk_quota_mb_save_object_overwrite_is_not_undercounted_when_write_file_seeds
         )
         .expect("unconditional pre-quota save");
     assert!(matches!(pre_ok, Value::Bool(true)));
+    // OBI-348: `save_object` now returns "accepted", not "durable" -- this
+    // test asserts against the file itself, so it takes the durability
+    // barrier first (the same one `begin_snapshot` uses). Nothing else in
+    // this file needs it: `restore_object` waits for its own path, and the
+    // quota math below runs off the charge that the barrier applies.
+    world.flush_pending_saves();
     let old_save_bytes = std::fs::metadata(world.save_root().join("appr-save.o"))
         .expect("save file exists")
         .len();

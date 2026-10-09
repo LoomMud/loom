@@ -108,7 +108,7 @@ fn binary_snapshot_round_trip_preserves_object_state() {
 #[test]
 fn bad_magic_and_bad_abi_are_clean_errors_not_panics() {
     let root = fixture("tworoom");
-    let world = World::boot(&root).expect("boot");
+    let mut world = World::boot(&root).expect("boot"); // OBI-348: `begin_snapshot` flushes queued saves, so it takes `&mut`
     let bytes = world
         .begin_snapshot()
         .expect("capture")
