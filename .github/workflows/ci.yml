@@ -559,6 +559,27 @@ jobs:
           # no longer fails the step; `upload-artifact` runs `if: always()` with
           # `if-no-files-found: warn`, so the missing file is still visible.
           set +e
+          # OBI-344 half (b): the serve loop now paces its disconnect teardowns
+          # instead of running a whole logout backlog inline, so the server may
+          # still be working through it when the loadtest exits. Give it time to
+          # finish *before* scraping /metrics and counting saved objects:
+          # without this, a paced run would report fewer stall events and fewer
+          # saves than actually happened, i.e. the change would read as an
+          # improvement for a reporting-timing reason. Non-gating -- an
+          # unfinished drain is printed, never failed.
+          settle_start=$(date +%s)
+          while [ "$(find "$SAVES" -type f -name '*.o' 2>/dev/null | wc -l)" -lt 150 ] \
+                 && [ $(( $(date +%s) - settle_start )) -lt 60 ]; do
+            sleep 1
+          done
+          settled=$(find "$SAVES" -type f -name '*.o' 2>/dev/null | wc -l)
+          settle_wait=$(( $(date +%s) - settle_start ))
+          if [ "$settled" -ge 150 ]; then
+            settle_done=yes
+          else
+            settle_done=no
+          fi
+          echo "save_settle: objects_saved=$settled waited=${settle_wait}s drain_complete=$settle_done"
           # Scrape before stopping: the previous version of this step curled
           # `/metrics` *after* `kill`, so the "final /metrics" section was
           # always empty and the artifact's only server numbers were the

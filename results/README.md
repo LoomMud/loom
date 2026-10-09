@@ -245,6 +245,31 @@ closes first. Two consequences, both recorded so nobody has to rediscover them:
   `status=$?` gone). Reproduced deterministically against both archived scrapes, and the
   rule states the invariant plainly: the p99 verdict is the only thing that can turn
   this check red, and the evidence below it can only ever inform, never decide.
+- Since OBI-344 half (b) (`DisconnectDrain` in `crates/loom-cli/src/main.rs`) a
+  `Disconnected` event no longer runs `World::disconnect` inline: the connection id
+  is queued, and each serve-loop iteration runs at most
+  `LOOM_WORLD_DISCONNECT_BUDGET` (default 1) queued teardowns, no closer than
+  `LOOM_WORLD_DISCONNECT_INTERVAL_MS` (default 50) apart. The point is that the
+  backlog leaves the event FIFO's critical path -- the queueing costs an iteration
+  nothing -- so during a mass drop a live player's command waits behind at most
+  *one* teardown plus its own work instead of the whole ~4.9 s. A single `quit` is
+  unchanged: with nothing else queued the teardown still runs in the same
+  iteration. The queue is flushed before every `Connected` (a reconnect must never
+  bind an object whose teardown is pending, or that teardown would clear the fresh
+  binding), before a snapshot request, and when the event loop ends. What the
+  pacing costs: while a mass drop drains, the dying sessions stay bound (no
+  `net_dead`, no autosave) for up to about `pending x max(interval, 100 ms tick
+  cadence)` -- measured 15 s for 150 sessions -- and a 4096-deep backlog abandons
+  pacing rather than letting teardowns go stale. Spread that way the teardown
+  storm stops being a stall at all: run `37867234896` (`97dde57`) ended with
+  `save_settle: objects_saved=150 waited=15s drain_complete=yes` and a *cumulative*
+  scrape carrying **zero** `loom_world_loop_stalls_total` and
+  `duration_ms_max 26`, against 31 stalls / 562 ms on `ad489db` and 44 / 400 ms on
+  `36f1b55`; sampled p99 was 22.49 ms (PASS) versus 24.09 ms before. A single
+  logout's raw cost is untouched -- that is OBI-348 -- but no iteration has to
+  wait behind a batch of them any more, and `stalls{kind="disconnect"}` now counts
+  *iterations that did disconnect work*, including a `Tick`/`Line` iteration that
+  carried a pass.
 
 This is also why the historical tail is still open. Before PR #151 the same
 disconnect path failed instantly on ENOENT and the worst iteration in a green run
